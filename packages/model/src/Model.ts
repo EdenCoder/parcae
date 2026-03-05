@@ -39,7 +39,7 @@ import type {
   QueryChain,
   SchemaDefinition,
   PatchOp,
-} from "./adapters/types.js";
+} from "./adapters/types";
 
 // ─── ID Generation ───────────────────────────────────────────────────────────
 

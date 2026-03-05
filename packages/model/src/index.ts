@@ -5,10 +5,10 @@
  * Class properties ARE the schema. Direct property access. Full type safety.
  */
 
-export { Model, generateId } from "./Model.js";
+export { Model, generateId } from "./Model";
 
-export { FrontendAdapter } from "./adapters/client.js";
-export type { Transport } from "./adapters/client.js";
+export { FrontendAdapter } from "./adapters/client";
+export type { Transport } from "./adapters/client";
 
 export type {
   ModelAdapter,
@@ -25,4 +25,4 @@ export type {
   ScopeResult,
   ScopeFunction,
   PatchOp,
-} from "./adapters/types.js";
+} from "./adapters/types";

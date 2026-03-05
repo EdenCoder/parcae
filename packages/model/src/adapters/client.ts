@@ -16,7 +16,7 @@ import type {
   QueryChain,
   QueryStep,
   PatchOp,
-} from "./types.js";
+} from "./types";
 
 // ─── Transport Interface ─────────────────────────────────────────────────────
 
