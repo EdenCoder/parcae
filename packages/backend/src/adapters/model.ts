@@ -20,6 +20,10 @@ import type {
 } from "@parcae/model";
 import { getHooksFor } from "../routing/hook";
 import type { HookAction, HookTiming } from "../routing/hook";
+import {
+  enqueue as globalEnqueue,
+  lock as globalLock,
+} from "../services/context";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -572,13 +576,8 @@ export class BackendAdapter implements ModelAdapter {
       const ctx = {
         model,
         action: action as HookAction,
-        lock: async (key: string, ttl?: number) => {
-          if (this.pubsub?.lock) return this.pubsub.lock(key, ttl);
-          return async () => {}; // no-op if no pubsub
-        },
-        enqueue: async (name: string, data: any, opts?: any) => {
-          // TODO: Wire to BullMQ queue
-        },
+        lock: globalLock,
+        enqueue: globalEnqueue,
       };
 
       if (hookEntry.async) {

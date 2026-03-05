@@ -27,6 +27,8 @@ export type { PubSubConfig } from "./services/pubsub";
 export { QueueService, addJobIfNotExists } from "./services/queue";
 export type { QueueConfig } from "./services/queue";
 export { QuerySubscriptionManager } from "./services/subscriptions";
+export { enqueue, lock, getQueue, getPubSub } from "./services/context";
+export type { EnqueueOptions } from "./services/context";
 
 // Auth
 export {

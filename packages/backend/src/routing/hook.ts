@@ -42,8 +42,8 @@ export interface HookContext {
   data?: Record<string, any>;
   /** Distributed lock function. */
   lock: (key: string, ttl?: number) => Promise<() => Promise<void>>;
-  /** Enqueue a background job. */
-  enqueue: (name: string, data: any, opts?: any) => Promise<void>;
+  /** Enqueue a background job. Returns true if enqueued, false if deduped/skipped. */
+  enqueue: (name: string, data: any, opts?: any) => Promise<boolean>;
   /** The authenticated user (if any). */
   user?: { id: string; [key: string]: any } | null;
 }

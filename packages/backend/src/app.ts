@@ -22,6 +22,7 @@ import { registerModelRoutes } from "./adapters/routes";
 import { PubSub } from "./services/pubsub";
 import { QueueService } from "./services/queue";
 import { QuerySubscriptionManager } from "./services/subscriptions";
+import { _setServices } from "./services/context";
 import { getJobs } from "./routing/job";
 import {
   createAuth,
@@ -223,6 +224,9 @@ export function createApp(config: AppConfig): ParcaeApp {
       await pubsub.building;
       const queue = new QueueService({ url: envConfig.REDIS_URL });
       await queue.building;
+
+      // Make queue + pubsub available globally via enqueue() and lock()
+      _setServices(queue, pubsub);
 
       if (envConfig.REDIS_URL) {
         console.log("[parcae] Redis connected (PubSub + Queue)");
