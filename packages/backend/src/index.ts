@@ -21,6 +21,13 @@ export { BackendAdapter } from "./adapters/model";
 export type { BackendServices } from "./adapters/model";
 export { registerModelRoutes } from "./adapters/routes";
 
+// Services
+export { PubSub } from "./services/pubsub";
+export type { PubSubConfig } from "./services/pubsub";
+export { QueueService, addJobIfNotExists } from "./services/queue";
+export type { QueueConfig } from "./services/queue";
+export { QuerySubscriptionManager } from "./services/subscriptions";
+
 // Schema
 export { SchemaResolver, resolveFallbackSchema } from "./schema/resolver";
 export { generateSchemas, loadCachedSchemas } from "./schema/generate";

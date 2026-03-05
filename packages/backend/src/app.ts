@@ -19,6 +19,10 @@ import type { ServerContext } from "./server";
 import { getRoutes } from "./routing/route";
 import { BackendAdapter } from "./adapters/model";
 import { registerModelRoutes } from "./adapters/routes";
+import { PubSub } from "./services/pubsub";
+import { QueueService } from "./services/queue";
+import { QuerySubscriptionManager } from "./services/subscriptions";
+import { getJobs } from "./routing/job";
 import knex from "knex";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -172,25 +176,49 @@ export function createApp(config: AppConfig): ParcaeApp {
 
       console.log("[parcae] Database connected");
 
-      // ── Step 4: Set up BackendAdapter + Model.use() ────────────────
-      const adapter = new BackendAdapter({ read: readDb, write: writeDb });
+      // ── Step 4: Connect Redis (PubSub + Queue) ─────────────────────
+      const pubsub = new PubSub({ url: envConfig.REDIS_URL });
+      await pubsub.building;
+      const queue = new QueueService({ url: envConfig.REDIS_URL });
+      await queue.building;
+
+      if (envConfig.REDIS_URL) {
+        console.log("[parcae] Redis connected (PubSub + Queue)");
+      } else {
+        console.log(
+          "[parcae] Redis not configured — using in-process fallbacks",
+        );
+      }
+
+      // ── Step 5: Set up BackendAdapter + Model.use() ────────────────
+      const adapter = new BackendAdapter({
+        read: readDb,
+        write: writeDb,
+        pubsub,
+      });
       Model.use(adapter);
 
-      // ── Step 5: Ensure tables (additive migration) ─────────────────
+      // ── Step 6: Ensure tables (additive migration) ─────────────────
       await adapter.ensureAllTables(models);
       console.log("[parcae] Database schema ensured");
 
-      // ── Step 6: Create server ──────────────────────────────────────
+      // ── Step 7: Create server ──────────────────────────────────────
       server = createServer_({ config: envConfig, version });
 
-      // ── Step 7: Register auto-CRUD routes ──────────────────────────
+      // ── Step 8: Set up QuerySubscriptionManager ────────────────────
+      const subscriptions = new QuerySubscriptionManager(
+        adapter,
+        (socketId, event, data) => {
+          server?.io.to(socketId).emit(event, data);
+        },
+      );
+      adapter.subscriptions = subscriptions;
+
+      // ── Step 9: Register auto-CRUD routes ──────────────────────────
       const crudCount = registerModelRoutes(models, adapter, version);
       console.log(`[parcae] Registered ${crudCount} auto-CRUD route(s)`);
 
-      // ── Step 8: Discover & register custom routes, hooks, jobs ─────
-      // Auto-discovered controllers/hooks/jobs are loaded and registered
-      // at import time via their respective register functions.
-      // Here we apply them to the Polka instance.
+      // ── Step 10: Register custom routes, hooks, jobs ───────────────
       const routes = getRoutes();
       for (const entry of routes) {
         const method = entry.method.toLowerCase() as keyof typeof server.polka;
@@ -199,24 +227,61 @@ export function createApp(config: AppConfig): ParcaeApp {
           (server.polka[method] as any)(entry.path, ...handlers);
         }
       }
-
       console.log(`[parcae] Registered ${routes.length} custom route(s)`);
 
-      // ── Step 9: Socket.IO connection handling ──────────────────────
+      // ── Step 11: Start job workers ─────────────────────────────────
+      const registeredJobs = getJobs();
+      if (registeredJobs.length > 0 && queue.get()) {
+        const defaultQueue = queue.get()!;
+        queue.createWorker(defaultQueue.name, async (bullJob) => {
+          const jobEntry = registeredJobs.find((j) => j.name === bullJob.name);
+          if (!jobEntry) {
+            console.warn(`[parcae] No handler for job "${bullJob.name}"`);
+            return;
+          }
+          return jobEntry.handler({
+            data: bullJob.data,
+            bullJob,
+            attempt: bullJob.attemptsMade,
+          });
+        });
+        console.log(
+          `[parcae] Started worker for ${registeredJobs.length} job(s)`,
+        );
+      }
+
+      // ── Step 12: Socket.IO connection handling ─────────────────────
+      // Model class lookup for subscription requests
+      const modelsByType = new Map(models.map((m) => [m.type, m]));
+
       server.io.on("connection", (socket) => {
-        // TODO: DOL-150 — Auth, subscribe:query, call events
         console.log(`[parcae] Client connected: ${socket.id}`);
 
+        // Query subscriptions
+        socket.on("subscribe:query", async (data: any) => {
+          const modelClass = modelsByType.get(data.modelType);
+          if (!modelClass) return;
+          const result = await subscriptions.subscribe({
+            socketId: socket.id,
+            modelClass,
+            steps: data.steps ?? [],
+            scopeFilter: data.scopeFilter ?? null,
+          });
+          socket.emit(`query:${data.hash}:init`, result.items);
+        });
+
+        socket.on("unsubscribe:query", (data: any) => {
+          subscriptions.unsubscribe(socket.id, data.hash);
+        });
+
         socket.on("disconnect", () => {
-          // TODO: Cleanup subscriptions
+          subscriptions.unsubscribeAll(socket.id);
         });
       });
 
-      // ── Step 10: Start listening ───────────────────────────────────
+      // ── Step 13: Start listening ───────────────────────────────────
       await new Promise<void>((resolveStart) => {
-        server!.httpServer.listen(port, () => {
-          resolveStart();
-        });
+        server!.httpServer.listen(port, () => resolveStart());
       });
 
       console.log(`[parcae] Ready on port ${port} (v${version})`);
