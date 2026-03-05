@@ -108,6 +108,45 @@ async function discoverModels(dir: string): Promise<ModelConstructor[]> {
   return models;
 }
 
+// ─── Auto-discovery ──────────────────────────────────────────────────────────
+
+/**
+ * Auto-discover and import all .ts/.js files from a directory (recursively).
+ * Files self-register by calling route.*, hook.*, job() at import time.
+ * Like Next.js — just put files in the directory, they're auto-loaded.
+ */
+async function discoverAndImport(dir: string, label: string): Promise<number> {
+  const absDir = resolve(dir);
+  if (!existsSync(absDir)) return 0;
+
+  let count = 0;
+  const entries = readdirSync(absDir, { recursive: true });
+
+  for (const entry of entries) {
+    const entryStr = entry.toString();
+    if (!entryStr.endsWith(".ts") && !entryStr.endsWith(".js")) continue;
+    if (entryStr.startsWith(".") || entryStr.startsWith("_")) continue;
+    if (entryStr.includes("node_modules")) continue;
+    if (entryStr === "index.ts" || entryStr === "index.js") continue;
+
+    const filePath = join(absDir, entryStr);
+    const stat = statSync(filePath);
+    if (!stat.isFile()) continue;
+
+    try {
+      await import(filePath);
+      count++;
+    } catch (err) {
+      console.warn(
+        `[parcae] Failed to import ${label} from ${entryStr}:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
+  return count;
+}
+
 // ─── createApp ───────────────────────────────────────────────────────────────
 
 export function createApp(config: AppConfig): ParcaeApp {
@@ -255,7 +294,23 @@ export function createApp(config: AppConfig): ParcaeApp {
       const crudCount = registerModelRoutes(models, adapter, version);
       console.log(`[parcae] Registered ${crudCount} auto-CRUD route(s)`);
 
-      // ── Step 10: Register custom routes, hooks, jobs ───────────────
+      // ── Step 10: Auto-discover controllers, hooks, jobs ────────────
+      // Files self-register by calling route.*, hook.*, job() at import time.
+      // Just importing them is enough — like Next.js pages.
+      if (typeof config.controllers === "string") {
+        const n = await discoverAndImport(config.controllers, "controller");
+        console.log(`[parcae] Discovered ${n} controller file(s)`);
+      }
+      if (typeof config.hooks === "string") {
+        const n = await discoverAndImport(config.hooks, "hook");
+        console.log(`[parcae] Discovered ${n} hook file(s)`);
+      }
+      if (typeof config.jobs === "string") {
+        const n = await discoverAndImport(config.jobs, "job");
+        console.log(`[parcae] Discovered ${n} job file(s)`);
+      }
+
+      // ── Step 11: Apply discovered routes to Polka ──────────────────
       const routes = getRoutes();
       for (const entry of routes) {
         const method = entry.method.toLowerCase() as keyof typeof server.polka;
@@ -266,7 +321,7 @@ export function createApp(config: AppConfig): ParcaeApp {
       }
       console.log(`[parcae] Registered ${routes.length} custom route(s)`);
 
-      // ── Step 11: Start job workers ─────────────────────────────────
+      // ── Step 12: Start job workers ─────────────────────────────────
       const registeredJobs = getJobs();
       if (registeredJobs.length > 0 && queue.get()) {
         const defaultQueue = queue.get()!;
@@ -287,7 +342,7 @@ export function createApp(config: AppConfig): ParcaeApp {
         );
       }
 
-      // ── Step 12: Socket.IO connection handling ─────────────────────
+      // ── Step 13: Socket.IO connection handling ─────────────────────
       // Model class lookup for subscription requests
       const modelsByType = new Map(models.map((m) => [m.type, m]));
 
@@ -325,7 +380,7 @@ export function createApp(config: AppConfig): ParcaeApp {
         });
       });
 
-      // ── Step 13: Start listening ───────────────────────────────────
+      // ── Step 14: Start listening ───────────────────────────────────
       await new Promise<void>((resolveStart) => {
         server!.httpServer.listen(port, () => resolveStart());
       });
