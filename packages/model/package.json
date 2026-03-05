@@ -1,6 +1,6 @@
 {
   "name": "@parcae/model",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Parcae Model — typed ORM base class with adapter pattern",
   "type": "module",
   "main": "./dist/index.js",
@@ -9,15 +9,18 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
     },
     "./adapters/types": {
       "types": "./dist/adapters/types.d.ts",
-      "import": "./dist/adapters/types.js"
+      "import": "./dist/adapters/types.js",
+      "default": "./dist/adapters/types.js"
     },
     "./adapters/client": {
       "types": "./dist/adapters/client.d.ts",
-      "import": "./dist/adapters/client.js"
+      "import": "./dist/adapters/client.js",
+      "default": "./dist/adapters/client.js"
     }
   },
   "files": [
