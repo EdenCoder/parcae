@@ -1,7 +1,9 @@
 node_modules/
 dist/
 .parcae/
+.turbo/
 *.tsbuildinfo
 .env
 .env.local
 .DS_Store
+pnpm-lock.yaml

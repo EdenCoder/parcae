@@ -1,0 +1,58 @@
+{
+  "name": "@parcae/backend",
+  "version": "0.0.1",
+  "description": "Parcae Backend — TypeScript backend framework with auto-CRUD, realtime, and jobs",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@parcae/model": "workspace:*",
+    "@rttist/typegen": "^0.2.0",
+    "@sesamecare-oss/redlock": "^1.1.0",
+    "async-lock": "^1.4.1",
+    "better-auth": "^1.2.0",
+    "body-parser": "^1.20.3",
+    "bullmq": "^5.0.0",
+    "compress-json": "^3.1.0",
+    "connect-busboy": "^1.0.0",
+    "deep-equal": "^2.2.3",
+    "ioredis": "^5.4.0",
+    "knex": "^3.1.0",
+    "pako": "^2.1.0",
+    "pg": "^8.13.0",
+    "pluralize": "^8.0.0",
+    "polka": "^0.5.2",
+    "rttist": "^1.0.0-rc.4",
+    "socket.io": "^4.8.0",
+    "trouter": "^4.0.0",
+    "winston": "^3.17.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/async-lock": "^1.4.2",
+    "@types/body-parser": "^1.19.5",
+    "@types/deep-equal": "^1.0.4",
+    "@types/node": "^22.0.0",
+    "@types/pako": "^2.0.3",
+    "@types/pluralize": "^0.0.33",
+    "tsup": "^8.5.0",
+    "typescript": "^5.8.0"
+  },
+  "license": "MIT"
+}
