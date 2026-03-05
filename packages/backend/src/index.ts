@@ -5,11 +5,41 @@
  * and background jobs. Built on Polka, Socket.IO, Knex, and BullMQ.
  */
 
+// App
 export { createApp } from "./app";
 export type { ParcaeApp, AppConfig } from "./app";
 
+// Config
+export { parseConfig, configSchema } from "./config";
+export type { Config } from "./config";
+
+// Server
+export { createServer_ } from "./server";
+
+// Schema
 export { SchemaResolver, resolveFallbackSchema } from "./schema/resolver";
 export { generateSchemas, loadCachedSchemas } from "./schema/generate";
+
+// Routing
+export { route, Controller, getRoutes, clearRoutes } from "./routing/route";
+export type {
+  RouteHandler,
+  Middleware,
+  RouteOptions,
+  RouteEntry,
+} from "./routing/route";
+
+export { hook, getHooks, getHooksFor, clearHooks } from "./routing/hook";
+export type {
+  HookTiming,
+  HookAction,
+  HookContext,
+  HookOptions,
+  HookEntry,
+} from "./routing/hook";
+
+export { job, getJobs, getJob, clearJobs } from "./routing/job";
+export type { JobHandler, JobContext, JobEntry } from "./routing/job";
 
 // Re-export model for convenience
 export { Model } from "@parcae/model";

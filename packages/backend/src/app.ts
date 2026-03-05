@@ -11,6 +11,11 @@ import { resolve, join } from "node:path";
 import { readdirSync, existsSync, statSync } from "node:fs";
 import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
 import { generateSchemas } from "./schema/generate";
+import { parseConfig } from "./config";
+import type { Config } from "./config";
+import { createServer_ } from "./server";
+import type { ServerContext } from "./server";
+import { getRoutes } from "./routing/route";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -100,6 +105,8 @@ export function createApp(config: AppConfig): ParcaeApp {
 
   let schemas = new Map<string, SchemaDefinition>();
   let models: ModelConstructor[] = [];
+  let server: ServerContext | null = null;
+  let envConfig: Config | null = null;
 
   return {
     get schemas() {
@@ -110,8 +117,10 @@ export function createApp(config: AppConfig): ParcaeApp {
     },
 
     async start(options = {}) {
-      const port = options.port ?? parseInt(process.env.PORT ?? "3000", 10);
-      const dev = options.dev ?? process.env.NODE_ENV === "development";
+      // ── Step 0: Parse & validate config ────────────────────────────
+      envConfig = parseConfig(process.env);
+      const port = options.port ?? envConfig.PORT;
+      const dev = options.dev ?? envConfig.NODE_ENV === "development";
 
       console.log(`[parcae] Starting${dev ? " (dev mode)" : ""}...`);
 
@@ -127,7 +136,7 @@ export function createApp(config: AppConfig): ParcaeApp {
 
       // ── Step 2: Generate schemas (.parcae/) ────────────────────────
       const modelPaths = Array.isArray(config.models)
-        ? [] // No file paths to hash when models are passed directly
+        ? []
         : [resolve(config.models)];
 
       const result = await generateSchemas(models, {
@@ -152,21 +161,56 @@ export function createApp(config: AppConfig): ParcaeApp {
       // ── Step 5: Ensure tables ──────────────────────────────────────
       // TODO: DOL-150 — Additive migration from schemas
 
-      // ── Step 6: Register auto-CRUD routes ──────────────────────────
+      // ── Step 6: Create server ──────────────────────────────────────
+      server = createServer_({ config: envConfig, version });
+
+      // ── Step 7: Register auto-CRUD routes ──────────────────────────
       // TODO: DOL-151 — Auto-CRUD from model schemas
 
-      // ── Step 7: Discover controllers, hooks, jobs ──────────────────
-      // TODO: DOL-152 — Auto-discovery
+      // ── Step 8: Discover & register custom routes, hooks, jobs ─────
+      // Auto-discovered controllers/hooks/jobs are loaded and registered
+      // at import time via their respective register functions.
+      // Here we apply them to the Polka instance.
+      const routes = getRoutes();
+      for (const entry of routes) {
+        const method = entry.method.toLowerCase() as keyof typeof server.polka;
+        if (typeof server.polka[method] === "function") {
+          const handlers = [...entry.middlewares, entry.handler];
+          (server.polka[method] as any)(entry.path, ...handlers);
+        }
+      }
 
-      // ── Step 8: Start HTTP + WebSocket server ──────────────────────
-      // TODO: DOL-149 continued — Polka + Socket.IO
+      console.log(`[parcae] Registered ${routes.length} custom route(s)`);
+
+      // ── Step 9: Socket.IO connection handling ──────────────────────
+      server.io.on("connection", (socket) => {
+        // TODO: DOL-150 — Auth, subscribe:query, call events
+        console.log(`[parcae] Client connected: ${socket.id}`);
+
+        socket.on("disconnect", () => {
+          // TODO: Cleanup subscriptions
+        });
+      });
+
+      // ── Step 10: Start listening ───────────────────────────────────
+      await new Promise<void>((resolveStart) => {
+        server!.httpServer.listen(port, () => {
+          resolveStart();
+        });
+      });
 
       console.log(`[parcae] Ready on port ${port} (v${version})`);
     },
 
     async stop() {
       console.log("[parcae] Shutting down...");
-      // TODO: Graceful shutdown
+      if (server) {
+        server.io.close();
+        await new Promise<void>((resolveClose) => {
+          server!.httpServer.close(() => resolveClose());
+        });
+        server = null;
+      }
     },
   };
 }
