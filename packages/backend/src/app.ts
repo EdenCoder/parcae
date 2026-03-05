@@ -23,6 +23,12 @@ import { PubSub } from "./services/pubsub";
 import { QueueService } from "./services/queue";
 import { QuerySubscriptionManager } from "./services/subscriptions";
 import { getJobs } from "./routing/job";
+import {
+  createAuth,
+  createAuthMiddleware,
+  createSocketAuthHandler,
+} from "./auth";
+import type { AuthConfig } from "./auth";
 import knex from "knex";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -36,11 +42,8 @@ export interface AppConfig {
   hooks?: string;
   /** Jobs directory for auto-discovery. */
   jobs?: string;
-  /** Authentication configuration. */
-  auth?: {
-    providers?: ("email" | "google" | "github")[];
-    [key: string]: any;
-  };
+  /** Authentication configuration. Opt-in — omit to skip auth entirely. */
+  auth?: AuthConfig;
   /** API version prefix. Default: "v1" */
   version?: string;
   /** Project root directory. Default: process.cwd() */
@@ -214,6 +217,40 @@ export function createApp(config: AppConfig): ParcaeApp {
       );
       adapter.subscriptions = subscriptions;
 
+      // ── Step 8b: Set up auth (opt-in) ─────────────────────────────
+      let authInstance: ReturnType<typeof createAuth> | null = null;
+      let socketAuthHandler: ReturnType<typeof createSocketAuthHandler> | null =
+        null;
+
+      if (config.auth) {
+        authInstance = createAuth(config.auth, envConfig);
+        const authMiddleware = createAuthMiddleware(authInstance);
+        socketAuthHandler = createSocketAuthHandler(authInstance);
+
+        // Mount auth middleware on all requests (resolves req.session)
+        server.polka.use(authMiddleware);
+
+        // Mount Better Auth handler for /v1/auth/* routes
+        const authBasePath = config.auth.basePath ?? "/v1/auth";
+        server.polka.all(`${authBasePath}/*`, async (req: any, res: any) => {
+          // Forward to Better Auth
+          const response = await authInstance!.handler(req);
+          // Better Auth returns a Response object — pipe it through
+          if (response && typeof response.status === "number") {
+            res.writeHead(
+              response.status,
+              Object.fromEntries(response.headers.entries()),
+            );
+            const body = await response.text();
+            res.end(body);
+          }
+        });
+
+        console.log(
+          `[parcae] Auth enabled (${config.auth.providers?.join(", ") ?? "email"})`,
+        );
+      }
+
       // ── Step 9: Register auto-CRUD routes ──────────────────────────
       const crudCount = registerModelRoutes(models, adapter, version);
       console.log(`[parcae] Registered ${crudCount} auto-CRUD route(s)`);
@@ -255,7 +292,16 @@ export function createApp(config: AppConfig): ParcaeApp {
       const modelsByType = new Map(models.map((m) => [m.type, m]));
 
       server.io.on("connection", (socket) => {
-        console.log(`[parcae] Client connected: ${socket.id}`);
+        let socketSession: any = null;
+
+        // Authenticate via bearer token
+        socket.on("authenticate", async (token: string, callback: any) => {
+          if (socketAuthHandler) {
+            socketSession = await socketAuthHandler(token, callback);
+          } else {
+            callback?.({ userId: null });
+          }
+        });
 
         // Query subscriptions
         socket.on("subscribe:query", async (data: any) => {

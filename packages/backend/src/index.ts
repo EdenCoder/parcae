@@ -28,6 +28,14 @@ export { QueueService, addJobIfNotExists } from "./services/queue";
 export type { QueueConfig } from "./services/queue";
 export { QuerySubscriptionManager } from "./services/subscriptions";
 
+// Auth
+export {
+  createAuth,
+  createAuthMiddleware,
+  createSocketAuthHandler,
+} from "./auth";
+export type { AuthConfig, AuthInstance, Session } from "./auth";
+
 // Schema
 export { SchemaResolver, resolveFallbackSchema } from "./schema/resolver";
 export { generateSchemas, loadCachedSchemas } from "./schema/generate";
