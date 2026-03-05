@@ -1,11 +1,11 @@
 /**
- * FrontendAdapter — Valtio + Socket transport for Parcae Model.
+ * FrontendAdapter — Valtio + Transport for Parcae Model.
  *
- * - createStore() returns a Valtio proxy (reactive data)
- * - save() sends changes via socket to the backend
- * - query() sends serialized QuerySteps via socket
- * - findById() fetches via socket GET
- * - patch() sends ops via socket PATCH
+ * Transport-agnostic. Works with any implementation of the Transport interface:
+ * - SocketTransport (Socket.IO — bidirectional, realtime)
+ * - SSETransport (Server-Sent Events — read-heavy, simpler)
+ * - GRPCTransport (gRPC — service-to-service)
+ * - Or any custom transport
  */
 
 import { proxy } from "valtio";
@@ -21,27 +21,70 @@ import type {
 // ─── Transport Interface ─────────────────────────────────────────────────────
 
 /**
- * The transport layer the FrontendAdapter communicates over.
- * Implemented by the SDK's Client class.
+ * Abstract transport layer. Decouples the Model system from the wire protocol.
+ *
+ * Implementations:
+ * - SocketTransport: Socket.IO (bidirectional, realtime subscriptions)
+ * - SSETransport: HTTP + Server-Sent Events (read-heavy, simpler infra)
+ * - GRPCTransport: gRPC (service-to-service, protobuf)
  */
 export interface Transport {
+  // ── Request/Response (RPC-style) ────────────────────────────────────
   get(path: string, data?: any): Promise<any>;
   post(path: string, data?: any): Promise<any>;
   put(path: string, data?: any): Promise<any>;
   patch(path: string, data?: any): Promise<any>;
   delete(path: string, data?: any): Promise<any>;
-  /** Low-level socket emit (for control messages like subscribe:query). */
-  emitSocket?(event: string, ...args: any[]): void;
-  /** Subscribe to a raw socket event. */
-  subscribe?(event: string, handler: (...args: any[]) => void): any;
-  /** Unsubscribe from a raw socket event. */
-  unsubscribe?(event: string, handler?: (...args: any[]) => void): any;
+
+  // ── Subscriptions (realtime) ────────────────────────────────────────
+  /**
+   * Subscribe to a named event stream.
+   * Returns a dispose function to unsubscribe.
+   *
+   * Socket.IO: socket.on(event, handler)
+   * SSE: new EventSource(url) per channel
+   * gRPC: server streaming RPC
+   */
+  subscribe?(event: string, handler: (...args: any[]) => void): () => void;
+
+  /**
+   * Unsubscribe from a named event stream.
+   * Alternative to calling the dispose function returned by subscribe().
+   */
+  unsubscribe?(event: string, handler?: (...args: any[]) => void): void;
+
+  // ── Control messages ────────────────────────────────────────────────
+  /**
+   * Send a control message to the server (fire-and-forget).
+   *
+   * Socket.IO: socket.emit(event, ...args)
+   * SSE: POST /v1/__control { event, args }
+   * gRPC: unary RPC
+   */
+  send?(event: string, ...args: any[]): void;
+
+  // ── Connection state ────────────────────────────────────────────────
+  /** Whether the transport is currently connected. */
+  readonly isConnected?: boolean;
+  /** Whether the transport is currently loading/connecting. */
+  readonly isLoading?: boolean;
+
+  /**
+   * Listen for connection state changes.
+   * Events: "connected", "disconnected", "reconnecting", "error"
+   */
+  on?(event: string, handler: (...args: any[]) => void): void;
+  off?(event: string, handler?: (...args: any[]) => void): void;
+
+  /** Disconnect the transport. */
+  disconnect?(): void;
+  /** Reconnect the transport. */
+  reconnect?(): Promise<void>;
 }
 
 /**
  * Strip version prefix from a path if it starts with /v{number}.
- * The SDK transport prepends the version automatically.
- * "/v1/projects" → "/projects"
+ * The transport prepends the version automatically.
  */
 function stripVersion(path: string): string {
   return path.replace(/^\/v\d+/, "");
@@ -50,13 +93,12 @@ function stripVersion(path: string): string {
 // ─── FrontendAdapter ─────────────────────────────────────────────────────────
 
 export class FrontendAdapter implements ModelAdapter {
-  private transport: Transport;
+  public transport: Transport;
 
   constructor(transport: Transport) {
     this.transport = transport;
   }
 
-  /** Resolve a model path for the transport (strips version prefix). */
   private p(modelPath: string): string {
     return stripVersion(modelPath);
   }
@@ -230,10 +272,6 @@ export class FrontendAdapter implements ModelAdapter {
     return chain as QueryChain<T>;
   }
 
-  /**
-   * Serialize query args — strip functions (like builder functions from scope)
-   * since they can't be sent over the wire.
-   */
   private _serializeArgs(args: any[]): any[] {
     return args.map((arg) => {
       if (typeof arg === "function") return "__fn__";
