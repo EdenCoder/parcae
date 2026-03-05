@@ -53,6 +53,7 @@ export { hook, getHooks, getHooksFor, clearHooks } from "./routing/hook";
 export type {
   HookTiming,
   HookAction,
+  HookHandler,
   HookContext,
   HookOptions,
   HookEntry,

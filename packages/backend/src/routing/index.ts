@@ -10,6 +10,7 @@ export { hook, getHooks, getHooksFor, clearHooks } from "./hook";
 export type {
   HookTiming,
   HookAction,
+  HookHandler,
   HookContext,
   HookOptions,
   HookEntry,
