@@ -16,6 +16,11 @@ export type { Config } from "./config";
 // Server
 export { createServer_ } from "./server";
 
+// Adapters
+export { BackendAdapter } from "./adapters/model";
+export type { BackendServices } from "./adapters/model";
+export { registerModelRoutes } from "./adapters/routes";
+
 // Schema
 export { SchemaResolver, resolveFallbackSchema } from "./schema/resolver";
 export { generateSchemas, loadCachedSchemas } from "./schema/generate";

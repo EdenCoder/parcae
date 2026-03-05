@@ -9,6 +9,7 @@
 
 import { resolve, join } from "node:path";
 import { readdirSync, existsSync, statSync } from "node:fs";
+import { Model } from "@parcae/model";
 import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
 import { generateSchemas } from "./schema/generate";
 import { parseConfig } from "./config";
@@ -16,6 +17,9 @@ import type { Config } from "./config";
 import { createServer_ } from "./server";
 import type { ServerContext } from "./server";
 import { getRoutes } from "./routing/route";
+import { BackendAdapter } from "./adapters/model";
+import { registerModelRoutes } from "./adapters/routes";
+import knex from "knex";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -153,19 +157,35 @@ export function createApp(config: AppConfig): ParcaeApp {
       );
 
       // ── Step 3: Connect database ───────────────────────────────────
-      // TODO: DOL-150 — Knex connection, read/write replicas
+      const writeDb = knex({
+        client: "pg",
+        connection: envConfig.DATABASE_URL,
+        pool: { min: 2, max: 10 },
+      });
+      const readDb = envConfig.DATABASE_READ_URL
+        ? knex({
+            client: "pg",
+            connection: envConfig.DATABASE_READ_URL,
+            pool: { min: 2, max: 10 },
+          })
+        : writeDb;
+
+      console.log("[parcae] Database connected");
 
       // ── Step 4: Set up BackendAdapter + Model.use() ────────────────
-      // TODO: DOL-150 — BackendAdapter
+      const adapter = new BackendAdapter({ read: readDb, write: writeDb });
+      Model.use(adapter);
 
-      // ── Step 5: Ensure tables ──────────────────────────────────────
-      // TODO: DOL-150 — Additive migration from schemas
+      // ── Step 5: Ensure tables (additive migration) ─────────────────
+      await adapter.ensureAllTables(models);
+      console.log("[parcae] Database schema ensured");
 
       // ── Step 6: Create server ──────────────────────────────────────
       server = createServer_({ config: envConfig, version });
 
       // ── Step 7: Register auto-CRUD routes ──────────────────────────
-      // TODO: DOL-151 — Auto-CRUD from model schemas
+      const crudCount = registerModelRoutes(models, adapter, version);
+      console.log(`[parcae] Registered ${crudCount} auto-CRUD route(s)`);
 
       // ── Step 8: Discover & register custom routes, hooks, jobs ─────
       // Auto-discovered controllers/hooks/jobs are loaded and registered
