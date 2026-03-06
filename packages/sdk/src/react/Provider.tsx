@@ -1,17 +1,24 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef } from "react";
+import React, {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useCallback,
+} from "react";
 import { createClient } from "../client";
 import type { ParcaeClient, ClientConfig } from "../client";
 import { ParcaeContext } from "./context";
+import type { ParcaeContextValue, AuthState } from "./context";
 
 export interface ParcaeProviderProps {
   /** Pre-created client instance. If provided, url/key/transport are ignored. */
   client?: ParcaeClient;
   /** API base URL (required if no client provided). */
   url?: string;
-  /** Bearer token or null (pre-auth). */
-  apiKey?: string | null;
+  /** Bearer token, null (no session), or undefined (still loading). */
+  apiKey?: string | null | undefined;
   /** Stable user ID — triggers re-auth when it changes. */
   userId?: string | null;
   /** API version. Default: "v1" */
@@ -23,22 +30,6 @@ export interface ParcaeProviderProps {
   onError?: (error: Error) => void;
 }
 
-/**
- * ParcaeProvider — creates the SDK client once and re-authenticates on userId change.
- *
- * Usage with pre-created client:
- * ```tsx
- * const client = createClient({ url: "...", transport: "socket" });
- * <ParcaeProvider client={client}><App /></ParcaeProvider>
- * ```
- *
- * Usage with inline config:
- * ```tsx
- * <ParcaeProvider url="http://localhost:3000" apiKey={token} userId={user.id}>
- *   <App />
- * </ParcaeProvider>
- * ```
- */
 export const ParcaeProvider: React.FC<ParcaeProviderProps> = ({
   client: externalClient,
   url,
@@ -50,7 +41,18 @@ export const ParcaeProvider: React.FC<ParcaeProviderProps> = ({
   onReady,
   onError,
 }) => {
-  // Create client once per url+version+transport (or use external)
+  const [authState, setAuthState] = useState<AuthState>(
+    // If apiKey is undefined, the frontend auth provider is still loading.
+    // If apiKey is null, the user is not logged in.
+    // If apiKey is a string, we have a token but haven't verified it yet.
+    apiKey === undefined
+      ? "loading"
+      : apiKey === null
+        ? "unauthenticated"
+        : "loading",
+  );
+  const [authVersion, setAuthVersion] = useState(0);
+
   const client = useMemo(() => {
     if (externalClient) return externalClient;
     if (!url)
@@ -60,23 +62,42 @@ export const ParcaeProvider: React.FC<ParcaeProviderProps> = ({
     return createClient({ url, version, transport, key: null });
   }, [externalClient, url, version, transport]);
 
-  // Refs for callbacks to avoid re-running effects on unstable inline functions
-  const apiKeyRef = useRef(apiKey);
-  apiKeyRef.current = apiKey;
   const onReadyRef = useRef(onReady);
   onReadyRef.current = onReady;
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
 
-  // Re-authenticate when userId changes
+  // Authenticate when apiKey changes
   useEffect(() => {
-    client
-      .setKey(apiKeyRef.current ?? null)
-      .then(() => onReadyRef.current?.(client))
-      .catch((err) => onErrorRef.current?.(err));
-  }, [userId, client]);
+    // apiKey is undefined → frontend auth still loading, do nothing
+    if (apiKey === undefined) {
+      setAuthState("loading");
+      return;
+    }
 
-  // Forward transport errors
+    // apiKey is null → user is not logged in
+    if (apiKey === null) {
+      setAuthState("unauthenticated");
+      setAuthVersion((v) => v + 1);
+      return;
+    }
+
+    // apiKey is a string → send to backend for verification
+    setAuthState("loading");
+    client
+      .setKey(apiKey)
+      .then(() => {
+        setAuthState("authenticated");
+        setAuthVersion((v) => v + 1);
+        onReadyRef.current?.(client);
+      })
+      .catch((err) => {
+        setAuthState("unauthenticated");
+        setAuthVersion((v) => v + 1);
+        onErrorRef.current?.(err);
+      });
+  }, [apiKey, userId, client]);
+
   useEffect(() => {
     const onErr = (err: Error) => onErrorRef.current?.(err);
     client.on("error", onErr);
@@ -85,8 +106,15 @@ export const ParcaeProvider: React.FC<ParcaeProviderProps> = ({
     };
   }, [client]);
 
+  const contextValue = useMemo<ParcaeContextValue>(
+    () => ({ client, authState, authVersion }),
+    [client, authState, authVersion],
+  );
+
   return (
-    <ParcaeContext.Provider value={client}>{children}</ParcaeContext.Provider>
+    <ParcaeContext.Provider value={contextValue}>
+      {children}
+    </ParcaeContext.Provider>
   );
 };
 

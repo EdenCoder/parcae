@@ -3,13 +3,12 @@
 /**
  * useQuery — reactive data fetching with realtime subscriptions.
  *
- * Takes a query chain, returns an array of typed model instances.
- * Subscribes to realtime updates — the server diffs queries on model changes
- * and pushes surgical add/remove/update ops.
- *
  * @example
  * ```tsx
  * const { items, loading } = useQuery(Post.where({ published: true }));
+ *
+ * // Wait for auth before firing (default: true)
+ * const { items } = useQuery(query, { waitForAuth: true });
  * ```
  */
 
@@ -25,6 +24,15 @@ interface QueryChain<T> {
   __modelClass?: any;
   __adapter?: any;
   __debounceMs?: number;
+}
+
+interface UseQueryOptions {
+  /**
+   * Wait for authentication to resolve before firing the query.
+   * Default: true — queries don't fire while auth is "loading".
+   * Set to false for public/unauthenticated queries.
+   */
+  waitForAuth?: boolean;
 }
 
 interface UseQueryResult<T> {
@@ -74,15 +82,20 @@ function buildCacheKey(chain: QueryChain<any>, authVersion: number): string {
 
 export function useQuery<T>(
   chain: QueryChain<T> | null | undefined,
+  options: UseQueryOptions = {},
 ): UseQueryResult<T> {
-  const client = useParcae();
-  const authVersion = client.authVersion;
+  const { client, authState, authVersion } = useParcae();
+  const waitForAuth = options.waitForAuth ?? true;
 
-  const cacheKey = chain ? buildCacheKey(chain, authVersion) : "__null__";
+  // If waiting for auth and auth is still loading, return empty loading state
+  const authReady = !waitForAuth || authState !== "loading";
+
+  const cacheKey =
+    chain && authReady ? buildCacheKey(chain, authVersion) : "__null__";
 
   // ── Get or create cache entry ──────────────────────────────────────
 
-  if (!queryCache.has(cacheKey) && chain) {
+  if (!queryCache.has(cacheKey) && chain && authReady) {
     queryCache.set(cacheKey, {
       items: [],
       itemMap: new Map(),
@@ -111,7 +124,6 @@ export function useQuery<T>(
       entry.listeners.add(listener);
       entry.refCount++;
 
-      // Cancel pending GC
       if (entry.timeoutHandle) {
         clearTimeout(entry.timeoutHandle);
         entry.timeoutHandle = null;
@@ -121,7 +133,6 @@ export function useQuery<T>(
         entry.listeners.delete(listener);
         entry.refCount--;
 
-        // GC: if no subscribers left, schedule cleanup
         if (entry.refCount <= 0) {
           entry.timeoutHandle = setTimeout(() => {
             entry.disposeSubscription?.();
@@ -140,7 +151,7 @@ export function useQuery<T>(
   // ── Fetch + subscribe ──────────────────────────────────────────────
 
   const refetch = useCallback(() => {
-    if (!chain || !entry) return;
+    if (!chain || !entry || !authReady) return;
 
     entry.loading = true;
     notifyListeners(entry);
@@ -161,23 +172,20 @@ export function useQuery<T>(
         notifyListeners(entry);
       });
 
-    // Set up realtime subscription if transport supports it
+    // Set up realtime subscription
     if (!entry.disposeSubscription && chain.__modelType) {
       const subEvent = `query:${cacheKey}`;
 
-      // Ask server to subscribe to this query
       client.send("subscribe:query", {
         hash: cacheKey,
         modelType: chain.__modelType,
         steps: chain.__steps ?? [],
       });
 
-      // Listen for diff ops from the server
       const dispose = client.subscribe(subEvent, (ops: DiffOp[]) => {
         if (!entry) return;
         entry.pendingOps.push(...ops);
 
-        // Debounce application of ops
         if (entry.debounceTimer) clearTimeout(entry.debounceTimer);
         entry.debounceTimer = setTimeout(() => {
           applyDiffOps(entry, chain);
@@ -191,12 +199,17 @@ export function useQuery<T>(
         client.send("unsubscribe:query", { hash: cacheKey });
       };
     }
-  }, [chain, entry, cacheKey, client]);
+  }, [chain, entry, cacheKey, client, authReady]);
 
-  // Initial fetch on mount / chain change
+  // Fetch when auth becomes ready or cache key changes
   useEffect(() => {
-    if (chain) refetch();
-  }, [cacheKey]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (chain && authReady) refetch();
+  }, [cacheKey, authReady]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Auth not ready — return loading
+  if (!authReady) {
+    return { items: [], loading: true, error: null, refetch: () => {} };
+  }
 
   if (!entry) {
     return { items: [], loading: false, error: null, refetch: () => {} };
@@ -248,7 +261,7 @@ function applyDiffOps<T>(entry: CacheEntry<T>, chain: QueryChain<T>): void {
         const existing = entry.itemMap.get(op.id) as any;
         if (existing && op.data) {
           for (const [key, value] of Object.entries(op.data)) {
-            existing.__data[key] = value;
+            existing[key] = value;
           }
           changed = true;
         }

@@ -1,20 +1,10 @@
 "use client";
 
-/**
- * useApi — pre-bound HTTP methods from the Parcae client.
- *
- * @example
- * ```tsx
- * const { get, post } = useApi();
- * const data = await get("/custom-endpoint");
- * ```
- */
-
 import { useMemo } from "react";
 import { useParcae } from "./context";
 
 export function useApi() {
-  const client = useParcae();
+  const { client } = useParcae();
 
   return useMemo(
     () => ({
@@ -32,18 +22,24 @@ export function useApi() {
  * useSDK — raw client instance.
  */
 export function useSDK() {
-  return useParcae();
+  return useParcae().client;
 }
 
 /**
- * useConnectionStatus — reactive connection state.
+ * useConnectionStatus — connection + auth state.
  */
 export function useConnectionStatus() {
-  const client = useParcae();
-  // This is a snapshot — for true reactivity, components should
-  // listen to client.on("connected"/"disconnected") events.
+  const { client, authState } = useParcae();
   return {
     isConnected: client.isConnected,
     isLoading: client.isLoading,
+    authState,
   };
+}
+
+/**
+ * useAuthState — just the auth state.
+ */
+export function useAuthState() {
+  return useParcae().authState;
 }

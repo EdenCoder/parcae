@@ -1,14 +1,5 @@
 "use client";
 
-/**
- * useSetting — key-value user settings stored as a Setting model.
- *
- * @example
- * ```tsx
- * const [theme, setTheme, { isLoading }] = useSetting("theme", "light");
- * ```
- */
-
 import { useState, useEffect, useCallback } from "react";
 import { useParcae } from "./context";
 
@@ -16,11 +7,18 @@ export function useSetting<T = string>(
   key: string,
   defaultValue: T,
 ): [T, (value: T) => Promise<void>, { isLoading: boolean }] {
-  const client = useParcae();
+  const { client, authState } = useParcae();
   const [value, setValue] = useState<T>(defaultValue);
   const [isLoading, setIsLoading] = useState(true);
 
+  // Wait for auth before fetching settings (they're user-scoped)
   useEffect(() => {
+    if (authState === "loading") return;
+    if (authState === "unauthenticated") {
+      setIsLoading(false);
+      return;
+    }
+
     let cancelled = false;
 
     client
@@ -30,9 +28,7 @@ export function useSetting<T = string>(
           setValue(result.value);
         }
       })
-      .catch(() => {
-        // Setting doesn't exist yet — use default
-      })
+      .catch(() => {})
       .finally(() => {
         if (!cancelled) setIsLoading(false);
       });
@@ -40,7 +36,7 @@ export function useSetting<T = string>(
     return () => {
       cancelled = true;
     };
-  }, [key, client]);
+  }, [key, client, authState]);
 
   const update = useCallback(
     async (newValue: T) => {
