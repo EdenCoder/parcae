@@ -169,7 +169,7 @@ export function createApp(config: AppConfig): ParcaeApp {
 
     async start(options = {}) {
       // ── Step 0: Parse & validate config ────────────────────────────
-      envConfig = parseConfig(process.env);
+      envConfig = parseConfig(process.env, projectRoot);
       const port = options.port ?? envConfig.PORT;
       const dev = options.dev ?? envConfig.NODE_ENV === "development";
 

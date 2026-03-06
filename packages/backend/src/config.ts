@@ -5,6 +5,31 @@
  */
 
 import { z } from "zod";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
+/**
+ * Load .env file into process.env if it exists.
+ * Supports basic KEY=VALUE format with # comments.
+ */
+function loadEnvFile(dir: string = process.cwd()): void {
+  const envPath = resolve(dir, ".env");
+  if (!existsSync(envPath)) return;
+
+  const content = readFileSync(envPath, "utf-8");
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx === -1) continue;
+    const key = trimmed.slice(0, eqIdx).trim();
+    const value = trimmed.slice(eqIdx + 1).trim();
+    // Don't override existing env vars
+    if (process.env[key] === undefined) {
+      process.env[key] = value;
+    }
+  }
+}
 
 export const configSchema = z.object({
   /** PostgreSQL connection URL (required). */
@@ -45,7 +70,11 @@ export type Config = z.infer<typeof configSchema>;
  */
 export function parseConfig(
   env: Record<string, string | undefined> = process.env,
+  projectRoot?: string,
 ): Config {
+  // Auto-load .env file
+  loadEnvFile(projectRoot);
+
   const result = configSchema.safeParse(env);
 
   if (!result.success) {
