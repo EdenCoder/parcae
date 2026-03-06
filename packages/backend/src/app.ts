@@ -49,6 +49,12 @@ export interface AppConfig {
   version?: string;
   /** Project root directory. Default: process.cwd() */
   root?: string;
+  /**
+   * Path to the models package (where reflect.config.json lives).
+   * Used by RTTIST for type generation. Can be absolute or relative to root.
+   * If not set, auto-detected from common monorepo locations.
+   */
+  modelsPath?: string;
 }
 
 export interface ParcaeApp {
@@ -186,13 +192,9 @@ export function createApp(config: AppConfig): ParcaeApp {
       );
 
       // ── Step 2: Generate schemas (.parcae/) ────────────────────────
-      const modelPaths = Array.isArray(config.models)
-        ? []
-        : [resolve(config.models)];
-
       const result = await generateSchemas(models, {
         projectRoot,
-        modelPaths,
+        modelsPath: config.modelsPath,
         force: false,
         dev,
       });
