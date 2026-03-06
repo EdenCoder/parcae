@@ -198,7 +198,7 @@ client.send("some:event", data);
 
 ### useConnectionStatus
 
-Connection state for the transport.
+Connection state snapshot for the transport.
 
 ```tsx
 import { useConnectionStatus } from "@parcae/sdk/react";
@@ -234,21 +234,29 @@ function ThemeToggle() {
 ```typescript
 // Main
 import { createClient, SocketTransport, SSETransport } from "@parcae/sdk";
-import type { ClientConfig, ParcaeClient, Transport } from "@parcae/sdk";
+import type {
+  ClientConfig,
+  ParcaeClient,
+  SocketTransportConfig,
+  SSETransportConfig,
+  Transport,
+} from "@parcae/sdk";
+
+// Re-exports from @parcae/model
+import { Model, FrontendAdapter } from "@parcae/sdk";
 
 // React
 import {
   ParcaeProvider,
+  ParcaeContext,
+  useParcae,
   useQuery,
   useApi,
   useSDK,
   useConnectionStatus,
   useSetting,
-  useParcae,
 } from "@parcae/sdk/react";
-
-// Re-exports from @parcae/model
-import { Model, FrontendAdapter } from "@parcae/sdk";
+import type { ParcaeProviderProps } from "@parcae/sdk/react";
 ```
 
 ## License

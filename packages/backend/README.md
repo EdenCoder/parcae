@@ -15,11 +15,10 @@ import { createApp } from "@parcae/backend";
 
 const app = createApp({ models: "./models" });
 await app.start();
-// -> .parcae/ generated
-// -> Tables created
-// -> CRUD routes live
-// -> WebSocket ready
+// -> .parcae/ generated, tables created, CRUD routes live, WebSocket ready
 ```
+
+`.env` files are auto-loaded at startup:
 
 ```bash
 # .env
@@ -49,9 +48,11 @@ const app = createApp({
 await app.start({ port: 3000, dev: true });
 ```
 
+Controllers, hooks, and jobs self-register on import — just put files in the directory and they're auto-loaded (like Next.js pages).
+
 ### Startup Sequence
 
-1. Parse and validate env config (Zod)
+1. Parse and validate env config (Zod), auto-load `.env`
 2. Discover models (array or directory scan)
 3. Generate `.parcae/` type metadata (RTTIST)
 4. Connect Postgres (Knex, optional read replica)
@@ -62,7 +63,7 @@ await app.start({ port: 3000, dev: true });
 9. Set up `QuerySubscriptionManager` for realtime
 10. Mount auth middleware + routes (if configured)
 11. Register auto-CRUD routes for scoped models
-12. Register custom routes, hooks, jobs
+12. Auto-discover and import controllers, hooks, jobs
 13. Start BullMQ workers + HTTP listener
 
 ### ParcaeApp
@@ -117,7 +118,7 @@ List endpoints support:
 
 | Parameter | Example | Description |
 | --- | --- | --- |
-| `limit` | `?limit=25` | Page size |
+| `limit` | `?limit=25` | Page size (max 100) |
 | `page` | `?page=2` | Page number |
 | `sort` | `?sort=createdAt` | Sort column |
 | `direction` | `?direction=desc` | Sort direction |
@@ -148,20 +149,39 @@ Methods: `route.get`, `route.post`, `route.put`, `route.patch`, `route.delete`, 
 route.get("/health", handler, { priority: 0 }); // lower = registered first
 ```
 
-### Controller Class
+### Response Helpers
 
-Optional class-based alternative:
+Convenience functions for common response patterns:
 
 ```typescript
-import { Controller, route } from "@parcae/backend";
+import { json, ok, error, unauthorized, notFound, badRequest } from "@parcae/backend";
 
-class MediaController extends Controller {
-  @route.post("/v1/media/upload")
-  async upload(req, res) {
-    // ...
-  }
-}
+route.get("/v1/posts", async (req, res) => {
+  const posts = await Post.where({ published: true }).find();
+  ok(res, { posts });
+});
+
+route.get("/v1/posts/:id", async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post) return notFound(res, "Post");
+  ok(res, post.toJSON());
+});
+
+route.post("/v1/admin/action", async (req, res) => {
+  if (!req.session?.user) return unauthorized(res);
+  if (!req.body.name) return badRequest(res, "name is required");
+  // ...
+});
 ```
+
+| Helper | Status | Body |
+| --- | --- | --- |
+| `json(res, status, body)` | any | raw JSON |
+| `ok(res, result)` | 200 | `{ result, success: true }` |
+| `error(res, status, message)` | any | `{ result: null, success: false, error }` |
+| `unauthorized(res)` | 401 | `{ error: "Unauthorized" }` |
+| `notFound(res, what?)` | 404 | `{ error: "{what} not found" }` |
+| `badRequest(res, message)` | 400 | `{ error: message }` |
 
 ## Hooks
 
@@ -195,12 +215,12 @@ hook.before(Post, "create", ({ model }) => {
 
 ```typescript
 interface HookContext {
-  model: any;                   // the model instance
-  action: HookAction;          // which action triggered this hook
-  data?: Record<string, any>;  // raw request data
-  lock(key, ttl?): Promise<() => Promise<void>>; // distributed lock
-  enqueue(name, data, opts?): Promise<void>;      // queue a background job
-  user?: { id: string };       // authenticated user
+  model: any;
+  action: HookAction;
+  data?: Record<string, any>;
+  user?: { id: string; [key: string]: any } | null;
+  lock(key, ttl?): Promise<() => Promise<void>>;
+  enqueue(name, data, opts?): Promise<boolean>;
 }
 ```
 
@@ -228,10 +248,17 @@ job("post:index", async ({ data, bullJob, attempt }) => {
 });
 ```
 
-Jobs retry 3 times with exponential backoff (5s base). Enqueue from hooks or anywhere:
+Jobs retry 3 times with exponential backoff (5s base).
+
+### Standalone enqueue
+
+You can enqueue jobs from anywhere — not just hook contexts:
 
 ```typescript
+import { enqueue } from "@parcae/backend";
+
 await enqueue("post:index", { postId: post.id });
+await enqueue("post:index", { postId: post.id }, { jobId: `post:index:${post.id}` }); // deduped
 ```
 
 ## BackendAdapter
@@ -270,8 +297,8 @@ import { PubSub } from "@parcae/backend";
 const pubsub = new PubSub({ url: "redis://localhost:6379" });
 await pubsub.building;
 
-pubsub.publish("post:updated", { id: "abc" });
-pubsub.subscribe("post:updated", (data) => { ... });
+pubsub.emit("post:updated", { id: "abc" });
+pubsub.on("post:updated", (data) => { ... });
 ```
 
 Includes distributed locking via Redlock:
@@ -279,6 +306,16 @@ Includes distributed locking via Redlock:
 ```typescript
 const unlock = await pubsub.lock("resource:key", 10000);
 try { /* critical section */ }
+finally { await unlock(); }
+```
+
+### Standalone lock
+
+```typescript
+import { lock } from "@parcae/backend";
+
+const unlock = await lock("resource:abc", 120000);
+try { /* exclusive access */ }
 finally { await unlock(); }
 ```
 
@@ -292,24 +329,12 @@ import { QueueService, addJobIfNotExists } from "@parcae/backend";
 const queue = new QueueService({ url: "redis://localhost:6379" });
 await queue.building;
 
-// Add a job (deduped by ID)
 await addJobIfNotExists(queue.get(), "post:index", { postId: "abc" });
 ```
 
 ## QuerySubscriptionManager
 
 Manages realtime query subscriptions for connected clients. When a model changes, affected queries are re-evaluated and surgical diff ops (`add`, `remove`, `update`) are pushed to subscribers.
-
-```typescript
-import { QuerySubscriptionManager } from "@parcae/backend";
-
-const subs = new QuerySubscriptionManager(adapter, (socketId, event, data) => {
-  io.to(socketId).emit(event, data);
-});
-
-// Called automatically by BackendAdapter on model changes
-subs.onModelChange("post");
-```
 
 ## Auth
 
@@ -342,7 +367,7 @@ At startup, `createApp()` generates type metadata into `.parcae/` (gitignored, l
 
 ## Configuration
 
-Environment variables validated at startup via Zod:
+Environment variables validated at startup via Zod. `.env` files are auto-loaded.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
@@ -364,26 +389,38 @@ import { createApp } from "@parcae/backend";
 import type { ParcaeApp, AppConfig } from "@parcae/backend";
 
 // Adapter
-import { BackendAdapter } from "@parcae/backend";
+import { BackendAdapter, registerModelRoutes } from "@parcae/backend";
 import type { BackendServices } from "@parcae/backend";
 
 // Routing
 import { route, Controller, hook, job } from "@parcae/backend";
-import type { RouteHandler, Middleware, HookContext, JobContext } from "@parcae/backend";
+import type {
+  RouteHandler, Middleware, RouteOptions, RouteEntry,
+  HookContext, HookOptions, HookEntry,
+  JobHandler, JobContext, JobEntry,
+} from "@parcae/backend";
+
+// Response helpers
+import { json, ok, error, unauthorized, notFound, badRequest } from "@parcae/backend";
 
 // Services
-import { PubSub, QueueService, QuerySubscriptionManager } from "@parcae/backend";
+import { PubSub, QueueService, addJobIfNotExists, QuerySubscriptionManager } from "@parcae/backend";
+import { enqueue, lock, getQueue, getPubSub } from "@parcae/backend";
+import type { PubSubConfig, QueueConfig, EnqueueOptions } from "@parcae/backend";
 
 // Auth
-import { createAuth, createAuthMiddleware } from "@parcae/backend";
-import type { AuthConfig, Session } from "@parcae/backend";
+import { createAuth, createAuthMiddleware, createSocketAuthHandler } from "@parcae/backend";
+import type { AuthConfig, AuthInstance, Session } from "@parcae/backend";
 
 // Schema
-import { SchemaResolver, generateSchemas } from "@parcae/backend";
+import { SchemaResolver, resolveFallbackSchema, generateSchemas, loadCachedSchemas } from "@parcae/backend";
 
 // Config
 import { parseConfig, configSchema } from "@parcae/backend";
 import type { Config } from "@parcae/backend";
+
+// Registry utilities
+import { getRoutes, clearRoutes, getHooks, getHooksFor, clearHooks, getJobs, getJob, clearJobs } from "@parcae/backend";
 
 // Convenience re-export
 import { Model } from "@parcae/backend";

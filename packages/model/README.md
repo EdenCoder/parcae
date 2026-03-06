@@ -21,7 +21,7 @@ class Post extends Model {
   body: PostBody = {};      // object -> JSONB
   tags: string[] = [];      // array -> JSONB
   published: boolean = false; // boolean -> BOOLEAN
-  views: number = 0;        // number -> INTEGER
+  views: number = 0;        // number -> DOUBLE PRECISION
 }
 ```
 
@@ -172,7 +172,7 @@ Model.use(adapter);
 Included in this package. Wraps a `Transport` to handle client-side persistence.
 
 ```typescript
-import { FrontendAdapter } from "@parcae/model/adapters/client";
+import { FrontendAdapter } from "@parcae/model";
 
 const adapter = new FrontendAdapter(transport);
 Model.use(adapter);
@@ -226,15 +226,9 @@ interface Transport {
 ## Exports
 
 ```typescript
-// Main
-import { Model, generateId } from "@parcae/model";
-
-// Frontend adapter
-import { FrontendAdapter } from "@parcae/model/adapters/client";
-import type { Transport } from "@parcae/model/adapters/client";
-
-// Types
+import { Model, generateId, FrontendAdapter } from "@parcae/model";
 import type {
+  Transport,
   ModelAdapter,
   ModelConstructor,
   ChangeSet,
@@ -249,7 +243,14 @@ import type {
   ScopeResult,
   ScopeFunction,
   PatchOp,
-} from "@parcae/model/adapters/types";
+} from "@parcae/model";
+```
+
+Deep imports also available:
+
+```typescript
+import { FrontendAdapter } from "@parcae/model/adapters/client";
+import type { ModelAdapter } from "@parcae/model/adapters/types";
 ```
 
 ## License

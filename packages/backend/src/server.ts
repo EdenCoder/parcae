@@ -6,6 +6,7 @@
  */
 
 import { createServer } from "node:http";
+import { parse as parseUrl } from "node:url";
 import polka from "polka";
 import { Server as SocketServer } from "socket.io";
 import bodyParser from "body-parser";
@@ -34,10 +35,19 @@ export function createServer_(options: ServerOptions): ServerContext {
     ? config.TRUSTED_ORIGINS.split(",").map((o) => o.trim())
     : ["http://localhost:*", "https://localhost:*"];
 
-  // Create Polka app with body parsing
+  // Create Polka app with body parsing + query string parsing
   const app = polka();
   app.use(bodyParser.json({ limit: "50mb" }));
   app.use(bodyParser.urlencoded({ extended: true }));
+
+  // Polka doesn't parse query strings — add a middleware that does
+  app.use((req: any, _res: any, next: any) => {
+    if (!req.query) {
+      const parsed = parseUrl(req.url || "", true);
+      req.query = parsed.query || {};
+    }
+    next();
+  });
 
   // CORS middleware
   app.use((req: any, res: any, next: any) => {

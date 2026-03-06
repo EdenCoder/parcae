@@ -30,18 +30,17 @@
     "better-auth": "^1.2.0",
     "body-parser": "^1.20.3",
     "bullmq": "^5.0.0",
-    "compress-json": "^3.1.0",
-    "connect-busboy": "^1.0.0",
+
     "deep-equal": "^2.2.3",
     "ioredis": "^5.4.0",
     "knex": "^3.1.0",
-    "pako": "^2.1.0",
+
     "pg": "^8.13.0",
     "pluralize": "^8.0.0",
     "polka": "^0.5.2",
     "rttist": "^1.0.0-rc.4",
     "socket.io": "^4.8.0",
-    "trouter": "^4.0.0",
+
     "winston": "^3.17.0",
     "zod": "^3.24.0"
   },
@@ -50,7 +49,7 @@
     "@types/body-parser": "^1.19.5",
     "@types/deep-equal": "^1.0.4",
     "@types/node": "^22.0.0",
-    "@types/pako": "^2.0.3",
+
     "@types/pg": "^8.18.0",
     "@types/pluralize": "^0.0.33",
     "tsup": "^8.5.0",

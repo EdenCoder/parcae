@@ -564,7 +564,12 @@ export class BackendAdapter implements ModelAdapter {
 
   // ── Hooks ────────────────────────────────────────────────────────────
 
-  async runHooks(model: any, action: string, timing: string): Promise<void> {
+  async runHooks(
+    model: any,
+    action: string,
+    timing: string,
+    extra?: { data?: Record<string, any>; user?: { id: string; [key: string]: any } | null },
+  ): Promise<void> {
     const ModelClass = model.constructor as typeof Model;
     const hooks = getHooksFor(
       ModelClass.type,
@@ -576,6 +581,8 @@ export class BackendAdapter implements ModelAdapter {
       const ctx = {
         model,
         action: action as HookAction,
+        data: extra?.data,
+        user: extra?.user,
         lock: globalLock,
         enqueue: globalEnqueue,
       };
@@ -675,8 +682,10 @@ export class BackendAdapter implements ModelAdapter {
               t.text(key);
               break;
             case "integer":
-            case "number":
               t.integer(key);
+              break;
+            case "number":
+              t.double(key);
               break;
             case "boolean":
               t.boolean(key);

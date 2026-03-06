@@ -19,13 +19,3 @@ declare module "polka" {
   function polka(options?: any): Polka;
   export = polka;
 }
-
-declare module "trouter" {
-  export default class Trouter<T = any> {
-    add(method: string, pattern: string, handler: T): this;
-    find(
-      method: string,
-      url: string,
-    ): { params: Record<string, string>; handlers: T[] };
-  }
-}
