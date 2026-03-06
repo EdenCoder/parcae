@@ -261,4 +261,34 @@ describe("E2E: server + socket + auth + query", () => {
 
     transport.disconnect();
   });
+
+  it("should re-authenticate on reconnect", async () => {
+    const transport = new SocketTransport({
+      url: `http://localhost:${port}`,
+      token: TEST_TOKEN,
+    });
+
+    await transport.auth.ready;
+    expect(transport.auth.state.status).toBe("authenticated");
+    expect(transport.auth.state.userId).toBe(TEST_USER_ID);
+
+    // Simulate disconnect — auth gate should reset to pending
+    transport.disconnect();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(transport.auth.state.status).toBe("pending");
+
+    // Reconnect — should auto re-authenticate
+    await transport.reconnect();
+
+    // Wait for auth to resolve again
+    await transport.auth.ready;
+    expect(transport.auth.state.status).toBe("authenticated");
+    expect(transport.auth.state.userId).toBe(TEST_USER_ID);
+
+    // RPC should work after reconnect
+    const result = await transport.get("/projects");
+    expect(result.projects).toHaveLength(3);
+
+    transport.disconnect();
+  });
 });
