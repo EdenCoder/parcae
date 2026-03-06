@@ -285,6 +285,7 @@ export function createApp(config: AppConfig): ParcaeApp {
         },
       );
       adapter.subscriptions = subscriptions;
+      adapter.broadcast = (event: string, data?: any) => server?.io.emit(event, data);
 
       // ── Step 9: Set up auth (opt-in) ───────────────────────────────
       const authAdapter: AuthAdapter | null = config.auth ?? null;
@@ -411,7 +412,6 @@ export function createApp(config: AppConfig): ParcaeApp {
             path: string,
             data: any,
           ) => {
-            log.debug(`RPC ${method} ${path}`);
             try {
               // Parse query string from path
               const [pathname, qs] = path.split("?");

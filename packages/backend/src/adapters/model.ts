@@ -150,9 +150,13 @@ export class BackendAdapter implements ModelAdapter {
     this.services = services;
   }
 
-  private _notifySubscriptions(model: any): void {
+  /** Broadcast to all connected sockets — set by createApp */
+  public broadcast: ((event: string, data?: any) => void) | null = null;
+
+  private _notifyChange(model: any): void {
     const ModelClass = model.constructor as typeof Model;
     this.subscriptions?.onModelChange(ModelClass.type);
+    this.broadcast?.(`model:${ModelClass.type}:changed`, { id: model.id });
   }
 
   // ── createStore ──────────────────────────────────────────────────────
@@ -194,7 +198,7 @@ export class BackendAdapter implements ModelAdapter {
     log.info(`model saved model=${ModelClass.type}, id=${model.id}`);
 
     await this.runHooks(model, creating ? "create" : "save", "after");
-    this._notifySubscriptions(model);
+    this._notifyChange(model);
   }
 
   // ── remove ───────────────────────────────────────────────────────────
@@ -208,7 +212,7 @@ export class BackendAdapter implements ModelAdapter {
     await this.runHooks(model, "remove", "after");
 
     this.pubsub?.emit?.(`delete+${ModelClass.type}:${model.id}`, model.__data);
-    this._notifySubscriptions(model);
+    this._notifyChange(model);
   }
 
   // ── findById ─────────────────────────────────────────────────────────
@@ -509,7 +513,7 @@ export class BackendAdapter implements ModelAdapter {
 
     await this.write(table).where("id", model.id).update(updateFields);
     await this.runHooks(model, "patch", "after");
-    this._notifySubscriptions(model);
+    this._notifyChange(model);
   }
 
   private _ensureIntermediates(
@@ -565,7 +569,10 @@ export class BackendAdapter implements ModelAdapter {
     model: any,
     action: string,
     timing: string,
-    extra?: { data?: Record<string, any>; user?: { id: string; [key: string]: any } | null },
+    extra?: {
+      data?: Record<string, any>;
+      user?: { id: string; [key: string]: any } | null;
+    },
   ): Promise<void> {
     const ModelClass = model.constructor as typeof Model;
     const hooks = getHooksFor(

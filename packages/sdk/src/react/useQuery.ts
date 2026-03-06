@@ -142,6 +142,14 @@ export function useQuery<T>(
     if (entry.items === EMPTY) {
       doFetch(key, entry, chain);
     }
+
+    // Subscribe to model-level change events → refetch
+    if (chain.__modelType) {
+      const unsub = client.subscribe(`model:${chain.__modelType}:changed`, () =>
+        doFetch(key, getOrCreate(key), chain),
+      );
+      return unsub;
+    }
   }, [key]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const refetch = () => {
