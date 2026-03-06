@@ -102,7 +102,7 @@ async function discoverModels(dir: string): Promise<ModelConstructor[]> {
       }
     } catch (err) {
       log.warn(
-        `[parcae] Failed to import model from ${entry}:`,
+        `Failed to import model from ${entry}:`,
         err instanceof Error ? err.message : err,
       );
     }
@@ -141,7 +141,7 @@ async function discoverAndImport(dir: string, label: string): Promise<number> {
       count++;
     } catch (err) {
       log.warn(
-        `[parcae] Failed to import ${label} from ${entryStr}:`,
+        `Failed to import ${label} from ${entryStr}:`,
         err instanceof Error ? err.message : err,
       );
     }
@@ -184,7 +184,7 @@ export function createApp(config: AppConfig): ParcaeApp {
         models = await discoverModels(config.models);
       }
       log.info(
-        `[parcae] Found ${models.length} model(s): ${models.map((m) => m.type).join(", ")}`,
+        `Found ${models.length} model(s): ${models.map((m) => m.type).join(", ")}`,
       );
 
       // ── Step 2: Generate schemas (.parcae/) ────────────────────────
@@ -197,7 +197,7 @@ export function createApp(config: AppConfig): ParcaeApp {
       schemas = result.schemas;
 
       log.info(
-        `[parcae] Resolved schemas for: ${[...schemas.keys()].join(", ")}` +
+        `Resolved schemas for: ${[...schemas.keys()].join(", ")}` +
           (result.cached ? " (cached)" : " (resolved)"),
       );
 
@@ -215,7 +215,7 @@ export function createApp(config: AppConfig): ParcaeApp {
           })
         : writeDb;
 
-      log.info("[parcae] Database connected");
+      log.info("Database connected");
 
       // ── Step 4: Connect Redis (PubSub + Queue) ─────────────────────
       const pubsub = new PubSub({ url: envConfig.REDIS_URL });
@@ -227,11 +227,9 @@ export function createApp(config: AppConfig): ParcaeApp {
       _setServices(queue, pubsub);
 
       if (envConfig.REDIS_URL) {
-        log.info("[parcae] Redis connected (PubSub + Queue)");
+        log.info("Redis connected (PubSub + Queue)");
       } else {
-        log.info(
-          "[parcae] Redis not configured — using in-process fallbacks",
-        );
+        log.info("Redis not configured — using in-process fallbacks");
       }
 
       // ── Step 5: Set up BackendAdapter + Model.use() ────────────────
@@ -243,8 +241,10 @@ export function createApp(config: AppConfig): ParcaeApp {
       Model.use(adapter);
 
       // ── Step 6: Ensure tables (additive migration) ─────────────────
-      await adapter.ensureAllTables(models);
-      log.info("[parcae] Database schema ensured");
+      if (process.env.ENSURE_SCHEMA === "true") {
+        await adapter.ensureAllTables(models);
+        log.info("Database schema ensured");
+      }
 
       // ── Step 7: Create server ──────────────────────────────────────
       server = createServer_({ config: envConfig, version });
@@ -291,7 +291,7 @@ export function createApp(config: AppConfig): ParcaeApp {
           next();
         });
 
-        log.info("[parcae] Auth enabled");
+        log.info("Auth enabled");
       }
 
       // ── Step 10: Register auto-CRUD routes ─────────────────────────
@@ -341,9 +341,7 @@ export function createApp(config: AppConfig): ParcaeApp {
             attempt: bullJob.attemptsMade,
           });
         });
-        log.info(
-          `[parcae] Started worker for ${registeredJobs.length} job(s)`,
-        );
+        log.info(`Started worker for ${registeredJobs.length} job(s)`);
       }
 
       // ── Step 14: Socket.IO connection handling ─────────────────────
@@ -391,11 +389,11 @@ export function createApp(config: AppConfig): ParcaeApp {
         server!.httpServer.listen(port, () => resolveStart());
       });
 
-      log.info(`Ready on port ${port} (v${version})`);
+      log.info(`Ready on port ${port} (${version})`);
     },
 
     async stop() {
-      log.info("[parcae] Shutting down...");
+      log.info("Shutting down...");
       if (server) {
         server.io.close();
         await new Promise<void>((resolveClose) => {
