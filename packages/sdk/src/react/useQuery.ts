@@ -115,7 +115,6 @@ export function useQuery<T>(
       ? `${chain.__modelType}:${authVersion}:${JSON.stringify(chain.__steps ?? [])}`
       : null;
 
-  log.debug("useQuery:", chain?.__modelType, "auth=" + authStatus, "ready=" + authReady, "key=" + (key ? "yes" : "null"));
   const keyRef = useRef(key);
   keyRef.current = key;
 

@@ -257,3 +257,7 @@ export class SocketTransport extends EventEmitter implements Transport {
 }
 
 export default SocketTransport;
+
+/** @internal — clear socket cache (for testing) */
+export function _resetSockets(): void { SOCKETS.clear(); }
+
