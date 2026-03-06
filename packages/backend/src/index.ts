@@ -30,13 +30,8 @@ export { QuerySubscriptionManager } from "./services/subscriptions";
 export { enqueue, lock, getQueue, getPubSub } from "./services/context";
 export type { EnqueueOptions } from "./services/context";
 
-// Auth
-export {
-  createAuth,
-  createAuthMiddleware,
-  createSocketAuthHandler,
-} from "./auth";
-export type { AuthConfig, AuthInstance, Session } from "./auth";
+// Auth (adapter interface — implementations in @parcae/auth-betterauth, @parcae/auth-clerk)
+export type { AuthAdapter, AuthSession, AuthSetupContext } from "./auth";
 
 // Schema
 export { SchemaResolver, resolveFallbackSchema } from "./schema/resolver";

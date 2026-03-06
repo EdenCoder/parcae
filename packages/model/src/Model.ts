@@ -1,32 +1,12 @@
 /**
  * @parcae/model — Model Base Class
  *
- * The core of Parcae. Properties on the class ARE the schema.
- * Direct property access (no .get()/.set()), fully typed, with change tracking.
+ * The instance IS the data store. No separate __data object.
+ * A Proxy wraps the instance for change tracking and ref resolution.
+ * Class property defaults (title = "", published = false) work naturally
+ * because they set directly on the instance which the Proxy intercepts.
  *
- * Uses a Proxy to intercept property access:
- * - Data properties read/write to the internal store with change tracking
- * - Reference properties (other Models) return lazy-loading proxies
- * - $-prefixed access returns raw IDs for references
- * - Methods and internals pass through to the real instance
- *
- * @example
- * ```typescript
- * class Post extends Model {
- *   static type = "post" as const;
- *   user: User;
- *   title: string = "";
- *   body: PostBody;
- *   published: boolean = false;
- * }
- *
- * const post = await Post.findById("abc");
- * post.title           // string — typed
- * post.title = "New";  // change tracked
- * post.user            // User (lazy proxy)
- * post.$user           // "user_k8f2m9x" (raw ID)
- * await post.save();
- * ```
+ * Internal state uses Symbol keys to avoid collisions with data properties.
  */
 
 import { EventEmitter } from "eventemitter3";
@@ -49,27 +29,32 @@ export function generateId(): string {
   return uid.rnd();
 }
 
-// ─── Internal Symbols ────────────────────────────────────────────────────────
+// ─── Symbols for internal state (never collide with data properties) ─────────
 
-/** Properties that live on the Model instance, not in the data store */
-const INTERNAL_KEYS = new Set([
-  // Instance properties
-  "__data",
-  "__updates",
-  "__patchingColumns",
-  "__pendingKeys",
-  "__isNew",
-  "__saveTimer",
-  "__debounceMs",
-  "__adapter",
-  // Methods
+const SYM_ADAPTER = Symbol("parcae:adapter");
+const SYM_UPDATES = Symbol("parcae:updates");
+const SYM_PATCHING = Symbol("parcae:patching");
+const SYM_IS_NEW = Symbol("parcae:isNew");
+const SYM_SAVE_TIMER = Symbol("parcae:saveTimer");
+const SYM_DEBOUNCE = Symbol("parcae:debounceMs");
+const SYM_IS_PROXY = Symbol("parcae:isProxy");
+
+// ─── Keys that should NOT be treated as data ─────────────────────────────────
+
+const INSTANCE_METHODS = new Set([
   "save",
   "patch",
   "remove",
   "refresh",
   "load",
   "sanitize",
+  "toJSON",
+  "_flush",
+  "_createRefProxy",
   "constructor",
+]);
+
+const EVENTEMITTER_KEYS = new Set([
   "emit",
   "on",
   "off",
@@ -78,37 +63,22 @@ const INTERNAL_KEYS = new Set([
   "removeAllListeners",
   "listeners",
   "listenerCount",
-  // Meta
-  "id",
-  "type",
-  "createdAt",
-  "updatedAt",
-  // Static access
-  "prototype",
-  "__proto__",
-  // Symbol access
-  "then",
-  "toJSON",
-  "valueOf",
-  "toString",
-  "inspect",
-  Symbol.toPrimitive,
-  Symbol.toStringTag,
-  Symbol.iterator,
+  "addListener",
+  "eventNames",
+  "_events",
+  "_eventsCount",
 ]);
+
+/** Properties that are part of the data but handled specially. */
+const SYSTEM_DATA_KEYS = new Set(["id", "type", "createdAt", "updatedAt"]);
 
 // ─── Model Class ─────────────────────────────────────────────────────────────
 
 export class Model extends EventEmitter {
   // ── Static ─────────────────────────────────────────────────────────
 
-  /** The model type identifier. Used for table naming and routing. */
   static type: string = "";
-
-  /** Optional explicit path. If not set, derived from type: /v1/{pluralize(type)} */
   static path?: string;
-
-  /** Scope definitions for access control. */
   static scope?: {
     read?: (ctx: any) => any;
     create?: (ctx: any) => any;
@@ -116,32 +86,17 @@ export class Model extends EventEmitter {
     delete?: (ctx: any) => any;
     patch?: (ctx: any) => any;
   };
-
-  /** Index definitions. */
   static indexes?: (string | string[])[];
-
-  /**
-   * Whether the table is managed by Parcae. Set to false for externally
-   * managed tables (e.g. Better Auth user/session tables).
-   */
   static managed: boolean = true;
-
-  /**
-   * Schema definition resolved from RTTIST metadata at startup.
-   * Maps property names to column types.
-   * @internal
-   */
+  /** @internal */
   static __schema?: SchemaDefinition;
 
-  /** The global adapter instance. Set via Model.use(). */
   private static __adapter: ModelAdapter | null = null;
 
-  /** Set the global adapter. Called once at startup. */
   static use(adapter: ModelAdapter): void {
     Model.__adapter = adapter;
   }
 
-  /** Get the global adapter. Throws if not set. */
   static getAdapter(): ModelAdapter {
     if (!Model.__adapter) {
       throw new Error(
@@ -153,7 +108,6 @@ export class Model extends EventEmitter {
 
   // ── Static Query Methods ───────────────────────────────────────────
 
-  /** Create a new model instance and optionally save it. */
   static create<T extends Model>(
     this: ModelConstructor<T>,
     data?: Record<string, any>,
@@ -162,11 +116,10 @@ export class Model extends EventEmitter {
       ...data,
       id: data?.id ?? generateId(),
     });
-    (instance as any).__isNew = true;
+    (instance as any)[SYM_IS_NEW] = true;
     return instance;
   }
 
-  /** Find a model by ID. */
   static findById<T extends Model>(
     this: ModelConstructor<T>,
     id: string,
@@ -174,7 +127,6 @@ export class Model extends EventEmitter {
     return Model.getAdapter().findById(this, id);
   }
 
-  /** Start a query chain with a where clause. */
   static where<T extends Model>(
     this: ModelConstructor<T>,
     ...args: any[]
@@ -184,7 +136,6 @@ export class Model extends EventEmitter {
       .where(...args);
   }
 
-  /** Start a query chain with a raw where clause. */
   static whereRaw<T extends Model>(
     this: ModelConstructor<T>,
     query: string,
@@ -195,7 +146,6 @@ export class Model extends EventEmitter {
       .whereRaw(query, ...bindings);
   }
 
-  /** Start a query chain with whereIn. */
   static whereIn<T extends Model>(
     this: ModelConstructor<T>,
     column: string,
@@ -204,7 +154,6 @@ export class Model extends EventEmitter {
     return Model.getAdapter().query(this).whereIn(column, values);
   }
 
-  /** Start a query chain with whereNot. */
   static whereNot<T extends Model>(
     this: ModelConstructor<T>,
     ...args: any[]
@@ -214,7 +163,6 @@ export class Model extends EventEmitter {
       .whereNot(...args);
   }
 
-  /** Start a query chain with whereNotIn. */
   static whereNotIn<T extends Model>(
     this: ModelConstructor<T>,
     column: string,
@@ -223,7 +171,6 @@ export class Model extends EventEmitter {
     return Model.getAdapter().query(this).whereNotIn(column, values);
   }
 
-  /** Start a query chain with select. */
   static select<T extends Model>(
     this: ModelConstructor<T>,
     ...columns: string[]
@@ -233,12 +180,10 @@ export class Model extends EventEmitter {
       .select(...columns);
   }
 
-  /** Count matching records. */
   static count<T extends Model>(this: ModelConstructor<T>): Promise<number> {
     return Model.getAdapter().query(this).count();
   }
 
-  /** Convenience query: paginated, sorted. */
   static basic<T extends Model>(
     this: ModelConstructor<T>,
     limit?: number,
@@ -249,73 +194,100 @@ export class Model extends EventEmitter {
     return Model.getAdapter().query(this).basic(limit, sort, direction, page);
   }
 
-  // ── Instance ───────────────────────────────────────────────────────
-
-  /** The internal data store. Frontend: Valtio proxy. Backend: plain object. */
-  public __data: Record<string, any>;
-
-  /** The adapter this instance was created with. */
-  private __adapter: ModelAdapter;
-
-  /** Property names that have been modified since last save. */
-  private __updates: string[] = [];
-
-  /** Columns currently being patched (in-flight PATCH ops). */
-  private __patchingColumns: Set<string> = new Set();
-
-  /** Combined set of pending keys (updates + patching) for optimistic UI. */
-  get __pendingKeys(): ReadonlySet<string> {
-    const keys = new Set(this.__updates);
-    for (const col of this.__patchingColumns) keys.add(col);
-    return keys;
-  }
-
-  /** Whether this is a newly created model not yet persisted. */
-  private __isNew: boolean = false;
-
-  /** Debounce timer for batched saves. */
-  private __saveTimer: ReturnType<typeof setTimeout> | null = null;
-
-  /** Debounce delay in ms. 0 = immediate (backend). 500 = batched (frontend). */
-  public __debounceMs: number = 0;
+  // ── Constructor ────────────────────────────────────────────────────
 
   constructor(adapter: ModelAdapter, data?: Record<string, any>) {
     super();
 
-    this.__adapter = adapter;
+    // Set internal state via symbols (invisible to data property access)
+    this[SYM_ADAPTER] = adapter;
+    this[SYM_UPDATES] = [] as string[];
+    this[SYM_PATCHING] = new Set<string>();
+    this[SYM_IS_NEW] = false;
+    this[SYM_SAVE_TIMER] = null;
+    this[SYM_DEBOUNCE] = 0;
 
-    // Initialize data store with defaults
-    const initialData = {
-      id: data?.id ?? generateId(),
-      type: (this.constructor as typeof Model).type,
-      createdAt: data?.createdAt ?? new Date().toISOString(),
-      updatedAt: data?.updatedAt ?? new Date().toISOString(),
-      ...data,
-    };
+    // Set system data properties directly on the instance
+    (this as any).id = data?.id ?? generateId();
+    (this as any).type = (this.constructor as typeof Model).type;
+    (this as any).createdAt = data?.createdAt ?? new Date().toISOString();
+    (this as any).updatedAt = data?.updatedAt ?? new Date().toISOString();
 
-    // Let the adapter create the store (Valtio proxy or plain object)
-    this.__data = adapter.createStore(initialData);
+    // Set all provided data properties directly on the instance
+    if (data) {
+      for (const [key, value] of Object.entries(data)) {
+        if (!SYSTEM_DATA_KEYS.has(key)) {
+          (this as any)[key] = value;
+        }
+      }
+    }
 
-    // Return a Proxy wrapping this instance
-    return new Proxy(this, {
-      get(target, prop, receiver) {
-        // Symbol properties — pass through
+    // Return a Proxy for change tracking and ref resolution
+    const proxy = new Proxy(this, {
+      set(target, prop, value) {
         if (typeof prop === "symbol") {
-          return Reflect.get(target, prop, receiver);
+          (target as any)[prop] = value;
+          return true;
         }
 
-        // Internal keys and methods — pass through to the real instance
-        if (INTERNAL_KEYS.has(prop)) {
-          return Reflect.get(target, prop, receiver);
+        // EventEmitter internals — set directly, no tracking
+        if (EVENTEMITTER_KEYS.has(prop)) {
+          (target as any)[prop] = value;
+          return true;
+        }
+
+        // Reference property — accept Model instance (extract ID) or raw value
+        const schema = (target.constructor as typeof Model).__schema;
+        if (schema && prop in schema) {
+          const colDef = schema[prop];
+          if (
+            typeof colDef === "object" &&
+            colDef !== null &&
+            "kind" in colDef &&
+            colDef.kind === "ref"
+          ) {
+            (target as any)[prop] =
+              value instanceof Model ? (value as any).id : value;
+            target[SYM_UPDATES].push(prop);
+            return true;
+          }
+        }
+
+        // $-prefixed write — raw ID for refs
+        if (typeof prop === "string" && prop.startsWith("$")) {
+          const realKey = prop.slice(1);
+          (target as any)[realKey] = value;
+          target[SYM_UPDATES].push(realKey);
+          return true;
+        }
+
+        // Regular data property — set on the instance, track the change
+        (target as any)[prop] = value;
+
+        // Only track changes for data properties (not during construction)
+        if (
+          target[SYM_IS_PROXY] &&
+          !SYSTEM_DATA_KEYS.has(prop) &&
+          !INSTANCE_METHODS.has(prop)
+        ) {
+          target[SYM_UPDATES].push(prop);
+        }
+
+        return true;
+      },
+
+      get(target, prop) {
+        if (typeof prop === "symbol") {
+          return (target as any)[prop];
         }
 
         // $-prefixed access — raw ID for reference properties
         if (typeof prop === "string" && prop.startsWith("$")) {
           const realKey = prop.slice(1);
-          return target.__data[realKey];
+          return (target as any)[realKey];
         }
 
-        // Check if this is a reference property (another Model class)
+        // Reference property — return lazy-loading proxy
         const schema = (target.constructor as typeof Model).__schema;
         if (schema && prop in schema) {
           const colDef = schema[prop];
@@ -325,261 +297,207 @@ export class Model extends EventEmitter {
             "kind" in colDef &&
             colDef.kind === "ref"
           ) {
-            // Reference property — return lazy-loading proxy
-            const refId = target.__data[prop];
+            const refId = (target as any)[prop];
             if (!refId) return null;
             return target._createRefProxy(colDef.target, refId);
           }
         }
 
-        // Check if property exists on data store
-        if (prop in target.__data) {
-          return target.__data[prop];
-        }
-
-        // Fall through to the real instance (for prototype methods, etc.)
-        return Reflect.get(target, prop, receiver);
-      },
-
-      set(target, prop, value, receiver) {
-        if (typeof prop === "symbol") {
-          return Reflect.set(target, prop, value, receiver);
-        }
-
-        // Internal keys — set directly on the instance
-        if (INTERNAL_KEYS.has(prop)) {
-          return Reflect.set(target, prop, value, receiver);
-        }
-
-        // $-prefixed write — set raw ID
-        if (typeof prop === "string" && prop.startsWith("$")) {
-          const realKey = prop.slice(1);
-          target.__data[realKey] = value;
-          target.__updates.push(realKey);
-          return true;
-        }
-
-        // Check if this is a reference — accept Model instance or string ID
-        const schema = (target.constructor as typeof Model).__schema;
-        if (schema && prop in schema) {
-          const colDef = schema[prop];
-          if (
-            typeof colDef === "object" &&
-            colDef !== null &&
-            "kind" in colDef &&
-            colDef.kind === "ref"
-          ) {
-            // If value is a Model instance, extract its ID
-            if (value instanceof Model) {
-              target.__data[prop] = value.id;
-            } else {
-              target.__data[prop] = value;
-            }
-            target.__updates.push(prop as string);
-            return true;
-          }
-        }
-
-        // Regular data property — set on the data store
-        target.__data[prop as string] = value;
-        target.__updates.push(prop as string);
-        return true;
+        return (target as any)[prop];
       },
 
       has(target, prop) {
-        if (typeof prop === "string" && prop in target.__data) return true;
-        return Reflect.has(target, prop);
-      },
-
-      ownKeys(target) {
-        return [
-          ...Object.keys(target.__data),
-          ...Reflect.ownKeys(target),
-        ].filter((key, index, arr) => arr.indexOf(key) === index);
+        return prop in target;
       },
     });
+
+    // Mark that construction is complete — changes after this are tracked
+    proxy[SYM_IS_PROXY] = true;
+
+    return proxy;
   }
 
-  // ── Accessors ────────────────────────────────────────────────────────
+  // ── Data Access (for adapters/serialization) ──────────────────────
 
-  /** The model's unique ID. */
-  get id(): string {
-    return this.__data.id;
+  /**
+   * Get all data properties as a plain object.
+   * Used by adapters for serialization. Excludes methods, symbols, and EE internals.
+   */
+  get __data(): Record<string, any> {
+    const data: Record<string, any> = {};
+    for (const key of Object.keys(this)) {
+      if (EVENTEMITTER_KEYS.has(key)) continue;
+      if (INSTANCE_METHODS.has(key)) continue;
+      if (key.startsWith("_")) continue;
+      data[key] = (this as any)[key];
+    }
+    return data;
   }
 
-  /** The model type (from static type). */
-  get type(): string {
-    return (this.constructor as typeof Model).type;
+  /**
+   * Set data properties from a plain object (used by adapters during hydration).
+   */
+  set __data(data: Record<string, any>) {
+    for (const [key, value] of Object.entries(data)) {
+      (this as any)[key] = value;
+    }
   }
 
-  /** Created timestamp. */
-  get createdAt(): string {
-    return this.__data.createdAt;
+  /** @internal */
+  get __updates(): string[] {
+    return this[SYM_UPDATES];
+  }
+  set __updates(v: string[]) {
+    this[SYM_UPDATES] = v;
   }
 
-  /** Updated timestamp. */
-  get updatedAt(): string {
-    return this.__data.updatedAt;
+  /** @internal */
+  get __isNew(): boolean {
+    return this[SYM_IS_NEW];
+  }
+  set __isNew(v: boolean) {
+    this[SYM_IS_NEW] = v;
+  }
+
+  /** @internal */
+  get __debounceMs(): number {
+    return this[SYM_DEBOUNCE];
+  }
+  set __debounceMs(v: number) {
+    this[SYM_DEBOUNCE] = v;
+  }
+
+  /** @internal */
+  get __patchingColumns(): Set<string> {
+    return this[SYM_PATCHING];
+  }
+
+  /** @internal */
+  get __pendingKeys(): ReadonlySet<string> {
+    const keys = new Set(this[SYM_UPDATES]);
+    for (const col of this[SYM_PATCHING]) keys.add(col);
+    return keys;
   }
 
   // ── Persistence ──────────────────────────────────────────────────────
 
-  /**
-   * Save pending changes to the adapter.
-   * Supports debouncing for frontend batched saves.
-   */
   async save(immediate?: boolean): Promise<void> {
-    if (immediate || this.__debounceMs <= 0) {
+    if (immediate || this[SYM_DEBOUNCE] <= 0) {
       return this._flush();
     }
 
-    // Debounced save
-    if (this.__saveTimer) {
-      clearTimeout(this.__saveTimer);
-    }
+    if (this[SYM_SAVE_TIMER]) clearTimeout(this[SYM_SAVE_TIMER]);
 
     return new Promise<void>((resolve) => {
-      this.__saveTimer = setTimeout(async () => {
-        this.__saveTimer = null;
+      this[SYM_SAVE_TIMER] = setTimeout(async () => {
+        this[SYM_SAVE_TIMER] = null;
         await this._flush();
         resolve();
-      }, this.__debounceMs);
+      }, this[SYM_DEBOUNCE]);
     });
   }
 
-  /** Flush all pending changes to the adapter. */
   private async _flush(): Promise<void> {
-    const updates = [...this.__updates];
-    this.__updates = [];
+    const updates = [...this[SYM_UPDATES]];
+    this[SYM_UPDATES] = [];
 
-    if (updates.length === 0 && !this.__isNew) return;
+    if (updates.length === 0 && !this[SYM_IS_NEW]) return;
 
     const changes: ChangeSet = {
       updates,
       ops: [],
-      creating: this.__isNew,
+      creating: this[SYM_IS_NEW],
     };
 
-    // Update the timestamp
-    this.__data.updatedAt = new Date().toISOString();
+    (this as any).updatedAt = new Date().toISOString();
 
-    await this.__adapter.save(this, changes);
-    this.__isNew = false;
+    await this[SYM_ADAPTER].save(this, changes);
+    this[SYM_IS_NEW] = false;
     this.emit("saved", this);
   }
 
-  /**
-   * Apply RFC 6902 JSON Patch operations.
-   * Applies locally first (optimistic), then persists via adapter.
-   */
   async patch(ops: PatchOp[]): Promise<void> {
-    // Track which top-level columns are being patched
     const columns = new Set<string>();
     for (const op of ops) {
       const parts = op.path.split("/").filter(Boolean);
       if (parts[0]) columns.add(parts[0]);
     }
 
-    // Add to patching columns (protects from stale server overwrites)
-    for (const col of columns) {
-      this.__patchingColumns.add(col);
-    }
+    for (const col of columns) this[SYM_PATCHING].add(col);
 
     try {
-      // Apply locally first (optimistic)
-      applyPatch(this.__data, ops, false, true);
+      // Apply locally (optimistic) — build a data object for applyPatch
+      const localData = this.__data;
+      applyPatch(localData, ops, false, true);
+      // Write patched values back
+      for (const col of columns) {
+        if (col in localData) (this as any)[col] = localData[col];
+      }
 
-      // Persist via adapter
-      await this.__adapter.patch(this, ops);
-
+      await this[SYM_ADAPTER].patch(this, ops);
       this.emit("patched", this);
     } finally {
-      // Remove from patching columns
-      for (const col of columns) {
-        this.__patchingColumns.delete(col);
-      }
+      for (const col of columns) this[SYM_PATCHING].delete(col);
     }
   }
 
-  /** Delete this model. */
   async remove(): Promise<void> {
-    await this.__adapter.remove(this);
+    await this[SYM_ADAPTER].remove(this);
     this.emit("removed", this);
   }
 
-  /** Reload this model from the adapter. */
   async refresh(): Promise<void> {
     const ModelClass = this.constructor as ModelConstructor;
-    const fresh = await this.__adapter.findById(ModelClass, this.id);
+    const fresh = await this[SYM_ADAPTER].findById(
+      ModelClass,
+      (this as any).id,
+    );
     if (fresh) {
       const freshData = (fresh as any).__data;
+      const pendingKeys = this.__pendingKeys;
       for (const key of Object.keys(freshData)) {
-        if (!this.__pendingKeys.has(key)) {
-          this.__data[key] = freshData[key];
+        if (!pendingKeys.has(key)) {
+          (this as any)[key] = freshData[key];
         }
       }
     }
   }
 
-  /** Alias for refresh(). */
   async load(): Promise<void> {
     return this.refresh();
   }
 
-  /**
-   * Serialize for API response. Override in subclasses to strip sensitive fields.
-   */
   async sanitize(_user?: { id: string }): Promise<Record<string, any>> {
-    return {
-      type: this.type,
-      ...this.__data,
-    };
+    return { type: (this as any).type, ...this.__data };
   }
 
-  /** JSON serialization. */
   toJSON(): Record<string, any> {
-    return {
-      type: this.type,
-      ...this.__data,
-    };
+    return { type: (this as any).type, ...this.__data };
   }
 
   // ── Reference Proxy ──────────────────────────────────────────────────
 
-  /** Cache for loaded reference proxies. */
   private static __refCache = new Map<string, any>();
 
-  /**
-   * Create a lazy-loading proxy for a reference property.
-   * On first property access, loads the referenced model.
-   */
   private _createRefProxy(targetClass: ModelConstructor, refId: string): any {
     const cacheKey = `${targetClass.type}:${refId}`;
-
-    // Check cache first
     const cached = Model.__refCache.get(cacheKey);
     if (cached) return cached;
 
-    // Create a lazy proxy
     let loaded: any = null;
     let loading: Promise<any> | null = null;
 
-    const lazyProxy = new Proxy({} as any, {
+    return new Proxy({} as any, {
       get(_target, prop) {
-        // Allow ID access without loading
         if (prop === "id") return refId;
         if (prop === "type") return targetClass.type;
-        if (prop === "then") return undefined; // Not a thenable
+        if (prop === "then") return undefined;
         if (prop === "toJSON")
           return () => ({ id: refId, type: targetClass.type });
         if (prop === Symbol.toPrimitive) return () => refId;
 
-        // If already loaded, return from loaded instance
-        if (loaded) {
-          return (loaded as any)[prop];
-        }
+        if (loaded) return (loaded as any)[prop];
 
-        // Start loading if not already
         if (!loading) {
           loading = Model.getAdapter()
             .findById(targetClass, refId)
@@ -590,12 +508,22 @@ export class Model extends EventEmitter {
             });
         }
 
-        // Throw the promise for React Suspense
         throw loading;
       },
     });
+  }
+}
 
-    return lazyProxy;
+// Symbol declarations for TypeScript
+declare module "./Model" {
+  interface Model {
+    [SYM_ADAPTER]: ModelAdapter;
+    [SYM_UPDATES]: string[];
+    [SYM_PATCHING]: Set<string>;
+    [SYM_IS_NEW]: boolean;
+    [SYM_SAVE_TIMER]: ReturnType<typeof setTimeout> | null;
+    [SYM_DEBOUNCE]: number;
+    [SYM_IS_PROXY]: boolean;
   }
 }
 

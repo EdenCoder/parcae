@@ -24,12 +24,7 @@ import { QueueService } from "./services/queue";
 import { QuerySubscriptionManager } from "./services/subscriptions";
 import { _setServices } from "./services/context";
 import { getJobs } from "./routing/job";
-import {
-  createAuth,
-  createAuthMiddleware,
-  createSocketAuthHandler,
-} from "./auth";
-import type { AuthConfig } from "./auth";
+import type { AuthAdapter } from "./auth";
 import knex from "knex";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -43,8 +38,8 @@ export interface AppConfig {
   hooks?: string;
   /** Jobs directory for auto-discovery. */
   jobs?: string;
-  /** Authentication configuration. Opt-in — omit to skip auth entirely. */
-  auth?: AuthConfig;
+  /** Authentication adapter. Opt-in — omit to skip auth entirely. */
+  auth?: AuthAdapter;
   /** API version prefix. Default: "v1" */
   version?: string;
   /** Project root directory. Default: process.cwd() */
@@ -262,45 +257,47 @@ export function createApp(config: AppConfig): ParcaeApp {
       );
       adapter.subscriptions = subscriptions;
 
-      // ── Step 8b: Set up auth (opt-in) ─────────────────────────────
-      let authInstance: ReturnType<typeof createAuth> | null = null;
-      let socketAuthHandler: ReturnType<typeof createSocketAuthHandler> | null =
-        null;
+      // ── Step 9: Set up auth (opt-in) ───────────────────────────────
+      const authAdapter: AuthAdapter | null = config.auth ?? null;
 
-      if (config.auth) {
-        authInstance = createAuth(config.auth, envConfig);
-        const authMiddleware = createAuthMiddleware(authInstance);
-        socketAuthHandler = createSocketAuthHandler(authInstance);
+      if (authAdapter) {
+        // Find the User model (if registered)
+        const userModel = models.find((m) => m.type === "user") ?? null;
 
-        // Mount auth middleware on all requests (resolves req.session)
-        server.polka.use(authMiddleware);
-
-        // Mount Better Auth handler for /v1/auth/* routes
-        const authBasePath = config.auth.basePath ?? "/v1/auth";
-        server.polka.all(`${authBasePath}/*`, async (req: any, res: any) => {
-          // Forward to Better Auth
-          const response = await authInstance!.handler(req);
-          // Better Auth returns a Response object — pipe it through
-          if (response && typeof response.status === "number") {
-            res.writeHead(
-              response.status,
-              Object.fromEntries(response.headers.entries()),
-            );
-            const body = await response.text();
-            res.end(body);
-          }
+        // Let the auth adapter set itself up (create tables, configure sync, etc.)
+        await authAdapter.setup({
+          userModel,
+          adapter,
+          config: envConfig,
+          db: writeDb,
         });
 
-        console.log(
-          `[parcae] Auth enabled (${config.auth.providers?.join(", ") ?? "email"})`,
-        );
+        // Mount auth-specific routes (e.g. /v1/auth/* for Better Auth, /webhooks/clerk for Clerk)
+        if (authAdapter.routes) {
+          server.polka.all(
+            `${authAdapter.routes.basePath}/*`,
+            authAdapter.routes.handler,
+          );
+        }
+
+        // Middleware: resolve every request to req.session
+        server.polka.use(async (req: any, _res: any, next: any) => {
+          try {
+            req.session = await authAdapter!.resolveRequest(req);
+          } catch {
+            req.session = null;
+          }
+          next();
+        });
+
+        console.log("[parcae] Auth enabled");
       }
 
-      // ── Step 9: Register auto-CRUD routes ──────────────────────────
+      // ── Step 10: Register auto-CRUD routes ─────────────────────────
       const crudCount = registerModelRoutes(models, adapter, version);
       console.log(`[parcae] Registered ${crudCount} auto-CRUD route(s)`);
 
-      // ── Step 10: Auto-discover controllers, hooks, jobs ────────────
+      // ── Step 11: Auto-discover controllers, hooks, jobs ────────────
       // Files self-register by calling route.*, hook.*, job() at import time.
       // Just importing them is enough — like Next.js pages.
       if (typeof config.controllers === "string") {
@@ -316,7 +313,7 @@ export function createApp(config: AppConfig): ParcaeApp {
         console.log(`[parcae] Discovered ${n} job file(s)`);
       }
 
-      // ── Step 11: Apply discovered routes to Polka ──────────────────
+      // ── Step 12: Apply discovered routes to Polka ──────────────────
       const routes = getRoutes();
       for (const entry of routes) {
         const method = entry.method.toLowerCase() as keyof typeof server.polka;
@@ -327,7 +324,7 @@ export function createApp(config: AppConfig): ParcaeApp {
       }
       console.log(`[parcae] Registered ${routes.length} custom route(s)`);
 
-      // ── Step 12: Start job workers ─────────────────────────────────
+      // ── Step 13: Start job workers ─────────────────────────────────
       const registeredJobs = getJobs();
       if (registeredJobs.length > 0 && queue.get()) {
         const defaultQueue = queue.get()!;
@@ -348,17 +345,19 @@ export function createApp(config: AppConfig): ParcaeApp {
         );
       }
 
-      // ── Step 13: Socket.IO connection handling ─────────────────────
-      // Model class lookup for subscription requests
+      // ── Step 14: Socket.IO connection handling ─────────────────────
       const modelsByType = new Map(models.map((m) => [m.type, m]));
 
       server.io.on("connection", (socket) => {
-        let socketSession: any = null;
-
         // Authenticate via bearer token
         socket.on("authenticate", async (token: string, callback: any) => {
-          if (socketAuthHandler) {
-            socketSession = await socketAuthHandler(token, callback);
+          if (authAdapter) {
+            try {
+              const session = await authAdapter.resolveToken(token);
+              callback({ userId: session?.user?.id ?? null });
+            } catch {
+              callback({ userId: null });
+            }
           } else {
             callback?.({ userId: null });
           }
@@ -386,7 +385,7 @@ export function createApp(config: AppConfig): ParcaeApp {
         });
       });
 
-      // ── Step 14: Start listening ───────────────────────────────────
+      // ── Step 15: Start listening ───────────────────────────────────
       await new Promise<void>((resolveStart) => {
         server!.httpServer.listen(port, () => resolveStart());
       });

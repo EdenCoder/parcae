@@ -11,11 +11,9 @@ export default defineConfig({
   treeshake: true,
   external: [
     "@parcae/model",
-    "pg",
     "knex",
     "socket.io",
     "bullmq",
     "ioredis",
-    "better-auth",
   ],
 });

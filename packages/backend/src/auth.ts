@@ -1,156 +1,85 @@
 /**
- * @parcae/backend — Better Auth integration
+ * @parcae/backend — Auth Adapter Interface
  *
- * Opt-in authentication. If `auth` config is provided to createApp(),
- * this module sets up Better Auth with the app's Postgres database.
+ * Auth is pluggable. The framework doesn't care HOW you authenticate —
+ * it only needs to know WHO is making the request.
  *
- * Features:
- * - Email/password + social OAuth (Google, GitHub)
- * - Bearer token sessions (for Socket.IO auth)
- * - Socket auth via handshake query or `authenticate` event
- * - `req.session.user` available in route handlers
+ * Auth adapters implement this interface. The framework provides:
+ * - @parcae/auth-betterauth — Better Auth (self-hosted, same Postgres)
+ * - @parcae/auth-clerk — Clerk (external, proxied to local User model)
+ *
+ * The User Model is always a real, managed Parcae Model.
+ * Auth adapters resolve identity and sync user data into it.
  */
 
-import { betterAuth } from "better-auth";
-import { bearer } from "better-auth/plugins/bearer";
-import pg from "pg";
+import type { ModelConstructor } from "@parcae/model";
+import type { BackendAdapter } from "./adapters/model";
 import type { Config } from "./config";
 
-// ─── Auth Configuration ──────────────────────────────────────────────────────
+// ─── AuthAdapter Interface ───────────────────────────────────────────────────
 
-export interface AuthConfig {
-  /** Enabled auth providers. */
-  providers?: ("email" | "google" | "github")[];
-  /** Google OAuth config. */
-  google?: { clientId: string; clientSecret: string };
-  /** GitHub OAuth config. */
-  github?: { clientId: string; clientSecret: string };
-  /** Session config. */
-  session?: { expiresIn?: number; updateAge?: number };
-  /** Trusted origins for CORS. */
-  trustedOrigins?: string[];
-  /** Auth path prefix. Default: "/v1/auth" */
-  basePath?: string;
-  /** Base URL (for OAuth callbacks). Auto-detected if not set. */
-  baseURL?: string;
+export interface AuthAdapter {
+  /**
+   * Called once at startup after the database and adapter are ready.
+   *
+   * Use this to:
+   * - Configure the auth provider against the database
+   * - Register webhook routes or sync hooks
+   * - Run any provider-specific migrations (sessions, accounts, etc.)
+   */
+  setup(ctx: AuthSetupContext): Promise<void>;
+
+  /**
+   * Resolve an HTTP request to an authenticated session.
+   * Returns null if the request is unauthenticated.
+   *
+   * The returned session is set on `req.session` for route handlers and scopes.
+   */
+  resolveRequest(req: any): Promise<AuthSession | null>;
+
+  /**
+   * Resolve a bearer token to an authenticated session.
+   * Used for Socket.IO authentication via the `authenticate` event.
+   */
+  resolveToken(token: string): Promise<AuthSession | null>;
+
+  /**
+   * Optional: HTTP routes the auth provider needs mounted.
+   *
+   * Better Auth: { basePath: "/v1/auth", handler: auth.handler }
+   * Clerk: { basePath: "/webhooks/clerk", handler: webhookHandler } or null
+   */
+  routes?: {
+    basePath: string;
+    handler: (req: any, res: any) => Promise<void> | void;
+  } | null;
 }
 
-// ─── Create Auth Instance ────────────────────────────────────────────────────
+// ─── Supporting Types ────────────────────────────────────────────────────────
 
-export function createAuth(authConfig: AuthConfig, envConfig: Config) {
-  const basePath = authConfig.basePath ?? "/v1/auth";
-  const baseURL = authConfig.baseURL ?? `http://localhost:${envConfig.PORT}`;
-  const secret = envConfig.AUTH_SECRET;
-
-  if (!secret) {
-    throw new Error(
-      "[parcae] AUTH_SECRET is required when auth is enabled.\n" +
-        "Set it in .env or your environment.",
-    );
-  }
-
-  const socialProviders: Record<string, any> = {};
-  const providers = authConfig.providers ?? ["email"];
-
-  if (providers.includes("google") && authConfig.google) {
-    socialProviders.google = {
-      clientId: authConfig.google.clientId,
-      clientSecret: authConfig.google.clientSecret,
-    };
-  }
-
-  if (providers.includes("github") && authConfig.github) {
-    socialProviders.github = {
-      clientId: authConfig.github.clientId,
-      clientSecret: authConfig.github.clientSecret,
-    };
-  }
-
-  const trustedOrigins = [
-    ...(authConfig.trustedOrigins ?? []),
-    ...(envConfig.TRUSTED_ORIGINS?.split(",").map((o) => o.trim()) ?? []),
-    "http://localhost:*",
-  ].filter(Boolean);
-
-  const auth = betterAuth({
-    basePath,
-    baseURL,
-    secret,
-
-    database: new pg.Pool({
-      connectionString: envConfig.DATABASE_URL,
-    }),
-
-    user: { modelName: "users" },
-
-    session: {
-      modelName: "sessions",
-      expiresIn: authConfig.session?.expiresIn ?? 60 * 60 * 24 * 30, // 30 days
-      updateAge: authConfig.session?.updateAge ?? 60 * 60 * 24, // refresh daily
-    },
-
-    account: {
-      modelName: "accounts",
-      accountLinking: { enabled: true },
-    },
-
-    verification: { modelName: "verifications" },
-
-    emailAndPassword: {
-      enabled: providers.includes("email"),
-    },
-
-    socialProviders:
-      Object.keys(socialProviders).length > 0 ? socialProviders : undefined,
-    trustedOrigins,
-    plugins: [bearer()],
-  });
-
-  return auth;
+export interface AuthSession {
+  /** The authenticated user. `id` maps to the User Model's ID. */
+  user: { id: string; [key: string]: any };
+  /** Optional: raw session/token data from the provider. */
+  [key: string]: any;
 }
 
-/**
- * Create auth middleware for Polka.
- * Resolves req.session from Bearer token on every request.
- */
-export function createAuthMiddleware(auth: ReturnType<typeof createAuth>) {
-  return async (req: any, _res: any, next: () => void) => {
-    try {
-      const session = await auth.api.getSession({
-        headers: new Headers(req.headers as Record<string, string>),
-      });
-      req.session = session;
-    } catch {
-      req.session = null;
-    }
-    next();
-  };
-}
+export interface AuthSetupContext {
+  /**
+   * The User model class, if one is registered with `static type = "user"`.
+   * Auth adapters use this to determine the table name and schema.
+   */
+  userModel: ModelConstructor | null;
 
-/**
- * Create socket auth handler.
- * Resolves user from bearer token sent via authenticate event.
- */
-export function createSocketAuthHandler(auth: ReturnType<typeof createAuth>) {
-  return async (
-    token: string,
-    callback: (response: { userId: string | null }) => void,
-  ) => {
-    try {
-      const session = await auth.api.getSession({
-        headers: new Headers({ authorization: `Bearer ${token}` }),
-      });
-      callback({ userId: session?.user?.id ?? null });
-      return session;
-    } catch {
-      callback({ userId: null });
-      return null;
-    }
-  };
-}
+  /** The BackendAdapter — for database operations. */
+  adapter: BackendAdapter;
 
-export type AuthInstance = ReturnType<typeof createAuth>;
-export type Session =
-  ReturnType<typeof createAuth> extends { $Infer: { Session: infer S } }
-    ? S
-    : any;
+  /** Parsed and validated environment config. */
+  config: Config;
+
+  /**
+   * Knex write instance — for auth providers that need direct DB access.
+   * Better Auth uses this to share Parcae's database connection.
+   */
+  db: any;
+}
