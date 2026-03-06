@@ -151,6 +151,30 @@ async function discoverAndImport(dir: string, label: string): Promise<number> {
   return count;
 }
 
+// ─── Path matching ───────────────────────────────────────────────────────────
+
+function matchPath(
+  pattern: string,
+  actual: string,
+): { params: Record<string, string> } | null {
+  const patternParts = pattern.split("/").filter(Boolean);
+  const actualParts = actual.split("?")[0]!.split("/").filter(Boolean);
+
+  if (patternParts.length !== actualParts.length) return null;
+
+  const params: Record<string, string> = {};
+  for (let i = 0; i < patternParts.length; i++) {
+    const p = patternParts[i]!;
+    const a = actualParts[i]!;
+    if (p.startsWith(":")) {
+      params[p.slice(1)] = a;
+    } else if (p !== a) {
+      return null;
+    }
+  }
+  return { params };
+}
+
 // ─── createApp ───────────────────────────────────────────────────────────────
 
 export function createApp(config: AppConfig): ParcaeApp {
@@ -371,12 +395,124 @@ export function createApp(config: AppConfig): ParcaeApp {
       const modelsByType = new Map(models.map((m) => [m.type, m]));
 
       server.io.on("connection", (socket) => {
+        let socketSession: any = null;
+
+        // ── RPC: route socket calls through the HTTP handler ─────────
+        socket.on(
+          "call",
+          async (
+            requestId: string,
+            method: string,
+            path: string,
+            data: any,
+          ) => {
+            try {
+              // Build a fake req/res pair and run through Polka's handler
+              const fakeReq: any = {
+                method: method.toUpperCase(),
+                url: path,
+                headers: { ...socket.handshake.headers },
+                body: data,
+                query: data,
+                params: {},
+                session: socketSession,
+              };
+
+              let responseBody: any = null;
+              let statusCode = 200;
+
+              const fakeRes: any = {
+                writeHead(code: number) {
+                  statusCode = code;
+                },
+                setHeader() {},
+                end(body?: string) {
+                  if (body) {
+                    try {
+                      responseBody = JSON.parse(body);
+                    } catch {
+                      responseBody = body;
+                    }
+                  }
+                },
+              };
+
+              // Run through route handlers
+              const routeEntries = getRoutes();
+              let handled = false;
+
+              for (const entry of routeEntries) {
+                if (
+                  entry.method !== "ALL" &&
+                  entry.method !== method.toUpperCase()
+                )
+                  continue;
+
+                // Simple path matching (exact + params)
+                const match = matchPath(entry.path, path);
+                if (!match) continue;
+
+                fakeReq.params = match.params;
+                const handlers = [...entry.middlewares, entry.handler];
+
+                let idx = 0;
+                const next = () => {
+                  const handler = handlers[idx++];
+                  if (handler) handler(fakeReq, fakeRes, next);
+                };
+                await handlers[idx++]?.(fakeReq, fakeRes, next);
+
+                handled = true;
+                break;
+              }
+
+              // If not handled by custom routes, try auto-CRUD
+              if (!handled) {
+                // Let Polka handle it
+                const { IncomingMessage, ServerResponse } =
+                  await import("node:http");
+                // For now, return not found
+                responseBody = {
+                  result: null,
+                  success: false,
+                  error: "Not found",
+                };
+              }
+
+              // Compress and send response
+              const pako = await import("pako");
+              const compressJson = await import("compress-json");
+              const compressed = pako.gzip(
+                JSON.stringify(
+                  compressJson.compress(
+                    responseBody ?? { result: null, success: true },
+                  ),
+                ),
+              );
+              socket.emit(requestId, compressed);
+            } catch (err: any) {
+              const pako = await import("pako");
+              const compressJson = await import("compress-json");
+              const compressed = pako.gzip(
+                JSON.stringify(
+                  compressJson.compress({
+                    result: null,
+                    success: false,
+                    error: err?.message || "Internal error",
+                  }),
+                ),
+              );
+              socket.emit(requestId, compressed);
+            }
+          },
+        );
+
         // Authenticate via bearer token
         socket.on("authenticate", async (token: string, callback: any) => {
           if (authAdapter) {
             try {
-              const session = await authAdapter.resolveToken(token);
-              callback({ userId: session?.user?.id ?? null });
+              socketSession = await authAdapter.resolveToken(token);
+              callback({ userId: socketSession?.user?.id ?? null });
             } catch {
               callback({ userId: null });
             }

@@ -79,6 +79,7 @@ export function createServer_(options: ServerOptions): ServerContext {
 
   // Create Socket.IO server
   const io = new SocketServer(httpServer, {
+    path: "/ws",
     cors: {
       origin: (origin, callback) => {
         if (!origin || isOriginAllowed(origin, trustedOrigins)) {

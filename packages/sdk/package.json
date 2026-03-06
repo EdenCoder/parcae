@@ -1,6 +1,6 @@
 {
   "name": "@parcae/sdk",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "Parcae SDK — client transport and React hooks for Parcae backends",
   "type": "module",
   "main": "./dist/index.js",
