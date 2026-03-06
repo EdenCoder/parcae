@@ -1,13 +1,10 @@
 "use client";
 
 /**
- * useQuery — efficient reactive data fetching.
+ * useQuery — calls chain.find() via socket RPC, subscribes to diffs automatically.
  *
- * - Deduplicates: same query from multiple components = one fetch
- * - Caches: unmount/remount doesn't re-fetch if data is fresh
- * - Realtime: subscribes to server-pushed diffs (add/remove/update)
- * - Auth-aware: waits for auth before firing scoped queries
- * - Efficient: React only re-renders when the items array reference changes
+ * No separate subscribe:query event. The server auto-subscribes when you
+ * query a list endpoint. Diffs arrive on the same query key.
  */
 
 import { useEffect, useRef, useSyncExternalStore } from "react";
@@ -25,7 +22,6 @@ interface QueryChain<T> {
 }
 
 interface UseQueryOptions {
-  /** Wait for auth before firing. Default: true. */
   waitForAuth?: boolean;
 }
 
@@ -50,19 +46,12 @@ interface CacheEntry {
 
 const cache = new Map<string, CacheEntry>();
 const GC_DELAY = 60_000;
-
 const EMPTY: any[] = [];
-const EMPTY_RESULT: UseQueryResult<any> = {
-  items: EMPTY,
-  loading: true,
-  error: null,
-  refetch: () => {},
-};
 
 function getOrCreate(key: string): CacheEntry {
-  let entry = cache.get(key);
-  if (!entry) {
-    entry = {
+  let e = cache.get(key);
+  if (!e) {
+    e = {
       items: EMPTY,
       loading: true,
       error: null,
@@ -71,24 +60,23 @@ function getOrCreate(key: string): CacheEntry {
       dispose: null,
       gcTimer: null,
     };
-    cache.set(key, entry);
+    cache.set(key, e);
   }
-  return entry;
+  return e;
 }
 
-function notify(entry: CacheEntry): void {
-  for (const fn of entry.listeners) fn();
+function notify(e: CacheEntry): void {
+  for (const fn of e.listeners) fn();
 }
 
-// ─── Fetch + Subscribe ───────────────────────────────────────────────────────
+// ─── Fetch via chain.find() ──────────────────────────────────────────────────
 
-function fetchAndSubscribe(
+function doFetch(
   key: string,
   entry: CacheEntry,
   chain: QueryChain<any>,
   client: ParcaeClient,
 ): void {
-  // Fetch
   entry.loading = true;
   entry.error = null;
   notify(entry);
@@ -106,46 +94,33 @@ function fetchAndSubscribe(
       notify(entry);
     });
 
-  // Subscribe to realtime diffs
+  // Listen for realtime diffs (server auto-subscribes on the call)
   if (!entry.dispose && chain.__modelType) {
-    const event = `query:${key}`;
+    const diffEvent = `query:diff:${key}`;
 
-    client.send("subscribe:query", {
-      hash: key,
-      modelType: chain.__modelType,
-      steps: chain.__steps ?? [],
-    });
-
-    const unsub = client.subscribe(event, (ops: any[]) => {
+    const unsub = client.subscribe(diffEvent, (ops: any[]) => {
       if (!ops?.length) return;
 
-      const map = new Map(entry.items.map((item: any) => [item.id, item]));
+      const map = new Map(entry.items.map((i: any) => [i.id, i]));
       let changed = false;
 
       for (const op of ops) {
-        switch (op.op) {
-          case "add":
-            if (!map.has(op.id) && op.data && chain.__modelClass) {
-              map.set(op.id, new chain.__modelClass(chain.__adapter, op.data));
-              changed = true;
-            }
-            break;
-          case "remove":
-            if (map.has(op.id)) {
-              map.delete(op.id);
-              changed = true;
-            }
-            break;
-          case "update": {
-            const existing = map.get(op.id);
-            if (existing && op.data) {
-              for (const [k, v] of Object.entries(op.data)) {
-                (existing as any)[k] = v;
-              }
-              changed = true;
-            }
-            break;
-          }
+        if (
+          op.op === "add" &&
+          !map.has(op.id) &&
+          op.data &&
+          chain.__modelClass
+        ) {
+          map.set(op.id, new chain.__modelClass(chain.__adapter, op.data));
+          changed = true;
+        } else if (op.op === "remove" && map.has(op.id)) {
+          map.delete(op.id);
+          changed = true;
+        } else if (op.op === "update" && map.has(op.id) && op.data) {
+          const existing = map.get(op.id);
+          for (const [k, v] of Object.entries(op.data))
+            (existing as any)[k] = v;
+          changed = true;
         }
       }
 
@@ -157,7 +132,6 @@ function fetchAndSubscribe(
 
     entry.dispose = () => {
       unsub();
-      client.send("unsubscribe:query", { hash: key });
       entry.dispose = null;
     };
   }
@@ -178,33 +152,25 @@ export function useQuery<T>(
       ? `${chain.__modelType}:${authVersion}:${JSON.stringify(chain.__steps ?? [])}`
       : null;
 
-  // Ref to track the current key (for cleanup)
   const keyRef = useRef(key);
   keyRef.current = key;
 
-  // ── useSyncExternalStore ──────────────────────────────────────────
-
-  const subscribe = (onStoreChange: () => void) => {
+  const subscribe = (onChange: () => void) => {
     const k = keyRef.current;
     if (!k) return () => {};
-
-    const entry = getOrCreate(k);
-    entry.refs++;
-    entry.listeners.add(onStoreChange);
-
-    // Cancel GC
-    if (entry.gcTimer) {
-      clearTimeout(entry.gcTimer);
-      entry.gcTimer = null;
+    const e = getOrCreate(k);
+    e.refs++;
+    e.listeners.add(onChange);
+    if (e.gcTimer) {
+      clearTimeout(e.gcTimer);
+      e.gcTimer = null;
     }
-
     return () => {
-      entry.listeners.delete(onStoreChange);
-      entry.refs--;
-
-      if (entry.refs <= 0) {
-        entry.gcTimer = setTimeout(() => {
-          entry.dispose?.();
+      e.listeners.delete(onChange);
+      e.refs--;
+      if (e.refs <= 0) {
+        e.gcTimer = setTimeout(() => {
+          e.dispose?.();
           cache.delete(k);
         }, GC_DELAY);
       }
@@ -223,30 +189,26 @@ export function useQuery<T>(
     getSnapshot,
   ) as T[];
 
-  // ── Trigger fetch when key changes ────────────────────────────────
-
   useEffect(() => {
     if (!key || !chain) return;
-
     const entry = getOrCreate(key);
-
-    // Only fetch if this is the first subscriber or items are empty
-    if (entry.items === EMPTY || entry.items.length === 0) {
-      fetchAndSubscribe(key, entry, chain, client);
+    if (entry.items === EMPTY) {
+      doFetch(key, entry, chain, client);
     }
   }, [key]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Refetch ───────────────────────────────────────────────────────
-
   const refetch = () => {
     if (!key || !chain) return;
-    const entry = getOrCreate(key);
-    fetchAndSubscribe(key, entry, chain, client);
+    doFetch(key, getOrCreate(key), chain, client);
   };
 
-  // ── Return ────────────────────────────────────────────────────────
-
-  if (!key) return EMPTY_RESULT;
+  if (!key)
+    return {
+      items: EMPTY as T[],
+      loading: !authReady,
+      error: null,
+      refetch: () => {},
+    };
 
   const entry = cache.get(key);
   return {

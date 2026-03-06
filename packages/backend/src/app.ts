@@ -311,6 +311,8 @@ export function createApp(config: AppConfig): ParcaeApp {
 
         // Middleware: resolve every request to req.session
         server.polka.use(async (req: any, _res: any, next: any) => {
+          // Skip for socket RPC calls — session already injected
+          if (req._socketRpc) return next();
           try {
             req.session = await authAdapter!.resolveRequest(req);
           } catch {
@@ -409,10 +411,8 @@ export function createApp(config: AppConfig): ParcaeApp {
             path: string,
             data: any,
           ) => {
+            log.debug(`RPC ${method} ${path}`);
             try {
-              
-              
-
               // Parse query string from path
               const [pathname, qs] = path.split("?");
               const query: Record<string, any> = {};
@@ -431,62 +431,53 @@ export function createApp(config: AppConfig): ParcaeApp {
                 method.toUpperCase() === "GET" ? { ...query, ...data } : query;
 
               // Build fake req that Polka's handler can process
-              const fakeReq: any = Object.assign(
-                new PassThrough(),
-                {
-                  method: method.toUpperCase(),
-                  url: path,
-                  headers: {
-                    ...socket.handshake.headers,
-                    "content-type": "application/json",
-                  },
-                  body: data,
-                  query: mergedQuery,
-                  params: {},
-                  session: socketSession,
-                  _parsedUrl: { pathname, query: qs || "", _raw: path },
+              const fakeReq: any = Object.assign(new PassThrough(), {
+                method: method.toUpperCase(),
+                url: path,
+                headers: {
+                  ...socket.handshake.headers,
+                  "content-type": "application/json",
                 },
-              );
+                body: data,
+                query: mergedQuery,
+                params: {},
+                session: socketSession,
+                _socketRpc: true, // marker: skip auth middleware resolution
+                _parsedUrl: { pathname, query: qs || "", _raw: path },
+              });
 
               // Build fake res that captures the response
               let responseBody: any = null;
-              const fakeRes: any = Object.assign(
-                new PassThrough(),
-                {
-                  statusCode: 200,
-                  writeHead(code: number, headers?: any) {
-                    this.statusCode = code;
-                    return this;
-                  },
-                  setHeader() {
-                    return this;
-                  },
-                  end(body?: string) {
-                    if (body) {
-                      try {
-                        responseBody = JSON.parse(body);
-                      } catch {
-                        responseBody = body;
-                      }
-                    }
-                    // Send compressed response
-                    const compressed = pako.gzip(
-                      JSON.stringify(
-                        compress(
-                          responseBody ?? { result: null, success: true },
-                        ),
-                      ),
-                    );
-                    socket.emit(requestId, compressed);
-                  },
+              const fakeRes: any = Object.assign(new PassThrough(), {
+                statusCode: 200,
+                writeHead(code: number, headers?: any) {
+                  this.statusCode = code;
+                  return this;
                 },
-              );
+                setHeader() {
+                  return this;
+                },
+                end(body?: string) {
+                  if (body) {
+                    try {
+                      responseBody = JSON.parse(body);
+                    } catch {
+                      responseBody = body;
+                    }
+                  }
+                  // Send compressed response
+                  const compressed = pako.gzip(
+                    JSON.stringify(
+                      compress(responseBody ?? { result: null, success: true }),
+                    ),
+                  );
+                  socket.emit(requestId, compressed);
+                },
+              });
 
               // Run through Polka's full handler (includes middleware, auth, auto-CRUD, custom routes)
               (server!.polka as any).handler(fakeReq, fakeRes);
             } catch (err: any) {
-              
-              
               const compressed = pako.gzip(
                 JSON.stringify(
                   compress({
