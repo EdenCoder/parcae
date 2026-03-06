@@ -5,6 +5,7 @@
  * No useState, no useEffect, no manual syncing.
  */
 
+import { log } from "./log";
 import { proxy } from "valtio";
 
 export type AuthStatus = "pending" | "authenticated" | "unauthenticated";
@@ -35,6 +36,7 @@ export class AuthGate {
   /** Auth confirmed — user is authenticated */
   resolve(userId: string): void {
     this.state.status = "authenticated";
+    log.info("auth: authenticated, userId:", userId);
     this.state.userId = userId;
     this.state.version++;
     this._resolve?.();
@@ -44,6 +46,7 @@ export class AuthGate {
   /** Auth confirmed — no user */
   resolveUnauthenticated(): void {
     this.state.status = "unauthenticated";
+    log.info("auth: unauthenticated");
     this.state.userId = null;
     this.state.version++;
     this._resolve?.();
@@ -54,6 +57,7 @@ export class AuthGate {
   reset(): void {
     if (this.state.status !== "pending") {
       this.state.status = "pending";
+    log.info("auth: reset to pending");
       this.state.userId = null;
       this.ready = this._makePending();
     }

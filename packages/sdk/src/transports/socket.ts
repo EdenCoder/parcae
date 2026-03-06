@@ -12,6 +12,7 @@ import { EventEmitter } from "eventemitter3";
 import ShortId from "short-unique-id";
 import type { Transport } from "@parcae/model";
 import { AuthGate } from "../auth-gate";
+import { log } from "../log";
 
 const uid = new ShortId({ length: 10 });
 const SOCKETS = new Map<string, any>();
@@ -55,12 +56,14 @@ export class SocketTransport extends EventEmitter implements Transport {
 
     this.socket.on("connect", () => {
       this.isConnected = true;
+      log.info("socket connected");
       this._doAuth();
       this.emit("connected");
     });
 
     this.socket.on("disconnect", () => {
       this.isConnected = false;
+      log.info("socket disconnected");
       this.auth.reset();
       this.emit("disconnected");
     });
@@ -69,6 +72,7 @@ export class SocketTransport extends EventEmitter implements Transport {
 
     if (this.socket.connected) {
       this.isConnected = true;
+      log.info("socket connected");
       this._doAuth();
     }
 
@@ -84,6 +88,7 @@ export class SocketTransport extends EventEmitter implements Transport {
       return;
     }
 
+      log.info("authenticating with token", this.token?.slice(0, 8) + "...");
     this.socket.emit("authenticate", this.token, (response: any) => {
       const userId = response?.userId ?? null;
       if (userId) {
@@ -244,6 +249,7 @@ export class SocketTransport extends EventEmitter implements Transport {
   disconnect(): void {
     this.socket.disconnect();
     this.isConnected = false;
+      log.info("socket disconnected");
   }
   async reconnect(): Promise<void> {
     this.socket.connect();

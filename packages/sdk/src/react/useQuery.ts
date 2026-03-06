@@ -6,6 +6,7 @@
 
 import { useEffect, useRef, useSyncExternalStore } from "react";
 import { useSnapshot } from "valtio";
+import { log } from "../log";
 import { useParcae } from "./context";
 import type { ParcaeClient } from "../client";
 import type { AuthState } from "../auth-gate";
@@ -67,6 +68,7 @@ function notify(e: CacheEntry): void {
 }
 
 function doFetch(key: string, entry: CacheEntry, chain: QueryChain<any>): void {
+  log.info("useQuery: fetching", chain.__modelType, "key:", key.slice(0, 40));
   entry.loading = true;
   entry.error = null;
   notify(entry);
@@ -74,11 +76,13 @@ function doFetch(key: string, entry: CacheEntry, chain: QueryChain<any>): void {
   chain
     .find()
     .then((result: any[]) => {
+      log.info("useQuery: got", result.length, "items for", chain.__modelType);
       entry.items = result;
       entry.loading = false;
       notify(entry);
     })
     .catch((err: Error) => {
+      log.error("useQuery: error", err.message);
       entry.error = err;
       entry.loading = false;
       notify(entry);
@@ -111,6 +115,7 @@ export function useQuery<T>(
       ? `${chain.__modelType}:${authVersion}:${JSON.stringify(chain.__steps ?? [])}`
       : null;
 
+  log.debug("useQuery:", chain?.__modelType, "auth=" + authStatus, "ready=" + authReady, "key=" + (key ? "yes" : "null"));
   const keyRef = useRef(key);
   keyRef.current = key;
 
