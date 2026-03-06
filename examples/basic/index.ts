@@ -13,6 +13,7 @@
  */
 
 import { createApp } from "@parcae/backend";
+import { betterAuth } from "@parcae/auth-betterauth";
 import { Post } from "./models/Post";
 import { User } from "./models/User";
 
@@ -23,9 +24,9 @@ import "./jobs/post-index";
 
 const app = createApp({
   models: [User, Post],
-  auth: {
+  auth: betterAuth({
     providers: ["email"],
-  },
+  }),
 });
 
 app.start({ port: 3000 }).catch(console.error);

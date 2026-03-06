@@ -338,23 +338,39 @@ Manages realtime query subscriptions for connected clients. When a model changes
 
 ## Auth
 
-Opt-in authentication via Better Auth. Email/password + OAuth providers.
+Auth is pluggable via the `AuthAdapter` interface. The framework doesn't ship with any auth provider — install the one you need:
+
+| Package | Provider | Users live... |
+| --- | --- | --- |
+| `@parcae/auth-betterauth` | Better Auth | In your Postgres (same table as your User model) |
+| `@parcae/auth-clerk` | Clerk | In Clerk's cloud (proxied to your User model) |
 
 ```typescript
+import { betterAuth } from "@parcae/auth-betterauth";
+
 const app = createApp({
   models: [User, Post],
-  auth: {
-    providers: ["email", "google", "github"],
-    google: { clientId: "...", clientSecret: "..." },
-    session: { expiresIn: 60 * 60 * 24 * 7 },
-    basePath: "/v1/auth",
-  },
+  auth: betterAuth({ providers: ["email", "google"] }),
 });
 ```
 
-- Bearer token sessions resolved on all HTTP requests (`req.session`)
+```typescript
+import { clerk } from "@parcae/auth-clerk";
+
+const app = createApp({
+  models: [User, Post],
+  auth: clerk({
+    secretKey: process.env.CLERK_SECRET_KEY!,
+    publishableKey: process.env.CLERK_PUBLISHABLE_KEY!,
+  }),
+});
+```
+
+The `User` Model is always a real, managed Parcae Model. Auth adapters resolve identity and sync user data into it.
+
+- `req.session.user` available in route handlers and scopes
 - Socket.IO auth via `authenticate` event
-- Better Auth handler mounted at `/v1/auth/*`
+- Implement `AuthAdapter` to bring your own provider
 
 ## Schema Generation
 
@@ -408,9 +424,8 @@ import { PubSub, QueueService, addJobIfNotExists, QuerySubscriptionManager } fro
 import { enqueue, lock, getQueue, getPubSub } from "@parcae/backend";
 import type { PubSubConfig, QueueConfig, EnqueueOptions } from "@parcae/backend";
 
-// Auth
-import { createAuth, createAuthMiddleware, createSocketAuthHandler } from "@parcae/backend";
-import type { AuthConfig, AuthInstance, Session } from "@parcae/backend";
+// Auth (interface only — implementations in separate packages)
+import type { AuthAdapter, AuthSession, AuthSetupContext } from "@parcae/backend";
 
 // Schema
 import { SchemaResolver, resolveFallbackSchema, generateSchemas, loadCachedSchemas } from "@parcae/backend";

@@ -1,16 +1,21 @@
 import { Model } from "@parcae/model";
 
 /**
- * User model — managed by Better Auth.
- * We declare it here so other models can reference it,
- * but set managed=false so Parcae doesn't create the table
- * (Better Auth owns the users table).
+ * User model — a first-class Parcae Model.
+ *
+ * Auth fields (name, email, image, emailVerified) are written by
+ * the auth adapter. Custom fields (bio, role) are yours.
  */
 export class User extends Model {
   static type = "user" as const;
-  static managed = false;
 
+  // Auth-synced fields
   name: string = "";
   email: string = "";
+  emailVerified: boolean = false;
   image?: string;
+
+  // Custom fields
+  bio: string = "";
+  role: "user" | "admin" = "user";
 }

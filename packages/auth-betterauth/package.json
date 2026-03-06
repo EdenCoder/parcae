@@ -1,0 +1,42 @@
+{
+  "name": "@parcae/auth-betterauth",
+  "version": "0.1.0",
+  "description": "Better Auth adapter for Parcae — self-hosted auth with your User model",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "better-auth": "^1.2.0",
+    "pg": "^8.13.0"
+  },
+  "peerDependencies": {
+    "@parcae/backend": "workspace:*",
+    "@parcae/model": "workspace:*"
+  },
+  "devDependencies": {
+    "@parcae/backend": "workspace:*",
+    "@parcae/model": "workspace:*",
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.18.0",
+    "tsup": "^8.5.0",
+    "typescript": "^5.8.0"
+  },
+  "license": "MIT"
+}

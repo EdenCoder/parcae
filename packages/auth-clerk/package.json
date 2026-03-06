@@ -1,0 +1,41 @@
+{
+  "name": "@parcae/auth-clerk",
+  "version": "0.1.0",
+  "description": "Clerk adapter for Parcae — external auth proxied to your User model",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@clerk/backend": "^1.0.0",
+    "svix": "^1.0.0"
+  },
+  "peerDependencies": {
+    "@parcae/backend": "workspace:*",
+    "@parcae/model": "workspace:*"
+  },
+  "devDependencies": {
+    "@parcae/backend": "workspace:*",
+    "@parcae/model": "workspace:*",
+    "@types/node": "^22.0.0",
+    "tsup": "^8.5.0",
+    "typescript": "^5.8.0"
+  },
+  "license": "MIT"
+}

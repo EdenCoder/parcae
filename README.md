@@ -117,8 +117,10 @@ node index.ts
 | Package | What |
 | --- | --- |
 | [`@parcae/model`](./packages/model) | Model base class, Proxy-based property access, adapter pattern, query builder |
-| [`@parcae/backend`](./packages/backend) | Server framework — createApp, auto-CRUD, hooks, jobs, auth, PubSub, Queue |
+| [`@parcae/backend`](./packages/backend) | Server framework — createApp, auto-CRUD, hooks, jobs, PubSub, Queue |
 | [`@parcae/sdk`](./packages/sdk) | Client SDK — Socket.IO and SSE transports, React hooks |
+| [`@parcae/auth-betterauth`](./packages/auth-betterauth) | Better Auth adapter — self-hosted auth, same Postgres |
+| [`@parcae/auth-clerk`](./packages/auth-clerk) | Clerk adapter — external auth, proxied to your User model |
 
 ## Models
 
@@ -243,19 +245,32 @@ await enqueue("post:index", { postId: post.id });
 
 ## Auth
 
-Opt-in Better Auth integration. Email/password + OAuth.
+Pluggable auth adapters. Your User model is always a real Parcae model — auth adapters just resolve identity and sync user data into it.
 
 ```typescript
+// Better Auth — self-hosted, same Postgres
+import { betterAuth } from "@parcae/auth-betterauth";
+
 const app = createApp({
-  models: [Post],
-  auth: {
-    providers: ["email", "google", "github"],
-    google: { clientId: "...", clientSecret: "..." },
-  },
+  models: [User, Post],
+  auth: betterAuth({ providers: ["email", "google"] }),
 });
 ```
 
-Bearer token sessions. `req.session.user` in route handlers. Socket.IO auth via `authenticate` event.
+```typescript
+// Clerk — external auth, proxied to your User model
+import { clerk } from "@parcae/auth-clerk";
+
+const app = createApp({
+  models: [User, Post],
+  auth: clerk({
+    secretKey: process.env.CLERK_SECRET_KEY!,
+    publishableKey: process.env.CLERK_PUBLISHABLE_KEY!,
+  }),
+});
+```
+
+`req.session.user` in route handlers. Socket.IO auth via `authenticate` event. Implement the `AuthAdapter` interface to bring your own provider.
 
 ## Client SDK
 
@@ -319,6 +334,8 @@ packages/
   model/              @parcae/model
   backend/            @parcae/backend
   sdk/                @parcae/sdk
+  auth-betterauth/    @parcae/auth-betterauth
+  auth-clerk/         @parcae/auth-clerk
 examples/
   basic/              Minimal working app
 ```

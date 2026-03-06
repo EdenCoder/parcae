@@ -38,6 +38,7 @@ const SYM_IS_NEW = Symbol("parcae:isNew");
 const SYM_SAVE_TIMER = Symbol("parcae:saveTimer");
 const SYM_DEBOUNCE = Symbol("parcae:debounceMs");
 const SYM_IS_PROXY = Symbol("parcae:isProxy");
+const SYM_INIT_DATA = Symbol("parcae:initData");
 
 // ─── Keys that should NOT be treated as data ─────────────────────────────────
 
@@ -206,6 +207,13 @@ export class Model extends EventEmitter {
     this[SYM_IS_NEW] = false;
     this[SYM_SAVE_TIMER] = null;
     this[SYM_DEBOUNCE] = 0;
+    this[SYM_IS_PROXY] = false;
+
+    // Store the init data keys so the Proxy set trap knows which values
+    // were explicitly provided (and shouldn't be overwritten by class
+    // property defaults that run AFTER super() returns).
+    const initDataKeys = new Set(data ? Object.keys(data) : []);
+    this[SYM_INIT_DATA] = initDataKeys;
 
     // Set system data properties directly on the instance
     (this as any).id = data?.id ?? generateId();
@@ -213,7 +221,8 @@ export class Model extends EventEmitter {
     (this as any).createdAt = data?.createdAt ?? new Date().toISOString();
     (this as any).updatedAt = data?.updatedAt ?? new Date().toISOString();
 
-    // Set all provided data properties directly on the instance
+    // Set all provided data on the instance BEFORE the Proxy wraps it.
+    // These go directly on `this`, bypassing the Proxy.
     if (data) {
       for (const [key, value] of Object.entries(data)) {
         if (!SYSTEM_DATA_KEYS.has(key)) {
@@ -258,6 +267,14 @@ export class Model extends EventEmitter {
           const realKey = prop.slice(1);
           (target as any)[realKey] = value;
           target[SYM_UPDATES].push(realKey);
+          return true;
+        }
+
+        // During construction (before SYM_IS_PROXY is set), class property
+        // initializers fire. If this key was explicitly provided in the
+        // constructor data, don't let the default overwrite it.
+        if (!target[SYM_IS_PROXY] && target[SYM_INIT_DATA]?.has(prop)) {
+          // Skip — the explicit value is already set on the instance
           return true;
         }
 
@@ -311,8 +328,19 @@ export class Model extends EventEmitter {
       },
     });
 
-    // Mark that construction is complete — changes after this are tracked
-    proxy[SYM_IS_PROXY] = true;
+    // SYM_IS_PROXY starts false (set earlier). Property initializers from the
+    // subclass run after this return, setting defaults on the proxy. The set
+    // trap skips change tracking when SYM_IS_PROXY is false. After construction
+    // completes, the first explicit write flips it to true via a lazy check.
+    //
+    // But we need a way to flip it. Use a microtask: by the time any user code
+    // runs (which is async or at least after the constructor call), the
+    // microtask will have fired.
+    const target = this;
+    queueMicrotask(() => {
+      target[SYM_IS_PROXY] = true;
+      delete (target as any)[SYM_INIT_DATA];
+    });
 
     return proxy;
   }
@@ -524,6 +552,7 @@ declare module "./Model" {
     [SYM_SAVE_TIMER]: ReturnType<typeof setTimeout> | null;
     [SYM_DEBOUNCE]: number;
     [SYM_IS_PROXY]: boolean;
+    [SYM_INIT_DATA]: Set<string> | undefined;
   }
 }
 
