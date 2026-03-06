@@ -1,6 +1,6 @@
 {
   "name": "@parcae/model",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Parcae Model — typed ORM base class with adapter pattern",
   "type": "module",
   "main": "./dist/index.js",
@@ -30,7 +30,9 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "eventemitter3": "^5.0.1",
@@ -41,7 +43,8 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "tsup": "^8.5.0",
-    "typescript": "^5.8.0"
+    "typescript": "^5.8.0",
+    "vitest": "^4.0.18"
   },
   "license": "MIT"
 }

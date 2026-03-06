@@ -1,4 +1,3 @@
-import { log } from "./logger";
 /**
  * @parcae/backend — createApp()
  *
@@ -10,8 +9,12 @@ import { log } from "./logger";
 
 import { resolve, join } from "node:path";
 import { readdirSync, existsSync, statSync } from "node:fs";
+import { PassThrough } from "node:stream";
+import pako from "pako";
+import { compress } from "compress-json";
 import { Model } from "@parcae/model";
 import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
+import { log } from "./logger";
 import { generateSchemas } from "./schema/generate";
 import { parseConfig } from "./config";
 import type { Config } from "./config";
@@ -397,7 +400,7 @@ export function createApp(config: AppConfig): ParcaeApp {
       server.io.on("connection", (socket) => {
         let socketSession: any = null;
 
-        // ── RPC: route socket calls through the HTTP handler ─────────
+        // ── RPC: pipe socket calls through Polka's HTTP handler ─────
         socket.on(
           "call",
           async (
@@ -407,95 +410,86 @@ export function createApp(config: AppConfig): ParcaeApp {
             data: any,
           ) => {
             try {
-              // Build a fake req/res pair and run through Polka's handler
-              const fakeReq: any = {
-                method: method.toUpperCase(),
-                url: path,
-                headers: { ...socket.handshake.headers },
-                body: data,
-                query: data,
-                params: {},
-                session: socketSession,
-              };
+              
+              
 
-              let responseBody: any = null;
-              let statusCode = 200;
-
-              const fakeRes: any = {
-                writeHead(code: number) {
-                  statusCode = code;
-                },
-                setHeader() {},
-                end(body?: string) {
-                  if (body) {
-                    try {
-                      responseBody = JSON.parse(body);
-                    } catch {
-                      responseBody = body;
-                    }
-                  }
-                },
-              };
-
-              // Run through route handlers
-              const routeEntries = getRoutes();
-              let handled = false;
-
-              for (const entry of routeEntries) {
-                if (
-                  entry.method !== "ALL" &&
-                  entry.method !== method.toUpperCase()
-                )
-                  continue;
-
-                // Simple path matching (exact + params)
-                const match = matchPath(entry.path, path);
-                if (!match) continue;
-
-                fakeReq.params = match.params;
-                const handlers = [...entry.middlewares, entry.handler];
-
-                let idx = 0;
-                const next = () => {
-                  const handler = handlers[idx++];
-                  if (handler) handler(fakeReq, fakeRes, next);
-                };
-                await handlers[idx++]?.(fakeReq, fakeRes, next);
-
-                handled = true;
-                break;
+              // Parse query string from path
+              const [pathname, qs] = path.split("?");
+              const query: Record<string, any> = {};
+              if (qs) {
+                for (const pair of qs.split("&")) {
+                  const [k, v] = pair.split("=");
+                  if (k)
+                    query[decodeURIComponent(k)] = v
+                      ? decodeURIComponent(v)
+                      : "";
+                }
               }
 
-              // If not handled by custom routes, try auto-CRUD
-              if (!handled) {
-                // Let Polka handle it
-                const { IncomingMessage, ServerResponse } =
-                  await import("node:http");
-                // For now, return not found
-                responseBody = {
-                  result: null,
-                  success: false,
-                  error: "Not found",
-                };
-              }
+              // Merge data into query for GET requests
+              const mergedQuery =
+                method.toUpperCase() === "GET" ? { ...query, ...data } : query;
 
-              // Compress and send response
-              const pako = await import("pako");
-              const compressJson = await import("compress-json");
-              const compressed = pako.gzip(
-                JSON.stringify(
-                  compressJson.compress(
-                    responseBody ?? { result: null, success: true },
-                  ),
-                ),
+              // Build fake req that Polka's handler can process
+              const fakeReq: any = Object.assign(
+                new PassThrough(),
+                {
+                  method: method.toUpperCase(),
+                  url: path,
+                  headers: {
+                    ...socket.handshake.headers,
+                    "content-type": "application/json",
+                  },
+                  body: data,
+                  query: mergedQuery,
+                  params: {},
+                  session: socketSession,
+                  _parsedUrl: { pathname, query: qs || "", _raw: path },
+                },
               );
-              socket.emit(requestId, compressed);
+
+              // Build fake res that captures the response
+              let responseBody: any = null;
+              const fakeRes: any = Object.assign(
+                new PassThrough(),
+                {
+                  statusCode: 200,
+                  writeHead(code: number, headers?: any) {
+                    this.statusCode = code;
+                    return this;
+                  },
+                  setHeader() {
+                    return this;
+                  },
+                  end(body?: string) {
+                    if (body) {
+                      try {
+                        responseBody = JSON.parse(body);
+                      } catch {
+                        responseBody = body;
+                      }
+                    }
+                    // Send compressed response
+                    const compressed = pako.gzip(
+                      JSON.stringify(
+                        compress(
+                          responseBody ?? { result: null, success: true },
+                        ),
+                      ),
+                    );
+                    socket.emit(requestId, compressed);
+                  },
+                },
+              );
+
+              // Run through Polka's full handler (includes middleware, auth, auto-CRUD, custom routes)
+              (server!.polka as any).handler(fakeReq, fakeRes);
             } catch (err: any) {
-              const pako = await import("pako");
-              const compressJson = await import("compress-json");
+              
+              
               const compressed = pako.gzip(
                 JSON.stringify(
-                  compressJson.compress({
+                  compress({
                     result: null,
                     success: false,
                     error: err?.message || "Internal error",

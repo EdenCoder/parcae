@@ -1,6 +1,6 @@
 {
   "name": "@parcae/backend",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Parcae Backend — TypeScript backend framework with auto-CRUD, realtime, and jobs",
   "type": "module",
   "main": "./dist/index.js",
@@ -20,7 +20,9 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@parcae/model": "workspace:*",
@@ -45,7 +47,8 @@
     "@types/node": "^22.0.0",
     "@types/pluralize": "^0.0.33",
     "tsup": "^8.5.0",
-    "typescript": "^5.8.0"
+    "typescript": "^5.8.0",
+    "vitest": "^4.0.18"
   },
   "license": "MIT"
 }
