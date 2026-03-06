@@ -20,11 +20,16 @@
  */
 
 import { betterAuth as createBetterAuth } from "better-auth";
+import { log } from "@parcae/backend";
 import { bearer } from "better-auth/plugins/bearer";
 import pg from "pg";
 import { generateId } from "@parcae/model";
 import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
-import type { AuthAdapter, AuthSession, AuthSetupContext } from "@parcae/backend";
+import type {
+  AuthAdapter,
+  AuthSession,
+  AuthSetupContext,
+} from "@parcae/backend";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -54,7 +59,10 @@ export interface BetterAuthConfig {
  */
 function inferAdditionalFields(
   userModel: ModelConstructor,
-): Record<string, { type: "string" | "number" | "boolean" | "date"; required: boolean }> {
+): Record<
+  string,
+  { type: "string" | "number" | "boolean" | "date"; required: boolean }
+> {
   const schema = (userModel as any).__schema as SchemaDefinition | undefined;
   if (!schema) return {};
 
@@ -68,7 +76,10 @@ function inferAdditionalFields(
     "updatedAt",
   ]);
 
-  const fields: Record<string, { type: "string" | "number" | "boolean" | "date"; required: boolean }> = {};
+  const fields: Record<
+    string,
+    { type: "string" | "number" | "boolean" | "date"; required: boolean }
+  > = {};
 
   for (const [key, colDef] of Object.entries(schema)) {
     if (betterAuthFields.has(key)) continue;
@@ -130,7 +141,9 @@ export function betterAuth(config: BetterAuthConfig = {}): AuthAdapter {
       }
 
       const baseURL =
-        config.baseURL ?? `http://localhost:${envConfig.PORT}`;
+        config.baseURL ??
+        envConfig.BACKEND_URL ??
+        `http://localhost:${envConfig.PORT}`;
 
       // Social providers
       const socialProviders: Record<string, any> = {};
@@ -159,9 +172,7 @@ export function betterAuth(config: BetterAuthConfig = {}): AuthAdapter {
 
       // Determine user table name from the Model
       // Convention: type "user" → table "users"
-      const userTableName = userModel
-        ? (userModel as any).type + "s"
-        : "users";
+      const userTableName = userModel ? (userModel as any).type + "s" : "users";
 
       // Infer additional fields from the User model schema
       const additionalFields = userModel
@@ -190,10 +201,8 @@ export function betterAuth(config: BetterAuthConfig = {}): AuthAdapter {
 
         session: {
           modelName: "sessions",
-          expiresIn:
-            config.session?.expiresIn ?? 60 * 60 * 24 * 30, // 30 days
-          updateAge:
-            config.session?.updateAge ?? 60 * 60 * 24, // refresh daily
+          expiresIn: config.session?.expiresIn ?? 60 * 60 * 24 * 30, // 30 days
+          updateAge: config.session?.updateAge ?? 60 * 60 * 24, // refresh daily
         },
 
         account: {
@@ -208,9 +217,7 @@ export function betterAuth(config: BetterAuthConfig = {}): AuthAdapter {
         },
 
         socialProviders:
-          Object.keys(socialProviders).length > 0
-            ? socialProviders
-            : undefined,
+          Object.keys(socialProviders).length > 0 ? socialProviders : undefined,
 
         trustedOrigins,
         plugins: [bearer()],
@@ -227,19 +234,32 @@ export function betterAuth(config: BetterAuthConfig = {}): AuthAdapter {
       (this as any).routes = {
         basePath,
         handler: async (req: any, res: any) => {
-          const response = await auth!.handler(req);
+          // Convert Polka/Node request to Web Fetch Request for Better Auth
+          const url = `${baseURL}${req.url}`;
+
+          const webRequest = new Request(url, {
+            method: req.method,
+            headers: new Headers(req.headers as Record<string, string>),
+            body:
+              req.method !== "GET" && req.method !== "HEAD"
+                ? JSON.stringify(req.body)
+                : undefined,
+          });
+
+          const response = await auth!.handler(webRequest);
           if (response && typeof response.status === "number") {
-            res.writeHead(
-              response.status,
-              Object.fromEntries(response.headers.entries()),
-            );
+            const headers: Record<string, string> = {};
+            response.headers.forEach((value: string, key: string) => {
+              headers[key] = value;
+            });
+            res.writeHead(response.status, headers);
             const body = await response.text();
             res.end(body);
           }
         },
       };
 
-      console.log(
+      log.info(
         `[parcae/auth-betterauth] Configured (${providers.join(", ")}) → table: ${userTableName}`,
       );
     },
@@ -275,4 +295,8 @@ export function betterAuth(config: BetterAuthConfig = {}): AuthAdapter {
 }
 
 export default betterAuth;
-export type { AuthAdapter, AuthSession, AuthSetupContext } from "@parcae/backend";
+export type {
+  AuthAdapter,
+  AuthSession,
+  AuthSetupContext,
+} from "@parcae/backend";

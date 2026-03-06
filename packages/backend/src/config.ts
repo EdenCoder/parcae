@@ -60,6 +60,12 @@ export const configSchema = z.object({
 
   /** Trusted origins for CORS. Comma-separated. */
   TRUSTED_ORIGINS: z.string().optional(),
+
+  /** Backend URL (for auth callbacks, etc). Default: http://localhost:{PORT} */
+  BACKEND_URL: z.string().optional(),
+
+  /** Frontend URL. */
+  FRONTEND_URL: z.string().optional(),
 });
 
 export type Config = z.infer<typeof configSchema>;
