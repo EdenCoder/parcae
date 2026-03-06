@@ -37,6 +37,11 @@ export interface ParcaeClient {
 }
 
 export function createClient(config: ClientConfig): ParcaeClient {
+  // Idempotent — return existing client if already created for this url
+  const cacheKey = `${config.url}:${config.version ?? "v1"}`;
+  const existing = (globalThis as any).__parcae_clients?.get(cacheKey);
+  if (existing) return existing;
+
   const version = config.version ?? "v1";
 
   let transport: any;
@@ -55,7 +60,7 @@ export function createClient(config: ClientConfig): ParcaeClient {
 
   Model.use(new FrontendAdapter(transport));
 
-  return {
+  const client: ParcaeClient = {
     transport,
     get: (p, d) => transport.get(p, d),
     post: (p, d) => transport.post(p, d),
@@ -75,4 +80,12 @@ export function createClient(config: ClientConfig): ParcaeClient {
     disconnect: () => transport.disconnect?.(),
     reconnect: () => transport.reconnect?.() ?? Promise.resolve(),
   };
+
+  // Cache the client globally
+  if (!(globalThis as any).__parcae_clients) {
+    (globalThis as any).__parcae_clients = new Map();
+  }
+  (globalThis as any).__parcae_clients.set(cacheKey, client);
+
+  return client;
 }

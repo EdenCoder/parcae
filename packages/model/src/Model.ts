@@ -131,6 +131,10 @@ function lazyQuery<T>(
     const adapter = Model.hasAdapter()
       ? Model.getAdapter()
       : await Model.waitForAdapter();
+    console.log(
+      "[parcae/model] lazy resolve: got adapter, building chain for",
+      modelClass.type,
+    );
     let q = adapter.query(modelClass);
     for (const step of steps) {
       q = (q as any)[step.method](...step.args);
@@ -190,14 +194,33 @@ export class Model extends EventEmitter {
   /** @internal */
   static __schema?: SchemaDefinition;
 
-  private static __adapter: ModelAdapter | null = null;
-  private static __pendingAdapter: Promise<ModelAdapter> | null = null;
-  private static __resolveAdapter: ((adapter: ModelAdapter) => void) | null =
-    null;
+  // Adapter lives on globalThis so it works across multiple copies of @parcae/model
+  // (pnpm can install multiple versions — they all need to share the same adapter)
+  private static get __adapter(): ModelAdapter | null {
+    return (globalThis as any).__parcae_adapter ?? null;
+  }
+  private static set __adapter(v: ModelAdapter | null) {
+    (globalThis as any).__parcae_adapter = v;
+  }
+  private static get __pendingAdapter(): Promise<ModelAdapter> | null {
+    return (globalThis as any).__parcae_pending ?? null;
+  }
+  private static set __pendingAdapter(v: Promise<ModelAdapter> | null) {
+    (globalThis as any).__parcae_pending = v;
+  }
+  private static get __resolveAdapter():
+    | ((adapter: ModelAdapter) => void)
+    | null {
+    return (globalThis as any).__parcae_resolve ?? null;
+  }
+  private static set __resolveAdapter(
+    v: ((adapter: ModelAdapter) => void) | null,
+  ) {
+    (globalThis as any).__parcae_resolve = v;
+  }
 
   static use(adapter: ModelAdapter): void {
     Model.__adapter = adapter;
-    // Resolve any pending waiters
     if (Model.__resolveAdapter) {
       Model.__resolveAdapter(adapter);
       Model.__resolveAdapter = null;
@@ -205,7 +228,6 @@ export class Model extends EventEmitter {
     }
   }
 
-  /** Get the adapter. Throws if not set (use waitForAdapter() for async contexts). */
   static getAdapter(): ModelAdapter {
     if (!Model.__adapter) {
       throw new Error(
@@ -215,12 +237,10 @@ export class Model extends EventEmitter {
     return Model.__adapter;
   }
 
-  /** Returns true if an adapter has been set. */
   static hasAdapter(): boolean {
     return Model.__adapter !== null;
   }
 
-  /** Wait for the adapter to be set. Resolves immediately if already set. */
   static waitForAdapter(): Promise<ModelAdapter> {
     if (Model.__adapter) return Promise.resolve(Model.__adapter);
     if (!Model.__pendingAdapter) {

@@ -241,6 +241,12 @@ export class FrontendAdapter implements ModelAdapter {
 
     chain.find = async (): Promise<T[]> => {
       const path = adapter.resolvePath(modelClass);
+      console.log(
+        "[parcae/model] find:",
+        path,
+        "transport:",
+        typeof adapter.transport?.get,
+      );
       const result = await adapter.transport.get(path, { __query: steps });
       const items = result?.[modelClass.type + "s"] ?? result?.items ?? [];
       return items.map((row: any) => new modelClass(adapter, row));

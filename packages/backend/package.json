@@ -1,6 +1,6 @@
 {
   "name": "@parcae/backend",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "description": "Parcae Backend — TypeScript backend framework with auto-CRUD, realtime, and jobs",
   "type": "module",
   "main": "./dist/index.js",
