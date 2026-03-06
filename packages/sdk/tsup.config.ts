@@ -9,5 +9,5 @@ export default defineConfig({
   target: "es2022",
   splitting: true,
   treeshake: true,
-  external: ["@parcae/model", "react", "react-dom"],
+  external: ["@parcae/model", "react", "react-dom", "valtio"],
 });
