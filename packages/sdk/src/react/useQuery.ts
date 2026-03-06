@@ -1,15 +1,9 @@
 "use client";
 
-/**
- * useQuery — reactive data fetching. Auth state from Valtio snapshot.
- */
-
 import { useEffect, useRef, useSyncExternalStore } from "react";
-import { useSnapshot } from "valtio";
-import { log } from "../log";
 import { useParcae } from "./context";
-import type { ParcaeClient } from "../client";
-import type { AuthState } from "../auth-gate";
+import { useAuthStatus } from "./useAuth";
+import { log } from "../log";
 
 interface QueryChain<T> {
   find(): Promise<T[]>;
@@ -30,7 +24,7 @@ interface UseQueryResult<T> {
   refetch: () => void;
 }
 
-// ── External Cache ───────────────────────────────────────────────────────────
+// ── Cache ────────────────────────────────────────────────────────────────────
 
 interface CacheEntry {
   items: any[];
@@ -68,7 +62,7 @@ function notify(e: CacheEntry): void {
 }
 
 function doFetch(key: string, entry: CacheEntry, chain: QueryChain<any>): void {
-  log.debug("useQuery: fetching", chain.__modelType, "key:", key.slice(0, 40));
+  log.debug("useQuery: fetching", chain.__modelType);
   entry.loading = true;
   entry.error = null;
   notify(entry);
@@ -91,23 +85,13 @@ function doFetch(key: string, entry: CacheEntry, chain: QueryChain<any>): void {
 
 // ── useQuery ─────────────────────────────────────────────────────────────────
 
-function getAuthGate(client: ParcaeClient): AuthState | null {
-  const transport = client.transport as any;
-  return transport?.auth?.state ?? null;
-}
-
 export function useQuery<T>(
   chain: QueryChain<T> | null | undefined,
   options: UseQueryOptions = {},
 ): UseQueryResult<T> {
   const client = useParcae();
   const waitForAuth = options.waitForAuth ?? true;
-
-  // Read auth state reactively via Valtio snapshot
-  const authGate = getAuthGate(client);
-  const authSnap = authGate ? useSnapshot(authGate as any) : null;
-  const authStatus = (authSnap as any)?.status ?? "pending";
-  const authVersion = (authSnap as any)?.version ?? 0;
+  const { status: authStatus, version: authVersion } = useAuthStatus();
   const authReady = !waitForAuth || authStatus !== "pending";
 
   const key =

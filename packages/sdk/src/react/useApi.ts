@@ -1,8 +1,8 @@
 "use client";
 
 import { useMemo } from "react";
-import { useSnapshot } from "valtio";
 import { useParcae } from "./context";
+import { useAuthStatus } from "./useAuth";
 
 export function useApi() {
   const client = useParcae();
@@ -24,23 +24,10 @@ export function useSDK() {
 
 export function useConnectionStatus() {
   const client = useParcae();
-  const transport = client.transport as any;
-  const authState = transport?.auth?.state;
-  const snap = authState ? useSnapshot(authState) : null;
-  return {
-    isConnected: client.isConnected,
-    authStatus: (snap as any)?.status ?? "pending",
-  };
+  const { status } = useAuthStatus();
+  return { isConnected: client.isConnected, authStatus: status };
 }
 
 export function useAuthState() {
-  const client = useParcae();
-  const transport = client.transport as any;
-  const authState = transport?.auth?.state;
-  const snap = authState ? useSnapshot(authState) : null;
-  return {
-    status: (snap as any)?.status ?? "pending",
-    userId: (snap as any)?.userId ?? null,
-    version: (snap as any)?.version ?? 0,
-  };
+  return useAuthStatus();
 }

@@ -1,18 +1,15 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { useSnapshot } from "valtio";
 import { useParcae } from "./context";
+import { useAuthStatus } from "./useAuth";
 
 export function useSetting<T = string>(
   key: string,
   defaultValue: T,
 ): [T, (value: T) => Promise<void>, { isLoading: boolean }] {
   const client = useParcae();
-  const transport = client.transport as any;
-  const authState = transport?.auth?.state;
-  const snap = authState ? useSnapshot(authState) : null;
-  const authStatus = (snap as any)?.status ?? "pending";
+  const { status: authStatus } = useAuthStatus();
 
   const [value, setValue] = useState<T>(defaultValue);
   const [isLoading, setIsLoading] = useState(true);
@@ -34,7 +31,6 @@ export function useSetting<T = string>(
       .finally(() => {
         if (!cancelled) setIsLoading(false);
       });
-
     return () => {
       cancelled = true;
     };
