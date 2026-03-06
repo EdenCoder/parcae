@@ -55,6 +55,101 @@ const INSTANCE_METHODS = new Set([
   "constructor",
 ]);
 
+// ─── Lazy Query Chain ────────────────────────────────────────────────────────
+// Records query steps without needing an adapter. The adapter is resolved
+// lazily when a terminal method (.find(), .first(), .count()) is called.
+// This allows building queries before Model.use() is called (e.g. in React
+// component bodies before ParcaeProvider mounts).
+
+function lazyQuery<T>(
+  modelClass: ModelConstructor<T>,
+  steps: any[] = [],
+): QueryChain<T> {
+  const CHAINABLE = [
+    "select",
+    "where",
+    "andWhere",
+    "orWhere",
+    "whereIn",
+    "whereNot",
+    "whereNotIn",
+    "whereNull",
+    "whereNotNull",
+    "whereBetween",
+    "whereRaw",
+    "orWhereRaw",
+    "orWhereIn",
+    "orWhereNull",
+    "whereExists",
+    "orderBy",
+    "orderByRaw",
+    "groupBy",
+    "groupByRaw",
+    "having",
+    "havingRaw",
+    "limit",
+    "offset",
+    "distinct",
+    "distinctOn",
+    "join",
+    "innerJoin",
+    "leftJoin",
+    "rightJoin",
+    "clearOrder",
+    "clearSelect",
+    "from",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "increment",
+    "decrement",
+  ] as const;
+
+  const chain: any = {};
+
+  for (const method of CHAINABLE) {
+    chain[method] = (...args: any[]) =>
+      lazyQuery(modelClass, [...steps, { method, args }]);
+  }
+
+  chain.basic = (
+    limit = 25,
+    sort = "createdAt",
+    direction: "asc" | "desc" = "desc",
+    page = 0,
+  ) =>
+    lazyQuery(modelClass, [
+      ...steps,
+      { method: "orderBy", args: [sort, direction] },
+      { method: "limit", args: [limit] },
+      { method: "offset", args: [page * limit] },
+    ]);
+
+  // Terminal methods — resolve adapter here
+  const resolve = (): QueryChain<T> => {
+    let q = Model.getAdapter().query(modelClass);
+    for (const step of steps) {
+      q = (q as any)[step.method](...step.args);
+    }
+    return q;
+  };
+
+  chain.find = () => resolve().find();
+  chain.first = () => resolve().first();
+  chain.count = () => resolve().count();
+
+  // Internal metadata
+  chain.__steps = steps;
+  chain.__modelType = modelClass.type;
+  chain.__modelClass = modelClass;
+  chain.__adapter = null; // resolved lazily
+
+  return chain as QueryChain<T>;
+}
+
+// ─── Keys ────────────────────────────────────────────────────────────────────
+
 const EVENTEMITTER_KEYS = new Set([
   "emit",
   "on",
