@@ -126,18 +126,21 @@ function lazyQuery<T>(
       { method: "offset", args: [page * limit] },
     ]);
 
-  // Terminal methods — resolve adapter here
-  const resolve = (): QueryChain<T> => {
-    let q = Model.getAdapter().query(modelClass);
+  // Terminal methods — resolve adapter here (async, waits if not set yet)
+  const resolve = async (): Promise<QueryChain<T>> => {
+    const adapter = Model.hasAdapter()
+      ? Model.getAdapter()
+      : await Model.waitForAdapter();
+    let q = adapter.query(modelClass);
     for (const step of steps) {
       q = (q as any)[step.method](...step.args);
     }
     return q;
   };
 
-  chain.find = () => resolve().find();
-  chain.first = () => resolve().first();
-  chain.count = () => resolve().count();
+  chain.find = async () => (await resolve()).find();
+  chain.first = async () => (await resolve()).first();
+  chain.count = async () => (await resolve()).count();
 
   // Internal metadata
   chain.__steps = steps;
@@ -188,11 +191,21 @@ export class Model extends EventEmitter {
   static __schema?: SchemaDefinition;
 
   private static __adapter: ModelAdapter | null = null;
+  private static __pendingAdapter: Promise<ModelAdapter> | null = null;
+  private static __resolveAdapter: ((adapter: ModelAdapter) => void) | null =
+    null;
 
   static use(adapter: ModelAdapter): void {
     Model.__adapter = adapter;
+    // Resolve any pending waiters
+    if (Model.__resolveAdapter) {
+      Model.__resolveAdapter(adapter);
+      Model.__resolveAdapter = null;
+      Model.__pendingAdapter = null;
+    }
   }
 
+  /** Get the adapter. Throws if not set (use waitForAdapter() for async contexts). */
   static getAdapter(): ModelAdapter {
     if (!Model.__adapter) {
       throw new Error(
@@ -200,6 +213,22 @@ export class Model extends EventEmitter {
       );
     }
     return Model.__adapter;
+  }
+
+  /** Returns true if an adapter has been set. */
+  static hasAdapter(): boolean {
+    return Model.__adapter !== null;
+  }
+
+  /** Wait for the adapter to be set. Resolves immediately if already set. */
+  static waitForAdapter(): Promise<ModelAdapter> {
+    if (Model.__adapter) return Promise.resolve(Model.__adapter);
+    if (!Model.__pendingAdapter) {
+      Model.__pendingAdapter = new Promise<ModelAdapter>((resolve) => {
+        Model.__resolveAdapter = resolve;
+      });
+    }
+    return Model.__pendingAdapter;
   }
 
   // ── Static Query Methods ───────────────────────────────────────────
