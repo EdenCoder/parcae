@@ -630,6 +630,18 @@ export class Model extends EventEmitter {
     try {
       // Apply locally (optimistic) — build a data object for applyPatch
       const localData = this.__data;
+
+      // Ensure intermediate objects exist for nested paths
+      for (const op of ops) {
+        const segments = op.path.split("/").filter(Boolean);
+        let cursor: any = localData;
+        for (let i = 0; i < segments.length - 1; i++) {
+          const seg = segments[i]!;
+          if (cursor[seg] == null) cursor[seg] = {};
+          cursor = cursor[seg];
+        }
+      }
+
       applyPatch(localData, ops, false, true);
       // Write patched values back
       for (const col of columns) {
