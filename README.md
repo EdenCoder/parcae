@@ -1,8 +1,22 @@
-# Parcae
+<p align="center">
+  <strong>PARCAE</strong>
+</p>
 
-A TypeScript backend framework where your class **is** the API.
+<p align="center">
+  <em>Nona spins the thread. Decima measures it. Morta cuts it.</em><br/>
+  <em>You write the class. Parcae does the rest.</em>
+</p>
 
-Define a class. Get a database, REST endpoints, realtime subscriptions, auth, and a typed React SDK. No dashboard, no code generation, no vendor lock-in — just your code and Postgres.
+<p align="center">
+  <a href="https://www.npmjs.com/package/@parcae/backend"><img src="https://img.shields.io/npm/v/@parcae/backend?label=%40parcae%2Fbackend&color=161b22&labelColor=0d1117" alt="npm"></a>
+  <a href="https://github.com/EdenCoder/parcae/blob/master/LICENSE"><img src="https://img.shields.io/github/license/EdenCoder/parcae?color=161b22&labelColor=0d1117" alt="license"></a>
+  <a href="https://nodejs.org"><img src="https://img.shields.io/badge/node-%3E%3D20-161b22?labelColor=0d1117" alt="node"></a>
+  <a href="https://www.typescriptlang.org"><img src="https://img.shields.io/badge/typescript-strict-161b22?labelColor=0d1117" alt="typescript"></a>
+</p>
+
+---
+
+TypeScript backend framework. Your class is the schema, the API, and the type system. One function call gives you Postgres, REST, realtime, auth, and a React SDK. No codegen, no dashboard, no vendor lock-in.
 
 ```typescript
 class Post extends Model {
@@ -15,116 +29,102 @@ class Post extends Model {
 
 const app = createApp({ models: [Post] });
 await app.start();
-// -> Tables exist. CRUD routes live. WebSocket ready. Go.
 ```
 
-## Why Not Supabase?
+That's a running server. Tables exist. CRUD routes are live. WebSocket is ready.
 
-Supabase gives you a Postgres database and auto-generates a REST API from the schema. That works — until it doesn't.
+## The pitch (or: why not Supabase)
+
+Supabase is a platform. You write SQL, generate types, deploy edge functions, configure RLS policies, and hope the dashboard doesn't drift from your code. When you need a complex join, a multi-table transaction, or a background job — you're reaching outside the platform.
+
+Parcae is the opposite. Everything is TypeScript. The class *is* the schema. The scope *is* the access rule. The hook *is* the side effect. It runs in your process, lives in your repo, and you debug it with a breakpoint.
 
 | | Supabase | Parcae |
 | --- | --- | --- |
-| **Schema source of truth** | SQL migrations or their dashboard | TypeScript classes — your code IS the schema |
-| **Type safety** | Generated types from DB, always one step behind | Types flow from the class definition. Nothing to generate or sync. |
-| **Business logic** | Edge Functions (separate runtime, separate deploy) or Postgres functions (SQL) | Hooks, jobs, routes — same codebase, same process, same types |
-| **Realtime** | Postgres CDC (row-level, channel-based) | Query-level subscriptions — server re-evaluates your query and pushes diffs |
-| **Auth** | Supabase Auth (proprietary, tied to their infra) | Better Auth (open source, self-hosted, same database) |
-| **Row-level security** | Postgres RLS policies (SQL, hard to test, easy to misconfigure) | Scope functions in TypeScript — composable, testable, debuggable |
-| **Client SDK** | `supabase-js` (query builder that generates PostgREST calls) | Typed Model classes with `useQuery()` — same class on client and server |
-| **Background jobs** | None built-in (need separate infra) | BullMQ — `job("post:index", handler)`, retries, backoff, built in |
-| **Hosting** | Their cloud or self-host their entire stack | Your server. Any host. It's a Node process. |
-| **Vendor lock-in** | Deep (auth, storage, edge functions, realtime all coupled) | None. Postgres + Redis. Swap any piece. |
-
-### The real difference
-
-Supabase is a platform. You build around their abstractions — their auth, their client, their dashboard, their edge functions. When you hit a wall (complex joins, transactions across tables, custom auth flows, background processing), you're reaching outside the platform.
-
-Parcae is a framework. Your TypeScript code is the system. The class defines the schema. The scope defines the access rules. The hook runs the side effects. The job processes the background work. It all lives in your repo, runs in your process, and you can debug it with `console.log`.
+| **Schema** | SQL migrations or dashboard | TypeScript classes. That's it. |
+| **Types** | Generated from DB, always one step behind | Flow from the class. Nothing to generate. |
+| **Business logic** | Edge Functions or Postgres triggers | Hooks, jobs, routes — same codebase, same types |
+| **Realtime** | Postgres CDC (row-level) | Query-level subs — re-evaluates and pushes diffs |
+| **Auth** | Proprietary, tied to their infra | Pluggable — Better Auth, Clerk, or roll your own |
+| **Row-level security** | SQL policies (hard to test) | TypeScript scope functions (composable, testable) |
+| **Background jobs** | Not built in | BullMQ with retries and backoff |
+| **Lock-in** | Deep | Zero. Postgres + Redis. Swap anything. |
 
 ```typescript
-// Supabase: schema lives in SQL, types are generated, business logic is somewhere else
+// supabase: types are generated. schema lives in SQL. business logic is elsewhere.
 const { data } = await supabase.from("posts").select("*").eq("published", true);
-// What type is `data`? Whatever the codegen says. Hope it's current.
 
-// Parcae: the class IS the schema, IS the type, IS the API
+// parcae: the class IS the type IS the schema IS the API.
 const posts = await Post.where({ published: true }).find();
-// posts is Post[]. Always. The class is the source of truth.
+// posts is Post[]. always.
 ```
 
-```typescript
-// Supabase: side effects need an Edge Function (separate deploy, separate runtime)
-// Or a Postgres trigger (SQL, no access to your app logic)
-
-// Parcae: hook runs in your process, has access to everything
-hook.after(Post, "save", async ({ model, enqueue }) => {
-  await enqueue("post:index", { id: model.id });
-});
-```
-
-```typescript
-// Supabase RLS: SQL policy, hard to unit test
-// CREATE POLICY "users can update own posts" ON posts
-//   FOR UPDATE USING (auth.uid() = user_id);
-
-// Parcae scope: TypeScript function, easy to test and compose
-static scope = {
-  update: (ctx) => (qb) => qb.where("user", ctx.user.id),
-};
-```
-
-## Quick Start
+## Getting started
 
 ```bash
-mkdir my-app && cd my-app
-npm init -y
 npm install @parcae/backend @parcae/model
 ```
+
+Define a model. Properties are columns.
 
 ```typescript
 // models/Post.ts
 import { Model } from "@parcae/model";
 
-class Post extends Model {
+export class Post extends Model {
   static type = "post" as const;
   title: string = "";
   published: boolean = false;
 }
-export { Post };
 ```
+
+Start the server.
 
 ```typescript
 // index.ts
 import { createApp } from "@parcae/backend";
+
 const app = createApp({ models: "./models" });
 await app.start();
 ```
 
 ```bash
-# .env (auto-loaded)
-DATABASE_URL=postgresql://localhost:5432/myapp
+DATABASE_URL=postgresql://localhost:5432/myapp node index.ts
 ```
 
-```bash
-node index.ts
-# -> .parcae/ generated
-# -> Tables created
-# -> CRUD routes live at /v1/posts
-# -> WebSocket ready on port 3000
+```
+09:41:02 INF Found 1 model(s): post
+09:41:02 INF Resolved schemas for: post (cached)
+09:41:02 INF Database connected
+09:41:02 INF Registered 5 auto-CRUD route(s)
+09:41:02 OK  Ready on port 3000 — 1 models, 6 routes, 0 hooks, 0 jobs
+```
+
+You now have:
+
+```
+GET    /v1/posts          paginated list
+GET    /v1/posts/:id      single record
+POST   /v1/posts          create
+PUT    /v1/posts/:id      update
+DELETE /v1/posts/:id      delete
+PATCH  /v1/posts/:id      atomic JSON Patch (RFC 6902)
+GET    /v1/health         status, uptime, model count
 ```
 
 ## Packages
 
-| Package | What |
+| Package | Description |
 | --- | --- |
-| [`@parcae/model`](./packages/model) | Model base class, Proxy-based property access, adapter pattern, query builder |
-| [`@parcae/backend`](./packages/backend) | Server framework — createApp, auto-CRUD, hooks, jobs, PubSub, Queue |
+| [`@parcae/model`](./packages/model) | Model base class, Proxy system, query builder, adapter interface |
+| [`@parcae/backend`](./packages/backend) | createApp, auto-CRUD, hooks, jobs, PubSub, queue, schema resolution |
 | [`@parcae/sdk`](./packages/sdk) | Client SDK — Socket.IO and SSE transports, React hooks |
-| [`@parcae/auth-betterauth`](./packages/auth-betterauth) | Better Auth adapter — self-hosted auth, same Postgres |
-| [`@parcae/auth-clerk`](./packages/auth-clerk) | Clerk adapter — external auth, proxied to your User model |
+| [`@parcae/auth-betterauth`](./packages/auth-betterauth) | Better Auth adapter — self-hosted, same Postgres |
+| [`@parcae/auth-clerk`](./packages/auth-clerk) | Clerk adapter — external auth proxied to your User model |
 
 ## Models
 
-Properties on the class are the schema. No separate column definitions.
+A class property with a default value becomes a Postgres column. A property typed as another Model becomes a lazy-loading reference. That's the whole system.
 
 ```typescript
 import { Model } from "@parcae/model";
@@ -132,65 +132,67 @@ import { Model } from "@parcae/model";
 class Post extends Model {
   static type = "post" as const;
 
-  user!: User;                    // reference — VARCHAR storing ID
-  title: string = "";             // string — VARCHAR
-  body: PostBody = { content: "" }; // object — JSONB
-  tags: string[] = [];            // array — JSONB
-  published: boolean = false;     // boolean — BOOLEAN
-  views: number = 0;              // number — DOUBLE PRECISION
+  user!: User;                      // -> VARCHAR (foreign key, lazy-loads User)
+  title: string = "";               // -> VARCHAR
+  body: PostBody = { content: "" }; // -> JSONB
+  tags: string[] = [];              // -> JSONB
+  published: boolean = false;       // -> BOOLEAN
+  views: number = 0;                // -> DOUBLE PRECISION
 }
 ```
 
-Direct property access, fully typed:
+Direct property access. No `.get()`, no `.data.title`. Just `post.title`.
 
 ```typescript
 const post = await Post.findById("abc");
-post.title;              // string
-post.published;          // boolean
-post.user;               // User (lazy proxy, Suspense-compatible)
-post.$user;              // "user_k8f2m9x" (raw ID)
-post.title = "New";      // change tracked
+
+post.title;         // "Hello" — typed as string
+post.user;          // User proxy — loads on access, works with Suspense
+post.$user;         // "user_k8f2m9x" — raw ID, no loading
+post.title = "New"; // change tracked automatically
+
 await post.save();
 ```
 
-Scoped access control:
+Properties not in the schema spill into an overflow `data` JSONB column. You can throw anything on a model and it persists — declared properties just get their own typed columns.
+
+### Scopes
+
+Scopes are row-level security in TypeScript. Any model with a `scope` gets auto-CRUD routes.
 
 ```typescript
-class Post extends Model {
-  static type = "post" as const;
-
-  static scope = {
-    read: (ctx) => (qb) =>
-      qb.where("published", true).orWhere("user", ctx.user?.id),
-    create: (ctx) => (ctx.user ? { user: ctx.user.id } : null),
-    update: (ctx) => (qb) => qb.where("user", ctx.user.id),
-    delete: (ctx) => (qb) => qb.where("user", ctx.user.id),
-  };
-
-  // ...
-}
+static scope = {
+  read: (ctx) => (qb) =>
+    qb.where("published", true).orWhere("user", ctx.user?.id),
+  create: (ctx) => (ctx.user ? { user: ctx.user.id } : null),
+  update: (ctx) => (qb) => qb.where("user", ctx.user.id),
+  delete: (ctx) => (qb) => qb.where("user", ctx.user.id),
+};
 ```
 
-Any model with a `scope` gets full CRUD routes automatically:
+Return `null` to deny. Return an object to inject defaults. Return a function to modify the query. These are real query builder callbacks — you can do OR clauses, subqueries, joins, whatever Knex supports.
 
+### Query builder
+
+```typescript
+Post.where({ published: true }).orderBy("createdAt", "desc").limit(10).find();
+Post.where("views", ">", 100).first();
+Post.whereIn("id", ["a", "b", "c"]).find();
+Post.count();
 ```
-GET    /v1/posts          list (paginated, sortable, filterable)
-GET    /v1/posts/:id      get one
-POST   /v1/posts          create
-PUT    /v1/posts/:id      update
-DELETE /v1/posts/:id      delete
-PATCH  /v1/posts/:id      atomic JSON Patch (RFC 6902)
-```
+
+40+ chainable methods. On the backend they map to Knex. On the frontend they serialize and execute server-side.
 
 ## Routes
 
-Express-compatible. Middleware works the same way.
+Express-compatible function API with middleware support.
 
 ```typescript
 import { route, ok, unauthorized } from "@parcae/backend";
 
-route.get("/v1/health", (req, res) => {
-  ok(res, { status: "healthy" });
+route.get("/v1/stats", async (req, res) => {
+  const count = await Post.count();
+  ok(res, { posts: count });
 });
 
 route.post("/v1/upload", requireAuth, async (req, res) => {
@@ -199,56 +201,53 @@ route.post("/v1/upload", requireAuth, async (req, res) => {
 });
 ```
 
+Drop files in a `controllers/` directory and they self-register on import. Like Next.js pages — just put them there.
+
 ## Hooks
 
-Model lifecycle hooks. Run before or after save, patch, remove, create, update.
+Model lifecycle hooks. Before or after `save`, `create`, `update`, `patch`, `remove`.
 
 ```typescript
 import { hook } from "@parcae/backend";
 
-hook.after(Post, "save", async ({ model, lock, enqueue }) => {
-  const unlock = await lock(`index:${model.id}`);
-  try {
-    await model.refresh();
-    await enqueue("post:index", { postId: model.id });
-  } finally {
-    await unlock();
-  }
+hook.after(Post, "save", async ({ model, enqueue }) => {
+  await enqueue("post:index", { postId: model.id });
 });
 
-hook.before(Post, "remove", async ({ model }) => {
-  // cleanup
+hook.before(Post, "create", ({ model }) => {
+  model.title = model.title.trim();
 });
 ```
 
+Hook context gives you `model`, `lock` (distributed), `enqueue` (background jobs), and `user`.
+
 ## Jobs
 
-Background job processing via BullMQ. 3 retries with exponential backoff.
+BullMQ. 3 retries, exponential backoff. Requires Redis.
 
 ```typescript
 import { job } from "@parcae/backend";
 
 job("post:index", async ({ data }) => {
   const post = await Post.findById(data.postId);
-  // ...
-  return { success: true };
+  // index it somewhere
+  return { indexed: true };
 });
 ```
 
-Enqueue from anywhere:
-
 ```typescript
 import { enqueue } from "@parcae/backend";
-
 await enqueue("post:index", { postId: post.id });
 ```
 
 ## Auth
 
-Pluggable auth adapters. Your User model is always a real Parcae model — auth adapters just resolve identity and sync user data into it.
+Auth is a pluggable adapter. The framework itself has no opinion about your auth provider — it just needs to know who's making the request.
+
+Your `User` model is always a real, managed Parcae model. Auth adapters resolve identity and sync user data into it. No `managed = false`, no hollow facades.
 
 ```typescript
-// Better Auth — self-hosted, same Postgres
+// self-hosted — Better Auth writes directly into your users table
 import { betterAuth } from "@parcae/auth-betterauth";
 
 const app = createApp({
@@ -258,7 +257,7 @@ const app = createApp({
 ```
 
 ```typescript
-// Clerk — external auth, proxied to your User model
+// external — Clerk users are proxied into your local User model
 import { clerk } from "@parcae/auth-clerk";
 
 const app = createApp({
@@ -270,81 +269,88 @@ const app = createApp({
 });
 ```
 
-`req.session.user` in route handlers. Socket.IO auth via `authenticate` event. Implement the `AuthAdapter` interface to bring your own provider.
+`req.session.user` is available in every route handler and scope. Socket.IO authenticates via the `authenticate` event. Implement the `AuthAdapter` interface to bring whatever you want.
 
 ## Client SDK
 
-Pluggable transport layer. Same API regardless of wire protocol.
+Two transports, same API. Socket.IO for bidirectional realtime, SSE for simpler infrastructure.
 
 ```typescript
 import { createClient } from "@parcae/sdk";
 
-// Socket.IO (default) — bidirectional, realtime
 const client = createClient({ url: "http://localhost:3000" });
-
-// SSE — HTTP + Server-Sent Events, simpler infra
-const client = createClient({ url: "http://localhost:3000", transport: "sse" });
+// or: createClient({ url: "...", transport: "sse" })
 ```
+
+The client wires up `Model.use()` automatically — `Post.where(...)` just works on the frontend.
 
 ## React
 
 ```tsx
-import { ParcaeProvider, useQuery, useSetting } from "@parcae/sdk/react";
+import { ParcaeProvider, useQuery } from "@parcae/sdk/react";
 
-<ParcaeProvider client={client}>
-  <App />
-</ParcaeProvider>;
+function App() {
+  return (
+    <ParcaeProvider url="http://localhost:3000">
+      <PostList />
+    </ParcaeProvider>
+  );
+}
 
 function PostList() {
   const { items, loading } = useQuery(
     Post.where({ published: true }).orderBy("createdAt", "desc"),
   );
 
+  if (loading) return <p>Loading...</p>;
+
   return items.map((post) => (
     <article key={post.id}>
       <h2>{post.title}</h2>
       <Suspense fallback="...">
-        <span>{post.user.name}</span>
+        <span>by {post.user.name}</span>
       </Suspense>
     </article>
   ));
 }
 ```
 
-`useQuery` subscribes to realtime updates. When a model changes on the server, your query is re-evaluated and surgical diffs are pushed to the client. No polling, no refetching, no stale data.
+`useQuery` is realtime. When something changes on the server, your query is re-evaluated and surgical diffs (`add`, `remove`, `update`) are pushed to the client. No polling, no refetching.
 
-Hooks: `useQuery`, `useSetting`, `useApi`, `useSDK`, `useConnectionStatus`.
+Other hooks: `useApi`, `useSDK`, `useSetting`, `useConnectionStatus`.
 
 ## Configuration
 
-Env vars, validated at startup. `.env` files auto-loaded.
+`.env` files are auto-loaded. Everything is validated at startup with Zod.
 
 ```bash
-DATABASE_URL=postgresql://localhost:5432/myapp    # required
-DATABASE_READ_URL=postgresql://...                # optional read replica
-REDIS_URL=redis://localhost:6379                  # optional (PubSub + Queue)
-AUTH_SECRET=...                                   # required if auth enabled
-PORT=3000                                         # optional
+DATABASE_URL=postgresql://localhost:5432/myapp  # required
+DATABASE_READ_URL=postgresql://...              # read replica (optional)
+REDIS_URL=redis://localhost:6379                # PubSub + Queue (optional)
+PORT=3000                                       # default: 3000
+AUTH_SECRET=...                                 # required if auth enabled
+BACKEND_URL=https://api.myapp.com               # for auth callbacks (optional)
+FRONTEND_URL=https://myapp.com                  # (optional)
+ENSURE_SCHEMA=true                              # run DDL migration on startup
 ```
 
-## Project Structure
+## Project structure
 
 ```
 packages/
-  model/              @parcae/model
-  backend/            @parcae/backend
-  sdk/                @parcae/sdk
+  model/              @parcae/model       — the Model class
+  backend/            @parcae/backend     — the server
+  sdk/                @parcae/sdk         — the client
   auth-betterauth/    @parcae/auth-betterauth
   auth-clerk/         @parcae/auth-clerk
 examples/
-  basic/              Minimal working app
+  basic/              working example app
 ```
 
-Requirements: Node >= 20, pnpm
+Requires Node >= 20 and pnpm.
 
 ```bash
-pnpm install
-pnpm build
+pnpm install && pnpm build
 ```
 
 ## License

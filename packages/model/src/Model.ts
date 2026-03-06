@@ -108,6 +108,19 @@ export class Model extends EventEmitter {
   }
 
   // ── Static Query Methods ───────────────────────────────────────────
+  //
+  // These build lazy query chains that only resolve the adapter at
+  // execution time (.find(), .first(), .count()). This allows you to
+  // build queries before the adapter is set (e.g. in React component
+  // bodies before the ParcaeProvider mounts).
+
+  /** Build a lazy query chain for this model class. */
+  private static _query<T extends Model>(
+    this: ModelConstructor<T>,
+  ): QueryChain<T> {
+    const ModelClass = this;
+    return lazyQuery(ModelClass);
+  }
 
   static create<T extends Model>(
     this: ModelConstructor<T>,
@@ -132,9 +145,7 @@ export class Model extends EventEmitter {
     this: ModelConstructor<T>,
     ...args: any[]
   ): QueryChain<T> {
-    return Model.getAdapter()
-      .query(this)
-      .where(...args);
+    return (this as any)._query().where(...args);
   }
 
   static whereRaw<T extends Model>(
@@ -142,9 +153,7 @@ export class Model extends EventEmitter {
     query: string,
     ...bindings: any[]
   ): QueryChain<T> {
-    return Model.getAdapter()
-      .query(this)
-      .whereRaw(query, ...bindings);
+    return (this as any)._query().whereRaw(query, ...bindings);
   }
 
   static whereIn<T extends Model>(
@@ -152,16 +161,14 @@ export class Model extends EventEmitter {
     column: string,
     values: any[],
   ): QueryChain<T> {
-    return Model.getAdapter().query(this).whereIn(column, values);
+    return (this as any)._query().whereIn(column, values);
   }
 
   static whereNot<T extends Model>(
     this: ModelConstructor<T>,
     ...args: any[]
   ): QueryChain<T> {
-    return Model.getAdapter()
-      .query(this)
-      .whereNot(...args);
+    return (this as any)._query().whereNot(...args);
   }
 
   static whereNotIn<T extends Model>(
@@ -169,20 +176,18 @@ export class Model extends EventEmitter {
     column: string,
     values: any[],
   ): QueryChain<T> {
-    return Model.getAdapter().query(this).whereNotIn(column, values);
+    return (this as any)._query().whereNotIn(column, values);
   }
 
   static select<T extends Model>(
     this: ModelConstructor<T>,
     ...columns: string[]
   ): QueryChain<T> {
-    return Model.getAdapter()
-      .query(this)
-      .select(...columns);
+    return (this as any)._query().select(...columns);
   }
 
   static count<T extends Model>(this: ModelConstructor<T>): Promise<number> {
-    return Model.getAdapter().query(this).count();
+    return (this as any)._query().count();
   }
 
   static basic<T extends Model>(
@@ -192,7 +197,7 @@ export class Model extends EventEmitter {
     direction?: "asc" | "desc",
     page?: number,
   ): QueryChain<T> {
-    return Model.getAdapter().query(this).basic(limit, sort, direction, page);
+    return (this as any)._query().basic(limit, sort, direction, page);
   }
 
   // ── Constructor ────────────────────────────────────────────────────
