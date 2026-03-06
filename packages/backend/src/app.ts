@@ -295,7 +295,20 @@ export function createApp(config: AppConfig): ParcaeApp {
         log.info("Auth enabled");
       }
 
-      // ── Step 10: Register auto-CRUD routes ─────────────────────────
+      // ── Step 10: Default routes ────────────────────────────────────
+      server.polka.get(`/${version}/health`, (_req: any, res: any) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            status: "ok",
+            uptime: process.uptime(),
+            models: models.length,
+            version,
+          }),
+        );
+      });
+
+      // ── Step 11: Register auto-CRUD routes ─────────────────────────
       const crudCount = registerModelRoutes(models, adapter, version);
       log.info(`Registered ${crudCount} auto-CRUD route(s)`);
 
