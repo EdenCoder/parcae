@@ -1,19 +1,18 @@
 "use client";
 
 /**
- * useQuery — reactive data fetching with realtime subscriptions.
+ * useQuery — efficient reactive data fetching.
  *
- * @example
- * ```tsx
- * const { items, loading } = useQuery(Post.where({ published: true }));
- *
- * // Wait for auth before firing (default: true)
- * const { items } = useQuery(query, { waitForAuth: true });
- * ```
+ * - Deduplicates: same query from multiple components = one fetch
+ * - Caches: unmount/remount doesn't re-fetch if data is fresh
+ * - Realtime: subscribes to server-pushed diffs (add/remove/update)
+ * - Auth-aware: waits for auth before firing scoped queries
+ * - Efficient: React only re-renders when the items array reference changes
  */
 
-import { useCallback, useEffect, useSyncExternalStore } from "react";
+import { useEffect, useRef, useSyncExternalStore } from "react";
 import { useParcae } from "./context";
+import type { ParcaeClient } from "../client";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -23,15 +22,10 @@ interface QueryChain<T> {
   __modelType?: string;
   __modelClass?: any;
   __adapter?: any;
-  __debounceMs?: number;
 }
 
 interface UseQueryOptions {
-  /**
-   * Wait for authentication to resolve before firing the query.
-   * Default: true — queries don't fire while auth is "loading".
-   * Set to false for public/unauthenticated queries.
-   */
+  /** Wait for auth before firing. Default: true. */
   waitForAuth?: boolean;
 }
 
@@ -42,40 +36,131 @@ interface UseQueryResult<T> {
   refetch: () => void;
 }
 
-interface DiffOp {
-  op: "add" | "remove" | "update";
-  id: string;
-  data?: Record<string, any>;
-}
+// ─── External Cache ──────────────────────────────────────────────────────────
 
-// ─── Query Cache ─────────────────────────────────────────────────────────────
-
-const CACHE_TIMEOUT_MS = 60_000;
-const DEFAULT_DEBOUNCE_MS = 100;
-
-interface CacheEntry<T = any> {
-  items: T[];
-  itemMap: Map<string, T>;
+interface CacheEntry {
+  items: any[];
   loading: boolean;
   error: Error | null;
-  refCount: number;
-  timeoutHandle: ReturnType<typeof setTimeout> | null;
-  version: number;
-  stateVersion: number;
+  refs: number;
   listeners: Set<() => void>;
-  subscriptionHash: string | null;
-  pendingOps: DiffOp[];
-  debounceTimer: ReturnType<typeof setTimeout> | null;
-  debounceMs: number;
-  disposeSubscription: (() => void) | null;
+  dispose: (() => void) | null;
+  gcTimer: ReturnType<typeof setTimeout> | null;
 }
 
-const queryCache = new Map<string, CacheEntry>();
+const cache = new Map<string, CacheEntry>();
+const GC_DELAY = 60_000;
 
-function buildCacheKey(chain: QueryChain<any>, authVersion: number): string {
-  const type = chain.__modelType ?? "unknown";
-  const steps = JSON.stringify(chain.__steps ?? []);
-  return `${type}:${authVersion}:${steps}`;
+const EMPTY: any[] = [];
+const EMPTY_RESULT: UseQueryResult<any> = {
+  items: EMPTY,
+  loading: true,
+  error: null,
+  refetch: () => {},
+};
+
+function getOrCreate(key: string): CacheEntry {
+  let entry = cache.get(key);
+  if (!entry) {
+    entry = {
+      items: EMPTY,
+      loading: true,
+      error: null,
+      refs: 0,
+      listeners: new Set(),
+      dispose: null,
+      gcTimer: null,
+    };
+    cache.set(key, entry);
+  }
+  return entry;
+}
+
+function notify(entry: CacheEntry): void {
+  for (const fn of entry.listeners) fn();
+}
+
+// ─── Fetch + Subscribe ───────────────────────────────────────────────────────
+
+function fetchAndSubscribe(
+  key: string,
+  entry: CacheEntry,
+  chain: QueryChain<any>,
+  client: ParcaeClient,
+): void {
+  // Fetch
+  entry.loading = true;
+  entry.error = null;
+  notify(entry);
+
+  chain
+    .find()
+    .then((result: any[]) => {
+      entry.items = result;
+      entry.loading = false;
+      notify(entry);
+    })
+    .catch((err: Error) => {
+      entry.error = err;
+      entry.loading = false;
+      notify(entry);
+    });
+
+  // Subscribe to realtime diffs
+  if (!entry.dispose && chain.__modelType) {
+    const event = `query:${key}`;
+
+    client.send("subscribe:query", {
+      hash: key,
+      modelType: chain.__modelType,
+      steps: chain.__steps ?? [],
+    });
+
+    const unsub = client.subscribe(event, (ops: any[]) => {
+      if (!ops?.length) return;
+
+      const map = new Map(entry.items.map((item: any) => [item.id, item]));
+      let changed = false;
+
+      for (const op of ops) {
+        switch (op.op) {
+          case "add":
+            if (!map.has(op.id) && op.data && chain.__modelClass) {
+              map.set(op.id, new chain.__modelClass(chain.__adapter, op.data));
+              changed = true;
+            }
+            break;
+          case "remove":
+            if (map.has(op.id)) {
+              map.delete(op.id);
+              changed = true;
+            }
+            break;
+          case "update": {
+            const existing = map.get(op.id);
+            if (existing && op.data) {
+              for (const [k, v] of Object.entries(op.data)) {
+                (existing as any)[k] = v;
+              }
+              changed = true;
+            }
+            break;
+          }
+        }
+      }
+
+      if (changed) {
+        entry.items = [...map.values()];
+        notify(entry);
+      }
+    });
+
+    entry.dispose = () => {
+      unsub();
+      client.send("unsubscribe:query", { hash: key });
+      entry.dispose = null;
+    };
+  }
 }
 
 // ─── useQuery ────────────────────────────────────────────────────────────────
@@ -86,192 +171,88 @@ export function useQuery<T>(
 ): UseQueryResult<T> {
   const { client, authState, authVersion } = useParcae();
   const waitForAuth = options.waitForAuth ?? true;
-
-  // If waiting for auth and auth is still loading, return empty loading state
   const authReady = !waitForAuth || authState !== "loading";
 
-  const cacheKey =
-    chain && authReady ? buildCacheKey(chain, authVersion) : "__null__";
+  const key =
+    chain && authReady
+      ? `${chain.__modelType}:${authVersion}:${JSON.stringify(chain.__steps ?? [])}`
+      : null;
 
-  // ── Get or create cache entry ──────────────────────────────────────
+  // Ref to track the current key (for cleanup)
+  const keyRef = useRef(key);
+  keyRef.current = key;
 
-  if (!queryCache.has(cacheKey) && chain && authReady) {
-    queryCache.set(cacheKey, {
-      items: [],
-      itemMap: new Map(),
-      loading: true,
-      error: null,
-      refCount: 0,
-      timeoutHandle: null,
-      version: 0,
-      stateVersion: 0,
-      listeners: new Set(),
-      subscriptionHash: null,
-      pendingOps: [],
-      debounceTimer: null,
-      debounceMs: chain.__debounceMs ?? DEFAULT_DEBOUNCE_MS,
-      disposeSubscription: null,
-    });
-  }
+  // ── useSyncExternalStore ──────────────────────────────────────────
 
-  const entry = queryCache.get(cacheKey);
+  const subscribe = (onStoreChange: () => void) => {
+    const k = keyRef.current;
+    if (!k) return () => {};
 
-  // ── useSyncExternalStore for tear-safe rendering ───────────────────
+    const entry = getOrCreate(k);
+    entry.refs++;
+    entry.listeners.add(onStoreChange);
 
-  const subscribe = useCallback(
-    (listener: () => void) => {
-      if (!entry) return () => {};
-      entry.listeners.add(listener);
-      entry.refCount++;
-
-      if (entry.timeoutHandle) {
-        clearTimeout(entry.timeoutHandle);
-        entry.timeoutHandle = null;
-      }
-
-      return () => {
-        entry.listeners.delete(listener);
-        entry.refCount--;
-
-        if (entry.refCount <= 0) {
-          entry.timeoutHandle = setTimeout(() => {
-            entry.disposeSubscription?.();
-            queryCache.delete(cacheKey);
-          }, CACHE_TIMEOUT_MS);
-        }
-      };
-    },
-    [entry, cacheKey],
-  );
-
-  const getSnapshot = useCallback(() => entry?.stateVersion ?? 0, [entry]);
-
-  useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
-
-  // ── Fetch + subscribe ──────────────────────────────────────────────
-
-  const refetch = useCallback(() => {
-    if (!chain || !entry || !authReady) return;
-
-    entry.loading = true;
-    notifyListeners(entry);
-
-    chain
-      .find()
-      .then((items) => {
-        entry.items = items;
-        entry.itemMap = new Map(items.map((item: any) => [item.id, item]));
-        entry.loading = false;
-        entry.error = null;
-        entry.version++;
-        notifyListeners(entry);
-      })
-      .catch((err) => {
-        entry.error = err;
-        entry.loading = false;
-        notifyListeners(entry);
-      });
-
-    // Set up realtime subscription
-    if (!entry.disposeSubscription && chain.__modelType) {
-      const subEvent = `query:${cacheKey}`;
-
-      client.send("subscribe:query", {
-        hash: cacheKey,
-        modelType: chain.__modelType,
-        steps: chain.__steps ?? [],
-      });
-
-      const dispose = client.subscribe(subEvent, (ops: DiffOp[]) => {
-        if (!entry) return;
-        entry.pendingOps.push(...ops);
-
-        if (entry.debounceTimer) clearTimeout(entry.debounceTimer);
-        entry.debounceTimer = setTimeout(() => {
-          applyDiffOps(entry, chain);
-          entry.debounceTimer = null;
-        }, entry.debounceMs);
-      });
-
-      entry.subscriptionHash = cacheKey;
-      entry.disposeSubscription = () => {
-        dispose();
-        client.send("unsubscribe:query", { hash: cacheKey });
-      };
+    // Cancel GC
+    if (entry.gcTimer) {
+      clearTimeout(entry.gcTimer);
+      entry.gcTimer = null;
     }
-  }, [chain, entry, cacheKey, client, authReady]);
 
-  // Fetch when auth becomes ready or cache key changes
+    return () => {
+      entry.listeners.delete(onStoreChange);
+      entry.refs--;
+
+      if (entry.refs <= 0) {
+        entry.gcTimer = setTimeout(() => {
+          entry.dispose?.();
+          cache.delete(k);
+        }, GC_DELAY);
+      }
+    };
+  };
+
+  const getSnapshot = (): any[] => {
+    const k = keyRef.current;
+    if (!k) return EMPTY;
+    return cache.get(k)?.items ?? EMPTY;
+  };
+
+  const items = useSyncExternalStore(
+    subscribe,
+    getSnapshot,
+    getSnapshot,
+  ) as T[];
+
+  // ── Trigger fetch when key changes ────────────────────────────────
+
   useEffect(() => {
-    if (chain && authReady) refetch();
-  }, [cacheKey, authReady]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (!key || !chain) return;
 
-  // Auth not ready — return loading
-  if (!authReady) {
-    return { items: [], loading: true, error: null, refetch: () => {} };
-  }
+    const entry = getOrCreate(key);
 
-  if (!entry) {
-    return { items: [], loading: false, error: null, refetch: () => {} };
-  }
+    // Only fetch if this is the first subscriber or items are empty
+    if (entry.items === EMPTY || entry.items.length === 0) {
+      fetchAndSubscribe(key, entry, chain, client);
+    }
+  }, [key]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Refetch ───────────────────────────────────────────────────────
+
+  const refetch = () => {
+    if (!key || !chain) return;
+    const entry = getOrCreate(key);
+    fetchAndSubscribe(key, entry, chain, client);
+  };
+
+  // ── Return ────────────────────────────────────────────────────────
+
+  if (!key) return EMPTY_RESULT;
+
+  const entry = cache.get(key);
   return {
-    items: entry.items,
-    loading: entry.loading,
-    error: entry.error,
+    items,
+    loading: entry?.loading ?? true,
+    error: entry?.error ?? null,
     refetch,
   };
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-function notifyListeners(entry: CacheEntry): void {
-  entry.stateVersion++;
-  for (const listener of entry.listeners) listener();
-}
-
-function applyDiffOps<T>(entry: CacheEntry<T>, chain: QueryChain<T>): void {
-  const ops = entry.pendingOps.splice(0);
-  if (!ops.length) return;
-
-  const ModelClass = chain.__modelClass;
-  const adapter = chain.__adapter;
-  let changed = false;
-
-  for (const op of ops) {
-    switch (op.op) {
-      case "add": {
-        if (!entry.itemMap.has(op.id) && op.data && ModelClass && adapter) {
-          const instance = new ModelClass(adapter, op.data);
-          entry.items.push(instance);
-          entry.itemMap.set(op.id, instance);
-          changed = true;
-        }
-        break;
-      }
-      case "remove": {
-        if (entry.itemMap.has(op.id)) {
-          entry.items = entry.items.filter((item: any) => item.id !== op.id);
-          entry.itemMap.delete(op.id);
-          changed = true;
-        }
-        break;
-      }
-      case "update": {
-        const existing = entry.itemMap.get(op.id) as any;
-        if (existing && op.data) {
-          for (const [key, value] of Object.entries(op.data)) {
-            existing[key] = value;
-          }
-          changed = true;
-        }
-        break;
-      }
-    }
-  }
-
-  if (changed) {
-    entry.version++;
-    notifyListeners(entry);
-  }
 }

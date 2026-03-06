@@ -140,7 +140,15 @@ export class SocketTransport extends EventEmitter implements Transport {
       this.isConnected = true;
       this.isConnecting = false;
       hasConnected = true;
-      this.emit(wasDisconnected ? "reconnected" : "connected");
+
+      // Re-authenticate on reconnect
+      if (wasDisconnected && this.key) {
+        this.socket.emit("authenticate", this.key, () => {
+          this.emit("reconnected");
+        });
+      } else {
+        this.emit(wasDisconnected ? "reconnected" : "connected");
+      }
     });
 
     this.socket.on("disconnect", () => {
