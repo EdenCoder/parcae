@@ -1,3 +1,4 @@
+import { log } from "../logger";
 /**
  * Schema generation pipeline.
  *
@@ -142,14 +143,14 @@ export async function generateSchemas(
   // Find models source directory
   const modelsDir = findModelsDir(projectRoot, modelsPath);
   if (!modelsDir) {
-    console.warn("[parcae] Models directory not found. No schemas resolved.");
+    log.warn("[parcae] Models directory not found. No schemas resolved.");
     return { schemas: new Map(), cached: false };
   }
 
   // Collect and hash source files
   const sourceFiles = collectTsFiles(modelsDir);
   if (sourceFiles.length === 0) {
-    console.warn("[parcae] No .ts files found in models directory.");
+    log.warn("[parcae] No .ts files found in models directory.");
     return { schemas: new Map(), cached: false };
   }
 
@@ -171,7 +172,7 @@ export async function generateSchemas(
   }
 
   // Resolve schemas from source using ts-morph
-  console.log(
+  log.info(
     `[parcae] Resolving schemas from ${sourceFiles.length} source file(s)...`,
   );
 
@@ -196,7 +197,7 @@ export async function generateSchemas(
   // Cache
   writeCache(parcaeDir, currentHash, schemas);
 
-  console.log(
+  log.info(
     `[parcae] Resolved schemas: ${[...schemas.entries()].map(([t, s]) => `${t}(${Object.keys(s).length})`).join(", ")}`,
   );
 

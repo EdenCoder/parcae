@@ -1,6 +1,6 @@
 {
   "name": "@parcae/backend",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Parcae Backend — TypeScript backend framework with auto-CRUD, realtime, and jobs",
   "type": "module",
   "main": "./dist/index.js",
@@ -36,7 +36,6 @@
     "polka": "^0.5.2",
     "socket.io": "^4.8.0",
     "ts-morph": "^27.0.2",
-    "winston": "^3.17.0",
     "zod": "^3.24.0"
   },
   "devDependencies": {

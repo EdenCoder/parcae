@@ -1,3 +1,4 @@
+import { log } from "../logger";
 /**
  * QuerySubscriptionManager — server-side realtime query subscriptions.
  *
@@ -148,7 +149,7 @@ export class QuerySubscriptionManager {
       const cached = this.queries.get(hash);
       if (!cached) continue;
       this._reeval(cached).catch((err) => {
-        console.error(`[subscriptions] re-eval failed for ${hash}:`, err);
+        log.error(`subscriptions: re-eval failed for ${hash}:`, err);
       });
     }
   }

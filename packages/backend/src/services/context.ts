@@ -1,3 +1,4 @@
+import { log } from "../logger";
 /**
  * @parcae/backend — Global service context
  *
@@ -59,7 +60,7 @@ export async function enqueue(
   options: EnqueueOptions = {},
 ): Promise<boolean> {
   if (!_queue) {
-    console.warn(
+    log.warn(
       `[parcae] enqueue("${name}"): no queue configured (REDIS_URL not set)`,
     );
     return false;
@@ -67,7 +68,7 @@ export async function enqueue(
 
   const queue = _queue.get();
   if (!queue) {
-    console.warn(`[parcae] enqueue("${name}"): queue not available`);
+    log.warn(`enqueue("${name}"): queue not available`);
     return false;
   }
 

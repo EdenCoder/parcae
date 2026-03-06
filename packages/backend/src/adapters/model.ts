@@ -1,3 +1,4 @@
+import { log } from "../logger";
 /**
  * BackendAdapter — Knex + Postgres persistence for Parcae Model.
  *
@@ -31,7 +32,6 @@ export interface BackendServices {
   read: any; // Knex read replica
   write: any; // Knex primary
   pubsub?: any; // Redis pub/sub + lock (optional)
-  logger?: any; // Winston logger (optional)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -145,9 +145,6 @@ export class BackendAdapter implements ModelAdapter {
   get pubsub() {
     return this.services.pubsub;
   }
-  get logger() {
-    return this.services.logger;
-  }
 
   constructor(services: BackendServices) {
     this.services = services;
@@ -194,7 +191,7 @@ export class BackendAdapter implements ModelAdapter {
     const row = serialize(model);
     await this.write(table).insert(row).onConflict("id").merge();
 
-    this.logger?.info?.(`model saved model=${ModelClass.type}, id=${model.id}`);
+    log.info(`model saved model=${ModelClass.type}, id=${model.id}`);
 
     await this.runHooks(model, creating ? "create" : "save", "after");
     this._notifySubscriptions(model);
@@ -589,7 +586,7 @@ export class BackendAdapter implements ModelAdapter {
 
       if (hookEntry.async) {
         Promise.resolve(hookEntry.handler(ctx)).catch((err) => {
-          this.logger?.error?.(
+          log.error(
             `[hook] Async error in ${hookEntry.modelType}:${action}:`,
             err,
           );
@@ -611,7 +608,7 @@ export class BackendAdapter implements ModelAdapter {
 
   async ensureTable(modelClass: ModelConstructor): Promise<void> {
     if ((modelClass as any).managed === false) {
-      this.logger?.info?.(
+      log.info(
         `skipping schema — model=${modelClass.type} (externally managed)`,
       );
       return;
@@ -621,7 +618,7 @@ export class BackendAdapter implements ModelAdapter {
     const schema = ((modelClass as any).__schema as SchemaDefinition) ?? {};
     const indexes = (modelClass as any).indexes || [];
 
-    this.logger?.info?.(`ensuring schema — model=${modelClass.type}`);
+    log.info(`ensuring schema — model=${modelClass.type}`);
 
     const hasTable = await this.write.schema.hasTable(table);
 
@@ -706,7 +703,7 @@ export class BackendAdapter implements ModelAdapter {
       },
     );
 
-    this.logger?.info?.(`ensured schema — model=${modelClass.type}`);
+    log.info(`ensured schema — model=${modelClass.type}`);
   }
 
   async ensureAllTables(models: ModelConstructor[]): Promise<void> {

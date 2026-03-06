@@ -1,3 +1,4 @@
+import { log } from "./logger";
 /**
  * @parcae/backend — createApp()
  *
@@ -72,7 +73,7 @@ export interface ParcaeApp {
 async function discoverModels(dir: string): Promise<ModelConstructor[]> {
   const absDir = resolve(dir);
   if (!existsSync(absDir)) {
-    console.warn(`[parcae] Models directory not found: ${absDir}`);
+    log.warn(`Models directory not found: ${absDir}`);
     return [];
   }
 
@@ -100,7 +101,7 @@ async function discoverModels(dir: string): Promise<ModelConstructor[]> {
         }
       }
     } catch (err) {
-      console.warn(
+      log.warn(
         `[parcae] Failed to import model from ${entry}:`,
         err instanceof Error ? err.message : err,
       );
@@ -139,7 +140,7 @@ async function discoverAndImport(dir: string, label: string): Promise<number> {
       await import(filePath);
       count++;
     } catch (err) {
-      console.warn(
+      log.warn(
         `[parcae] Failed to import ${label} from ${entryStr}:`,
         err instanceof Error ? err.message : err,
       );
@@ -174,7 +175,7 @@ export function createApp(config: AppConfig): ParcaeApp {
       const port = options.port ?? envConfig.PORT;
       const dev = options.dev ?? envConfig.NODE_ENV === "development";
 
-      console.log(`[parcae] Starting${dev ? " (dev mode)" : ""}...`);
+      log.info(`Starting${dev ? " (dev mode)" : ""}...`);
 
       // ── Step 1: Discover models ────────────────────────────────────
       if (Array.isArray(config.models)) {
@@ -182,7 +183,7 @@ export function createApp(config: AppConfig): ParcaeApp {
       } else {
         models = await discoverModels(config.models);
       }
-      console.log(
+      log.info(
         `[parcae] Found ${models.length} model(s): ${models.map((m) => m.type).join(", ")}`,
       );
 
@@ -195,7 +196,7 @@ export function createApp(config: AppConfig): ParcaeApp {
       });
       schemas = result.schemas;
 
-      console.log(
+      log.info(
         `[parcae] Resolved schemas for: ${[...schemas.keys()].join(", ")}` +
           (result.cached ? " (cached)" : " (resolved)"),
       );
@@ -214,7 +215,7 @@ export function createApp(config: AppConfig): ParcaeApp {
           })
         : writeDb;
 
-      console.log("[parcae] Database connected");
+      log.info("[parcae] Database connected");
 
       // ── Step 4: Connect Redis (PubSub + Queue) ─────────────────────
       const pubsub = new PubSub({ url: envConfig.REDIS_URL });
@@ -226,9 +227,9 @@ export function createApp(config: AppConfig): ParcaeApp {
       _setServices(queue, pubsub);
 
       if (envConfig.REDIS_URL) {
-        console.log("[parcae] Redis connected (PubSub + Queue)");
+        log.info("[parcae] Redis connected (PubSub + Queue)");
       } else {
-        console.log(
+        log.info(
           "[parcae] Redis not configured — using in-process fallbacks",
         );
       }
@@ -243,7 +244,7 @@ export function createApp(config: AppConfig): ParcaeApp {
 
       // ── Step 6: Ensure tables (additive migration) ─────────────────
       await adapter.ensureAllTables(models);
-      console.log("[parcae] Database schema ensured");
+      log.info("[parcae] Database schema ensured");
 
       // ── Step 7: Create server ──────────────────────────────────────
       server = createServer_({ config: envConfig, version });
@@ -290,27 +291,27 @@ export function createApp(config: AppConfig): ParcaeApp {
           next();
         });
 
-        console.log("[parcae] Auth enabled");
+        log.info("[parcae] Auth enabled");
       }
 
       // ── Step 10: Register auto-CRUD routes ─────────────────────────
       const crudCount = registerModelRoutes(models, adapter, version);
-      console.log(`[parcae] Registered ${crudCount} auto-CRUD route(s)`);
+      log.info(`Registered ${crudCount} auto-CRUD route(s)`);
 
       // ── Step 11: Auto-discover controllers, hooks, jobs ────────────
       // Files self-register by calling route.*, hook.*, job() at import time.
       // Just importing them is enough — like Next.js pages.
       if (typeof config.controllers === "string") {
         const n = await discoverAndImport(config.controllers, "controller");
-        console.log(`[parcae] Discovered ${n} controller file(s)`);
+        log.info(`Discovered ${n} controller file(s)`);
       }
       if (typeof config.hooks === "string") {
         const n = await discoverAndImport(config.hooks, "hook");
-        console.log(`[parcae] Discovered ${n} hook file(s)`);
+        log.info(`Discovered ${n} hook file(s)`);
       }
       if (typeof config.jobs === "string") {
         const n = await discoverAndImport(config.jobs, "job");
-        console.log(`[parcae] Discovered ${n} job file(s)`);
+        log.info(`Discovered ${n} job file(s)`);
       }
 
       // ── Step 12: Apply discovered routes to Polka ──────────────────
@@ -322,7 +323,7 @@ export function createApp(config: AppConfig): ParcaeApp {
           (server.polka[method] as any)(entry.path, ...handlers);
         }
       }
-      console.log(`[parcae] Registered ${routes.length} custom route(s)`);
+      log.info(`Registered ${routes.length} custom route(s)`);
 
       // ── Step 13: Start job workers ─────────────────────────────────
       const registeredJobs = getJobs();
@@ -331,7 +332,7 @@ export function createApp(config: AppConfig): ParcaeApp {
         queue.createWorker(defaultQueue.name, async (bullJob) => {
           const jobEntry = registeredJobs.find((j) => j.name === bullJob.name);
           if (!jobEntry) {
-            console.warn(`[parcae] No handler for job "${bullJob.name}"`);
+            log.warn(`No handler for job "${bullJob.name}"`);
             return;
           }
           return jobEntry.handler({
@@ -340,7 +341,7 @@ export function createApp(config: AppConfig): ParcaeApp {
             attempt: bullJob.attemptsMade,
           });
         });
-        console.log(
+        log.info(
           `[parcae] Started worker for ${registeredJobs.length} job(s)`,
         );
       }
@@ -390,11 +391,11 @@ export function createApp(config: AppConfig): ParcaeApp {
         server!.httpServer.listen(port, () => resolveStart());
       });
 
-      console.log(`[parcae] Ready on port ${port} (v${version})`);
+      log.info(`Ready on port ${port} (v${version})`);
     },
 
     async stop() {
-      console.log("[parcae] Shutting down...");
+      log.info("[parcae] Shutting down...");
       if (server) {
         server.io.close();
         await new Promise<void>((resolveClose) => {
