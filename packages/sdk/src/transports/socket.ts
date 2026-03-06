@@ -88,7 +88,7 @@ export class SocketTransport extends EventEmitter implements Transport {
       return;
     }
 
-      log.info("authenticating with token", this.token?.slice(0, 8) + "...");
+    log.info("authenticating with token", this.token?.slice(0, 8) + "...");
     this.socket.emit("authenticate", this.token, (response: any) => {
       const userId = response?.userId ?? null;
       if (userId) {
@@ -140,7 +140,9 @@ export class SocketTransport extends EventEmitter implements Transport {
     path: string,
     data: any = {},
   ): Promise<any> {
+    log.info("fetch:", method, path);
     await this.auth.ready;
+    log.info("fetch: auth ready, connected:", this.socket.connected);
 
     if (!this.socket.connected) {
       await new Promise<void>((resolve, reject) => {
@@ -183,6 +185,7 @@ export class SocketTransport extends EventEmitter implements Transport {
 
   private _call(method: string, path: string, data: any): Promise<any> {
     const id = uid.rnd();
+    log.info("call:", method, `/${this.version}${path}`, "id:", id);
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.socket.off(id);
@@ -249,7 +252,7 @@ export class SocketTransport extends EventEmitter implements Transport {
   disconnect(): void {
     this.socket.disconnect();
     this.isConnected = false;
-      log.info("socket disconnected");
+    log.info("socket disconnected");
   }
   async reconnect(): Promise<void> {
     this.socket.connect();
@@ -259,5 +262,6 @@ export class SocketTransport extends EventEmitter implements Transport {
 export default SocketTransport;
 
 /** @internal — clear socket cache (for testing) */
-export function _resetSockets(): void { SOCKETS.clear(); }
-
+export function _resetSockets(): void {
+  SOCKETS.clear();
+}
