@@ -1,6 +1,6 @@
 {
   "name": "@parcae/backend",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Parcae Backend — TypeScript backend framework with auto-CRUD, realtime, and jobs",
   "type": "module",
   "main": "./dist/index.js",
@@ -24,7 +24,6 @@
   },
   "dependencies": {
     "@parcae/model": "workspace:*",
-    "@rttist/typegen": "^0.2.0",
     "@sesamecare-oss/redlock": "^1.1.0",
     "async-lock": "^1.4.1",
     "body-parser": "^1.20.3",
@@ -35,8 +34,8 @@
     "knex": "^3.1.0",
     "pluralize": "^8.0.0",
     "polka": "^0.5.2",
-    "rttist": "^1.0.0-rc.4",
     "socket.io": "^4.8.0",
+    "ts-morph": "^27.0.2",
     "winston": "^3.17.0",
     "zod": "^3.24.0"
   },

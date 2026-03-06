@@ -34,7 +34,7 @@ export type { EnqueueOptions } from "./services/context";
 export type { AuthAdapter, AuthSession, AuthSetupContext } from "./auth";
 
 // Schema
-export { SchemaResolver, resolveFallbackSchema } from "./schema/resolver";
+export { SchemaResolver } from "./schema/resolver";
 export { generateSchemas, loadCachedSchemas } from "./schema/generate";
 
 // Routing

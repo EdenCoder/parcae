@@ -197,7 +197,7 @@ export function createApp(config: AppConfig): ParcaeApp {
 
       console.log(
         `[parcae] Resolved schemas for: ${[...schemas.keys()].join(", ")}` +
-          (result.regenerated ? " (regenerated)" : " (cached)"),
+          (result.cached ? " (cached)" : " (resolved)"),
       );
 
       // ── Step 3: Connect database ───────────────────────────────────

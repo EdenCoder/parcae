@@ -1,236 +1,133 @@
 /**
- * .parcae/ generation pipeline
+ * Schema generation pipeline.
  *
- * Runs RTTIST typegen to generate type metadata, then uses SchemaResolver
- * to map types → column definitions. Output goes to .parcae/ in the
- * consuming app (like Next.js's .next/).
+ * 1. Hash model source files
+ * 2. If hash matches .parcae/schema.json cache → load from cache
+ * 3. Otherwise, run ts-morph to read actual TypeScript types
+ * 4. Write results to .parcae/schema.json
  *
- * Flow:
- * 1. Ensure .parcae/ directory exists
- * 2. Find the models package (has reflect.config.json)
- * 3. Run rttist typegen against it
- * 4. Load the generated typelib
- * 5. Resolve schemas from metadata
+ * No transformers, no build plugins, no binaries, no fallbacks.
  */
 
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  writeFileSync,
-  readdirSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, resolve, dirname } from "node:path";
-import { execSync } from "node:child_process";
+import { readdirSync, statSync } from "node:fs";
 import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
-import { SchemaResolver, resolveFallbackSchema } from "./resolver";
+import { SchemaResolver } from "./resolver";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 interface GenerateOptions {
-  /** Root directory of the consuming app. */
   projectRoot: string;
-  /** Path to the models package root (where reflect.config.json lives). */
   modelsPath?: string;
-  /** Whether to force regeneration (ignore cache). */
   force?: boolean;
-  /** Whether running in dev mode. */
   dev?: boolean;
 }
 
 interface GenerateResult {
   schemas: Map<string, SchemaDefinition>;
-  regenerated: boolean;
+  cached: boolean;
+}
+
+// ─── File hashing ────────────────────────────────────────────────────────────
+
+function collectTsFiles(dir: string): string[] {
+  const files: string[] = [];
+  if (!existsSync(dir)) return files;
+
+  const entries = readdirSync(dir, { recursive: true });
+  for (const entry of entries) {
+    const entryPath = join(dir, entry.toString());
+    if (
+      entryPath.endsWith(".ts") &&
+      !entryPath.endsWith(".d.ts") &&
+      !entryPath.includes("node_modules")
+    ) {
+      try {
+        if (statSync(entryPath).isFile()) files.push(entryPath);
+      } catch {}
+    }
+  }
+  return files.sort();
+}
+
+function hashFiles(files: string[]): string {
+  const hash = createHash("sha256");
+  for (const file of files) {
+    try {
+      hash.update(readFileSync(file));
+    } catch {}
+  }
+  return hash.digest("hex").slice(0, 16);
 }
 
 // ─── .parcae/ management ─────────────────────────────────────────────────────
 
 function ensureParcaeDir(projectRoot: string): string {
   const parcaeDir = join(projectRoot, ".parcae");
-  if (!existsSync(parcaeDir)) {
-    mkdirSync(parcaeDir, { recursive: true });
-  }
+  if (!existsSync(parcaeDir)) mkdirSync(parcaeDir, { recursive: true });
   const gitignorePath = join(parcaeDir, ".gitignore");
-  if (!existsSync(gitignorePath)) {
-    writeFileSync(gitignorePath, "*\n");
-  }
+  if (!existsSync(gitignorePath)) writeFileSync(gitignorePath, "*\n");
   return parcaeDir;
 }
 
-// ─── Find rttist binary ─────────────────────────────────────────────────────
+// ─── Find models directory ───────────────────────────────────────────────────
 
-function resolveTypegenBin(searchDirs: string[]): string | null {
-  for (const dir of searchDirs) {
-    // Direct node_modules/.bin
-    const binPath = join(dir, "node_modules", ".bin", "rttist");
-    if (existsSync(binPath)) return binPath;
-
-    // pnpm nested path
-    const pnpmBin = join(
-      dir,
-      "node_modules",
-      ".pnpm",
-      "node_modules",
-      ".bin",
-      "rttist",
-    );
-    if (existsSync(pnpmBin)) return pnpmBin;
-  }
-
-  // Walk up from first search dir to find monorepo root
-  let current = searchDirs[0];
-  if (current) {
-    for (let i = 0; i < 10; i++) {
-      const binPath = join(current, "node_modules", ".bin", "rttist");
-      if (existsSync(binPath)) return binPath;
-      const pnpmBin = join(
-        current,
-        "node_modules",
-        ".pnpm",
-        "node_modules",
-        ".bin",
-        "rttist",
-      );
-      if (existsSync(pnpmBin)) return pnpmBin;
-      const parent = dirname(current);
-      if (parent === current) break;
-      current = parent;
-    }
-  }
-
-  return null;
-}
-
-// ─── Find models package ─────────────────────────────────────────────────────
-
-/**
- * Find the models package directory. Looks for reflect.config.json
- * in common locations relative to the project root.
- */
 function findModelsDir(
   projectRoot: string,
   modelsPath?: string,
 ): string | null {
   if (modelsPath) {
     const resolved = resolve(projectRoot, modelsPath);
-    if (existsSync(join(resolved, "reflect.config.json"))) return resolved;
+    if (existsSync(resolved)) return resolved;
     return null;
   }
 
-  // Common locations in a monorepo
   const candidates = [
+    join(projectRoot, "packages", "models", "src"),
+    join(projectRoot, "..", "..", "packages", "models", "src"),
+    join(projectRoot, "..", "models", "src"),
     join(projectRoot, "packages", "models"),
-    join(projectRoot, "..", "..", "packages", "models"), // from apps/api/
-    join(projectRoot, "..", "models"),
+    join(projectRoot, "..", "..", "packages", "models"),
+    join(projectRoot, "models"),
   ];
 
-  for (const candidate of candidates) {
-    if (existsSync(join(candidate, "reflect.config.json"))) return candidate;
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
   }
 
   return null;
 }
 
-// ─── Run typegen ─────────────────────────────────────────────────────────────
+// ─── Cache ───────────────────────────────────────────────────────────────────
 
-function runTypegen(
-  modelsDir: string,
-  parcaeDir: string,
-  projectRoot: string,
-): boolean {
-  const typegenBin = resolveTypegenBin([projectRoot, modelsDir]);
-  if (!typegenBin) {
-    console.warn("[parcae] rttist binary not found. Skipping type generation.");
-    return false;
-  }
+interface CachedSchema {
+  hash: string;
+  schemas: Record<string, SchemaDefinition>;
+}
 
+function loadCache(parcaeDir: string): CachedSchema | null {
   try {
-    console.log(`[parcae] Running typegen against ${modelsDir}...`);
-
-    // rttist generate runs from the models package dir where reflect.config.json is.
-    // It reads outDir from the config. We temporarily override it to point to .parcae/.
-    // Since rttist doesn't support --output flag, we need to update the config or
-    // run from a temp config. Simplest: run from modelsDir with default outDir,
-    // then copy the output.
-    execSync(`${typegenBin} generate --force`, {
-      cwd: modelsDir,
-      stdio: "pipe",
-      timeout: 60_000,
-    });
-
-    // Find the output — rttist puts it in the outDir from reflect.config.json
-    // or the default "dist/" location
-    const possibleOutputs = [
-      join(modelsDir, ".rttist"),
-      join(modelsDir, "dist"),
-    ];
-
-    for (const outputDir of possibleOutputs) {
-      const publicTypelib = join(outputDir, "public.typelib.js");
-      const internalTypelib = join(outputDir, "internal.typelib.js");
-      const typelib = existsSync(publicTypelib)
-        ? publicTypelib
-        : existsSync(internalTypelib)
-          ? internalTypelib
-          : null;
-
-      if (typelib) {
-        // Copy to .parcae/
-        const content = readFileSync(typelib, "utf-8");
-        writeFileSync(join(parcaeDir, "metadata.typelib.js"), content);
-        console.log("[parcae] Type metadata generated.");
-
-        // Clean up the output from models dir
-        try {
-          const files = readdirSync(outputDir);
-          for (const f of files) {
-            const { unlinkSync } = require("node:fs");
-            unlinkSync(join(outputDir, f));
-          }
-          const { rmdirSync } = require("node:fs");
-          rmdirSync(outputDir);
-        } catch {}
-
-        // Also clean .metadata cache dir
-        try {
-          const metadataDir = join(modelsDir, ".metadata");
-          if (existsSync(metadataDir)) {
-            execSync(`rm -rf "${metadataDir}"`, { stdio: "pipe" });
-          }
-        } catch {}
-
-        return true;
-      }
-    }
-
-    console.warn("[parcae] typegen ran but no output found.");
-    return false;
-  } catch (err) {
-    console.warn(
-      "[parcae] typegen failed:",
-      err instanceof Error ? err.message : err,
-    );
-    return false;
+    const cachePath = join(parcaeDir, "schema.json");
+    if (!existsSync(cachePath)) return null;
+    return JSON.parse(readFileSync(cachePath, "utf-8"));
+  } catch {
+    return null;
   }
 }
 
-// ─── Load metadata ───────────────────────────────────────────────────────────
-
-async function loadTypelibMetadata(parcaeDir: string): Promise<any | null> {
-  const typelibPath = join(parcaeDir, "metadata.typelib.js");
-  if (!existsSync(typelibPath)) return null;
-
-  try {
-    const mod = await import(typelibPath);
-    return mod.Metadata ?? mod.default ?? null;
-  } catch (err) {
-    console.warn(
-      "[parcae] Failed to load typelib:",
-      err instanceof Error ? err.message : err,
-    );
-    return null;
-  }
+function writeCache(
+  parcaeDir: string,
+  hash: string,
+  schemas: Map<string, SchemaDefinition>,
+): void {
+  const obj: Record<string, SchemaDefinition> = {};
+  for (const [key, val] of schemas) obj[key] = val;
+  writeFileSync(
+    join(parcaeDir, "schema.json"),
+    JSON.stringify({ hash, schemas: obj }, null, 2),
+  );
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -242,61 +139,76 @@ export async function generateSchemas(
   const { projectRoot, modelsPath, force = false } = options;
   const parcaeDir = ensureParcaeDir(projectRoot);
 
-  // Try to find models package and run typegen
+  // Find models source directory
   const modelsDir = findModelsDir(projectRoot, modelsPath);
-  let regenerated = false;
-
-  if (modelsDir) {
-    const typelibExists = existsSync(join(parcaeDir, "metadata.typelib.js"));
-    if (force || !typelibExists) {
-      regenerated = runTypegen(modelsDir, parcaeDir, projectRoot);
-    }
+  if (!modelsDir) {
+    console.warn("[parcae] Models directory not found. No schemas resolved.");
+    return { schemas: new Map(), cached: false };
   }
 
-  // Try to load RTTIST metadata
-  const metadata = await loadTypelibMetadata(parcaeDir);
-  if (metadata) {
-    try {
-      const resolver = new SchemaResolver();
-      const schemas = await resolver.resolve(models, metadata);
-      resolver.resolveRefTargets(schemas, models);
+  // Collect and hash source files
+  const sourceFiles = collectTsFiles(modelsDir);
+  if (sourceFiles.length === 0) {
+    console.warn("[parcae] No .ts files found in models directory.");
+    return { schemas: new Map(), cached: false };
+  }
 
-      // Inject schemas onto model classes
-      for (const [type, schema] of schemas) {
+  const currentHash = hashFiles(sourceFiles);
+
+  // Check cache
+  if (!force) {
+    const cache = loadCache(parcaeDir);
+    if (cache && cache.hash === currentHash) {
+      // Inject cached schemas onto model classes
+      const schemas = new Map<string, SchemaDefinition>();
+      for (const [type, schema] of Object.entries(cache.schemas)) {
+        schemas.set(type, schema);
         const ModelClass = models.find((m) => m.type === type);
         if (ModelClass) (ModelClass as any).__schema = schema;
       }
-
-      return { schemas, regenerated };
-    } catch (err) {
-      console.warn(
-        "[parcae] RTTIST schema resolution failed, using fallback:",
-        err instanceof Error ? err.message : err,
-      );
+      return { schemas, cached: true };
     }
   }
 
-  // Fallback
+  // Resolve schemas from source using ts-morph
   console.log(
-    "[parcae] Using fallback schema resolution (no RTTIST metadata).",
+    `[parcae] Resolving schemas from ${sourceFiles.length} source file(s)...`,
   );
-  const fallbackSchemas = new Map<string, SchemaDefinition>();
-  for (const ModelClass of models) {
-    const schema = resolveFallbackSchema(ModelClass);
-    fallbackSchemas.set(ModelClass.type, schema);
-    (ModelClass as any).__schema = schema;
+
+  // Find tsconfig.json near the models dir
+  let tsConfigPath: string | undefined;
+  let searchDir = modelsDir;
+  for (let i = 0; i < 5; i++) {
+    const candidate = join(searchDir, "tsconfig.json");
+    if (existsSync(candidate)) {
+      tsConfigPath = candidate;
+      break;
+    }
+    const parent = dirname(searchDir);
+    if (parent === searchDir) break;
+    searchDir = parent;
   }
 
-  return { schemas: fallbackSchemas, regenerated: false };
+  const resolver = new SchemaResolver(tsConfigPath);
+  const schemas = resolver.resolveFromFiles(models, sourceFiles);
+  resolver.resolveRefTargets(schemas, models);
+
+  // Cache
+  writeCache(parcaeDir, currentHash, schemas);
+
+  console.log(
+    `[parcae] Resolved schemas: ${[...schemas.entries()].map(([t, s]) => `${t}(${Object.keys(s).length})`).join(", ")}`,
+  );
+
+  return { schemas, cached: false };
 }
 
 export function loadCachedSchemas(
   projectRoot: string,
 ): Record<string, SchemaDefinition> | null {
   try {
-    const schemaPath = join(projectRoot, ".parcae", "schema.json");
-    if (!existsSync(schemaPath)) return null;
-    return JSON.parse(readFileSync(schemaPath, "utf-8"));
+    const cache = loadCache(join(projectRoot, ".parcae"));
+    return cache?.schemas ?? null;
   } catch {
     return null;
   }

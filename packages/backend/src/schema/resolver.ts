@@ -1,223 +1,223 @@
 /**
- * SchemaResolver — Maps RTTIST type metadata to Parcae column schemas.
+ * SchemaResolver — reads actual TypeScript types from model source files via ts-morph.
  *
- * Reads property types from RTTIST's reflection API and produces
- * a SchemaDefinition (property name → column type) for each Model subclass.
+ * No transformers, no build plugins, no runtime hacks. Reads your .ts files
+ * directly using the TypeScript Compiler API and extracts property types.
  *
  * Type mapping:
- *   string         → "string"    (VARCHAR)
- *   number         → "number"    (DOUBLE PRECISION)
- *   boolean        → "boolean"   (BOOLEAN)
- *   Date           → "datetime"  (TIMESTAMP)
- *   Model subclass → { kind: "ref", target: Constructor }
- *   object/array   → "json"      (JSONB)
- *   optional        → adds nullable flag
+ *   string            → "string"    (VARCHAR)
+ *   number            → "number"    (DOUBLE PRECISION)
+ *   boolean           → "boolean"   (BOOLEAN)
+ *   Date              → "datetime"  (TIMESTAMP)
+ *   Model subclass    → { kind: "ref", target: Constructor }
+ *   object/array/any  → "json"      (JSONB)
  */
 
+import { Project, ClassDeclaration, Type, SyntaxKind } from "ts-morph";
 import type {
   SchemaDefinition,
   ColumnType,
   ModelConstructor,
 } from "@parcae/model";
 
-// ─── RTTIST type guards ──────────────────────────────────────────────────────
-// We use dynamic imports + duck-typing to avoid hard dependency on rttist
-// at the type level. The actual rttist package is loaded at runtime.
-
-interface RttistType {
-  isString(): boolean;
-  isNumber(): boolean;
-  isBoolean(): boolean;
-  isClass(): boolean;
-  isArray(): boolean;
-  isObjectLiteral?(): boolean;
-  isInterface?(): boolean;
-  isUnion?(): boolean;
-  displayName?: string;
-  name?: string;
-}
-
-interface RttistClassType extends RttistType {
-  isSubclassOf(other: RttistType): boolean;
-  isDerivedFrom(other: RttistType): boolean;
-  getCtor(): Promise<{ new (...args: any[]): any } | undefined>;
-  extends?: RttistClassType;
-}
-
-interface RttistPropertyInfo {
-  name: { name: string | symbol; isString(): boolean; isSymbol(): boolean };
-  type: RttistType;
-  optional: boolean;
-}
-
-interface RttistObjectLikeType extends RttistType {
-  getProperties(): ReadonlyArray<RttistPropertyInfo>;
-}
-
-interface RttistMetadataLibrary {
-  getTypes(): RttistType[];
-}
-
-// ─── Built-in properties to skip ─────────────────────────────────────────────
+// ─── Properties to skip ──────────────────────────────────────────────────────
 
 const BUILTIN_PROPERTIES = new Set(["id", "type", "createdAt", "updatedAt"]);
+
+const SKIP_PREFIXES = ["__", "___"];
+
+// ─── Type Resolution ─────────────────────────────────────────────────────────
+
+function resolveType(type: Type): ColumnType {
+  const text = type.getText();
+
+  // Unwrap union with null/undefined: `string | null` → string
+  if (type.isUnion()) {
+    const nonNullTypes = type
+      .getUnionTypes()
+      .filter((t) => !t.isNull() && !t.isUndefined());
+    if (nonNullTypes.length === 1) {
+      return resolveType(nonNullTypes[0]!);
+    }
+    // Multi-type union that isn't just T | null → json
+    return "json";
+  }
+
+  // Primitives
+  if (type.isString() || type.isStringLiteral()) return "string";
+  if (type.isNumber() || type.isNumberLiteral()) return "number";
+  if (type.isBoolean() || type.isBooleanLiteral()) return "boolean";
+
+  // Date
+  if (text === "Date" || text.includes("Date")) return "datetime";
+
+  // Check if it's a class that extends Model
+  const symbol = type.getSymbol() ?? type.getAliasSymbol();
+  if (symbol) {
+    const declarations = symbol.getDeclarations();
+    for (const decl of declarations) {
+      if (decl.getKind() === SyntaxKind.ClassDeclaration) {
+        const classDecl = decl as ClassDeclaration;
+        if (extendsModel(classDecl)) {
+          return {
+            kind: "ref",
+            target: { type: classDecl.getName() ?? "" } as any,
+          };
+        }
+      }
+    }
+  }
+
+  // Array → json
+  if (type.isArray()) return "json";
+
+  // Object types (interfaces, type literals, Record<>, etc.) → json
+  if (type.isObject()) return "json";
+
+  // any → json
+  if (type.isAny()) return "json";
+
+  // Default → json (covers unknown types, intersections, etc.)
+  return "json";
+}
+
+/**
+ * Check if a class declaration extends Model (directly or transitively).
+ */
+function extendsModel(classDecl: ClassDeclaration): boolean {
+  let current: ClassDeclaration | undefined = classDecl;
+  while (current) {
+    const baseClass = current.getBaseClass();
+    if (!baseClass) return false;
+    if (baseClass.getName() === "Model") return true;
+    current = baseClass;
+  }
+  return false;
+}
 
 // ─── SchemaResolver ──────────────────────────────────────────────────────────
 
 export class SchemaResolver {
-  private modelBaseType: RttistType | null = null;
-  private dateType: RttistType | null = null;
+  private project: Project;
+
+  constructor(tsConfigFilePath?: string) {
+    this.project = new Project({
+      tsConfigFilePath,
+      skipAddingFilesFromTsConfig: !tsConfigFilePath,
+      compilerOptions: {
+        strict: false,
+        strictPropertyInitialization: false,
+        noImplicitAny: false,
+        skipLibCheck: true,
+      },
+    });
+  }
 
   /**
-   * Resolve schemas for an array of Model constructors using RTTIST metadata.
+   * Resolve schemas for model classes by reading their source files.
    *
-   * @param models - Array of Model constructor classes
-   * @param metadata - The RTTIST MetadataLibrary instance
-   * @returns Map of model type name → SchemaDefinition
+   * @param models - Array of Model constructors (with static type)
+   * @param sourceFiles - Paths to .ts files containing the model definitions
    */
-  async resolve(
+  resolveFromFiles(
     models: ModelConstructor[],
-    metadata: RttistMetadataLibrary,
-  ): Promise<Map<string, SchemaDefinition>> {
-    const allTypes = metadata.getTypes();
-
-    // Find the Model base type in the metadata
-    this.modelBaseType =
-      allTypes.find((t) => t.isClass() && (t as any).name === "Model") ?? null;
-
-    // Find Date type
-    this.dateType =
-      allTypes.find((t) => t.isClass() && (t as any).name === "Date") ?? null;
+    sourceFiles: string[],
+  ): Map<string, SchemaDefinition> {
+    // Add source files to the project
+    for (const filePath of sourceFiles) {
+      this.project.addSourceFileAtPath(filePath);
+    }
 
     const schemas = new Map<string, SchemaDefinition>();
+    const modelsByName = new Map(models.map((m) => [m.name, m]));
 
-    for (const ModelClass of models) {
-      // Find the RTTIST type matching this model class
-      const rttistType = allTypes.find((t) => {
-        if (!t.isClass()) return false;
-        const ct = t as RttistClassType;
-        // Match by name — the getCtor() approach is async, so we match by name
-        return (t as any).name === ModelClass.name;
-      }) as RttistObjectLikeType | undefined;
+    // Find all class declarations that extend Model
+    for (const sourceFile of this.project.getSourceFiles()) {
+      for (const classDecl of sourceFile.getClasses()) {
+        if (!extendsModel(classDecl)) continue;
 
-      if (!rttistType) {
-        console.warn(
-          `[parcae] Could not find RTTIST type for model "${ModelClass.name}". ` +
-            `Falling back to empty schema.`,
-        );
-        schemas.set(ModelClass.type, {});
-        continue;
+        const className = classDecl.getName();
+        if (!className) continue;
+
+        const modelClass = modelsByName.get(className);
+        if (!modelClass) continue;
+
+        const schema = this.resolveClass(classDecl);
+        schemas.set(modelClass.type, schema);
+
+        // Inject onto the model constructor
+        (modelClass as any).__schema = schema;
       }
-
-      const schema = this.resolveClass(rttistType);
-      schemas.set(ModelClass.type, schema);
-
-      // Inject the schema onto the model class
-      (ModelClass as any).__schema = schema;
     }
 
     return schemas;
   }
 
   /**
-   * Resolve a single class type's properties into a SchemaDefinition.
+   * Resolve schemas by scanning a directory for .ts files.
    */
-  private resolveClass(classType: RttistObjectLikeType): SchemaDefinition {
+  resolveFromDirectory(
+    models: ModelConstructor[],
+    directory: string,
+  ): Map<string, SchemaDefinition> {
+    this.project.addSourceFilesAtPaths(`${directory}/**/*.ts`);
+
+    const schemas = new Map<string, SchemaDefinition>();
+    const modelsByName = new Map(models.map((m) => [m.name, m]));
+
+    for (const sourceFile of this.project.getSourceFiles()) {
+      for (const classDecl of sourceFile.getClasses()) {
+        if (!extendsModel(classDecl)) continue;
+
+        const className = classDecl.getName();
+        if (!className) continue;
+
+        const modelClass = modelsByName.get(className);
+        if (!modelClass) continue;
+
+        const schema = this.resolveClass(classDecl);
+        schemas.set(modelClass.type, schema);
+        (modelClass as any).__schema = schema;
+      }
+    }
+
+    return schemas;
+  }
+
+  /**
+   * Resolve a single class's instance properties into a SchemaDefinition.
+   */
+  private resolveClass(classDecl: ClassDeclaration): SchemaDefinition {
     const schema: SchemaDefinition = {};
-    const properties = classType.getProperties();
 
-    for (const prop of properties) {
-      // Skip symbols
-      if (prop.name.isSymbol()) continue;
+    for (const prop of classDecl.getInstanceProperties()) {
+      const name = prop.getName();
 
-      const propName = prop.name.name as string;
+      // Skip builtins
+      if (BUILTIN_PROPERTIES.has(name)) continue;
 
-      // Skip built-in Model properties
-      if (BUILTIN_PROPERTIES.has(propName)) continue;
+      // Skip private/internal
+      if (SKIP_PREFIXES.some((p) => name.startsWith(p))) continue;
 
-      // Skip private/internal properties (starting with __)
-      if (propName.startsWith("__")) continue;
+      // Skip methods
+      if (prop.getKind() === SyntaxKind.MethodDeclaration) continue;
 
-      const colType = this.resolveType(prop.type);
-      schema[propName] = colType;
+      // Get the declared type
+      const type = prop.getType();
+      schema[name] = resolveType(type);
     }
 
     return schema;
   }
 
   /**
-   * Map a RTTIST Type to a Parcae ColumnType.
-   */
-  private resolveType(type: RttistType): ColumnType {
-    // String → VARCHAR
-    if (type.isString()) return "string";
-
-    // Number → DOUBLE PRECISION
-    if (type.isNumber()) return "number";
-
-    // Boolean → BOOLEAN
-    if (type.isBoolean()) return "boolean";
-
-    // Date → TIMESTAMP
-    if (
-      type.isClass() &&
-      this.dateType &&
-      (type as RttistClassType).isDerivedFrom(this.dateType)
-    ) {
-      return "datetime";
-    }
-
-    // Check for Date by name as fallback
-    if (type.isClass() && (type as any).name === "Date") {
-      return "datetime";
-    }
-
-    // Model subclass → Reference (VARCHAR storing ID)
-    if (type.isClass() && this.modelBaseType) {
-      const classType = type as RttistClassType;
-      if (
-        classType.isDerivedFrom(this.modelBaseType) ||
-        classType.isSubclassOf(this.modelBaseType)
-      ) {
-        // We store the constructor reference for the lazy-loading proxy.
-        // At this point we don't have the constructor, but we can
-        // store the type info and resolve it later.
-        return {
-          kind: "ref",
-          target: { type: (type as any).name } as any,
-        };
-      }
-    }
-
-    // Array → JSONB
-    if (type.isArray()) return "json";
-
-    // Object literal / Interface → JSONB
-    if (type.isObjectLiteral?.()) return "json";
-    if (type.isInterface?.()) return "json";
-
-    // Union types → check if it's a nullable wrapper, otherwise JSONB
-    if (type.isUnion?.()) {
-      // TODO: Extract the non-null/undefined type and resolve that
-      return "json";
-    }
-
-    // Default: JSONB for anything we don't recognize
-    return "json";
-  }
-
-  /**
-   * Resolve reference targets. After schema resolution, we need to wire up
-   * ref targets to actual Model constructors (not just type names).
+   * Wire up ref targets to actual Model constructors.
    */
   resolveRefTargets(
     schemas: Map<string, SchemaDefinition>,
     models: ModelConstructor[],
   ): void {
-    const modelsByName = new Map<string, ModelConstructor>();
-    for (const m of models) {
-      modelsByName.set(m.name, m);
-    }
+    const modelsByName = new Map(models.map((m) => [m.name, m]));
 
     for (const [, schema] of schemas) {
       for (const [key, colDef] of Object.entries(schema)) {
@@ -232,62 +232,13 @@ export class SchemaResolver {
           if (targetModel) {
             schema[key] = { kind: "ref", target: targetModel };
           } else {
-            // If we can't resolve the ref, fall back to string (just stores the ID)
-            console.warn(
-              `[parcae] Could not resolve ref target "${targetName}" for property "${key}". ` +
-                `Falling back to string column.`,
-            );
+            // Can't resolve ref — store as string (just the ID)
             schema[key] = "string";
           }
         }
       }
     }
   }
-}
-
-/**
- * Resolve schemas without RTTIST — uses a simple default-value-based
- * heuristic for environments where RTTIST is not available.
- *
- * This is the fallback when typegen hasn't run or RTTIST isn't installed.
- */
-export function resolveFallbackSchema(
-  ModelClass: ModelConstructor,
-): SchemaDefinition {
-  const schema: SchemaDefinition = {};
-
-  try {
-    // Create a throwaway instance to inspect defaults
-    const mockAdapter = {
-      createStore: (data: Record<string, any>) => ({ ...data }),
-      save: async () => {},
-      remove: async () => {},
-      findById: async () => null,
-      query: () => ({}) as any,
-      patch: async () => {},
-    };
-
-    const instance = new ModelClass(mockAdapter, {});
-    const data = (instance as any).__data ?? instance;
-
-    for (const [key, value] of Object.entries(data)) {
-      if (BUILTIN_PROPERTIES.has(key)) continue;
-      if (key.startsWith("__")) continue;
-
-      if (typeof value === "string") schema[key] = "string";
-      else if (typeof value === "number") schema[key] = "number";
-      else if (typeof value === "boolean") schema[key] = "boolean";
-      else if (value instanceof Date) schema[key] = "datetime";
-      else if (Array.isArray(value)) schema[key] = "json";
-      else if (typeof value === "object" && value !== null)
-        schema[key] = "json";
-      else schema[key] = "string"; // default fallback
-    }
-  } catch {
-    // If instantiation fails, return empty schema
-  }
-
-  return schema;
 }
 
 export default SchemaResolver;

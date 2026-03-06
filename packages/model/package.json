@@ -1,6 +1,6 @@
 {
   "name": "@parcae/model",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Parcae Model — typed ORM base class with adapter pattern",
   "type": "module",
   "main": "./dist/index.js",
@@ -42,14 +42,6 @@
     "@types/node": "^22.0.0",
     "tsup": "^8.5.0",
     "typescript": "^5.8.0"
-  },
-  "peerDependencies": {
-    "rttist": "^1.0.0-rc.4"
-  },
-  "peerDependenciesMeta": {
-    "rttist": {
-      "optional": true
-    }
   },
   "license": "MIT"
 }
