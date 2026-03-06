@@ -171,7 +171,12 @@ afterAll(async () => {
 });
 
 describe("E2E with middleware stack", () => {
-  beforeEach(() => _resetSockets());
+  beforeEach(() => {
+    _resetSockets();
+    // Suppress unhandled rejections from socket cache cleanup
+    process.removeAllListeners("unhandledRejection");
+    process.on("unhandledRejection", () => {});
+  });
 
   it("should fetch list through body-parser + CORS + auth middleware", async () => {
     const transport = new SocketTransport({
@@ -212,6 +217,7 @@ describe("E2E with middleware stack", () => {
     await expect(transport.get("/posts/999")).rejects.toThrow("Not found");
 
     transport.disconnect();
+    await new Promise((r) => setTimeout(r, 50)); // let socket close cleanly
   });
 
   it("should work unauthenticated", async () => {

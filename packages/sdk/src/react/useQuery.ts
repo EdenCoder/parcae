@@ -68,7 +68,7 @@ function notify(e: CacheEntry): void {
 }
 
 function doFetch(key: string, entry: CacheEntry, chain: QueryChain<any>): void {
-  log.info("useQuery: fetching", chain.__modelType, "key:", key.slice(0, 40));
+  log.debug("useQuery: fetching", chain.__modelType, "key:", key.slice(0, 40));
   entry.loading = true;
   entry.error = null;
   notify(entry);
@@ -76,7 +76,7 @@ function doFetch(key: string, entry: CacheEntry, chain: QueryChain<any>): void {
   chain
     .find()
     .then((result: any[]) => {
-      log.info("useQuery: got", result.length, "items for", chain.__modelType);
+      log.debug("useQuery: got", result.length, "items for", chain.__modelType);
       entry.items = result;
       entry.loading = false;
       notify(entry);

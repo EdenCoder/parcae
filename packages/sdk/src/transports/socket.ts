@@ -56,14 +56,14 @@ export class SocketTransport extends EventEmitter implements Transport {
 
     this.socket.on("connect", () => {
       this.isConnected = true;
-      log.info("socket connected");
+      log.debug("socket connected");
       this._doAuth();
       this.emit("connected");
     });
 
     this.socket.on("disconnect", () => {
       this.isConnected = false;
-      log.info("socket disconnected");
+      log.debug("socket disconnected");
       this.auth.reset();
       this.emit("disconnected");
     });
@@ -72,7 +72,7 @@ export class SocketTransport extends EventEmitter implements Transport {
 
     if (this.socket.connected) {
       this.isConnected = true;
-      log.info("socket connected");
+      log.debug("socket connected");
       this._doAuth();
     }
 
@@ -88,13 +88,17 @@ export class SocketTransport extends EventEmitter implements Transport {
       return;
     }
 
-    log.info("authenticating with token", this.token?.slice(0, 8) + "...");
+    const t0 = performance.now();
+    log.debug("authenticating...");
     this.socket.emit("authenticate", this.token, (response: any) => {
+      const ms = (performance.now() - t0).toFixed(0);
       const userId = response?.userId ?? null;
       if (userId) {
         this.auth.resolve(userId);
+        log.debug(`authenticated as ${userId} (${ms}ms)`);
       } else {
         this.auth.resolveUnauthenticated();
+        log.debug(`auth rejected (${ms}ms)`);
       }
     });
   }
@@ -140,9 +144,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     path: string,
     data: any = {},
   ): Promise<any> {
-    log.info("fetch:", method, path);
     await this.auth.ready;
-    log.info("fetch: auth ready, connected:", this.socket.connected);
 
     if (!this.socket.connected) {
       await new Promise<void>((resolve, reject) => {
@@ -185,26 +187,40 @@ export class SocketTransport extends EventEmitter implements Transport {
 
   private _call(method: string, path: string, data: any): Promise<any> {
     const id = uid.rnd();
-    log.info("call:", method, `/${this.version}${path}`, "id:", id);
+    const t0 = performance.now();
+    const fullPath = `/${this.version}${path}`;
+    log.debug(`→ ${method.toUpperCase()} ${fullPath}`);
+
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.socket.off(id);
+        log.debug(`✗ ${method.toUpperCase()} ${fullPath} timeout (30s)`);
         reject(new Error(`RPC timeout: ${method} ${path}`));
       }, 30000);
 
       this.socket.once(id, (msg: any) => {
         clearTimeout(timeout);
+        const ms = (performance.now() - t0).toFixed(0);
         try {
           const uncompressed = pako.ungzip(msg, { to: "string" });
           const parsed = decompress(JSON.parse(uncompressed));
-          if (parsed.success) resolve(parsed.result);
-          else
+          if (parsed.success) {
+            log.debug(`← ${method.toUpperCase()} ${fullPath} (${ms}ms)`);
+            resolve(parsed.result);
+          } else {
+            log.debug(
+              `✗ ${method.toUpperCase()} ${fullPath} (${ms}ms) ${parsed.error || parsed.message}`,
+            );
             reject(
               new Error(
                 parsed.message || parsed.error || `${method} ${path} failed`,
               ),
             );
+          }
         } catch (err) {
+          log.debug(
+            `✗ ${method.toUpperCase()} ${fullPath} (${ms}ms) parse error`,
+          );
           reject(err);
         }
       });
@@ -252,7 +268,7 @@ export class SocketTransport extends EventEmitter implements Transport {
   disconnect(): void {
     this.socket.disconnect();
     this.isConnected = false;
-    log.info("socket disconnected");
+    log.debug("socket disconnected");
   }
   async reconnect(): Promise<void> {
     this.socket.connect();
