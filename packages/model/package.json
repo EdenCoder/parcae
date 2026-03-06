@@ -1,6 +1,6 @@
 {
   "name": "@parcae/model",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "description": "Parcae Model — typed ORM base class with adapter pattern",
   "type": "module",
   "main": "./dist/index.js",

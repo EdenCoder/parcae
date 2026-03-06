@@ -5,7 +5,6 @@ import { useParcae } from "./context";
 
 export function useApi() {
   const { client } = useParcae();
-
   return useMemo(
     () => ({
       get: client.get.bind(client),
@@ -18,28 +17,15 @@ export function useApi() {
   );
 }
 
-/**
- * useSDK — raw client instance.
- */
 export function useSDK() {
   return useParcae().client;
 }
 
-/**
- * useConnectionStatus — connection + auth state.
- */
 export function useConnectionStatus() {
   const { client, authState } = useParcae();
-  return {
-    isConnected: client.isConnected,
-    isLoading: client.isLoading,
-    authState,
-  };
+  return { isConnected: client.isConnected, authState };
 }
 
-/**
- * useAuthState — just the auth state.
- */
 export function useAuthState() {
   return useParcae().authState;
 }
