@@ -25,6 +25,7 @@ import { QueueService } from "./services/queue";
 import { QuerySubscriptionManager } from "./services/subscriptions";
 import { _setServices } from "./services/context";
 import { getJobs } from "./routing/job";
+import { getHooks } from "./routing/hook";
 import type { AuthAdapter } from "./auth";
 import knex from "knex";
 
@@ -298,21 +299,32 @@ export function createApp(config: AppConfig): ParcaeApp {
       const crudCount = registerModelRoutes(models, adapter, version);
       log.info(`Registered ${crudCount} auto-CRUD route(s)`);
 
-      // ── Step 11: Auto-discover controllers, hooks, jobs ────────────
-      // Files self-register by calling route.*, hook.*, job() at import time.
-      // Just importing them is enough — like Next.js pages.
-      if (typeof config.controllers === "string") {
-        const n = await discoverAndImport(config.controllers, "controller");
-        log.info(`Discovered ${n} controller file(s)`);
+      // ── Step 11: Auto-discover ──────────────────────────────────────
+      // Scan all configured directories. Files self-register by calling
+      // route.*, hook.*, job() at import time. Doesn't matter which dir
+      // a hook or job lives in — just that the file exists.
+      const routesBefore = getRoutes().length;
+      const hooksBefore = getHooks().length;
+      const jobsBefore = getJobs().length;
+
+      const dirs = [config.controllers, config.hooks, config.jobs].filter(
+        (d): d is string => typeof d === "string",
+      );
+      let totalFiles = 0;
+      for (const dir of dirs) {
+        totalFiles += await discoverAndImport(dir, "module");
       }
-      if (typeof config.hooks === "string") {
-        const n = await discoverAndImport(config.hooks, "hook");
-        log.info(`Discovered ${n} hook file(s)`);
-      }
-      if (typeof config.jobs === "string") {
-        const n = await discoverAndImport(config.jobs, "job");
-        log.info(`Discovered ${n} job file(s)`);
-      }
+
+      const routesAfter = getRoutes().length;
+      const hooksAfter = getHooks().length;
+      const jobsAfter = getJobs().length;
+
+      log.info(
+        `Discovered ${totalFiles} file(s) → ` +
+          `${routesAfter - routesBefore} route(s), ` +
+          `${hooksAfter - hooksBefore} hook(s), ` +
+          `${jobsAfter - jobsBefore} job(s)`,
+      );
 
       // ── Step 12: Apply discovered routes to Polka ──────────────────
       const routes = getRoutes();
@@ -323,7 +335,6 @@ export function createApp(config: AppConfig): ParcaeApp {
           (server.polka[method] as any)(entry.path, ...handlers);
         }
       }
-      log.info(`Registered ${routes.length} custom route(s)`);
 
       // ── Step 13: Start job workers ─────────────────────────────────
       const registeredJobs = getJobs();
@@ -341,7 +352,6 @@ export function createApp(config: AppConfig): ParcaeApp {
             attempt: bullJob.attemptsMade,
           });
         });
-        log.info(`Started worker for ${registeredJobs.length} job(s)`);
       }
 
       // ── Step 14: Socket.IO connection handling ─────────────────────
@@ -389,7 +399,13 @@ export function createApp(config: AppConfig): ParcaeApp {
         server!.httpServer.listen(port, () => resolveStart());
       });
 
-      log.info(`Ready on port ${port} (${version})`);
+      log.success(
+        `Ready on port ${port} — ` +
+          `${models.length} models, ` +
+          `${routes.length + crudCount} routes, ` +
+          `${getHooks().length} hooks, ` +
+          `${getJobs().length} jobs`,
+      );
     },
 
     async stop() {
