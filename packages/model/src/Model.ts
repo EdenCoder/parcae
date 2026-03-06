@@ -326,6 +326,31 @@ export class Model extends EventEmitter {
       has(target, prop) {
         return prop in target;
       },
+
+      // Class field initializers use [[DefineOwnProperty]], not [[Set]].
+      // This trap intercepts them so we can skip defaults for keys that
+      // were explicitly provided in the constructor data.
+      defineProperty(target, prop, descriptor) {
+        if (typeof prop === "symbol") {
+          return Reflect.defineProperty(target, prop, descriptor);
+        }
+
+        // During construction: if this key was in init data, skip the default
+        if (
+          !target[SYM_IS_PROXY] &&
+          target[SYM_INIT_DATA]?.has(prop as string)
+        ) {
+          return true;
+        }
+
+        // EventEmitter internals — define directly
+        if (EVENTEMITTER_KEYS.has(prop)) {
+          return Reflect.defineProperty(target, prop, descriptor);
+        }
+
+        // Normal data property — define it (this is a class field default)
+        return Reflect.defineProperty(target, prop, descriptor);
+      },
     });
 
     // SYM_IS_PROXY starts false (set earlier). Property initializers from the
