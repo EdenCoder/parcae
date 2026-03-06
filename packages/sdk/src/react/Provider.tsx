@@ -1,10 +1,9 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef } from "react";
 import { createClient } from "../client";
 import type { ParcaeClient, ClientConfig } from "../client";
 import { ParcaeContext } from "./context";
-import type { AuthState } from "./context";
 
 export interface ParcaeProviderProps {
   client?: ParcaeClient;
@@ -30,79 +29,33 @@ export const ParcaeProvider: React.FC<ParcaeProviderProps> = ({
   onReady,
   onError,
 }) => {
-  const [authState, setAuthState] = useState<AuthState>(
-    apiKey === undefined
-      ? "loading"
-      : apiKey === null
-        ? "unauthenticated"
-        : "loading",
-  );
-  const [authVersion, setAuthVersion] = useState(0);
-
   const client = useMemo(() => {
     if (externalClient) return externalClient;
     if (!url)
       throw new Error(
-        "ParcaeProvider requires either a `client` prop or a `url` prop",
+        "ParcaeProvider requires either a `client` or `url` prop",
       );
-    return createClient({ url, version, transport });
+    return createClient({ url, version, transport, token: apiKey });
   }, [externalClient, url, version, transport]);
 
-  const apiKeyRef = useRef(apiKey);
-  apiKeyRef.current = apiKey;
   const onReadyRef = useRef(onReady);
   onReadyRef.current = onReady;
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
 
-  // Authenticate when apiKey changes
+  // When apiKey changes, re-authenticate
   useEffect(() => {
-    if (apiKey === undefined) {
-      setAuthState("loading");
-      return;
-    }
-
-    setAuthState("loading");
+    if (apiKey === undefined) return;
     client
       .authenticate(apiKey)
-      .then(({ userId: uid }) => {
-        setAuthState(uid ? "authenticated" : "unauthenticated");
-        setAuthVersion((v) => v + 1);
+      .then(() => {
         onReadyRef.current?.(client);
       })
       .catch((err: Error) => {
-        setAuthState("unauthenticated");
-        setAuthVersion((v) => v + 1);
         onErrorRef.current?.(err);
       });
   }, [apiKey, userId, client]);
 
-  // Re-authenticate on reconnect
-  useEffect(() => {
-    const onReconnect = () => {
-      const key = apiKeyRef.current;
-      if (key === undefined) return;
-
-      setAuthState("loading");
-      client
-        .authenticate(key)
-        .then(({ userId: uid }) => {
-          setAuthState(uid ? "authenticated" : "unauthenticated");
-          setAuthVersion((v) => v + 1);
-        })
-        .catch(() => {
-          setAuthState("unauthenticated");
-          setAuthVersion((v) => v + 1);
-        });
-    };
-
-    client.on("reconnected", onReconnect);
-    return () => {
-      client.off("reconnected", onReconnect);
-    };
-  }, [client]);
-
-  // Forward errors
   useEffect(() => {
     const onErr = (err: Error) => onErrorRef.current?.(err);
     client.on("error", onErr);
@@ -111,15 +64,8 @@ export const ParcaeProvider: React.FC<ParcaeProviderProps> = ({
     };
   }, [client]);
 
-  const contextValue = useMemo(
-    () => ({ client, authState, authVersion }),
-    [client, authState, authVersion],
-  );
-
   return (
-    <ParcaeContext.Provider value={contextValue}>
-      {children}
-    </ParcaeContext.Provider>
+    <ParcaeContext.Provider value={client}>{children}</ParcaeContext.Provider>
   );
 };
 

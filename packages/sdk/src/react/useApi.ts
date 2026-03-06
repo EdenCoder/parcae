@@ -1,10 +1,11 @@
 "use client";
 
 import { useMemo } from "react";
+import { useSnapshot } from "valtio";
 import { useParcae } from "./context";
 
 export function useApi() {
-  const { client } = useParcae();
+  const client = useParcae();
   return useMemo(
     () => ({
       get: client.get.bind(client),
@@ -18,14 +19,28 @@ export function useApi() {
 }
 
 export function useSDK() {
-  return useParcae().client;
+  return useParcae();
 }
 
 export function useConnectionStatus() {
-  const { client, authState } = useParcae();
-  return { isConnected: client.isConnected, authState };
+  const client = useParcae();
+  const transport = client.transport as any;
+  const authState = transport?.auth?.state;
+  const snap = authState ? useSnapshot(authState) : null;
+  return {
+    isConnected: client.isConnected,
+    authStatus: (snap as any)?.status ?? "pending",
+  };
 }
 
 export function useAuthState() {
-  return useParcae().authState;
+  const client = useParcae();
+  const transport = client.transport as any;
+  const authState = transport?.auth?.state;
+  const snap = authState ? useSnapshot(authState) : null;
+  return {
+    status: (snap as any)?.status ?? "pending",
+    userId: (snap as any)?.userId ?? null,
+    version: (snap as any)?.version ?? 0,
+  };
 }

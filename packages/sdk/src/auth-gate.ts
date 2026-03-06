@@ -1,42 +1,61 @@
 /**
- * AuthGate — resettable deferred promise for authentication state.
+ * AuthGate — reactive auth state via Valtio proxy.
  *
- * - resolve(): auth confirmed (authenticated or confirmed unauthenticated)
- * - reset(): back to pending (reconnect, token change)
- * - ready: awaitable promise that resolves when auth is confirmed
+ * The transport writes to this directly. React reads via useSnapshot().
+ * No useState, no useEffect, no manual syncing.
  */
 
-export type AuthGateState = "pending" | "ready";
+import { proxy } from "valtio";
+
+export type AuthStatus = "pending" | "authenticated" | "unauthenticated";
+
+export interface AuthState {
+  status: AuthStatus;
+  userId: string | null;
+  version: number;
+}
 
 export class AuthGate {
-  private _state: AuthGateState = "pending";
+  /** Reactive state — subscribe with valtio useSnapshot() */
+  public state = proxy<AuthState>({
+    status: "pending",
+    userId: null,
+    version: 0,
+  });
+
+  /** Awaitable — resolves when auth is confirmed (either way) */
+  public ready: Promise<void>;
+
   private _resolve: (() => void) | null = null;
-  private _promise: Promise<void>;
 
   constructor() {
-    this._promise = this._makePending();
+    this.ready = this._makePending();
   }
 
-  get state(): AuthGateState {
-    return this._state;
+  /** Auth confirmed — user is authenticated */
+  resolve(userId: string): void {
+    this.state.status = "authenticated";
+    this.state.userId = userId;
+    this.state.version++;
+    this._resolve?.();
+    this._resolve = null;
   }
 
-  get ready(): Promise<void> {
-    return this._promise;
+  /** Auth confirmed — no user */
+  resolveUnauthenticated(): void {
+    this.state.status = "unauthenticated";
+    this.state.userId = null;
+    this.state.version++;
+    this._resolve?.();
+    this._resolve = null;
   }
 
-  resolve(): void {
-    this._state = "ready";
-    if (this._resolve) {
-      this._resolve();
-      this._resolve = null;
-    }
-  }
-
+  /** Reset to pending (disconnect, token change) */
   reset(): void {
-    if (this._state === "ready") {
-      this._state = "pending";
-      this._promise = this._makePending();
+    if (this.state.status !== "pending") {
+      this.state.status = "pending";
+      this.state.userId = null;
+      this.ready = this._makePending();
     }
   }
 

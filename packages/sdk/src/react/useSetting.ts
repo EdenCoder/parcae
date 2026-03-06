@@ -1,32 +1,34 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
+import { useSnapshot } from "valtio";
 import { useParcae } from "./context";
 
 export function useSetting<T = string>(
   key: string,
   defaultValue: T,
 ): [T, (value: T) => Promise<void>, { isLoading: boolean }] {
-  const { client, authState } = useParcae();
+  const client = useParcae();
+  const transport = client.transport as any;
+  const authState = transport?.auth?.state;
+  const snap = authState ? useSnapshot(authState) : null;
+  const authStatus = (snap as any)?.status ?? "pending";
+
   const [value, setValue] = useState<T>(defaultValue);
   const [isLoading, setIsLoading] = useState(true);
 
-  // Wait for auth before fetching settings (they're user-scoped)
   useEffect(() => {
-    if (authState === "loading") return;
-    if (authState === "unauthenticated") {
+    if (authStatus === "pending") return;
+    if (authStatus === "unauthenticated") {
       setIsLoading(false);
       return;
     }
 
     let cancelled = false;
-
     client
       .get(`/settings/${encodeURIComponent(key)}`)
-      .then((result) => {
-        if (!cancelled && result?.value !== undefined) {
-          setValue(result.value);
-        }
+      .then((result: any) => {
+        if (!cancelled && result?.value !== undefined) setValue(result.value);
       })
       .catch(() => {})
       .finally(() => {
@@ -36,7 +38,7 @@ export function useSetting<T = string>(
     return () => {
       cancelled = true;
     };
-  }, [key, client, authState]);
+  }, [key, client, authStatus]);
 
   const update = useCallback(
     async (newValue: T) => {

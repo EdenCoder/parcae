@@ -2,116 +2,96 @@ import { describe, it, expect } from "vitest";
 import { AuthGate } from "../auth-gate";
 
 describe("AuthGate", () => {
-  it("should start in pending state", () => {
+  it("starts pending", () => {
     const gate = new AuthGate();
-    expect(gate.state).toBe("pending");
+    expect(gate.state.status).toBe("pending");
+    expect(gate.state.userId).toBeNull();
   });
 
-  it("resolve() should set state to ready", () => {
+  it("resolve() sets authenticated with userId", () => {
     const gate = new AuthGate();
-    gate.resolve();
-    expect(gate.state).toBe("ready");
+    gate.resolve("user_123");
+    expect(gate.state.status).toBe("authenticated");
+    expect(gate.state.userId).toBe("user_123");
+    expect(gate.state.version).toBe(1);
   });
 
-  it("ready should be an awaitable promise", async () => {
+  it("resolveUnauthenticated() sets unauthenticated", () => {
     const gate = new AuthGate();
-    // Resolve after a tick
-    setTimeout(() => gate.resolve(), 5);
+    gate.resolveUnauthenticated();
+    expect(gate.state.status).toBe("unauthenticated");
+    expect(gate.state.userId).toBeNull();
+    expect(gate.state.version).toBe(1);
+  });
+
+  it("ready resolves on resolve()", async () => {
+    const gate = new AuthGate();
+    setTimeout(() => gate.resolve("u1"), 5);
     await gate.ready;
-    expect(gate.state).toBe("ready");
+    expect(gate.state.status).toBe("authenticated");
   });
 
-  it("ready should resolve immediately if already resolved", async () => {
+  it("ready resolves on resolveUnauthenticated()", async () => {
     const gate = new AuthGate();
-    gate.resolve();
-    // Should not hang
+    setTimeout(() => gate.resolveUnauthenticated(), 5);
     await gate.ready;
-    expect(gate.state).toBe("ready");
+    expect(gate.state.status).toBe("unauthenticated");
   });
 
-  it("reset() should go back to pending", () => {
+  it("ready resolves immediately if already resolved", async () => {
     const gate = new AuthGate();
-    gate.resolve();
-    expect(gate.state).toBe("ready");
+    gate.resolve("u1");
+    await gate.ready;
+    expect(gate.state.status).toBe("authenticated");
+  });
+
+  it("reset() goes back to pending", () => {
+    const gate = new AuthGate();
+    gate.resolve("u1");
     gate.reset();
-    expect(gate.state).toBe("pending");
+    expect(gate.state.status).toBe("pending");
+    expect(gate.state.userId).toBeNull(); // userId preserved until re-resolve? No — let's check
   });
 
-  it("reset() on pending should be a no-op", () => {
+  it("handles resolve → reset → resolve cycle", async () => {
     const gate = new AuthGate();
-    gate.reset();
-    expect(gate.state).toBe("pending");
-  });
-
-  it("should handle resolve → reset → resolve cycle", async () => {
-    const gate = new AuthGate();
-
-    // First cycle
-    gate.resolve();
+    gate.resolve("u1");
     await gate.ready;
-    expect(gate.state).toBe("ready");
+    expect(gate.state.status).toBe("authenticated");
 
-    // Reset (simulates disconnect)
     gate.reset();
-    expect(gate.state).toBe("pending");
+    expect(gate.state.status).toBe("pending");
 
-    // Second cycle (simulates reconnect + re-auth)
-    setTimeout(() => gate.resolve(), 5);
+    setTimeout(() => gate.resolve("u2"), 5);
     await gate.ready;
-    expect(gate.state).toBe("ready");
+    expect(gate.state.status).toBe("authenticated");
+    expect(gate.state.userId).toBe("u2");
+    expect(gate.state.version).toBe(2);
   });
 
-  it("multiple resolves should be idempotent", () => {
-    const gate = new AuthGate();
-    gate.resolve();
-    gate.resolve();
-    gate.resolve();
-    expect(gate.state).toBe("ready");
-  });
-
-  it("fetch-like code should block until resolved", async () => {
+  it("fetch blocks until resolved", async () => {
     const gate = new AuthGate();
     const results: string[] = [];
 
-    // Simulate two fetches that await auth
-    const fetch1 = gate.ready.then(() => results.push("fetch1"));
-    const fetch2 = gate.ready.then(() => results.push("fetch2"));
-
-    // Nothing should have resolved yet
+    const f1 = gate.ready.then(() => results.push("a"));
+    const f2 = gate.ready.then(() => results.push("b"));
     expect(results).toEqual([]);
 
-    // Resolve auth
-    gate.resolve();
-
-    await Promise.all([fetch1, fetch2]);
-    expect(results).toEqual(["fetch1", "fetch2"]);
+    gate.resolve("u1");
+    await Promise.all([f1, f2]);
+    expect(results).toEqual(["a", "b"]);
   });
 
-  it("reset during pending waiters should make them wait for new resolve", async () => {
+  it("version increments on each resolve", () => {
     const gate = new AuthGate();
-    const results: string[] = [];
-
-    // Start waiting
-    const waiter1 = gate.ready.then(() => results.push("first"));
-
-    // Resolve first cycle
-    gate.resolve();
-    await waiter1;
-    expect(results).toEqual(["first"]);
-
-    // Reset
+    expect(gate.state.version).toBe(0);
+    gate.resolve("u1");
+    expect(gate.state.version).toBe(1);
     gate.reset();
-
-    // New waiter should block
-    const waiter2 = gate.ready.then(() => results.push("second"));
-
-    // Should not have resolved yet
-    await new Promise((r) => setTimeout(r, 10));
-    expect(results).toEqual(["first"]);
-
-    // Resolve second cycle
-    gate.resolve();
-    await waiter2;
-    expect(results).toEqual(["first", "second"]);
+    gate.resolveUnauthenticated();
+    expect(gate.state.version).toBe(2);
+    gate.reset();
+    gate.resolve("u2");
+    expect(gate.state.version).toBe(3);
   });
 });

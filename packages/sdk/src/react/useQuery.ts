@@ -1,17 +1,14 @@
 "use client";
 
 /**
- * useQuery — calls chain.find() via socket RPC, subscribes to diffs automatically.
- *
- * No separate subscribe:query event. The server auto-subscribes when you
- * query a list endpoint. Diffs arrive on the same query key.
+ * useQuery — reactive data fetching. Auth state from Valtio snapshot.
  */
 
 import { useEffect, useRef, useSyncExternalStore } from "react";
+import { useSnapshot } from "valtio";
 import { useParcae } from "./context";
 import type { ParcaeClient } from "../client";
-
-// ─── Types ───────────────────────────────────────────────────────────────────
+import type { AuthState } from "../auth-gate";
 
 interface QueryChain<T> {
   find(): Promise<T[]>;
@@ -32,7 +29,7 @@ interface UseQueryResult<T> {
   refetch: () => void;
 }
 
-// ─── External Cache ──────────────────────────────────────────────────────────
+// ── External Cache ───────────────────────────────────────────────────────────
 
 interface CacheEntry {
   items: any[];
@@ -69,14 +66,7 @@ function notify(e: CacheEntry): void {
   for (const fn of e.listeners) fn();
 }
 
-// ─── Fetch via chain.find() ──────────────────────────────────────────────────
-
-function doFetch(
-  key: string,
-  entry: CacheEntry,
-  chain: QueryChain<any>,
-  client: ParcaeClient,
-): void {
+function doFetch(key: string, entry: CacheEntry, chain: QueryChain<any>): void {
   entry.loading = true;
   entry.error = null;
   notify(entry);
@@ -93,59 +83,28 @@ function doFetch(
       entry.loading = false;
       notify(entry);
     });
-
-  // Listen for realtime diffs (server auto-subscribes on the call)
-  if (!entry.dispose && chain.__modelType) {
-    const diffEvent = `query:diff:${key}`;
-
-    const unsub = client.subscribe(diffEvent, (ops: any[]) => {
-      if (!ops?.length) return;
-
-      const map = new Map(entry.items.map((i: any) => [i.id, i]));
-      let changed = false;
-
-      for (const op of ops) {
-        if (
-          op.op === "add" &&
-          !map.has(op.id) &&
-          op.data &&
-          chain.__modelClass
-        ) {
-          map.set(op.id, new chain.__modelClass(chain.__adapter, op.data));
-          changed = true;
-        } else if (op.op === "remove" && map.has(op.id)) {
-          map.delete(op.id);
-          changed = true;
-        } else if (op.op === "update" && map.has(op.id) && op.data) {
-          const existing = map.get(op.id);
-          for (const [k, v] of Object.entries(op.data))
-            (existing as any)[k] = v;
-          changed = true;
-        }
-      }
-
-      if (changed) {
-        entry.items = [...map.values()];
-        notify(entry);
-      }
-    });
-
-    entry.dispose = () => {
-      unsub();
-      entry.dispose = null;
-    };
-  }
 }
 
-// ─── useQuery ────────────────────────────────────────────────────────────────
+// ── useQuery ─────────────────────────────────────────────────────────────────
+
+function getAuthGate(client: ParcaeClient): AuthState | null {
+  const transport = client.transport as any;
+  return transport?.auth?.state ?? null;
+}
 
 export function useQuery<T>(
   chain: QueryChain<T> | null | undefined,
   options: UseQueryOptions = {},
 ): UseQueryResult<T> {
-  const { client, authState, authVersion } = useParcae();
+  const client = useParcae();
   const waitForAuth = options.waitForAuth ?? true;
-  const authReady = !waitForAuth || authState !== "loading";
+
+  // Read auth state reactively via Valtio snapshot
+  const authGate = getAuthGate(client);
+  const authSnap = authGate ? useSnapshot(authGate as any) : null;
+  const authStatus = (authSnap as any)?.status ?? "pending";
+  const authVersion = (authSnap as any)?.version ?? 0;
+  const authReady = !waitForAuth || authStatus !== "pending";
 
   const key =
     chain && authReady
@@ -193,13 +152,13 @@ export function useQuery<T>(
     if (!key || !chain) return;
     const entry = getOrCreate(key);
     if (entry.items === EMPTY) {
-      doFetch(key, entry, chain, client);
+      doFetch(key, entry, chain);
     }
   }, [key]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const refetch = () => {
     if (!key || !chain) return;
-    doFetch(key, getOrCreate(key), chain, client);
+    doFetch(key, getOrCreate(key), chain);
   };
 
   if (!key)
@@ -209,7 +168,6 @@ export function useQuery<T>(
       error: null,
       refetch: () => {},
     };
-
   const entry = cache.get(key);
   return {
     items,

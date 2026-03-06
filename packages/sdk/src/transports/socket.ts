@@ -1,11 +1,8 @@
 /**
- * SocketTransport — Socket.IO transport with AuthGate.
+ * SocketTransport — Socket.IO with Valtio-reactive AuthGate.
  *
- * Connection and authentication are separate concerns:
- * - Constructor connects the socket
- * - authenticate(token) sends the token and waits for server confirmation
- * - fetch() awaits auth.ready before sending any request
- * - Disconnect resets the gate; reconnect event lets the Provider re-auth
+ * Auth state lives in a Valtio proxy. React reads via useSnapshot().
+ * Transport writes directly — no React involvement.
  */
 
 import SocketIO from "socket.io-client";
@@ -17,39 +14,49 @@ import type { Transport } from "@parcae/model";
 import { AuthGate } from "../auth-gate";
 
 const uid = new ShortId({ length: 10 });
+const SOCKETS = new Map<string, any>();
 
 export interface SocketTransportConfig {
   url: string;
   version?: string;
   path?: string;
+  token?: string | null;
 }
 
 export class SocketTransport extends EventEmitter implements Transport {
   public auth = new AuthGate();
   public isConnected = false;
-  public isLoading = false;
-  public userId: string | null = null;
 
   private socket: any;
   private url: string;
   private version: string;
+  private token: string | null | undefined;
   private inflight = new Map<string, Promise<any>>();
 
   constructor(config: SocketTransportConfig) {
     super();
     this.url = config.url;
     this.version = config.version ?? "v1";
+    this.token = config.token;
 
-    this.socket = SocketIO(this.url, {
-      path: config.path ?? "/ws",
-      transports: ["websocket"],
-      withCredentials: true,
-    });
+    const socketPath = config.path ?? "/ws";
+    const socketKey = `${this.url}:${socketPath}`;
+
+    if (SOCKETS.has(socketKey)) {
+      this.socket = SOCKETS.get(socketKey);
+    } else {
+      this.socket = SocketIO(this.url, {
+        path: socketPath,
+        transports: ["websocket"],
+        withCredentials: true,
+      });
+      SOCKETS.set(socketKey, this.socket);
+    }
 
     this.socket.on("connect", () => {
-      const wasConnected = this.isConnected;
       this.isConnected = true;
-      this.emit(wasConnected ? "reconnected" : "connected");
+      this._doAuth();
+      this.emit("connected");
     });
 
     this.socket.on("disconnect", () => {
@@ -58,42 +65,65 @@ export class SocketTransport extends EventEmitter implements Transport {
       this.emit("disconnected");
     });
 
-    this.socket.on("error", (err: Error) => {
-      this.emit("error", err);
+    this.socket.on("error", (err: Error) => this.emit("error", err));
+
+    if (this.socket.connected) {
+      this.isConnected = true;
+      this._doAuth();
+    }
+
+    if (this.token === null) {
+      this.auth.resolveUnauthenticated();
+    }
+  }
+
+  private _doAuth(): void {
+    if (this.token === undefined) return;
+    if (this.token === null) {
+      this.auth.resolveUnauthenticated();
+      return;
+    }
+
+    this.socket.emit("authenticate", this.token, (response: any) => {
+      const userId = response?.userId ?? null;
+      if (userId) {
+        this.auth.resolve(userId);
+      } else {
+        this.auth.resolveUnauthenticated();
+      }
     });
   }
 
-  // ── Authenticate ──────────────────────────────────────────────────
-
-  /**
-   * Authenticate with the backend. Resolves the AuthGate when done.
-   *
-   * - token=string → send to server, wait for confirmation
-   * - token=null → no auth, resolve gate immediately (unauthenticated)
-   */
   async authenticate(token: string | null): Promise<{ userId: string | null }> {
+    this.token = token;
     this.auth.reset();
-    this.userId = null;
 
-    if (!token) {
-      this.auth.resolve();
+    if (token === null) {
+      this.auth.resolveUnauthenticated();
       return { userId: null };
     }
 
-    // Wait for socket to be connected
     if (!this.socket.connected) {
-      await new Promise<void>((resolve) => {
-        if (this.socket.connected) return resolve();
-        this.socket.once("connect", () => resolve());
+      return new Promise((resolve) => {
+        const handler = () => {
+          this.socket.off("connect", handler);
+          this.socket.emit("authenticate", token, (response: any) => {
+            const userId = response?.userId ?? null;
+            if (userId) this.auth.resolve(userId);
+            else this.auth.resolveUnauthenticated();
+            resolve({ userId });
+          });
+        };
+        this.socket.once("connect", handler);
       });
     }
 
-    // Send token, wait for server callback
     return new Promise((resolve) => {
       this.socket.emit("authenticate", token, (response: any) => {
-        this.userId = response?.userId ?? null;
-        this.auth.resolve();
-        resolve({ userId: this.userId });
+        const userId = response?.userId ?? null;
+        if (userId) this.auth.resolve(userId);
+        else this.auth.resolveUnauthenticated();
+        resolve({ userId });
       });
     });
   }
@@ -105,10 +135,8 @@ export class SocketTransport extends EventEmitter implements Transport {
     path: string,
     data: any = {},
   ): Promise<any> {
-    // Wait for auth to be confirmed before any request
     await this.auth.ready;
 
-    // Wait for socket connection
     if (!this.socket.connected) {
       await new Promise<void>((resolve, reject) => {
         if (this.socket.connected) return resolve();
@@ -134,7 +162,6 @@ export class SocketTransport extends EventEmitter implements Transport {
       });
     }
 
-    // Deduplicate GET requests
     const upper = method.toUpperCase();
     if (upper === "GET") {
       const dedupeKey = `${path}:${JSON.stringify(data)}`;
@@ -151,7 +178,6 @@ export class SocketTransport extends EventEmitter implements Transport {
 
   private _call(method: string, path: string, data: any): Promise<any> {
     const id = uid.rnd();
-
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.socket.off(id);
@@ -163,15 +189,13 @@ export class SocketTransport extends EventEmitter implements Transport {
         try {
           const uncompressed = pako.ungzip(msg, { to: "string" });
           const parsed = decompress(JSON.parse(uncompressed));
-          if (parsed.success) {
-            resolve(parsed.result);
-          } else {
+          if (parsed.success) resolve(parsed.result);
+          else
             reject(
               new Error(
                 parsed.message || parsed.error || `${method} ${path} failed`,
               ),
             );
-          }
         } catch (err) {
           reject(err);
         }
@@ -203,8 +227,6 @@ export class SocketTransport extends EventEmitter implements Transport {
     return this.fetch("DELETE", path, data);
   }
 
-  // ── Subscriptions ─────────────────────────────────────────────────
-
   subscribe(event: string, handler: (...args: any[]) => void): () => void {
     this.socket.on(event, handler);
     return () => this.socket.off(event, handler);
@@ -214,20 +236,15 @@ export class SocketTransport extends EventEmitter implements Transport {
     this.socket.off(event, handler);
   }
 
-  // ── Control ───────────────────────────────────────────────────────
-
   async send(event: string, ...args: any[]): Promise<void> {
     await this.auth.ready;
     this.socket.emit(event, ...args);
   }
 
-  // ── Lifecycle ─────────────────────────────────────────────────────
-
   disconnect(): void {
     this.socket.disconnect();
     this.isConnected = false;
   }
-
   async reconnect(): Promise<void> {
     this.socket.connect();
   }
