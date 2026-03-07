@@ -28,7 +28,6 @@
   ],
   "scripts": {
     "build": "tsup",
-    "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
     "test": "vitest run",
