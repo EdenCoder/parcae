@@ -14,11 +14,7 @@
 
 import pluralize from "pluralize";
 import { Model } from "@parcae/model";
-import type {
-  ModelConstructor,
-  ScopeContext,
-  SchemaDefinition,
-} from "@parcae/model";
+import type { ModelConstructor, ScopeContext } from "@parcae/model";
 import type { BackendAdapter } from "./model";
 import { route } from "../routing/route";
 
@@ -68,13 +64,6 @@ export function registerModelRoutes(
 
     const path = resolvePath(ModelClass, version);
     const type = ModelClass.type;
-    const schema = ((ModelClass as any).__schema as SchemaDefinition) ?? {};
-    const validColumns = new Set([
-      "id",
-      "createdAt",
-      "updatedAt",
-      ...Object.keys(schema),
-    ]);
 
     // ── GET /path — list ───────────────────────────────────────────
 
@@ -85,59 +74,60 @@ export function registerModelRoutes(
         if (!scopeResult) return forbidden(res);
 
         const data = req.query || {};
-        const limit = Math.min(parseInt(data.limit) || 25, 100);
-        const page = parseInt(data.page) || 0;
-        const sort = data.sort || "createdAt";
-        const direction = data.direction === "asc" ? "asc" : "desc";
+        const steps = data.__query ?? [];
 
-        // Column selection
-        let selectCols: any = "*";
-        if (data.select && typeof data.select === "string") {
-          const requested = data.select
-            .split(",")
-            .map((s: string) => s.trim())
-            .filter(Boolean);
-          const allowed = requested.filter((c: string) => validColumns.has(c));
-          if (allowed.length > 0) {
-            if (!allowed.includes("id")) allowed.unshift("id");
-            selectCols = allowed;
+        try {
+          const query = adapter.queryFromClient(ModelClass, scopeResult, steps);
+
+          if (data.__count === "true" || data.__count === true) {
+            const total = await query.count();
+            return json(res, 200, { result: { total }, success: true });
           }
-        }
 
-        let query = adapter
-          .query(ModelClass)
-          .select(selectCols)
-          .where(scopeResult);
+          // For socket RPC, subscribe to query-level change notifications.
+          // The subscription manager will re-eval this query on model changes
+          // and emit surgical add/remove/update ops to this socket.
+          const socketId = req._socketId;
+          if (socketId && adapter.subscriptions) {
+            const sub = await adapter.subscriptions.subscribe({
+              socketId,
+              modelClass: ModelClass,
+              steps,
+              scopeFilter: scopeResult,
+            });
 
-        // Client-side filters: ?where[field]=value
-        if (data.where && typeof data.where === "object") {
-          for (const [key, value] of Object.entries(data.where)) {
-            if (validColumns.has(key)) query = query.where(key, value);
+            const items = [...sub.items];
+            json(res, 200, {
+              result: {
+                total: items.length,
+                __queryHash: sub.hash,
+                [type + "s"]: items,
+              },
+              success: true,
+            });
+            return;
           }
-        }
 
-        // Count query (fork before pagination)
-        const countQuery = data.__count === "true" ? query.count() : null;
+          const items = await query.find();
 
-        const items = await query
-          .orderBy(sort, direction as "asc" | "desc")
-          .limit(limit)
-          .offset(page * limit)
-          .find();
-
-        const total = countQuery ? await countQuery : items.length;
-
-        json(res, 200, {
-          result: {
-            total,
-            [type + "s"]: await Promise.all(
-              (items as any[]).map(
-                (m: any) => m.sanitize?.(ctx.user) ?? m.__data,
+          json(res, 200, {
+            result: {
+              total: items.length,
+              [type + "s"]: await Promise.all(
+                (items as any[]).map(
+                  (m: any) => m.sanitize?.(ctx.user) ?? m.__data,
+                ),
               ),
-            ),
-          },
-          success: true,
-        });
+            },
+            success: true,
+          });
+        } catch (err: any) {
+          json(res, 400, {
+            result: null,
+            success: false,
+            error: err?.message || "Invalid query",
+          });
+        }
       });
       count++;
     }

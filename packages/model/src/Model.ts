@@ -131,10 +131,6 @@ function lazyQuery<T>(
     const adapter = Model.hasAdapter()
       ? Model.getAdapter()
       : await Model.waitForAdapter();
-    console.log(
-      "[parcae/model] lazy resolve: got adapter, building chain for",
-      modelClass.type,
-    );
     let q = adapter.query(modelClass);
     for (const step of steps) {
       q = (q as any)[step.method](...step.args);

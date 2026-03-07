@@ -285,7 +285,6 @@ export function createApp(config: AppConfig): ParcaeApp {
         },
       );
       adapter.subscriptions = subscriptions;
-      adapter.broadcast = (event: string, data?: any) => server?.io.emit(event, data);
 
       // ── Step 9: Set up auth (opt-in) ───────────────────────────────
       const authAdapter: AuthAdapter | null = config.auth ?? null;
@@ -426,12 +425,16 @@ export function createApp(config: AppConfig): ParcaeApp {
                 }
               }
 
-              // Merge data into query for GET requests
+              // Merge URL query params with socket data for GET requests
               const mergedQuery =
                 method.toUpperCase() === "GET" ? { ...query, ...data } : query;
 
-              // Build fake req that Polka's handler can process
-              const fakeReq: any = Object.assign(new PassThrough(), {
+              // Build fake req that Polka's handler can process.
+              // NOTE: Polka's handler unconditionally overwrites req.query
+              // with querystring.parse(info.query), which destroys complex
+              // objects (like __query arrays). We stash the real query in
+              // _socketQuery so middleware can restore it.
+              const fakeReq: any = {
                 method: method.toUpperCase(),
                 url: path,
                 headers: {
@@ -440,15 +443,17 @@ export function createApp(config: AppConfig): ParcaeApp {
                 },
                 body: data,
                 query: mergedQuery,
+                _socketQuery: mergedQuery,
                 params: {},
                 session: socketSession,
                 _socketRpc: true, // marker: skip auth middleware resolution
+                _socketId: socket.id,
                 _parsedUrl: { pathname, query: qs || "", _raw: path },
-              });
+              };
 
               // Build fake res that captures the response
               let responseBody: any = null;
-              const fakeRes: any = Object.assign(new PassThrough(), {
+              const fakeRes: any = {
                 statusCode: 200,
                 writeHead(code: number, headers?: any) {
                   this.statusCode = code;
@@ -473,7 +478,7 @@ export function createApp(config: AppConfig): ParcaeApp {
                   );
                   socket.emit(requestId, compressed);
                 },
-              });
+              };
 
               // Run through Polka's full handler (includes middleware, auth, auto-CRUD, custom routes)
               (server!.polka as any).handler(fakeReq, fakeRes);
@@ -507,18 +512,6 @@ export function createApp(config: AppConfig): ParcaeApp {
         });
 
         // Query subscriptions
-        socket.on("subscribe:query", async (data: any) => {
-          const modelClass = modelsByType.get(data.modelType);
-          if (!modelClass) return;
-          const result = await subscriptions.subscribe({
-            socketId: socket.id,
-            modelClass,
-            steps: data.steps ?? [],
-            scopeFilter: data.scopeFilter ?? null,
-          });
-          socket.emit(`query:${data.hash}:init`, result.items);
-        });
-
         socket.on("unsubscribe:query", (data: any) => {
           subscriptions.unsubscribe(socket.id, data.hash);
         });

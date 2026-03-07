@@ -40,9 +40,13 @@ export function createServer_(options: ServerOptions): ServerContext {
   app.use(bodyParser.json({ limit: "50mb" }));
   app.use(bodyParser.urlencoded({ extended: true }));
 
-  // Polka doesn't parse query strings — add a middleware that does
+  // Polka's handler unconditionally sets req.query = querystring.parse(info.query),
+  // which flattens complex objects from socket RPC data. Restore the original
+  // structured query for socket calls, and fall back to URL parsing for HTTP.
   app.use((req: any, _res: any, next: any) => {
-    if (!req.query) {
+    if (req._socketQuery) {
+      req.query = req._socketQuery;
+    } else if (!req.query || Object.keys(req.query).length === 0) {
       const parsed = parseUrl(req.url || "", true);
       req.query = parsed.query || {};
     }

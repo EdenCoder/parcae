@@ -16,6 +16,7 @@ import type {
   ModelConstructor,
   ChangeSet,
   QueryChain,
+  QueryStep,
   SchemaDefinition,
   ColumnType,
 } from "@parcae/model";
@@ -150,13 +151,9 @@ export class BackendAdapter implements ModelAdapter {
     this.services = services;
   }
 
-  /** Broadcast to all connected sockets — set by createApp */
-  public broadcast: ((event: string, data?: any) => void) | null = null;
-
   private _notifyChange(model: any): void {
     const ModelClass = model.constructor as typeof Model;
     this.subscriptions?.onModelChange(ModelClass.type);
-    this.broadcast?.(`model:${ModelClass.type}:changed`, { id: model.id });
   }
 
   // ── createStore ──────────────────────────────────────────────────────
@@ -249,6 +246,205 @@ export class BackendAdapter implements ModelAdapter {
 
   queryWrite<T>(modelClass: ModelConstructor<T>): QueryChain<T> {
     return this._buildQuery(modelClass, this.write(tableName(modelClass)));
+  }
+
+  // ── queryFromClient — safe replay of client-sent __query steps ────────
+
+  /**
+   * Build a scoped query from client-sent QueryStep[].
+   *
+   * Security model:
+   *  1. Scope is always applied first (non-negotiable).
+   *  2. Only whitelisted methods are replayed.
+   *  3. Column names are validated against the model schema.
+   *  4. Limit is clamped to a maximum value.
+   *  5. A default limit is injected if the client omits one.
+   *
+   * Throws on invalid column references (fail loud during development).
+   */
+
+  private static SAFE_CLIENT_METHODS = new Set([
+    "select",
+    "where",
+    "andWhere",
+    "orWhere",
+    "whereIn",
+    "whereNot",
+    "whereNotIn",
+    "whereNull",
+    "whereNotNull",
+    "whereBetween",
+    "orderBy",
+    "limit",
+    "offset",
+  ]);
+
+  /** Methods whose first arg is a column name (or object of column→value). */
+  private static COLUMN_ARG_METHODS = new Set([
+    "where",
+    "andWhere",
+    "orWhere",
+    "whereIn",
+    "whereNot",
+    "whereNotIn",
+    "whereNull",
+    "whereNotNull",
+    "whereBetween",
+    "orderBy",
+  ]);
+
+  /** Operators safe for 3-arg where clauses. */
+  private static SAFE_OPERATORS = new Set([
+    "=",
+    "!=",
+    "<>",
+    "<",
+    ">",
+    "<=",
+    ">=",
+    "like",
+    "ilike",
+    "in",
+    "not in",
+    "is",
+    "is not",
+  ]);
+
+  private static MAX_LIMIT = 100;
+  private static DEFAULT_LIMIT = 25;
+
+  queryFromClient<T>(
+    modelClass: ModelConstructor<T>,
+    scope: Record<string, any>,
+    rawSteps: QueryStep[] | string | undefined,
+  ): QueryChain<T> {
+    // Normalize: socket sends an array, HTTP may send a JSON string
+    let steps: QueryStep[] = [];
+    if (Array.isArray(rawSteps)) {
+      steps = rawSteps;
+    } else if (typeof rawSteps === "string") {
+      try {
+        steps = JSON.parse(rawSteps);
+      } catch {
+        throw new Error("Invalid __query: malformed JSON");
+      }
+    }
+    if (!Array.isArray(steps)) steps = [];
+
+    const schema = ((modelClass as any).__schema as SchemaDefinition) ?? {};
+    const validColumns = new Set([
+      "id",
+      "createdAt",
+      "updatedAt",
+      ...Object.keys(schema),
+    ]);
+
+    // Start with scope — always first, never overridable
+    let chain = this.query(modelClass).where(scope);
+
+    let hasLimit = false;
+
+    for (const step of steps) {
+      if (!BackendAdapter.SAFE_CLIENT_METHODS.has(step.method)) continue;
+
+      const args = this._sanitizeStepArgs(step, validColumns, modelClass.type);
+
+      // Clamp limit
+      if (step.method === "limit") {
+        hasLimit = true;
+        args[0] = Math.min(
+          Math.max(parseInt(args[0]) || BackendAdapter.DEFAULT_LIMIT, 1),
+          BackendAdapter.MAX_LIMIT,
+        );
+      }
+
+      chain = (chain as any)[step.method](...args);
+    }
+
+    // Inject default limit if client didn't send one
+    if (!hasLimit) {
+      chain = chain.limit(BackendAdapter.DEFAULT_LIMIT);
+    }
+
+    return chain;
+  }
+
+  /**
+   * Validate and transform a single step's args for safe Knex execution.
+   * Handles nested builder callbacks ({ __nested: QueryStep[] }),
+   * column validation, and operator whitelisting.
+   */
+  private _sanitizeStepArgs(
+    step: QueryStep,
+    validColumns: Set<string>,
+    modelType: string,
+  ): any[] {
+    const args = [...(step.args ?? [])];
+
+    // Handle nested builder: .where((builder) => builder.where(...).orWhere(...))
+    // Serialized as: { __nested: [{ method, args }, ...] }
+    if (BackendAdapter.COLUMN_ARG_METHODS.has(step.method)) {
+      const firstArg = args[0];
+
+      if (
+        typeof firstArg === "object" &&
+        firstArg !== null &&
+        Array.isArray(firstArg.__nested)
+      ) {
+        const nestedSteps: QueryStep[] = firstArg.__nested;
+        // Replace with a Knex builder callback
+        args[0] = (builder: any) => {
+          for (const nested of nestedSteps) {
+            if (!BackendAdapter.SAFE_CLIENT_METHODS.has(nested.method))
+              continue;
+            const innerArgs = this._sanitizeStepArgs(
+              nested,
+              validColumns,
+              modelType,
+            );
+            builder = builder[nested.method](...innerArgs);
+          }
+        };
+        return args;
+      }
+
+      if (typeof firstArg === "string") {
+        if (!validColumns.has(firstArg)) {
+          throw new Error(
+            `Invalid column "${firstArg}" on model "${modelType}"`,
+          );
+        }
+        // 3-arg where: validate operator
+        if (args.length === 3 && typeof args[1] === "string") {
+          if (!BackendAdapter.SAFE_OPERATORS.has(args[1].toLowerCase())) {
+            throw new Error(`Invalid operator "${args[1]}"`);
+          }
+        }
+      } else if (
+        typeof firstArg === "object" &&
+        firstArg !== null &&
+        !Array.isArray(firstArg)
+      ) {
+        // Object form: where({ col1: val, col2: val })
+        for (const key of Object.keys(firstArg)) {
+          if (!validColumns.has(key)) {
+            throw new Error(`Invalid column "${key}" on model "${modelType}"`);
+          }
+        }
+      }
+    }
+
+    // select: validate all column names
+    if (step.method === "select") {
+      const cols = Array.isArray(args[0]) ? args[0] : args;
+      for (const col of cols) {
+        if (typeof col === "string" && col !== "*" && !validColumns.has(col)) {
+          throw new Error(`Invalid column "${col}" on model "${modelType}"`);
+        }
+      }
+    }
+
+    return args;
   }
 
   private _buildQuery<T>(

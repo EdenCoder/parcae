@@ -34,15 +34,16 @@ import { createApp } from "@parcae/backend";
 import { User, Post } from "./models";
 
 const app = createApp({
-  models: [User, Post],       // or "./models" for auto-discovery
+  models: [User, Post], // or "./models" for auto-discovery
   controllers: "./controllers", // optional — auto-import route files
-  hooks: "./hooks",             // optional — auto-import hook files
-  jobs: "./jobs",               // optional — auto-import job files
-  auth: {                       // optional — omit to skip auth
+  hooks: "./hooks", // optional — auto-import hook files
+  jobs: "./jobs", // optional — auto-import job files
+  auth: {
+    // optional — omit to skip auth
     providers: ["email"],
   },
-  version: "v1",                // API prefix (default: "v1")
-  root: process.cwd(),          // project root (default: cwd)
+  version: "v1", // API prefix (default: "v1")
+  root: process.cwd(), // project root (default: cwd)
 });
 
 await app.start({ port: 3000, dev: true });
@@ -116,14 +117,14 @@ class Post extends Model {
 
 List endpoints support:
 
-| Parameter | Example | Description |
-| --- | --- | --- |
-| `limit` | `?limit=25` | Page size (max 100) |
-| `page` | `?page=2` | Page number |
-| `sort` | `?sort=createdAt` | Sort column |
-| `direction` | `?direction=desc` | Sort direction |
-| `where[field]` | `?where[published]=true` | Field filter |
-| `select` | `?select=title,views` | Column selection |
+| Parameter      | Example                  | Description         |
+| -------------- | ------------------------ | ------------------- |
+| `limit`        | `?limit=25`              | Page size (max 100) |
+| `page`         | `?page=2`                | Page number         |
+| `sort`         | `?sort=createdAt`        | Sort column         |
+| `direction`    | `?direction=desc`        | Sort direction      |
+| `where[field]` | `?where[published]=true` | Field filter        |
+| `select`       | `?select=title,views`    | Column selection    |
 
 ## Custom Routes
 
@@ -154,7 +155,14 @@ route.get("/health", handler, { priority: 0 }); // lower = registered first
 Convenience functions for common response patterns:
 
 ```typescript
-import { json, ok, error, unauthorized, notFound, badRequest } from "@parcae/backend";
+import {
+  json,
+  ok,
+  error,
+  unauthorized,
+  notFound,
+  badRequest,
+} from "@parcae/backend";
 
 route.get("/v1/posts", async (req, res) => {
   const posts = await Post.where({ published: true }).find();
@@ -174,14 +182,14 @@ route.post("/v1/admin/action", async (req, res) => {
 });
 ```
 
-| Helper | Status | Body |
-| --- | --- | --- |
-| `json(res, status, body)` | any | raw JSON |
-| `ok(res, result)` | 200 | `{ result, success: true }` |
-| `error(res, status, message)` | any | `{ result: null, success: false, error }` |
-| `unauthorized(res)` | 401 | `{ error: "Unauthorized" }` |
-| `notFound(res, what?)` | 404 | `{ error: "{what} not found" }` |
-| `badRequest(res, message)` | 400 | `{ error: message }` |
+| Helper                        | Status | Body                                      |
+| ----------------------------- | ------ | ----------------------------------------- |
+| `json(res, status, body)`     | any    | raw JSON                                  |
+| `ok(res, result)`             | 200    | `{ result, success: true }`               |
+| `error(res, status, message)` | any    | `{ result: null, success: false, error }` |
+| `unauthorized(res)`           | 401    | `{ error: "Unauthorized" }`               |
+| `notFound(res, what?)`        | 404    | `{ error: "{what} not found" }`           |
+| `badRequest(res, message)`    | 400    | `{ error: message }`                      |
 
 ## Hooks
 
@@ -228,8 +236,8 @@ interface HookContext {
 
 ```typescript
 hook.after(Post, "patch", handler, {
-  async: true,    // don't block the response (default: false)
-  priority: 200,  // execution order — lower runs first (default: 100)
+  async: true, // don't block the response (default: false)
+  priority: 200, // execution order — lower runs first (default: 100)
 });
 ```
 
@@ -258,7 +266,11 @@ You can enqueue jobs from anywhere — not just hook contexts:
 import { enqueue } from "@parcae/backend";
 
 await enqueue("post:index", { postId: post.id });
-await enqueue("post:index", { postId: post.id }, { jobId: `post:index:${post.id}` }); // deduped
+await enqueue(
+  "post:index",
+  { postId: post.id },
+  { jobId: `post:index:${post.id}` },
+); // deduped
 ```
 
 ## BackendAdapter
@@ -269,10 +281,10 @@ The server-side `ModelAdapter` implementation. Handles Knex/Postgres persistence
 import { BackendAdapter } from "@parcae/backend";
 
 const adapter = new BackendAdapter({
-  read: readDb,   // Knex instance (read replica or same as write)
+  read: readDb, // Knex instance (read replica or same as write)
   write: writeDb, // Knex instance
-  pubsub,         // PubSub instance (optional)
-  logger,         // Winston logger (optional)
+  pubsub, // PubSub instance (optional)
+  logger, // Winston logger (optional)
 });
 
 Model.use(adapter);
@@ -305,8 +317,11 @@ Includes distributed locking via Redlock:
 
 ```typescript
 const unlock = await pubsub.lock("resource:key", 10000);
-try { /* critical section */ }
-finally { await unlock(); }
+try {
+  /* critical section */
+} finally {
+  await unlock();
+}
 ```
 
 ### Standalone lock
@@ -315,8 +330,11 @@ finally { await unlock(); }
 import { lock } from "@parcae/backend";
 
 const unlock = await lock("resource:abc", 120000);
-try { /* exclusive access */ }
-finally { await unlock(); }
+try {
+  /* exclusive access */
+} finally {
+  await unlock();
+}
 ```
 
 ## Queue
@@ -340,10 +358,10 @@ Manages realtime query subscriptions for connected clients. When a model changes
 
 Auth is pluggable via the `AuthAdapter` interface. The framework doesn't ship with any auth provider — install the one you need:
 
-| Package | Provider | Users live... |
-| --- | --- | --- |
+| Package                   | Provider    | Users live...                                    |
+| ------------------------- | ----------- | ------------------------------------------------ |
 | `@parcae/auth-betterauth` | Better Auth | In your Postgres (same table as your User model) |
-| `@parcae/auth-clerk` | Clerk | In Clerk's cloud (proxied to your User model) |
+| `@parcae/auth-clerk`      | Clerk       | In Clerk's cloud (proxied to your User model)    |
 
 ```typescript
 import { betterAuth } from "@parcae/auth-betterauth";
@@ -385,17 +403,17 @@ At startup, `createApp()` generates type metadata into `.parcae/` (gitignored, l
 
 Environment variables validated at startup via Zod. `.env` files are auto-loaded.
 
-| Variable | Required | Default | Description |
-| --- | --- | --- | --- |
-| `DATABASE_URL` | Yes | -- | PostgreSQL connection string |
-| `DATABASE_READ_URL` | No | -- | Read replica connection string |
-| `REDIS_URL` | No | -- | Redis for PubSub + Queue |
-| `PORT` | No | `3000` | HTTP server port |
-| `AUTH_SECRET` | No | -- | Session signing secret (required if auth enabled) |
-| `TRUSTED_ORIGINS` | No | -- | Comma-separated CORS origins |
-| `NODE_ENV` | No | `development` | `development` / `production` / `test` |
-| `SERVER` | No | `true` | Run HTTP + WebSocket server |
-| `DAEMON` | No | `false` | Run background workers |
+| Variable            | Required | Default       | Description                                       |
+| ------------------- | -------- | ------------- | ------------------------------------------------- |
+| `DATABASE_URL`      | Yes      | --            | PostgreSQL connection string                      |
+| `DATABASE_READ_URL` | No       | --            | Read replica connection string                    |
+| `REDIS_URL`         | No       | --            | Redis for PubSub + Queue                          |
+| `PORT`              | No       | `3000`        | HTTP server port                                  |
+| `AUTH_SECRET`       | No       | --            | Session signing secret (required if auth enabled) |
+| `TRUSTED_ORIGINS`   | No       | --            | Comma-separated CORS origins                      |
+| `NODE_ENV`          | No       | `development` | `development` / `production` / `test`             |
+| `SERVER`            | No       | `true`        | Run HTTP + WebSocket server                       |
+| `DAEMON`            | No       | `false`       | Run background workers                            |
 
 ## Exports
 
@@ -411,31 +429,71 @@ import type { BackendServices } from "@parcae/backend";
 // Routing
 import { route, Controller, hook, job } from "@parcae/backend";
 import type {
-  RouteHandler, Middleware, RouteOptions, RouteEntry,
-  HookContext, HookOptions, HookEntry,
-  JobHandler, JobContext, JobEntry,
+  RouteHandler,
+  Middleware,
+  RouteOptions,
+  RouteEntry,
+  HookContext,
+  HookOptions,
+  HookEntry,
+  JobHandler,
+  JobContext,
+  JobEntry,
 } from "@parcae/backend";
 
 // Response helpers
-import { json, ok, error, unauthorized, notFound, badRequest } from "@parcae/backend";
+import {
+  json,
+  ok,
+  error,
+  unauthorized,
+  notFound,
+  badRequest,
+} from "@parcae/backend";
 
 // Services
-import { PubSub, QueueService, addJobIfNotExists, QuerySubscriptionManager } from "@parcae/backend";
+import {
+  PubSub,
+  QueueService,
+  addJobIfNotExists,
+  QuerySubscriptionManager,
+} from "@parcae/backend";
 import { enqueue, lock, getQueue, getPubSub } from "@parcae/backend";
-import type { PubSubConfig, QueueConfig, EnqueueOptions } from "@parcae/backend";
+import type {
+  PubSubConfig,
+  QueueConfig,
+  EnqueueOptions,
+} from "@parcae/backend";
 
 // Auth (interface only — implementations in separate packages)
-import type { AuthAdapter, AuthSession, AuthSetupContext } from "@parcae/backend";
+import type {
+  AuthAdapter,
+  AuthSession,
+  AuthSetupContext,
+} from "@parcae/backend";
 
 // Schema
-import { SchemaResolver, resolveFallbackSchema, generateSchemas, loadCachedSchemas } from "@parcae/backend";
+import {
+  SchemaResolver,
+  generateSchemas,
+  loadCachedSchemas,
+} from "@parcae/backend";
 
 // Config
 import { parseConfig, configSchema } from "@parcae/backend";
 import type { Config } from "@parcae/backend";
 
 // Registry utilities
-import { getRoutes, clearRoutes, getHooks, getHooksFor, clearHooks, getJobs, getJob, clearJobs } from "@parcae/backend";
+import {
+  getRoutes,
+  clearRoutes,
+  getHooks,
+  getHooksFor,
+  clearHooks,
+  getJobs,
+  getJob,
+  clearJobs,
+} from "@parcae/backend";
 
 // Convenience re-export
 import { Model } from "@parcae/backend";

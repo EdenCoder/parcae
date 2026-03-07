@@ -239,15 +239,7 @@ export function clerk(config: ClerkConfig): AuthAdapter {
             }
           },
         };
-
-        console.log(
-          `[parcae/auth-clerk] Webhook sync enabled at ${webhookPath}`,
-        );
       }
-
-      console.log(
-        `[parcae/auth-clerk] Configured (proxy to ${userModel ? userModel.type + "s" : "no user model"} table)`,
-      );
     },
 
     async resolveRequest(req: any): Promise<AuthSession | null> {
@@ -268,4 +260,8 @@ export function clerk(config: ClerkConfig): AuthAdapter {
 }
 
 export default clerk;
-export type { AuthAdapter, AuthSession, AuthSetupContext } from "@parcae/backend";
+export type {
+  AuthAdapter,
+  AuthSession,
+  AuthSetupContext,
+} from "@parcae/backend";

@@ -219,6 +219,16 @@ export interface ModelAdapter {
   /** Start a query chain. */
   query<T>(modelClass: ModelConstructor<T>): QueryChain<T>;
 
+  /**
+   * Build a scoped query from client-sent QueryStep[] (backend only).
+   * Safe replay of __query steps with scope applied first.
+   */
+  queryFromClient?<T>(
+    modelClass: ModelConstructor<T>,
+    scope: Record<string, any>,
+    rawSteps: QueryStep[] | string | undefined,
+  ): QueryChain<T>;
+
   /** Apply atomic RFC 6902 JSON Patch operations. */
   patch(model: any, ops: PatchOp[]): Promise<void>;
 }

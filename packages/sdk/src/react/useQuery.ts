@@ -34,6 +34,7 @@ interface CacheEntry {
   listeners: Set<() => void>;
   dispose: (() => void) | null;
   gcTimer: ReturnType<typeof setTimeout> | null;
+  queryHash: string | null;
 }
 
 const cache = new Map<string, CacheEntry>();
@@ -51,6 +52,7 @@ function getOrCreate(key: string): CacheEntry {
       listeners: new Set(),
       dispose: null,
       gcTimer: null,
+      queryHash: null,
     };
     cache.set(key, e);
   }
@@ -61,7 +63,60 @@ function notify(e: CacheEntry): void {
   for (const fn of e.listeners) fn();
 }
 
-function doFetch(key: string, entry: CacheEntry, chain: QueryChain<any>): void {
+// ── Ops application ──────────────────────────────────────────────────────────
+
+type QueryOp = {
+  op: "add" | "remove" | "update";
+  id: string;
+  data?: Record<string, any>;
+};
+
+/**
+ * Apply surgical ops from the subscription manager to the cached items.
+ * Mutates nothing — returns a new array.
+ */
+function applyOps(
+  items: any[],
+  ops: QueryOp[],
+  modelClass: any,
+  adapter: any,
+): any[] {
+  // Index current items by id for fast lookup
+  const byId = new Map<string, any>();
+  for (const item of items) byId.set(item.id, item);
+
+  for (const op of ops) {
+    switch (op.op) {
+      case "add":
+        if (op.data && !byId.has(op.id)) {
+          const instance = new modelClass(adapter, op.data);
+          byId.set(op.id, instance);
+        }
+        break;
+      case "update":
+        if (op.data) {
+          // Replace with fresh instance
+          const instance = new modelClass(adapter, op.data);
+          byId.set(op.id, instance);
+        }
+        break;
+      case "remove":
+        byId.delete(op.id);
+        break;
+    }
+  }
+
+  return [...byId.values()];
+}
+
+// ── Fetch + subscribe ────────────────────────────────────────────────────────
+
+function doFetch(
+  key: string,
+  entry: CacheEntry,
+  chain: QueryChain<any>,
+  client: any,
+): void {
   log.debug("useQuery: fetching", chain.__modelType);
   entry.loading = true;
   entry.error = null;
@@ -73,6 +128,28 @@ function doFetch(key: string, entry: CacheEntry, chain: QueryChain<any>): void {
       log.debug("useQuery: got", result.length, "items for", chain.__modelType);
       entry.items = result;
       entry.loading = false;
+
+      // Pick up the query subscription hash from the backend response
+      const hash = (result as any).__queryHash;
+      if (hash && hash !== entry.queryHash) {
+        // Unsubscribe from previous hash if any
+        entry.dispose?.();
+        entry.queryHash = hash;
+
+        // Subscribe to query-level ops
+        const unsub = client.subscribe(`query:${hash}`, (ops: QueryOp[]) => {
+          if (!Array.isArray(ops) || ops.length === 0) return;
+          entry.items = applyOps(
+            entry.items,
+            ops,
+            chain.__modelClass,
+            chain.__adapter,
+          );
+          notify(entry);
+        });
+        entry.dispose = unsub;
+      }
+
       notify(entry);
     })
     .catch((err: Error) => {
@@ -140,21 +217,17 @@ export function useQuery<T>(
     if (!key || !chain) return;
     const entry = getOrCreate(key);
     if (entry.items === EMPTY) {
-      doFetch(key, entry, chain);
+      doFetch(key, entry, chain, client);
     }
 
-    // Subscribe to model-level change events → refetch
-    if (chain.__modelType) {
-      const unsub = client.subscribe(`model:${chain.__modelType}:changed`, () =>
-        doFetch(key, getOrCreate(key), chain),
-      );
-      return unsub;
-    }
+    return () => {
+      // Cleanup is handled by the subscribe() unsub above + GC timer
+    };
   }, [key]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const refetch = () => {
     if (!key || !chain) return;
-    doFetch(key, getOrCreate(key), chain);
+    doFetch(key, getOrCreate(key), chain, client);
   };
 
   if (!key)

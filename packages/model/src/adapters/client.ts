@@ -241,15 +241,17 @@ export class FrontendAdapter implements ModelAdapter {
 
     chain.find = async (): Promise<T[]> => {
       const path = adapter.resolvePath(modelClass);
-      console.log(
-        "[parcae/model] find:",
-        path,
-        "transport:",
-        typeof adapter.transport?.get,
-      );
       const result = await adapter.transport.get(path, { __query: steps });
       const items = result?.[modelClass.type + "s"] ?? result?.items ?? [];
-      return items.map((row: any) => new modelClass(adapter, row));
+      const models = items.map((row: any) => new modelClass(adapter, row));
+      // Attach query subscription hash if backend provided one
+      if (result?.__queryHash) {
+        Object.defineProperty(models, "__queryHash", {
+          value: result.__queryHash,
+          enumerable: false,
+        });
+      }
+      return models;
     };
 
     chain.first = async (): Promise<T | null> => {
@@ -280,7 +282,26 @@ export class FrontendAdapter implements ModelAdapter {
 
   private _serializeArgs(args: any[]): any[] {
     return args.map((arg) => {
-      if (typeof arg === "function") return "__fn__";
+      if (typeof arg === "function") {
+        // Capture nested builder calls: .where((b) => b.where(...).orWhere(...))
+        const nestedSteps: QueryStep[] = [];
+        const recorder: any = new Proxy(
+          {},
+          {
+            get: (_target, method: string) => {
+              return (...innerArgs: any[]) => {
+                nestedSteps.push({
+                  method,
+                  args: this._serializeArgs(innerArgs),
+                });
+                return recorder;
+              };
+            },
+          },
+        );
+        arg(recorder);
+        return { __nested: nestedSteps };
+      }
       return arg;
     });
   }
