@@ -17,6 +17,8 @@ import { Model } from "@parcae/model";
 import type { ModelConstructor, ScopeContext } from "@parcae/model";
 import type { BackendAdapter } from "./model";
 import { route } from "../routing/route";
+import { log } from "../logger";
+import { ClientError } from "../helpers";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -122,11 +124,20 @@ export function registerModelRoutes(
             success: true,
           });
         } catch (err: any) {
-          json(res, 400, {
-            result: null,
-            success: false,
-            error: err?.message || "Invalid query",
-          });
+          if (err instanceof ClientError) {
+            json(res, err.status, {
+              result: null,
+              success: false,
+              error: err.message,
+            });
+          } else {
+            log.error(`[routes] GET ${path} error:`, err?.message || err);
+            json(res, 500, {
+              result: null,
+              success: false,
+              error: "An error occurred while processing your request",
+            });
+          }
         }
       });
       count++;
@@ -136,24 +147,42 @@ export function registerModelRoutes(
 
     if (scope.read) {
       route.get(`${path}/:id`, async (req: any, res: any) => {
-        const ctx = buildScopeContext(req, res);
-        const scopeResult = scope.read!(ctx);
-        if (!scopeResult) return forbidden(res);
+        try {
+          const ctx = buildScopeContext(req, res);
+          const scopeResult = scope.read!(ctx);
+          if (!scopeResult) return forbidden(res);
 
-        const item = await adapter
-          .query(ModelClass)
-          .select("*")
-          .where("id", req.params.id)
-          .where(scopeResult)
-          .first();
+          const item = await adapter
+            .query(ModelClass)
+            .select("*")
+            .where("id", req.params.id)
+            .where(scopeResult)
+            .first();
 
-        if (!item) return notFound(res, type);
+          if (!item) return notFound(res, type);
 
-        json(res, 200, {
-          result:
-            (await (item as any).sanitize?.(ctx.user)) ?? (item as any).__data,
-          success: true,
-        });
+          json(res, 200, {
+            result:
+              (await (item as any).sanitize?.(ctx.user)) ??
+              (item as any).__data,
+            success: true,
+          });
+        } catch (err: any) {
+          if (err instanceof ClientError) {
+            json(res, err.status, {
+              result: null,
+              success: false,
+              error: err.message,
+            });
+          } else {
+            log.error(`[routes] GET ${path}/:id error:`, err?.message || err);
+            json(res, 500, {
+              result: null,
+              success: false,
+              error: "An error occurred while processing your request",
+            });
+          }
+        }
       });
       count++;
     }
@@ -162,18 +191,35 @@ export function registerModelRoutes(
 
     if (scope.create) {
       route.post(path, async (req: any, res: any) => {
-        const ctx = buildScopeContext(req, res);
-        const scopeData = scope.create!(ctx);
-        if (!scopeData) return forbidden(res);
+        try {
+          const ctx = buildScopeContext(req, res);
+          const scopeData = scope.create!(ctx);
+          if (!scopeData) return forbidden(res);
 
-        const data = { ...(req.body || {}), ...scopeData };
-        const item = Model.create.call(ModelClass, data) as any;
-        await item.save(true);
+          const data = { ...(req.body || {}), ...scopeData };
+          const item = Model.create.call(ModelClass, data) as any;
+          await item.save(true);
 
-        json(res, 201, {
-          result: (await item.sanitize?.(ctx.user)) ?? item.__data,
-          success: true,
-        });
+          json(res, 201, {
+            result: (await item.sanitize?.(ctx.user)) ?? item.__data,
+            success: true,
+          });
+        } catch (err: any) {
+          if (err instanceof ClientError) {
+            json(res, err.status, {
+              result: null,
+              success: false,
+              error: err.message,
+            });
+          } else {
+            log.error(`[routes] POST ${path} error:`, err?.message || err);
+            json(res, 500, {
+              result: null,
+              success: false,
+              error: "An error occurred while processing your request",
+            });
+          }
+        }
       });
       count++;
     }
@@ -182,36 +228,59 @@ export function registerModelRoutes(
 
     if (scope.update) {
       route.put(`${path}/:id`, async (req: any, res: any) => {
-        const ctx = buildScopeContext(req, res);
-        const scopeResult = scope.update!(ctx);
-        if (!scopeResult) return forbidden(res);
+        try {
+          const ctx = buildScopeContext(req, res);
+          const scopeResult = scope.update!(ctx);
+          if (!scopeResult) return forbidden(res);
 
-        const item = await adapter
-          .query(ModelClass)
-          .select("*")
-          .where("id", req.params.id)
-          .where(scopeResult)
-          .first();
+          const item = await adapter
+            .query(ModelClass)
+            .select("*")
+            .where("id", req.params.id)
+            .where(scopeResult)
+            .first();
 
-        if (!item) return notFound(res, type);
+          if (!item) return notFound(res, type);
 
-        const data = req.body || {};
-        const systemFields = new Set(["id", "createdAt", "updatedAt", "type"]);
-        for (const [key, value] of Object.entries(data)) {
-          if (!systemFields.has(key)) {
-            (item as any).__data[key] = value;
-            (item as any).__updates = (item as any).__updates || [];
-            (item as any).__updates.push(key);
+          const data = req.body || {};
+          const systemFields = new Set([
+            "id",
+            "createdAt",
+            "updatedAt",
+            "type",
+          ]);
+          for (const [key, value] of Object.entries(data)) {
+            if (!systemFields.has(key)) {
+              (item as any).__data[key] = value;
+              (item as any).__updates = (item as any).__updates || [];
+              (item as any).__updates.push(key);
+            }
+          }
+
+          await (item as any).save(true);
+
+          json(res, 200, {
+            result:
+              (await (item as any).sanitize?.(ctx.user)) ??
+              (item as any).__data,
+            success: true,
+          });
+        } catch (err: any) {
+          if (err instanceof ClientError) {
+            json(res, err.status, {
+              result: null,
+              success: false,
+              error: err.message,
+            });
+          } else {
+            log.error(`[routes] PUT ${path}/:id error:`, err?.message || err);
+            json(res, 500, {
+              result: null,
+              success: false,
+              error: "An error occurred while processing your request",
+            });
           }
         }
-
-        await (item as any).save(true);
-
-        json(res, 200, {
-          result:
-            (await (item as any).sanitize?.(ctx.user)) ?? (item as any).__data,
-          success: true,
-        });
       });
       count++;
     }
@@ -220,22 +289,42 @@ export function registerModelRoutes(
 
     if (scope.delete) {
       route.delete(`${path}/:id`, async (req: any, res: any) => {
-        const ctx = buildScopeContext(req, res);
-        const scopeResult = scope.delete!(ctx);
-        if (!scopeResult) return forbidden(res);
+        try {
+          const ctx = buildScopeContext(req, res);
+          const scopeResult = scope.delete!(ctx);
+          if (!scopeResult) return forbidden(res);
 
-        const item = await adapter
-          .query(ModelClass)
-          .select("*")
-          .where("id", req.params.id)
-          .where(scopeResult)
-          .first();
+          const item = await adapter
+            .query(ModelClass)
+            .select("*")
+            .where("id", req.params.id)
+            .where(scopeResult)
+            .first();
 
-        if (!item) return notFound(res, type);
+          if (!item) return notFound(res, type);
 
-        await (item as any).remove();
+          await (item as any).remove();
 
-        json(res, 200, { result: { id: req.params.id }, success: true });
+          json(res, 200, { result: { id: req.params.id }, success: true });
+        } catch (err: any) {
+          if (err instanceof ClientError) {
+            json(res, err.status, {
+              result: null,
+              success: false,
+              error: err.message,
+            });
+          } else {
+            log.error(
+              `[routes] DELETE ${path}/:id error:`,
+              err?.message || err,
+            );
+            json(res, 500, {
+              result: null,
+              success: false,
+              error: "An error occurred while processing your request",
+            });
+          }
+        }
       });
       count++;
     }
@@ -244,35 +333,53 @@ export function registerModelRoutes(
 
     if (scope.patch || scope.update) {
       route.patch(`${path}/:id`, async (req: any, res: any) => {
-        const ctx = buildScopeContext(req, res);
-        const scopeResult = (scope.patch ?? scope.update)!(ctx);
-        if (!scopeResult) return forbidden(res);
+        try {
+          const ctx = buildScopeContext(req, res);
+          const scopeResult = (scope.patch ?? scope.update)!(ctx);
+          if (!scopeResult) return forbidden(res);
 
-        const data = req.body || {};
-        if (!Array.isArray(data.ops) || data.ops.length === 0) {
-          return json(res, 400, {
-            result: null,
-            success: false,
-            error: "ops array required",
+          const data = req.body || {};
+          if (!Array.isArray(data.ops) || data.ops.length === 0) {
+            return json(res, 400, {
+              result: null,
+              success: false,
+              error: "ops array required",
+            });
+          }
+
+          const item = await adapter
+            .query(ModelClass)
+            .select("*")
+            .where("id", req.params.id)
+            .where(scopeResult)
+            .first();
+
+          if (!item) return notFound(res, type);
+
+          await adapter.patch(item as any, data.ops);
+
+          json(res, 200, {
+            result:
+              (await (item as any).sanitize?.(ctx.user)) ??
+              (item as any).__data,
+            success: true,
           });
+        } catch (err: any) {
+          if (err instanceof ClientError) {
+            json(res, err.status, {
+              result: null,
+              success: false,
+              error: err.message,
+            });
+          } else {
+            log.error(`[routes] PATCH ${path}/:id error:`, err?.message || err);
+            json(res, 500, {
+              result: null,
+              success: false,
+              error: "An error occurred while processing your request",
+            });
+          }
         }
-
-        const item = await adapter
-          .query(ModelClass)
-          .select("*")
-          .where("id", req.params.id)
-          .where(scopeResult)
-          .first();
-
-        if (!item) return notFound(res, type);
-
-        await adapter.patch(item as any, data.ops);
-
-        json(res, 200, {
-          result:
-            (await (item as any).sanitize?.(ctx.user)) ?? (item as any).__data,
-          success: true,
-        });
       });
       count++;
     }

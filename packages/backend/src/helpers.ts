@@ -5,6 +5,23 @@
  */
 
 /**
+ * An error that is safe to show to clients.
+ *
+ * Any code that wants to surface an error message to the end user should
+ * throw a ClientError. All other errors are treated as internal and their
+ * messages are never exposed — only logged server-side.
+ */
+export class ClientError extends Error {
+  public status: number;
+
+  constructor(message: string, status: number = 400) {
+    super(message);
+    this.name = "ClientError";
+    this.status = status;
+  }
+}
+
+/**
  * Send a JSON response.
  *
  * @example

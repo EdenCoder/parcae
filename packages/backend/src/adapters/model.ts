@@ -26,6 +26,7 @@ import {
   enqueue as globalEnqueue,
   lock as globalLock,
 } from "../services/context";
+import { ClientError } from "../helpers";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -143,6 +144,12 @@ export class BackendAdapter implements ModelAdapter {
   /** Whether search extensions have been enabled for this database. */
   private _searchExtensionsReady = false;
 
+  /** Tables that have had their search schema verified (tsvector + trigram + optional vector). */
+  private _searchReady = new Set<string>();
+
+  /** Tables that have a verified _embedding column (AlloyDB only). */
+  private _embeddingReady = new Set<string>();
+
   get read() {
     return this.services.read;
   }
@@ -242,7 +249,10 @@ export class BackendAdapter implements ModelAdapter {
     for (const _f of searchFields) rankBindings.push(term);
 
     // 3. Semantic similarity on AlloyDB (weight: 3x)
-    if (this.engine === "alloydb") {
+    // Only include vector search if the _embedding column was created for this table
+    const useVector =
+      this.engine === "alloydb" && this._embeddingReady.has(table);
+    if (useVector) {
       rankParts.push(
         `(1.0 - (${table}._embedding <=> embedding('gemini-embedding-001', ?)::vector)) * 3`,
       );
@@ -262,7 +272,7 @@ export class BackendAdapter implements ModelAdapter {
       whereBindings.push(term);
     }
 
-    if (this.engine === "alloydb") {
+    if (useVector) {
       whereParts.push(
         `${table}._embedding <=> embedding('gemini-embedding-001', ?)::vector < 0.7`,
       );
@@ -451,7 +461,7 @@ export class BackendAdapter implements ModelAdapter {
       try {
         steps = JSON.parse(rawSteps);
       } catch {
-        throw new Error("Invalid __query: malformed JSON");
+        throw new ClientError("Invalid __query: malformed JSON");
       }
     }
     if (!Array.isArray(steps)) steps = [];
@@ -544,14 +554,14 @@ export class BackendAdapter implements ModelAdapter {
 
       if (typeof firstArg === "string") {
         if (!validColumns.has(firstArg)) {
-          throw new Error(
+          throw new ClientError(
             `Invalid column "${firstArg}" on model "${modelType}"`,
           );
         }
         // 3-arg where: validate operator
         if (args.length === 3 && typeof args[1] === "string") {
           if (!BackendAdapter.SAFE_OPERATORS.has(args[1].toLowerCase())) {
-            throw new Error(`Invalid operator "${args[1]}"`);
+            throw new ClientError(`Invalid operator "${args[1]}"`);
           }
         }
       } else if (
@@ -562,7 +572,9 @@ export class BackendAdapter implements ModelAdapter {
         // Object form: where({ col1: val, col2: val })
         for (const key of Object.keys(firstArg)) {
           if (!validColumns.has(key)) {
-            throw new Error(`Invalid column "${key}" on model "${modelType}"`);
+            throw new ClientError(
+              `Invalid column "${key}" on model "${modelType}"`,
+            );
           }
         }
       }
@@ -573,7 +585,9 @@ export class BackendAdapter implements ModelAdapter {
       const cols = Array.isArray(args[0]) ? args[0] : args;
       for (const col of cols) {
         if (typeof col === "string" && col !== "*" && !validColumns.has(col)) {
-          throw new Error(`Invalid column "${col}" on model "${modelType}"`);
+          throw new ClientError(
+            `Invalid column "${col}" on model "${modelType}"`,
+          );
         }
       }
     }
@@ -714,10 +728,10 @@ export class BackendAdapter implements ModelAdapter {
       const innerSegments = segments.slice(1);
 
       if (!VALID_COLUMN_RE.test(column)) {
-        throw new Error(`patch: invalid column name "${column}"`);
+        throw new ClientError(`patch: invalid column name "${column}"`);
       }
       if (!(column in schema)) {
-        throw new Error(
+        throw new ClientError(
           `patch: unknown column "${column}" on model "${ModelClass.type}"`,
         );
       }
@@ -725,7 +739,7 @@ export class BackendAdapter implements ModelAdapter {
       const colType = resolveColType(schema[column]!);
 
       if (colType !== "json" && innerSegments.length > 0) {
-        throw new Error(
+        throw new ClientError(
           `patch: column "${column}" is ${colType}, not json — path must be "/${column}" (got "${o.path}")`,
         );
       }
@@ -739,7 +753,7 @@ export class BackendAdapter implements ModelAdapter {
           ? current?.[innerSegments[0]!]
           : current;
         if (!equal(actual, (o as any).value)) {
-          throw new Error(`patch test failed at ${o.path}`);
+          throw new ClientError(`patch test failed at ${o.path}`);
         }
       }
       parsed.push({ op: o, column, colType, innerSegments });
@@ -846,7 +860,7 @@ export class BackendAdapter implements ModelAdapter {
           case "test":
             break;
           default:
-            throw new Error(`patch: unsupported op "${o.op}"`);
+            throw new ClientError(`patch: unsupported op "${o.op}"`);
         }
       }
 
@@ -1145,6 +1159,11 @@ export class BackendAdapter implements ModelAdapter {
           [embIdxName, table],
         );
       } catch {}
+    }
+
+    this._searchReady.add(table);
+    if (this.engine === "alloydb") {
+      this._embeddingReady.add(table);
     }
 
     log.info(

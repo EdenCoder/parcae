@@ -64,7 +64,15 @@ export { searchAll } from "./search";
 export type { SearchResult, SearchAllOptions } from "./search";
 
 // Response helpers
-export { json, ok, error, unauthorized, notFound, badRequest } from "./helpers";
+export {
+  json,
+  ok,
+  error,
+  unauthorized,
+  notFound,
+  badRequest,
+  ClientError,
+} from "./helpers";
 
 // Logger
 export { log } from "./logger";

@@ -275,6 +275,8 @@ describe("BackendAdapter._applySearch", () => {
       }),
     };
     (adapter as any).engine = "alloydb";
+    // Mark the table as having an _embedding column
+    (adapter as any)._embeddingReady = new Set(["projects"]);
 
     (adapter as any)._applySearch(mockQuery, "ghost", ProjectModel);
 

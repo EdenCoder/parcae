@@ -15,6 +15,7 @@ import { compress } from "compress-json";
 import { Model } from "@parcae/model";
 import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
 import { log } from "./logger";
+import { ClientError } from "./helpers";
 import { generateSchemas } from "./schema/generate";
 import { parseConfig } from "./config";
 import type { Config } from "./config";
@@ -492,12 +493,16 @@ export function createApp(config: AppConfig): ParcaeApp {
               // Run through Polka's full handler (includes middleware, auth, auto-CRUD, custom routes)
               (server!.polka as any).handler(fakeReq, fakeRes);
             } catch (err: any) {
+              log.error(`[socket] RPC error:`, err?.message || err);
               const compressed = pako.gzip(
                 JSON.stringify(
                   compress({
                     result: null,
                     success: false,
-                    error: err?.message || "Internal error",
+                    error:
+                      err instanceof ClientError
+                        ? err.message
+                        : "An error occurred while processing your request",
                   }),
                 ),
               );
