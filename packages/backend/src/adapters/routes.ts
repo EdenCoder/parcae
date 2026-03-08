@@ -131,7 +131,7 @@ export function registerModelRoutes(
               error: err.message,
             });
           } else {
-            log.error(`[routes] GET ${path} error:`, err?.message || err);
+            log.error(`[routes] GET ${path} error:`, err);
             json(res, 500, {
               result: null,
               success: false,
@@ -175,7 +175,7 @@ export function registerModelRoutes(
               error: err.message,
             });
           } else {
-            log.error(`[routes] GET ${path}/:id error:`, err?.message || err);
+            log.error(`[routes] GET ${path}/:id error:`, err);
             json(res, 500, {
               result: null,
               success: false,
@@ -212,7 +212,7 @@ export function registerModelRoutes(
               error: err.message,
             });
           } else {
-            log.error(`[routes] POST ${path} error:`, err?.message || err);
+            log.error(`[routes] POST ${path} error:`, err);
             json(res, 500, {
               result: null,
               success: false,
@@ -273,7 +273,7 @@ export function registerModelRoutes(
               error: err.message,
             });
           } else {
-            log.error(`[routes] PUT ${path}/:id error:`, err?.message || err);
+            log.error(`[routes] PUT ${path}/:id error:`, err);
             json(res, 500, {
               result: null,
               success: false,
@@ -314,10 +314,7 @@ export function registerModelRoutes(
               error: err.message,
             });
           } else {
-            log.error(
-              `[routes] DELETE ${path}/:id error:`,
-              err?.message || err,
-            );
+            log.error(`[routes] DELETE ${path}/:id error:`, err);
             json(res, 500, {
               result: null,
               success: false,
@@ -372,7 +369,7 @@ export function registerModelRoutes(
               error: err.message,
             });
           } else {
-            log.error(`[routes] PATCH ${path}/:id error:`, err?.message || err);
+            log.error(`[routes] PATCH ${path}/:id error:`, err);
             json(res, 500, {
               result: null,
               success: false,

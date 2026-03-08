@@ -493,7 +493,7 @@ export function createApp(config: AppConfig): ParcaeApp {
               // Run through Polka's full handler (includes middleware, auth, auto-CRUD, custom routes)
               (server!.polka as any).handler(fakeReq, fakeRes);
             } catch (err: any) {
-              log.error(`[socket] RPC error:`, err?.message || err);
+              log.error(`[socket] RPC error:`, err);
               const compressed = pako.gzip(
                 JSON.stringify(
                   compress({
