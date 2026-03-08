@@ -130,7 +130,7 @@ export function betterAuth(config: BetterAuthConfig = {}): AuthAdapter {
     routes: null, // populated in setup()
 
     async setup(ctx: AuthSetupContext) {
-      const { userModel, config: envConfig, db } = ctx;
+      const { userModel, config: envConfig, db, ensureSchema } = ctx;
 
       const secret = envConfig.AUTH_SECRET;
       if (!secret) {
@@ -229,6 +229,23 @@ export function betterAuth(config: BetterAuthConfig = {}): AuthAdapter {
           },
         },
       });
+
+      // Run Better Auth migrations to create auth tables (users, sessions, accounts, verifications)
+      // This must happen BEFORE Parcae's ensureAllTables() so that the users table exists
+      // for Parcae to add custom columns to.
+      if (ensureSchema) {
+        try {
+          const ctx = await auth.$context;
+          await ctx.runMigrations();
+          log.info(
+            "[parcae/auth-betterauth] Auth tables migrated (users, sessions, accounts, verifications)",
+          );
+        } catch (err: any) {
+          log.warn(
+            `[parcae/auth-betterauth] Migration warning: ${err.message}`,
+          );
+        }
+      }
 
       // Populate routes for the framework to mount
       (this as any).routes = {

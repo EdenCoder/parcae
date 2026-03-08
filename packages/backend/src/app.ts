@@ -268,16 +268,38 @@ export function createApp(config: AppConfig): ParcaeApp {
       });
       Model.use(adapter);
 
-      // ── Step 6: Ensure tables (additive migration) ─────────────────
-      if (process.env.ENSURE_SCHEMA === "true") {
+      // ── Step 6: Set up auth (opt-in) ───────────────────────────────
+      // Auth runs BEFORE ensureAllTables so that auth-owned tables
+      // (users, sessions, accounts, verifications) are created first.
+      // Parcae's ensureAllTables then adds any custom columns to the
+      // users table and creates app-specific tables.
+      const authAdapter: AuthAdapter | null = config.auth ?? null;
+      const ensureSchema = process.env.ENSURE_SCHEMA === "true";
+
+      if (authAdapter) {
+        const userModel = models.find((m) => m.type === "user") ?? null;
+
+        await authAdapter.setup({
+          userModel,
+          adapter,
+          config: envConfig,
+          db: writeDb,
+          ensureSchema,
+        });
+
+        log.info("Auth enabled");
+      }
+
+      // ── Step 7: Ensure tables (additive migration) ─────────────────
+      if (ensureSchema) {
         await adapter.ensureAllTables(models);
         log.info("Database schema ensured");
       }
 
-      // ── Step 7: Create server ──────────────────────────────────────
+      // ── Step 8: Create server ──────────────────────────────────────
       server = createServer_({ config: envConfig, version });
 
-      // ── Step 8: Set up QuerySubscriptionManager ────────────────────
+      // ── Step 9: Set up QuerySubscriptionManager ────────────────────
       const subscriptions = new QuerySubscriptionManager(
         adapter,
         (socketId, event, data) => {
@@ -286,22 +308,8 @@ export function createApp(config: AppConfig): ParcaeApp {
       );
       adapter.subscriptions = subscriptions;
 
-      // ── Step 9: Set up auth (opt-in) ───────────────────────────────
-      const authAdapter: AuthAdapter | null = config.auth ?? null;
-
+      // ── Step 10: Mount auth routes + middleware ─────────────────────
       if (authAdapter) {
-        // Find the User model (if registered)
-        const userModel = models.find((m) => m.type === "user") ?? null;
-
-        // Let the auth adapter set itself up (create tables, configure sync, etc.)
-        await authAdapter.setup({
-          userModel,
-          adapter,
-          config: envConfig,
-          db: writeDb,
-        });
-
-        // Mount auth-specific routes (e.g. /v1/auth/* for Better Auth, /webhooks/clerk for Clerk)
         if (authAdapter.routes) {
           server.polka.all(
             `${authAdapter.routes.basePath}/*`,
@@ -320,11 +328,9 @@ export function createApp(config: AppConfig): ParcaeApp {
           }
           next();
         });
-
-        log.info("Auth enabled");
       }
 
-      // ── Step 10: Default routes ────────────────────────────────────
+      // ── Step 11: Default routes ────────────────────────────────────
       server.polka.get(`/${version}/health`, (_req: any, res: any) => {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(
@@ -337,11 +343,11 @@ export function createApp(config: AppConfig): ParcaeApp {
         );
       });
 
-      // ── Step 11: Register auto-CRUD routes ─────────────────────────
+      // ── Step 12: Register auto-CRUD routes ─────────────────────────
       const crudCount = registerModelRoutes(models, adapter, version);
       log.info(`Registered ${crudCount} auto-CRUD route(s)`);
 
-      // ── Step 11: Auto-discover ──────────────────────────────────────
+      // ── Step 13: Auto-discover ──────────────────────────────────────
       // Scan all configured directories. Files self-register by calling
       // route.*, hook.*, job() at import time. Doesn't matter which dir
       // a hook or job lives in — just that the file exists.
@@ -368,7 +374,7 @@ export function createApp(config: AppConfig): ParcaeApp {
           `${jobsAfter - jobsBefore} job(s)`,
       );
 
-      // ── Step 12: Apply discovered routes to Polka ──────────────────
+      // ── Step 14: Apply discovered routes to Polka ──────────────────
       const routes = getRoutes();
       for (const entry of routes) {
         const method = entry.method.toLowerCase() as keyof typeof server.polka;
@@ -378,7 +384,7 @@ export function createApp(config: AppConfig): ParcaeApp {
         }
       }
 
-      // ── Step 13: Start job workers ─────────────────────────────────
+      // ── Step 15: Start job workers ─────────────────────────────────
       const registeredJobs = getJobs();
       if (registeredJobs.length > 0 && queue.get()) {
         const defaultQueue = queue.get()!;
@@ -396,7 +402,7 @@ export function createApp(config: AppConfig): ParcaeApp {
         });
       }
 
-      // ── Step 14: Socket.IO connection handling ─────────────────────
+      // ── Step 16: Socket.IO connection handling ─────────────────────
       const modelsByType = new Map(models.map((m) => [m.type, m]));
 
       server.io.on("connection", (socket) => {
@@ -521,7 +527,7 @@ export function createApp(config: AppConfig): ParcaeApp {
         });
       });
 
-      // ── Step 15: Start listening ───────────────────────────────────
+      // ── Step 17: Start listening ───────────────────────────────────
       await new Promise<void>((resolveStart) => {
         server!.httpServer.listen(port, () => resolveStart());
       });

@@ -82,4 +82,13 @@ export interface AuthSetupContext {
    * Better Auth uses this to share Parcae's database connection.
    */
   db: any;
+
+  /**
+   * When true, the auth adapter should run its own table migrations
+   * (e.g. Better Auth's runMigrations()) to create auth tables like
+   * users, sessions, accounts, verifications.
+   *
+   * Set when ENSURE_SCHEMA=true (i.e. `pnpm run generate:schema`).
+   */
+  ensureSchema?: boolean;
 }
