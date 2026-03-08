@@ -59,6 +59,10 @@ export type {
 export { job, getJobs, getJob, clearJobs } from "./routing/job";
 export type { JobHandler, JobContext, JobEntry } from "./routing/job";
 
+// Search
+export { searchAll } from "./search";
+export type { SearchResult, SearchAllOptions } from "./search";
+
 // Response helpers
 export { json, ok, error, unauthorized, notFound, badRequest } from "./helpers";
 

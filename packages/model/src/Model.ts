@@ -81,6 +81,7 @@ function lazyQuery<T>(
     "orWhereIn",
     "orWhereNull",
     "whereExists",
+    "search",
     "orderBy",
     "orderByRaw",
     "groupBy",
@@ -186,6 +187,7 @@ export class Model extends EventEmitter {
     patch?: (ctx: any) => any;
   };
   static indexes?: (string | string[])[];
+  static searchFields?: string[];
   static managed: boolean = true;
   /** @internal */
   static __schema?: SchemaDefinition;
@@ -328,6 +330,13 @@ export class Model extends EventEmitter {
 
   static count<T extends Model>(this: ModelConstructor<T>): Promise<number> {
     return (this as any)._query().count();
+  }
+
+  static search<T extends Model>(
+    this: ModelConstructor<T>,
+    term: string,
+  ): QueryChain<T> {
+    return (this as any)._query().search(term);
   }
 
   static basic<T extends Model>(

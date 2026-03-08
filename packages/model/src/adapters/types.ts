@@ -52,6 +52,24 @@ export interface ModelConstructor<T = any> {
   scope?: ModelScope;
   indexes?: IndexDefinition[];
   managed?: boolean;
+  /**
+   * Fields to index for full-text and fuzzy search.
+   * When present, `ensureTable()` creates:
+   * - A generated `_search` tsvector column + GIN index
+   * - Per-field trigram GIN indexes (pg_trgm)
+   * - On AlloyDB: `_embedding` vector(768) column + ScaNN index
+   *
+   * Fields are weighted by order: first = 'A' (highest), second = 'B', etc.
+   *
+   * @example
+   * ```typescript
+   * class Project extends Model {
+   *   static searchFields = ["title", "description"];
+   * }
+   * // Then query with: Project.search("ghost town").find()
+   * ```
+   */
+  searchFields?: string[];
   __schema?: SchemaDefinition;
   new (adapter: ModelAdapter, data?: Record<string, any>): T;
 }
@@ -139,6 +157,14 @@ export interface QueryChain<T> {
   orWhereIn(column: string, values: any[]): QueryChain<T>;
   orWhereNull(column: string): QueryChain<T>;
   whereExists(callback: any): QueryChain<T>;
+
+  // Chainable — search
+  /**
+   * Full-text + fuzzy search across fields declared in `static search`.
+   * On the backend, generates hybrid SQL (tsvector + trigram + optional vector).
+   * On the frontend, records a QueryStep for serialization.
+   */
+  search(term: string): QueryChain<T>;
 
   // Chainable — ordering & pagination
   orderBy(column: string, direction?: "asc" | "desc"): QueryChain<T>;

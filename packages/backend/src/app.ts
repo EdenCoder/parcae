@@ -268,6 +268,9 @@ export function createApp(config: AppConfig): ParcaeApp {
       });
       Model.use(adapter);
 
+      // Detect AlloyDB vs standard Postgres (for search features)
+      await adapter.detectEngine();
+
       // ── Step 6: Set up auth (opt-in) ───────────────────────────────
       // Auth runs BEFORE ensureAllTables so that auth-owned tables
       // (users, sessions, accounts, verifications) are created first.

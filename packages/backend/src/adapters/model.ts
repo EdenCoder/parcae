@@ -20,7 +20,7 @@ import type {
   SchemaDefinition,
   ColumnType,
 } from "@parcae/model";
-import { getHooksFor } from "../routing/hook";
+import { hook, getHooksFor } from "../routing/hook";
 import type { HookAction, HookTiming } from "../routing/hook";
 import {
   enqueue as globalEnqueue,
@@ -137,6 +137,12 @@ export class BackendAdapter implements ModelAdapter {
   private services: BackendServices;
   public subscriptions: any | null = null;
 
+  /** Detected database engine — set by detectEngine(). */
+  public engine: "alloydb" | "postgres" = "postgres";
+
+  /** Whether search extensions have been enabled for this database. */
+  private _searchExtensionsReady = false;
+
   get read() {
     return this.services.read;
   }
@@ -151,9 +157,127 @@ export class BackendAdapter implements ModelAdapter {
     this.services = services;
   }
 
+  // ── Engine Detection ────────────────────────────────────────────────
+
+  /**
+   * Detect whether we're running on AlloyDB or standard Postgres.
+   * Should be called once at startup, before ensureAllTables().
+   */
+  async detectEngine(): Promise<"alloydb" | "postgres"> {
+    try {
+      const { rows } = await this.write.raw(`
+        SELECT EXISTS (
+          SELECT 1 FROM pg_available_extensions WHERE name = 'alloydb_scann'
+        ) AS has_scann
+      `);
+      this.engine = rows[0]?.has_scann ? "alloydb" : "postgres";
+    } catch {
+      this.engine = "postgres";
+    }
+    log.info(`Database engine detected: ${this.engine}`);
+    return this.engine;
+  }
+
+  // ── Search Extensions ───────────────────────────────────────────────
+
+  /**
+   * Enable search extensions (idempotent). Called once when the first
+   * model with `static searchFields` is encountered during ensureTable().
+   */
+  private async _ensureSearchExtensions(): Promise<void> {
+    if (this._searchExtensionsReady) return;
+
+    // Standard Postgres — trigram fuzzy matching
+    await this.write.raw("CREATE EXTENSION IF NOT EXISTS pg_trgm");
+    log.info("Extension enabled: pg_trgm");
+
+    if (this.engine === "alloydb") {
+      await this.write.raw("CREATE EXTENSION IF NOT EXISTS vector");
+      await this.write.raw(
+        "CREATE EXTENSION IF NOT EXISTS alloydb_scann CASCADE",
+      );
+      await this.write.raw(
+        "CREATE EXTENSION IF NOT EXISTS google_ml_integration",
+      );
+      log.info(
+        "Extensions enabled: vector, alloydb_scann, google_ml_integration",
+      );
+    }
+
+    this._searchExtensionsReady = true;
+  }
+
   private _notifyChange(model: any): void {
     const ModelClass = model.constructor as typeof Model;
     this.subscriptions?.onModelChange(ModelClass.type);
+  }
+
+  // ── Search Query ────────────────────────────────────────────────────
+
+  /**
+   * Apply hybrid search SQL to a Knex query builder.
+   * Combines full-text (tsvector), fuzzy (trigram), and optionally
+   * semantic (vector cosine) search with weighted ranking.
+   */
+  _applySearch(
+    knexQuery: any,
+    term: string,
+    modelClass: ModelConstructor,
+  ): any {
+    const searchFields = (modelClass as any).searchFields as string[];
+    if (!searchFields?.length || !term.trim()) return knexQuery;
+
+    const table = tableName(modelClass);
+
+    // Build the ranking expression
+    // 1. Full-text rank (weight: 2x)
+    const rankParts: string[] = [
+      `ts_rank(${table}._search, websearch_to_tsquery('english', ?)) * 2`,
+    ];
+    const rankBindings: any[] = [term];
+
+    // 2. Trigram similarity — best across all search fields (weight: 1x)
+    const simParts = searchFields.map((f) => `similarity(${table}.${f}, ?)`);
+    rankParts.push(`greatest(${simParts.join(", ")})`);
+    for (const _f of searchFields) rankBindings.push(term);
+
+    // 3. Semantic similarity on AlloyDB (weight: 3x)
+    if (this.engine === "alloydb") {
+      rankParts.push(
+        `(1.0 - (${table}._embedding <=> embedding('gemini-embedding-001', ?)::vector)) * 3`,
+      );
+      rankBindings.push(term);
+    }
+
+    const rankExpr = rankParts.join(" + ");
+
+    // Build the WHERE clause — match on any of the search methods
+    const whereParts: string[] = [
+      `${table}._search @@ websearch_to_tsquery('english', ?)`,
+    ];
+    const whereBindings: any[] = [term];
+
+    for (const f of searchFields) {
+      whereParts.push(`${table}.${f} % ?`);
+      whereBindings.push(term);
+    }
+
+    if (this.engine === "alloydb") {
+      whereParts.push(
+        `${table}._embedding <=> embedding('gemini-embedding-001', ?)::vector < 0.7`,
+      );
+      whereBindings.push(term);
+    }
+
+    const whereExpr = whereParts.join(" OR ");
+
+    return knexQuery
+      .whereRaw(`(${whereExpr})`, whereBindings)
+      .select(
+        this.write.raw(`${table}.*, (${rankExpr}) AS _rank`, rankBindings),
+      )
+      .clearOrder()
+      .orderByRaw("_rank DESC");
   }
 
   // ── createStore ──────────────────────────────────────────────────────
@@ -265,6 +389,7 @@ export class BackendAdapter implements ModelAdapter {
 
   private static SAFE_CLIENT_METHODS = new Set([
     "select",
+    "search",
     "where",
     "andWhere",
     "orWhere",
@@ -346,6 +471,15 @@ export class BackendAdapter implements ModelAdapter {
 
     for (const step of steps) {
       if (!BackendAdapter.SAFE_CLIENT_METHODS.has(step.method)) continue;
+
+      // search() is handled specially — not a Knex method
+      if (step.method === "search") {
+        const term = typeof step.args[0] === "string" ? step.args[0] : "";
+        if (term.trim()) {
+          chain = (chain as any).search(term);
+        }
+        continue;
+      }
 
       const args = this._sanitizeStepArgs(step, validColumns, modelClass.type);
 
@@ -501,6 +635,18 @@ export class BackendAdapter implements ModelAdapter {
         return adapter._buildQuery(modelClass, knexQuery[method](...args));
       };
     }
+
+    // search() — applies hybrid full-text + fuzzy search SQL
+    chain.search = (term: string) => {
+      const searchFields = (modelClass as any).searchFields as
+        | string[]
+        | undefined;
+      if (!searchFields?.length || !term.trim()) {
+        return adapter._buildQuery(modelClass, knexQuery);
+      }
+      const modified = adapter._applySearch(knexQuery, term, modelClass);
+      return adapter._buildQuery(modelClass, modified);
+    };
 
     chain.basic = (
       limit: number = 25,
@@ -907,11 +1053,184 @@ export class BackendAdapter implements ModelAdapter {
     );
 
     log.info(`ensured schema — model=${modelClass.type}`);
+
+    // ── Search schema (tsvector + trigram + optional vector) ──────────
+    const searchFields = (modelClass as any).searchFields as
+      | string[]
+      | undefined;
+    if (searchFields?.length) {
+      await this._ensureSearchSchema(table, searchFields);
+    }
+  }
+
+  /**
+   * Create search-related columns and indexes for a table.
+   * Called from ensureTable() when the model has `static searchFields`.
+   */
+  private async _ensureSearchSchema(
+    table: string,
+    fields: string[],
+  ): Promise<void> {
+    await this._ensureSearchExtensions();
+
+    // Weights by field order: A (highest), B, C, D
+    const weights = ["A", "B", "C", "D"];
+    const tsvectorParts = fields
+      .map((field, i) => {
+        const weight = weights[Math.min(i, weights.length - 1)];
+        return `setweight(to_tsvector('english', coalesce(${field}, '')), '${weight}')`;
+      })
+      .join(" || ");
+
+    // 1. Generated tsvector column + GIN index
+    const hasSearch = await this.write.schema.hasColumn(table, "_search");
+    if (!hasSearch) {
+      await this.write.raw(
+        `
+        ALTER TABLE ?? ADD COLUMN _search tsvector
+        GENERATED ALWAYS AS (${tsvectorParts}) STORED
+      `,
+        [table],
+      );
+      log.info(`search: added _search tsvector column — table=${table}`);
+    }
+
+    // GIN index on _search
+    const searchIdxName = `${table}__search_gin`;
+    try {
+      await this.write.raw(
+        `
+        CREATE INDEX IF NOT EXISTS ?? ON ?? USING gin(_search)
+      `,
+        [searchIdxName, table],
+      );
+    } catch {}
+
+    // 2. Per-field trigram GIN indexes
+    for (const field of fields) {
+      const trgmIdxName = `${table}_${field}_trgm`;
+      try {
+        await this.write.raw(
+          `
+          CREATE INDEX IF NOT EXISTS ?? ON ?? USING gin(?? gin_trgm_ops)
+        `,
+          [trgmIdxName, table, field],
+        );
+      } catch {}
+    }
+
+    // 3. AlloyDB: vector embedding column + ScaNN index
+    if (this.engine === "alloydb") {
+      const hasEmbedding = await this.write.schema.hasColumn(
+        table,
+        "_embedding",
+      );
+      if (!hasEmbedding) {
+        await this.write.raw(
+          `ALTER TABLE ?? ADD COLUMN _embedding vector(768)`,
+          [table],
+        );
+        log.info(
+          `search: added _embedding vector(768) column — table=${table}`,
+        );
+      }
+
+      const embIdxName = `${table}__embedding_scann`;
+      try {
+        await this.write.raw(
+          `
+          CREATE INDEX IF NOT EXISTS ?? ON ?? USING scann (_embedding cosine)
+          WITH (num_leaves = 1000, quantizer = 'SQ8')
+        `,
+          [embIdxName, table],
+        );
+      } catch {}
+    }
+
+    log.info(
+      `search: indexes ensured — table=${table} fields=[${fields.join(", ")}] engine=${this.engine}`,
+    );
   }
 
   async ensureAllTables(models: ModelConstructor[]): Promise<void> {
     for (const modelClass of models) {
       await this.ensureTable(modelClass);
+    }
+
+    // Register embedding hooks for AlloyDB models with searchFields
+    if (this.engine === "alloydb") {
+      this._registerEmbeddingHooks(models);
+    }
+  }
+
+  /**
+   * On AlloyDB, register afterSave hooks that generate embeddings for
+   * models with `static searchFields`. Uses AlloyDB's native
+   * `google_ml_integration` extension to call Vertex AI from SQL.
+   */
+  private _registerEmbeddingHooks(models: ModelConstructor[]): void {
+    for (const modelClass of models) {
+      const searchFields = (modelClass as any).searchFields as
+        | string[]
+        | undefined;
+      if (!searchFields?.length) continue;
+      if ((modelClass as any).managed === false) continue;
+
+      const table = tableName(modelClass);
+      const adapter = this;
+
+      // Register via hook.after() — the standard Parcae hook API
+      hook.after(
+        modelClass,
+        "save",
+        async (ctx: any) => {
+          try {
+            const model = ctx.model;
+            const text = searchFields
+              .map((f: string) => (model as any)[f] || "")
+              .join(" ")
+              .trim();
+            if (!text) return;
+
+            await adapter.write.raw(
+              `UPDATE ?? SET _embedding = embedding('gemini-embedding-001', ?)::vector WHERE id = ?`,
+              [table, text, model.id],
+            );
+          } catch (err: any) {
+            log.warn(
+              `search: embedding generation failed — model=${modelClass.type} id=${ctx.model?.id}: ${err.message}`,
+            );
+          }
+        },
+        { async: true, priority: 999 },
+      );
+
+      hook.after(
+        modelClass,
+        "create",
+        async (ctx: any) => {
+          try {
+            const model = ctx.model;
+            const text = searchFields
+              .map((f: string) => (model as any)[f] || "")
+              .join(" ")
+              .trim();
+            if (!text) return;
+
+            await adapter.write.raw(
+              `UPDATE ?? SET _embedding = embedding('gemini-embedding-001', ?)::vector WHERE id = ?`,
+              [table, text, model.id],
+            );
+          } catch (err: any) {
+            log.warn(
+              `search: embedding generation failed — model=${modelClass.type} id=${ctx.model?.id}: ${err.message}`,
+            );
+          }
+        },
+        { async: true, priority: 999 },
+      );
+
+      log.info(`search: registered embedding hook — model=${modelClass.type}`);
     }
   }
 
