@@ -181,6 +181,7 @@ export class FrontendAdapter implements ModelAdapter {
       "orWhereIn",
       "orWhereNull",
       "whereExists",
+      "search",
       "orderBy",
       "orderByRaw",
       "groupBy",
