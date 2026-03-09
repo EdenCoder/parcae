@@ -114,19 +114,6 @@ function lazyQuery<T>(
       lazyQuery(modelClass, [...steps, { method, args }]);
   }
 
-  chain.basic = (
-    limit = 25,
-    sort = "createdAt",
-    direction: "asc" | "desc" = "desc",
-    page = 0,
-  ) =>
-    lazyQuery(modelClass, [
-      ...steps,
-      { method: "orderBy", args: [sort, direction] },
-      { method: "limit", args: [limit] },
-      { method: "offset", args: [page * limit] },
-    ]);
-
   // Terminal methods — resolve adapter here (async, waits if not set yet)
   const resolve = async (): Promise<QueryChain<T>> => {
     const adapter = Model.hasAdapter()
@@ -337,16 +324,6 @@ export class Model extends EventEmitter {
     term: string,
   ): QueryChain<T> {
     return (this as any)._query().search(term);
-  }
-
-  static basic<T extends Model>(
-    this: ModelConstructor<T>,
-    limit?: number,
-    sort?: string,
-    direction?: "asc" | "desc",
-    page?: number,
-  ): QueryChain<T> {
-    return (this as any)._query().basic(limit, sort, direction, page);
   }
 
   // ── Constructor ────────────────────────────────────────────────────
@@ -682,10 +659,6 @@ export class Model extends EventEmitter {
     }
   }
 
-  async load(): Promise<void> {
-    return this.refresh();
-  }
-
   async sanitize(_user?: { id: string }): Promise<Record<string, any>> {
     return { type: (this as any).type, ...this.__data };
   }
@@ -746,5 +719,3 @@ declare module "./Model" {
     [SYM_INIT_DATA]: Set<string> | undefined;
   }
 }
-
-export default Model;

@@ -384,5 +384,3 @@ export function registerModelRoutes(
 
   return count;
 }
-
-export default registerModelRoutes;

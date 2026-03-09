@@ -9,7 +9,6 @@
 
 import { resolve, join } from "node:path";
 import { readdirSync, existsSync, statSync } from "node:fs";
-import { PassThrough } from "node:stream";
 import pako from "pako";
 import { compress } from "compress-json";
 import { Model } from "@parcae/model";
@@ -153,30 +152,6 @@ async function discoverAndImport(dir: string, label: string): Promise<number> {
   }
 
   return count;
-}
-
-// ─── Path matching ───────────────────────────────────────────────────────────
-
-function matchPath(
-  pattern: string,
-  actual: string,
-): { params: Record<string, string> } | null {
-  const patternParts = pattern.split("/").filter(Boolean);
-  const actualParts = actual.split("?")[0]!.split("/").filter(Boolean);
-
-  if (patternParts.length !== actualParts.length) return null;
-
-  const params: Record<string, string> = {};
-  for (let i = 0; i < patternParts.length; i++) {
-    const p = patternParts[i]!;
-    const a = actualParts[i]!;
-    if (p.startsWith(":")) {
-      params[p.slice(1)] = a;
-    } else if (p !== a) {
-      return null;
-    }
-  }
-  return { params };
 }
 
 // ─── createApp ───────────────────────────────────────────────────────────────
@@ -392,18 +367,28 @@ export function createApp(config: AppConfig): ParcaeApp {
       const registeredJobs = getJobs();
       if (registeredJobs.length > 0 && queue.get()) {
         const defaultQueue = queue.get()!;
-        queue.createWorker(defaultQueue.name, async (bullJob) => {
-          const jobEntry = registeredJobs.find((j) => j.name === bullJob.name);
-          if (!jobEntry) {
-            log.warn(`No handler for job "${bullJob.name}"`);
-            return;
-          }
-          return jobEntry.handler({
-            data: bullJob.data,
-            bullJob,
-            attempt: bullJob.attemptsMade,
-          });
-        });
+        const maxConcurrency = Math.max(
+          1,
+          ...registeredJobs.map((j) => j.options?.concurrency ?? 1),
+        );
+        queue.createWorker(
+          defaultQueue.name,
+          async (bullJob) => {
+            const jobEntry = registeredJobs.find(
+              (j) => j.name === bullJob.name,
+            );
+            if (!jobEntry) {
+              log.warn(`No handler for job "${bullJob.name}"`);
+              return;
+            }
+            return jobEntry.handler({
+              data: bullJob.data,
+              bullJob,
+              attempt: bullJob.attemptsMade,
+            });
+          },
+          maxConcurrency,
+        );
       }
 
       // ── Step 16: Socket.IO connection handling ─────────────────────

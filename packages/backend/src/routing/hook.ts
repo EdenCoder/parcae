@@ -166,5 +166,3 @@ export const hook = {
     return register(modelClass, "before", action, ...args);
   },
 };
-
-export default hook;

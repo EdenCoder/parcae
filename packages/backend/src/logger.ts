@@ -16,7 +16,6 @@ const c = {
   yellow: (s: string) => (isTTY ? `\x1b[33m${s}\x1b[0m` : s),
   red: (s: string) => (isTTY ? `\x1b[31m${s}\x1b[0m` : s),
   green: (s: string) => (isTTY ? `\x1b[32m${s}\x1b[0m` : s),
-  cyan: (s: string) => (isTTY ? `\x1b[36m${s}\x1b[0m` : s),
 };
 
 // ─── Time ────────────────────────────────────────────────────────────────────
@@ -47,13 +46,6 @@ export function success(...args: any[]): void {
   console.log(`${time()} ${c.green("OK ")}`, ...args);
 }
 
-export function debug(...args: any[]): void {
-  if (process.env.NODE_ENV === "production") return;
-  console.log(`${time()} ${c.dim("DBG")}`, ...args);
-}
-
 // ─── Logger object ───────────────────────────────────────────────────────────
 
-export const log = { info, warn, error, success, debug };
-
-export default log;
+export const log = { info, warn, error, success };

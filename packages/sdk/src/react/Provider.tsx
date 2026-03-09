@@ -113,5 +113,3 @@ export const ParcaeProvider: React.FC<ParcaeProviderProps> = ({
     <ParcaeContext.Provider value={client}>{children}</ParcaeContext.Provider>
   );
 };
-
-export default ParcaeProvider;

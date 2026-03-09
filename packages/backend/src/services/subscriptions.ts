@@ -244,5 +244,3 @@ export class QuerySubscriptionManager {
     };
   }
 }
-
-export default QuerySubscriptionManager;

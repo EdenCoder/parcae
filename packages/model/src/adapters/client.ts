@@ -20,6 +20,12 @@ import type {
 
 // ─── Transport Interface ─────────────────────────────────────────────────────
 
+/** Per-request options that callers can pass to any RPC method. */
+export interface RequestOptions {
+  /** Override the default RPC timeout (in milliseconds). */
+  timeout?: number;
+}
+
 /**
  * Abstract transport layer. Decouples the Model system from the wire protocol.
  *
@@ -30,11 +36,11 @@ import type {
  */
 export interface Transport {
   // ── Request/Response (RPC-style) ────────────────────────────────────
-  get(path: string, data?: any): Promise<any>;
-  post(path: string, data?: any): Promise<any>;
-  put(path: string, data?: any): Promise<any>;
-  patch(path: string, data?: any): Promise<any>;
-  delete(path: string, data?: any): Promise<any>;
+  get(path: string, data?: any, options?: RequestOptions): Promise<any>;
+  post(path: string, data?: any, options?: RequestOptions): Promise<any>;
+  put(path: string, data?: any, options?: RequestOptions): Promise<any>;
+  patch(path: string, data?: any, options?: RequestOptions): Promise<any>;
+  delete(path: string, data?: any, options?: RequestOptions): Promise<any>;
 
   // ── Subscriptions (realtime) ────────────────────────────────────────
   /**
@@ -218,28 +224,6 @@ export class FrontendAdapter implements ModelAdapter {
       };
     }
 
-    chain.basic = (
-      limit: number = 25,
-      sort: string = "createdAt",
-      direction: "asc" | "desc" = "desc",
-      page: number = 0,
-    ) => {
-      return adapter._buildQuery(modelClass, [
-        ...steps,
-        { method: "orderBy", args: [sort, direction] },
-        { method: "limit", args: [limit] },
-        { method: "offset", args: [page * limit] },
-      ]);
-    };
-
-    let debounceMs: number | undefined = undefined;
-    chain.debounce = (ms: number) => {
-      debounceMs = ms;
-      const newChain = adapter._buildQuery(modelClass, steps);
-      (newChain as any).__debounceMs = ms;
-      return newChain;
-    };
-
     chain.find = async (): Promise<T[]> => {
       const path = adapter.resolvePath(modelClass);
       const result = await adapter.transport.get(path, { __query: steps });
@@ -273,10 +257,6 @@ export class FrontendAdapter implements ModelAdapter {
     chain.__modelType = modelClass.type;
     chain.__modelClass = modelClass;
     chain.__adapter = adapter;
-    Object.defineProperty(chain, "__debounceMs", {
-      get: () => debounceMs,
-      enumerable: true,
-    });
 
     return chain as QueryChain<T>;
   }
@@ -325,5 +305,3 @@ export class FrontendAdapter implements ModelAdapter {
     return this.p(fullPath);
   }
 }
-
-export default FrontendAdapter;

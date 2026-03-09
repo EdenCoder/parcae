@@ -8,7 +8,7 @@
 export { Model, generateId } from "./Model";
 
 export { FrontendAdapter } from "./adapters/client";
-export type { Transport } from "./adapters/client";
+export type { Transport, RequestOptions } from "./adapters/client";
 
 export type {
   ModelAdapter,
@@ -18,11 +18,6 @@ export type {
   QueryStep,
   SchemaDefinition,
   ColumnType,
-  PrimitiveColumnType,
-  IndexDefinition,
-  ModelScope,
   ScopeContext,
-  ScopeResult,
-  ScopeFunction,
   PatchOp,
 } from "./adapters/types";

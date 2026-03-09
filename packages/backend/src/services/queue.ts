@@ -144,5 +144,3 @@ export class QueueService {
     this.workers.clear();
   }
 }
-
-export default QueueService;

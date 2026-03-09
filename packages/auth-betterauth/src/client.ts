@@ -19,7 +19,6 @@ interface AuthClientAdapter {
 
 export function betterAuth(): AuthClientAdapter {
   let client: ReturnType<typeof createAuthClient> | null = null;
-  let listeners: Array<(token: string | null) => void> = [];
 
   return {
     init(baseUrl: string) {
@@ -40,7 +39,6 @@ export function betterAuth(): AuthClientAdapter {
     },
 
     onChange(callback: (token: string | null) => void): () => void {
-      listeners.push(callback);
       // Better Auth doesn't have a native onChange — poll on visibility change
       const handler = async () => {
         if (document.visibilityState === "visible" && client) {
@@ -57,7 +55,6 @@ export function betterAuth(): AuthClientAdapter {
         document.addEventListener("visibilitychange", handler);
       }
       return () => {
-        listeners = listeners.filter((l) => l !== callback);
         if (typeof document !== "undefined") {
           document.removeEventListener("visibilitychange", handler);
         }

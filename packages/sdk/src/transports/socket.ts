@@ -10,9 +10,11 @@ import pako from "pako";
 import { decompress } from "compress-json";
 import { EventEmitter } from "eventemitter3";
 import ShortId from "short-unique-id";
-import type { Transport } from "@parcae/model";
+import type { Transport, RequestOptions } from "@parcae/model";
 import { AuthGate } from "../auth-gate";
 import { log } from "../log";
+
+const DEFAULT_TIMEOUT = 30_000;
 
 const uid = new ShortId({ length: 10 });
 const SOCKETS = new Map<string, any>();
@@ -143,6 +145,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     method: string,
     path: string,
     data: any = {},
+    options?: RequestOptions,
   ): Promise<any> {
     await this.auth.ready;
 
@@ -152,7 +155,7 @@ export class SocketTransport extends EventEmitter implements Transport {
         const timeout = setTimeout(() => {
           cleanup();
           reject(new Error("Connection timeout"));
-        }, 30000);
+        }, DEFAULT_TIMEOUT);
         const onConnect = () => {
           cleanup();
           resolve();
@@ -176,27 +179,35 @@ export class SocketTransport extends EventEmitter implements Transport {
       const dedupeKey = `${path}:${JSON.stringify(data)}`;
       const existing = this.inflight.get(dedupeKey);
       if (existing) return existing;
-      const req = this._call(method, path, data);
+      const req = this._call(method, path, data, options);
       this.inflight.set(dedupeKey, req);
       req.finally(() => this.inflight.delete(dedupeKey));
       return req;
     }
 
-    return this._call(method, path, data);
+    return this._call(method, path, data, options);
   }
 
-  private _call(method: string, path: string, data: any): Promise<any> {
+  private _call(
+    method: string,
+    path: string,
+    data: any,
+    options?: RequestOptions,
+  ): Promise<any> {
     const id = uid.rnd();
     const t0 = performance.now();
     const fullPath = `/${this.version}${path}`;
+    const timeoutMs = options?.timeout ?? DEFAULT_TIMEOUT;
     log.debug(`→ ${method.toUpperCase()} ${fullPath}`);
 
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.socket.off(id);
-        log.debug(`✗ ${method.toUpperCase()} ${fullPath} timeout (30s)`);
+        log.debug(
+          `✗ ${method.toUpperCase()} ${fullPath} timeout (${(timeoutMs / 1000).toFixed(0)}s)`,
+        );
         reject(new Error(`RPC timeout: ${method} ${path}`));
-      }, 30000);
+      }, timeoutMs);
 
       this.socket.once(id, (msg: any) => {
         clearTimeout(timeout);
@@ -235,20 +246,28 @@ export class SocketTransport extends EventEmitter implements Transport {
     });
   }
 
-  async get(path: string, data?: any): Promise<any> {
-    return this.fetch("GET", path, data);
+  async get(path: string, data?: any, options?: RequestOptions): Promise<any> {
+    return this.fetch("GET", path, data, options);
   }
-  async post(path: string, data?: any): Promise<any> {
-    return this.fetch("POST", path, data);
+  async post(path: string, data?: any, options?: RequestOptions): Promise<any> {
+    return this.fetch("POST", path, data, options);
   }
-  async put(path: string, data?: any): Promise<any> {
-    return this.fetch("PUT", path, data);
+  async put(path: string, data?: any, options?: RequestOptions): Promise<any> {
+    return this.fetch("PUT", path, data, options);
   }
-  async patch(path: string, data?: any): Promise<any> {
-    return this.fetch("PATCH", path, data);
+  async patch(
+    path: string,
+    data?: any,
+    options?: RequestOptions,
+  ): Promise<any> {
+    return this.fetch("PATCH", path, data, options);
   }
-  async delete(path: string, data?: any): Promise<any> {
-    return this.fetch("DELETE", path, data);
+  async delete(
+    path: string,
+    data?: any,
+    options?: RequestOptions,
+  ): Promise<any> {
+    return this.fetch("DELETE", path, data, options);
   }
 
   subscribe(event: string, handler: (...args: any[]) => void): () => void {
@@ -274,8 +293,6 @@ export class SocketTransport extends EventEmitter implements Transport {
     this.socket.connect();
   }
 }
-
-export default SocketTransport;
 
 /** @internal — clear socket cache (for testing) */
 export function _resetSockets(): void {

@@ -14,7 +14,7 @@
  */
 
 import { EventEmitter } from "eventemitter3";
-import type { Transport } from "@parcae/model";
+import type { Transport, RequestOptions } from "@parcae/model";
 
 export interface SSETransportConfig {
   /** Base URL of the Parcae backend. */
@@ -33,7 +33,6 @@ export class SSETransport extends EventEmitter implements Transport {
   private eventSources = new Map<string, EventSource>();
 
   public isConnected = true; // HTTP is "always connected"
-  public isLoading = true;
   public loading: Promise<void>;
 
   constructor(config: SSETransportConfig) {
@@ -48,10 +47,8 @@ export class SSETransport extends EventEmitter implements Transport {
     try {
       this.key =
         typeof this.apiKey === "function" ? await this.apiKey() : this.apiKey;
-      this.isLoading = false;
       this.emit("connected");
     } catch (err) {
-      this.isLoading = false;
       this.emit("error", err);
     }
   }
@@ -72,6 +69,7 @@ export class SSETransport extends EventEmitter implements Transport {
     method: string,
     path: string,
     data?: any,
+    options?: RequestOptions,
   ): Promise<any> {
     await this.loading;
 
@@ -86,36 +84,55 @@ export class SSETransport extends EventEmitter implements Transport {
       url += `?${params.toString()}`;
     }
 
-    const res = await fetch(url, {
-      method: method.toUpperCase(),
-      headers: this.headers(),
-      body: isGet ? undefined : JSON.stringify(data),
-    });
+    const controller = options?.timeout ? new AbortController() : undefined;
+    const timer = options?.timeout
+      ? setTimeout(() => controller!.abort(), options.timeout)
+      : undefined;
 
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({ error: res.statusText }));
-      throw new Error(body.error || body.message || `HTTP ${res.status}`);
+    try {
+      const res = await fetch(url, {
+        method: method.toUpperCase(),
+        headers: this.headers(),
+        body: isGet ? undefined : JSON.stringify(data),
+        signal: controller?.signal,
+      });
+
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({ error: res.statusText }));
+        throw new Error(body.error || body.message || `HTTP ${res.status}`);
+      }
+
+      const body = await res.json();
+      if (body.success === false)
+        throw new Error(body.error || "Request failed");
+      return body.result ?? body;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
-
-    const body = await res.json();
-    if (body.success === false) throw new Error(body.error || "Request failed");
-    return body.result ?? body;
   }
 
-  async get(path: string, data?: any): Promise<any> {
-    return this.request("GET", path, data);
+  async get(path: string, data?: any, options?: RequestOptions): Promise<any> {
+    return this.request("GET", path, data, options);
   }
-  async post(path: string, data?: any): Promise<any> {
-    return this.request("POST", path, data);
+  async post(path: string, data?: any, options?: RequestOptions): Promise<any> {
+    return this.request("POST", path, data, options);
   }
-  async put(path: string, data?: any): Promise<any> {
-    return this.request("PUT", path, data);
+  async put(path: string, data?: any, options?: RequestOptions): Promise<any> {
+    return this.request("PUT", path, data, options);
   }
-  async patch(path: string, data?: any): Promise<any> {
-    return this.request("PATCH", path, data);
+  async patch(
+    path: string,
+    data?: any,
+    options?: RequestOptions,
+  ): Promise<any> {
+    return this.request("PATCH", path, data, options);
   }
-  async delete(path: string, data?: any): Promise<any> {
-    return this.request("DELETE", path, data);
+  async delete(
+    path: string,
+    data?: any,
+    options?: RequestOptions,
+  ): Promise<any> {
+    return this.request("DELETE", path, data, options);
   }
 
   // ── Subscriptions (via Server-Sent Events) ────────────────────────────
@@ -173,5 +190,3 @@ export class SSETransport extends EventEmitter implements Transport {
     await this.loading;
   }
 }
-
-export default SSETransport;

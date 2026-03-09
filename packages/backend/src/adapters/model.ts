@@ -9,7 +9,7 @@ import { log } from "../logger";
 
 import pluralize from "pluralize";
 import equal from "deep-equal";
-import { applyPatch, type Operation as PatchOp } from "fast-json-patch";
+import { type Operation as PatchOp } from "fast-json-patch";
 import { Model, generateId } from "@parcae/model";
 import type {
   ModelAdapter,
@@ -143,9 +143,6 @@ export class BackendAdapter implements ModelAdapter {
 
   /** Whether search extensions have been enabled for this database. */
   private _searchExtensionsReady = false;
-
-  /** Tables that have had their search schema verified (tsvector + trigram + optional vector). */
-  private _searchReady = new Set<string>();
 
   /** Tables that have a verified _embedding column (AlloyDB only). */
   private _embeddingReady = new Set<string>();
@@ -360,26 +357,10 @@ export class BackendAdapter implements ModelAdapter {
     return row ? hydrate(modelClass, this, row) : null;
   }
 
-  async findByIdWrite<T>(
-    modelClass: ModelConstructor<T>,
-    id: string,
-  ): Promise<T | null> {
-    if (!id) return null;
-    const row = await this.write(tableName(modelClass))
-      .select("*")
-      .where("id", id)
-      .first();
-    return row ? hydrate(modelClass, this, row) : null;
-  }
-
   // ── query ────────────────────────────────────────────────────────────
 
   query<T>(modelClass: ModelConstructor<T>): QueryChain<T> {
     return this._buildQuery(modelClass, this.read(tableName(modelClass)));
-  }
-
-  queryWrite<T>(modelClass: ModelConstructor<T>): QueryChain<T> {
-    return this._buildQuery(modelClass, this.write(tableName(modelClass)));
   }
 
   // ── queryFromClient — safe replay of client-sent __query steps ────────
@@ -960,13 +941,6 @@ export class BackendAdapter implements ModelAdapter {
     }
   }
 
-  // ── Distributed Lock ─────────────────────────────────────────────────
-
-  async lock(id: string, ttl: number = 120000): Promise<(() => void) | null> {
-    if (this.pubsub?.lock) return this.pubsub.lock(id, ttl);
-    return () => {}; // no-op fallback
-  }
-
   // ── Schema Management ────────────────────────────────────────────────
 
   async ensureTable(modelClass: ModelConstructor): Promise<void> {
@@ -1161,7 +1135,6 @@ export class BackendAdapter implements ModelAdapter {
       } catch {}
     }
 
-    this._searchReady.add(table);
     if (this.engine === "alloydb") {
       this._embeddingReady.add(table);
     }
@@ -1252,16 +1225,4 @@ export class BackendAdapter implements ModelAdapter {
       log.info(`search: registered embedding hook — model=${modelClass.type}`);
     }
   }
-
-  // ── Raw Knex access ──────────────────────────────────────────────────
-
-  readQuery(modelClass: ModelConstructor): any {
-    return this.read(tableName(modelClass));
-  }
-
-  writeQuery(modelClass: ModelConstructor): any {
-    return this.write(tableName(modelClass));
-  }
 }
-
-export default BackendAdapter;

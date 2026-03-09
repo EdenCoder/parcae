@@ -154,37 +154,6 @@ export class SchemaResolver {
   }
 
   /**
-   * Resolve schemas by scanning a directory for .ts files.
-   */
-  resolveFromDirectory(
-    models: ModelConstructor[],
-    directory: string,
-  ): Map<string, SchemaDefinition> {
-    this.project.addSourceFilesAtPaths(`${directory}/**/*.ts`);
-
-    const schemas = new Map<string, SchemaDefinition>();
-    const modelsByName = new Map(models.map((m) => [m.name, m]));
-
-    for (const sourceFile of this.project.getSourceFiles()) {
-      for (const classDecl of sourceFile.getClasses()) {
-        if (!extendsModel(classDecl)) continue;
-
-        const className = classDecl.getName();
-        if (!className) continue;
-
-        const modelClass = modelsByName.get(className);
-        if (!modelClass) continue;
-
-        const schema = this.resolveClass(classDecl);
-        schemas.set(modelClass.type, schema);
-        (modelClass as any).__schema = schema;
-      }
-    }
-
-    return schemas;
-  }
-
-  /**
    * Resolve a single class's instance properties into a SchemaDefinition.
    */
   private resolveClass(classDecl: ClassDeclaration): SchemaDefinition {
@@ -240,5 +209,3 @@ export class SchemaResolver {
     }
   }
 }
-
-export default SchemaResolver;

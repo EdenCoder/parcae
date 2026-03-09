@@ -162,5 +162,3 @@ export class Controller {
   // Controllers are auto-discovered — the class just needs to exist.
   // Decorators on methods register routes at class load time.
 }
-
-export default route;

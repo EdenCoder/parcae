@@ -27,7 +27,3 @@ export function useConnectionStatus() {
   const { status } = useAuthStatus();
   return { isConnected: client.isConnected, authStatus: status };
 }
-
-export function useAuthState() {
-  return useAuthStatus();
-}

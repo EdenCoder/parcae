@@ -22,13 +22,11 @@ export class PubSub {
   private redisLock: Client | null = null;
   private redisRead: Client | null = null;
   private redisWrite: Client | null = null;
-  private isRedis: boolean;
 
   public building: Promise<void>;
 
   constructor(config: PubSubConfig = {}) {
     this.__events.setMaxListeners(0);
-    this.isRedis = !!config.url;
     this.building = config.url
       ? this.buildRedis(config.url)
       : Promise.resolve();
@@ -57,14 +55,6 @@ export class PubSub {
   }
 
   // ── Pub/Sub ──────────────────────────────────────────────────────────
-
-  on(event: string, handler: (...args: any[]) => void): void {
-    this.__events.on(event, handler);
-  }
-
-  off(event: string, handler: (...args: any[]) => void): void {
-    this.__events.removeListener(event, handler);
-  }
 
   emit(event: string, ...args: any[]): void {
     if (this.redisWrite) {
@@ -136,5 +126,3 @@ export class PubSub {
     this.__events.removeAllListeners();
   }
 }
-
-export default PubSub;

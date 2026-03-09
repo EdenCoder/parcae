@@ -310,10 +310,3 @@ export function betterAuth(config: BetterAuthConfig = {}): AuthAdapter {
     },
   };
 }
-
-export default betterAuth;
-export type {
-  AuthAdapter,
-  AuthSession,
-  AuthSetupContext,
-} from "@parcae/backend";

@@ -12,6 +12,13 @@
  *   return { success: true };
  * });
  * ```
+ *
+ * @example With concurrency for 3rd-party API jobs:
+ * ```typescript
+ * export default job("dialogue:audio", async ({ data }) => {
+ *   // call external TTS API ...
+ * }, { concurrency: 24 });
+ * ```
  */
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -27,9 +34,19 @@ export interface JobContext {
 
 export type JobHandler = (ctx: JobContext) => Promise<any>;
 
+export interface JobOptions {
+  /**
+   * Max number of this job that can run concurrently in the worker.
+   * The worker's overall concurrency is set to the highest value
+   * across all registered jobs (minimum 1).
+   */
+  concurrency?: number;
+}
+
 export interface JobEntry {
   name: string;
   handler: JobHandler;
+  options: JobOptions;
 }
 
 // ─── Global Job Registry ─────────────────────────────────────────────────────
@@ -59,12 +76,17 @@ export function clearJobs(): void {
  *   // ...
  *   return { success: true };
  * });
+ *
+ * // With concurrency for jobs that call external APIs:
+ * job("dialogue:audio", handler, { concurrency: 24 });
  * ```
  */
-export function job(name: string, handler: JobHandler): JobEntry {
-  const entry: JobEntry = { name, handler };
+export function job(
+  name: string,
+  handler: JobHandler,
+  options: JobOptions = {},
+): JobEntry {
+  const entry: JobEntry = { name, handler, options };
   registeredJobs.push(entry);
   return entry;
 }
-
-export default job;

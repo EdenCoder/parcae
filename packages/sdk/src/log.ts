@@ -12,8 +12,6 @@ function time(): string {
 }
 
 export const log = {
-  info: (...args: any[]) =>
-    isDev && console.log(`%c${time()} SDK`, "color: #6b7", ...args),
   warn: (...args: any[]) =>
     isDev && console.warn(`%c${time()} SDK`, "color: #fb3", ...args),
   error: (...args: any[]) =>
