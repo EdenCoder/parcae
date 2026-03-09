@@ -74,7 +74,7 @@ export async function enqueue(
 
   if (options.jobId) {
     const job = await addJobIfNotExists(queue, name, data, {
-      jobId: options.jobId,
+      jobId: options.jobId.replace(/:/g, "."),
       removeOnComplete: options.removeOnComplete,
       removeOnFail: options.removeOnFail,
     });
