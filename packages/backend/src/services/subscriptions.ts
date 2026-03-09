@@ -6,10 +6,14 @@ import { log } from "../logger";
  * diffed against cached results, and surgical add/remove/update ops are
  * emitted to subscribers.
  *
+ * Update ops carry RFC 6902 JSON Patch arrays — only the changed fields are
+ * sent over the wire, not the entire document.
+ *
  * Extracted from Dollhouse Studio's adapters/subscriptions.ts (308 lines).
  */
 
 import { createHash } from "node:crypto";
+import { compare, type Operation } from "fast-json-patch";
 import type { BackendAdapter } from "../adapters/model";
 import type { ModelConstructor, QueryStep } from "@parcae/model";
 
@@ -43,8 +47,9 @@ function hashQuery(
   return createHash("sha256").update(payload).digest("hex").slice(0, 16);
 }
 
-function deepEqual(a: any, b: any): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
+/** JSON round-trip to normalize Dates to strings, strip undefined, etc. */
+function jsonClone<T>(obj: T): T {
+  return JSON.parse(JSON.stringify(obj));
 }
 
 // ─── Manager ─────────────────────────────────────────────────────────────────
@@ -80,7 +85,10 @@ export class QuerySubscriptionManager {
     } else {
       const rows = await this._runQuery(modelClass, steps, scopeFilter);
       const result = new Map<string, Record<string, any>>();
-      for (const row of rows) result.set(row.id, row);
+      for (const row of rows) {
+        const clean = jsonClone(row);
+        result.set(clean.id, clean);
+      }
 
       cached = {
         hash,
@@ -165,18 +173,27 @@ export class QuerySubscriptionManager {
       cached.scopeFilter,
     );
     const newResult = new Map<string, Record<string, any>>();
-    for (const row of rows) newResult.set(row.id, row);
+    for (const row of rows) {
+      const clean = jsonClone(row);
+      newResult.set(clean.id, clean);
+    }
 
-    const ops: Array<{
-      op: "add" | "remove" | "update";
-      id: string;
-      data?: Record<string, any>;
-    }> = [];
+    const ops: Array<
+      | { op: "add"; id: string; data: Record<string, any> }
+      | { op: "remove"; id: string }
+      | { op: "update"; id: string; patch: Operation[] }
+    > = [];
 
     for (const [id, data] of newResult) {
       const prev = cached.result.get(id);
-      if (!prev) ops.push({ op: "add", id, data });
-      else if (!deepEqual(prev, data)) ops.push({ op: "update", id, data });
+      if (!prev) {
+        ops.push({ op: "add", id, data });
+      } else {
+        const patch = compare(prev, data);
+        if (patch.length > 0) {
+          ops.push({ op: "update", id, patch });
+        }
+      }
     }
 
     for (const id of cached.result.keys()) {

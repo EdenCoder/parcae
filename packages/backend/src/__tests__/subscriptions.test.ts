@@ -275,7 +275,7 @@ describe("QuerySubscriptionManager", () => {
       expect(ops[0]).toEqual({ op: "remove", id: "p2" });
     });
 
-    it("should emit 'update' op when an item's data changes", async () => {
+    it("should emit 'update' op with JSON Patch when an item's data changes", async () => {
       adapter.setResults([row("p1", { name: "A", views: 10 })]);
       await manager.subscribe({
         socketId: "s1",
@@ -291,11 +291,14 @@ describe("QuerySubscriptionManager", () => {
       expect(emitted).toHaveLength(1);
       const ops = emitted[0]!.data;
       expect(ops).toHaveLength(1);
-      expect(ops[0]).toEqual({
-        op: "update",
-        id: "p1",
-        data: { id: "p1", name: "A", views: 42 },
-      });
+      expect(ops[0].op).toBe("update");
+      expect(ops[0].id).toBe("p1");
+      // Should carry a JSON Patch array, not the full data
+      expect(ops[0].patch).toBeDefined();
+      expect(ops[0].data).toBeUndefined();
+      expect(ops[0].patch).toEqual([
+        { op: "replace", path: "/views", value: 42 },
+      ]);
     });
 
     it("should emit multiple ops in a single event (add + remove + update)", async () => {
@@ -324,11 +327,14 @@ describe("QuerySubscriptionManager", () => {
       expect(ops).toHaveLength(3);
 
       const byOp = new Map(ops.map((o: any) => [o.id, o]));
-      expect(byOp.get("p1")).toEqual({
-        op: "update",
-        id: "p1",
-        data: { id: "p1", name: "A-updated" },
-      });
+
+      const p1Op = byOp.get("p1") as any;
+      expect(p1Op.op).toBe("update");
+      expect(p1Op.patch).toEqual([
+        { op: "replace", path: "/name", value: "A-updated" },
+      ]);
+      expect(p1Op.data).toBeUndefined();
+
       expect(byOp.get("p2")).toEqual({ op: "remove", id: "p2" });
       expect(byOp.get("p4")).toEqual({
         op: "add",
@@ -420,7 +426,7 @@ describe("QuerySubscriptionManager", () => {
   // ── Minimal data transfer ──────────────────────────────────────────
 
   describe("minimal data transfer", () => {
-    it("should only include data in add and update ops, not remove", async () => {
+    it("should only include patch in update ops and nothing in remove", async () => {
       adapter.setResults([row("p1", { name: "A" }), row("p2", { name: "B" })]);
       await manager.subscribe({
         socketId: "s1",
@@ -437,12 +443,15 @@ describe("QuerySubscriptionManager", () => {
       const removeOp = ops.find((o: any) => o.op === "remove");
       const updateOp = ops.find((o: any) => o.op === "update");
 
-      // Remove op should NOT carry the full data — just the id
+      // Remove op should NOT carry any data — just the id
       expect(removeOp).toEqual({ op: "remove", id: "p1" });
       expect(removeOp.data).toBeUndefined();
 
-      // Update op SHOULD carry the new data
-      expect(updateOp.data).toEqual({ id: "p2", name: "B-updated" });
+      // Update op should carry a JSON Patch array, not the full data
+      expect(updateOp.data).toBeUndefined();
+      expect(updateOp.patch).toEqual([
+        { op: "replace", path: "/name", value: "B-updated" },
+      ]);
     });
 
     it("should not re-send unchanged items", async () => {
@@ -514,11 +523,10 @@ describe("QuerySubscriptionManager", () => {
       await tick();
 
       expect(emitted).toHaveLength(1);
-      expect(emitted[0]!.data[0]).toEqual({
-        op: "update",
-        id: "p1",
-        data: { id: "p1", name: "C" },
-      });
+      const op = emitted[0]!.data[0];
+      expect(op.op).toBe("update");
+      expect(op.id).toBe("p1");
+      expect(op.patch).toEqual([{ op: "replace", path: "/name", value: "C" }]);
     });
 
     it("should not emit if reeval returns same results after a previous change", async () => {

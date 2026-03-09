@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useSyncExternalStore } from "react";
+import { applyPatch, type Operation } from "fast-json-patch";
 import { useParcae } from "./context";
 import { useAuthStatus } from "./useAuth";
 import { log } from "../log";
@@ -65,14 +66,15 @@ function notify(e: CacheEntry): void {
 
 // ── Ops application ──────────────────────────────────────────────────────────
 
-type QueryOp = {
-  op: "add" | "remove" | "update";
-  id: string;
-  data?: Record<string, any>;
-};
+type QueryOp =
+  | { op: "add"; id: string; data: Record<string, any> }
+  | { op: "remove"; id: string }
+  | { op: "update"; id: string; patch: Operation[] };
 
 /**
  * Apply surgical ops from the subscription manager to the cached items.
+ * Update ops carry JSON Patch (RFC 6902) diffs — only the changed fields
+ * are sent over the wire, not the entire document.
  * Mutates nothing — returns a new array.
  */
 function applyOps(
@@ -93,13 +95,22 @@ function applyOps(
           byId.set(op.id, instance);
         }
         break;
-      case "update":
-        if (op.data) {
-          // Replace with fresh instance
-          const instance = new modelClass(adapter, op.data);
-          byId.set(op.id, instance);
+      case "update": {
+        const existing = byId.get(op.id);
+        if (existing && op.patch) {
+          // Both `patch` values and `__data` values should be plain JSON
+          // (no Dates etc, because they crossed the wire) so applyPatch
+          // doesn't stumble on objects treating them like iterables.
+          // We clone deeply first so we don't mutate the old instance's __data.
+          const rawData = JSON.parse(
+            JSON.stringify(existing.__data ?? existing),
+          );
+          // applyPatch mutates the object we pass it
+          applyPatch(rawData, op.patch);
+          byId.set(op.id, new modelClass(adapter, rawData));
         }
         break;
+      }
       case "remove":
         byId.delete(op.id);
         break;
