@@ -26,15 +26,15 @@
  */
 
 import { createClerkClient, verifyToken } from "@clerk/backend";
-import { Webhook } from "svix";
-import { Model } from "@parcae/model";
-import type { ModelConstructor } from "@parcae/model";
 import type {
   AuthAdapter,
   AuthSession,
   AuthSetupContext,
   BackendAdapter,
 } from "@parcae/backend";
+import type { ModelConstructor } from "@parcae/model";
+import { Model } from "@parcae/model";
+import { Webhook } from "svix";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -135,8 +135,42 @@ export function clerk(config: ClerkConfig): AuthAdapter {
       // Ensure the user exists locally
       await ensureLocalUser(userId);
 
-      return { user: { id: userId } };
-    } catch {
+      // Extract org context from Clerk JWT.
+      // Clerk uses `o.id` for org ID in the JWT payload (not `org_id`).
+      const orgId = (payload as any).o?.id ?? (payload as any).org_id ?? null;
+      const orgSlug =
+        (payload as any).o?.slg ?? (payload as any).org_slug ?? null;
+
+      // The JWT doesn't include the role — resolve via Clerk API.
+      let orgRole: string | null = null;
+      if (orgId) {
+        try {
+          const memberships =
+            await clerkClient.users.getOrganizationMembershipList({
+              userId,
+            });
+          const membership = memberships.data?.find(
+            (m: any) => m.organization.id === orgId,
+          );
+          orgRole = membership?.role ?? null;
+        } catch {
+          // Clerk API may fail — proceed without role
+        }
+      }
+
+      return {
+        user: {
+          id: userId,
+          ...(orgId && { orgId }),
+          ...(orgRole && { orgRole }),
+          ...(orgSlug && { orgSlug }),
+        },
+      };
+    } catch (err) {
+      console.error(
+        "[auth-clerk] resolveSessionToken failed:",
+        (err as Error).message ?? err,
+      );
       return null;
     }
   }

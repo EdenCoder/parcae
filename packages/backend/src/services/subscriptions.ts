@@ -13,9 +13,9 @@ import { log } from "../logger";
  */
 
 import { createHash } from "node:crypto";
+import type { ModelConstructor, QueryStep } from "@parcae/model";
 import { compare, type Operation } from "fast-json-patch";
 import type { BackendAdapter } from "../adapters/model";
-import type { ModelConstructor, QueryStep } from "@parcae/model";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -216,13 +216,33 @@ export class QuerySubscriptionManager {
     steps: QueryStep[],
     scopeFilter: Record<string, any> | ((qb: any) => any) | null,
   ): Promise<Record<string, any>[]> {
-    let chain = this.adapter.query(modelClass);
+    let chain: any;
 
-    if (scopeFilter) chain = chain.where(scopeFilter);
+    // Apply scope: function scopes go directly to knex builder
+    if (typeof scopeFilter === "function") {
+      const table = (modelClass.type ?? "") + "s";
+      const knexQuery = (this.adapter as any).read(table);
+      scopeFilter(knexQuery);
+      chain = (this.adapter as any)._buildQuery(modelClass, knexQuery);
+    } else {
+      chain = this.adapter.query(modelClass);
+      if (scopeFilter) chain = chain.where(scopeFilter);
+    }
 
     for (const step of steps) {
+      // Skip empty where() / where({})
+      const args = step.args ?? [];
+      if (args.length === 0) continue;
+      if (
+        args.length === 1 &&
+        typeof args[0] === "object" &&
+        args[0] !== null &&
+        !Array.isArray(args[0]) &&
+        Object.keys(args[0]).length === 0
+      )
+        continue;
       const method = (chain as any)[step.method];
-      if (typeof method === "function") chain = method.apply(chain, step.args);
+      if (typeof method === "function") chain = method.apply(chain, args);
     }
 
     const models = await chain.find();

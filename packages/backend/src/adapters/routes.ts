@@ -12,13 +12,13 @@
  * Extracted from Dollhouse Studio's adapters/routes.ts (373 lines).
  */
 
-import pluralize from "pluralize";
-import { Model } from "@parcae/model";
 import type { ModelConstructor, ScopeContext } from "@parcae/model";
-import type { BackendAdapter } from "./model";
-import { route } from "../routing/route";
-import { log } from "../logger";
+import { Model } from "@parcae/model";
+import pluralize from "pluralize";
 import { ClientError } from "../helpers";
+import { log } from "../logger";
+import { route } from "../routing/route";
+import type { BackendAdapter } from "./model";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -56,7 +56,7 @@ function resolvePath(modelClass: ModelConstructor, version: string): string {
 export function registerModelRoutes(
   models: ModelConstructor[],
   adapter: BackendAdapter,
-  version: string = "v1",
+  version = "v1",
 ): number {
   let count = 0;
 
@@ -79,7 +79,24 @@ export function registerModelRoutes(
         const steps = data.__query ?? [];
 
         try {
+          console.log(
+            `[routes] GET ${path} — scope:`,
+            typeof scopeResult,
+            scopeResult instanceof Function
+              ? "(fn)"
+              : JSON.stringify(scopeResult),
+            "steps:",
+            JSON.stringify(steps).slice(0, 200),
+          );
           const query = adapter.queryFromClient(ModelClass, scopeResult, steps);
+          try {
+            console.log(
+              "[routes] SQL preview:",
+              (query as any)._knex?.toSQL?.()?.sql ?? "n/a",
+            );
+          } catch (e: any) {
+            console.error("[routes] SQL preview failed:", e.message);
+          }
 
           if (data.__count === "true" || data.__count === true) {
             const total = await query.count();
