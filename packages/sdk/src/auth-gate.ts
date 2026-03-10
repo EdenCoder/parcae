@@ -1,8 +1,8 @@
 /**
- * AuthGate — reactive auth state via Valtio proxy.
+ * AuthGate — auth state container with awaitable resolution.
  *
- * The transport writes to this directly. React reads via useSnapshot().
- * No useState, no useEffect, no manual syncing.
+ * The transport writes to this directly. React reads via useAuthStatus()
+ * which polls gate.state.version to detect changes.
  */
 
 import { log } from "./log";
@@ -57,8 +57,9 @@ export class AuthGate {
   reset(): void {
     if (this.state.status !== "pending") {
       this.state.status = "pending";
-    log.debug("auth: reset to pending");
+      log.debug("auth: reset to pending");
       this.state.userId = null;
+      this.state.version++;
       this.ready = this._makePending();
     }
   }

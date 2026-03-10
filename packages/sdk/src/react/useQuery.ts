@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useSyncExternalStore } from "react";
 import { applyPatch, type Operation } from "fast-json-patch";
+import { Model } from "@parcae/model";
 import { useParcae } from "./context";
 import { useAuthStatus } from "./useAuth";
 import { log } from "../log";
@@ -27,10 +28,19 @@ interface UseQueryResult<T> {
 
 // ── Cache ────────────────────────────────────────────────────────────────────
 
+interface Snapshot {
+  items: any[];
+  loading: boolean;
+  error: Error | null;
+}
+
 interface CacheEntry {
   items: any[];
   loading: boolean;
   error: Error | null;
+  /** Immutable snapshot — replaced on every notify(). useSyncExternalStore
+   *  compares by reference, so a new object triggers re-render. */
+  snapshot: Snapshot;
   refs: number;
   listeners: Set<() => void>;
   dispose: (() => void) | null;
@@ -41,6 +51,11 @@ interface CacheEntry {
 const cache = new Map<string, CacheEntry>();
 const GC_DELAY = 60_000;
 const EMPTY: any[] = [];
+const EMPTY_SNAPSHOT: Snapshot = { items: EMPTY, loading: true, error: null };
+
+function buildSnapshot(e: CacheEntry): Snapshot {
+  return { items: e.items, loading: e.loading, error: e.error };
+}
 
 function getOrCreate(key: string): CacheEntry {
   let e = cache.get(key);
@@ -49,6 +64,7 @@ function getOrCreate(key: string): CacheEntry {
       items: EMPTY,
       loading: true,
       error: null,
+      snapshot: EMPTY_SNAPSHOT,
       refs: 0,
       listeners: new Set(),
       dispose: null,
@@ -60,7 +76,9 @@ function getOrCreate(key: string): CacheEntry {
   return e;
 }
 
+/** Rebuild the immutable snapshot and notify all subscribers. */
 function notify(e: CacheEntry): void {
+  e.snapshot = buildSnapshot(e);
   for (const fn of e.listeners) fn();
 }
 
@@ -98,14 +116,9 @@ function applyOps(
       case "update": {
         const existing = byId.get(op.id);
         if (existing && op.patch) {
-          // Both `patch` values and `__data` values should be plain JSON
-          // (no Dates etc, because they crossed the wire) so applyPatch
-          // doesn't stumble on objects treating them like iterables.
-          // We clone deeply first so we don't mutate the old instance's __data.
           const rawData = JSON.parse(
             JSON.stringify(existing.__data ?? existing),
           );
-          // applyPatch mutates the object we pass it
           applyPatch(rawData, op.patch);
           byId.set(op.id, new modelClass(adapter, rawData));
         }
@@ -118,6 +131,14 @@ function applyOps(
   }
 
   return [...byId.values()];
+}
+
+/**
+ * Resolve the adapter for subscription ops.
+ * Lazy queries have __adapter = null, so fall back to the global adapter.
+ */
+function resolveAdapter(chain: QueryChain<any>): any {
+  return chain.__adapter ?? (Model.hasAdapter() ? Model.getAdapter() : null);
 }
 
 // ── Fetch + subscribe ────────────────────────────────────────────────────────
@@ -147,15 +168,12 @@ function doFetch(
         entry.dispose?.();
         entry.queryHash = hash;
 
+        const adapter = resolveAdapter(chain);
+
         // Subscribe to query-level ops
         const unsub = client.subscribe(`query:${hash}`, (ops: QueryOp[]) => {
           if (!Array.isArray(ops) || ops.length === 0) return;
-          entry.items = applyOps(
-            entry.items,
-            ops,
-            chain.__modelClass,
-            chain.__adapter,
-          );
+          entry.items = applyOps(entry.items, ops, chain.__modelClass, adapter);
           notify(entry);
         });
         entry.dispose = unsub;
@@ -212,17 +230,17 @@ export function useQuery<T>(
     };
   };
 
-  const getSnapshot = (): any[] => {
+  const getSnapshot = (): Snapshot => {
     const k = keyRef.current;
-    if (!k) return EMPTY;
-    return cache.get(k)?.items ?? EMPTY;
+    if (!k) return EMPTY_SNAPSHOT;
+    return cache.get(k)?.snapshot ?? EMPTY_SNAPSHOT;
   };
 
-  const items = useSyncExternalStore(
+  const snap = useSyncExternalStore(
     subscribe,
     getSnapshot,
     getSnapshot,
-  ) as T[];
+  ) as Snapshot;
 
   useEffect(() => {
     if (!key || !chain) return;
@@ -248,11 +266,11 @@ export function useQuery<T>(
       error: null,
       refetch: () => {},
     };
-  const entry = cache.get(key);
+
   return {
-    items,
-    loading: entry?.loading ?? true,
-    error: entry?.error ?? null,
+    items: snap.items as T[],
+    loading: snap.loading,
+    error: snap.error,
     refetch,
   };
 }
