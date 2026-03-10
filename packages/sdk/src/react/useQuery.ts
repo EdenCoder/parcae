@@ -28,19 +28,17 @@ interface UseQueryResult<T> {
 
 // ── Cache ────────────────────────────────────────────────────────────────────
 
-interface Snapshot {
-  items: any[];
-  loading: boolean;
-  error: Error | null;
-}
-
 interface CacheEntry {
   items: any[];
   loading: boolean;
   error: Error | null;
-  /** Immutable snapshot — replaced on every notify(). useSyncExternalStore
-   *  compares by reference, so a new object triggers re-render. */
-  snapshot: Snapshot;
+  /**
+   * Hash that changes when the consumer should re-render.
+   * Encodes: loading flag, error presence, and item id list.
+   * Property-level changes on individual items flow through valtio
+   * proxies and do NOT need a re-render at the list level.
+   */
+  hash: string;
   refs: number;
   listeners: Set<() => void>;
   dispose: (() => void) | null;
@@ -51,10 +49,24 @@ interface CacheEntry {
 const cache = new Map<string, CacheEntry>();
 const GC_DELAY = 60_000;
 const EMPTY: any[] = [];
-const EMPTY_SNAPSHOT: Snapshot = { items: EMPTY, loading: true, error: null };
+const INITIAL_HASH = "L"; // loading=true, no items
 
-function buildSnapshot(e: CacheEntry): Snapshot {
-  return { items: e.items, loading: e.loading, error: e.error };
+/**
+ * Build a hash that captures the "shape" of the entry — loading state,
+ * error state, and which items are in the list (by id + order).
+ * Property-level mutations on existing items don't change this hash;
+ * those flow reactively through valtio proxies on each Model instance.
+ */
+function buildHash(e: CacheEntry): string {
+  if (e.loading) return "L";
+  if (e.error) return `E:${e.error.message}`;
+  // id list preserves order — a reorder or add/remove changes the hash
+  let h = "D:";
+  for (let i = 0; i < e.items.length; i++) {
+    if (i > 0) h += ",";
+    h += e.items[i]?.id ?? i;
+  }
+  return h;
 }
 
 function getOrCreate(key: string): CacheEntry {
@@ -64,7 +76,7 @@ function getOrCreate(key: string): CacheEntry {
       items: EMPTY,
       loading: true,
       error: null,
-      snapshot: EMPTY_SNAPSHOT,
+      hash: INITIAL_HASH,
       refs: 0,
       listeners: new Set(),
       dispose: null,
@@ -76,9 +88,30 @@ function getOrCreate(key: string): CacheEntry {
   return e;
 }
 
-/** Rebuild the immutable snapshot and notify all subscribers. */
+/**
+ * Recompute the hash and notify listeners only if it changed.
+ * This means useSyncExternalStore triggers a re-render only when:
+ *   - loading/error state transitions
+ *   - items are added, removed, or reordered
+ * It does NOT re-render for property-level changes on existing items
+ * (those propagate through valtio's proxy on each Model instance).
+ */
 function notify(e: CacheEntry): void {
-  e.snapshot = buildSnapshot(e);
+  const next = buildHash(e);
+  if (next !== e.hash) {
+    e.hash = next;
+    for (const fn of e.listeners) fn();
+  }
+}
+
+/**
+ * Force-notify — always fires listeners regardless of hash.
+ * Used after the initial fetch completes so the snapshot transitions
+ * from EMPTY to the real items array even if the hash happens to match
+ * (e.g. both are "D:" for an empty result set).
+ */
+function forceNotify(e: CacheEntry): void {
+  e.hash = buildHash(e);
   for (const fn of e.listeners) fn();
 }
 
@@ -179,13 +212,15 @@ function doFetch(
         entry.dispose = unsub;
       }
 
-      notify(entry);
+      // Force-notify so the snapshot transitions from EMPTY to real items,
+      // even if the hash matches (e.g. loading -> 0 items: both hash to "D:")
+      forceNotify(entry);
     })
     .catch((err: Error) => {
       log.error("useQuery: error", err.message);
       entry.error = err;
       entry.loading = false;
-      notify(entry);
+      forceNotify(entry);
     });
 }
 
@@ -230,17 +265,15 @@ export function useQuery<T>(
     };
   };
 
-  const getSnapshot = (): Snapshot => {
+  const getSnapshot = (): string => {
     const k = keyRef.current;
-    if (!k) return EMPTY_SNAPSHOT;
-    return cache.get(k)?.snapshot ?? EMPTY_SNAPSHOT;
+    if (!k) return INITIAL_HASH;
+    return cache.get(k)?.hash ?? INITIAL_HASH;
   };
 
-  const snap = useSyncExternalStore(
-    subscribe,
-    getSnapshot,
-    getSnapshot,
-  ) as Snapshot;
+  // useSyncExternalStore compares the hash string by value.
+  // Re-renders only when loading/error state or item list composition changes.
+  useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 
   useEffect(() => {
     if (!key || !chain) return;
@@ -267,10 +300,11 @@ export function useQuery<T>(
       refetch: () => {},
     };
 
+  const entry = cache.get(key);
   return {
-    items: snap.items as T[],
-    loading: snap.loading,
-    error: snap.error,
+    items: entry?.items ?? (EMPTY as T[]),
+    loading: entry?.loading ?? true,
+    error: entry?.error ?? null,
     refetch,
   };
 }
