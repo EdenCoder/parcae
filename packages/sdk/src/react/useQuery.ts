@@ -185,7 +185,9 @@ function doFetch(
   // without needing the original closure.
   entry.chain = chain;
   entry.client = client;
-  entry.loading = true;
+  if (entry.items === EMPTY) {
+    entry.loading = true;
+  }
   entry.error = null;
   notify(entry);
 
@@ -239,12 +241,12 @@ export function useQuery<T>(
 ): UseQueryResult<T> {
   const client = useParcae();
   const waitForAuth = options.waitForAuth ?? true;
-  const { status: authStatus, version: authVersion } = useAuthStatus();
+  const { status: authStatus, userId } = useAuthStatus();
   const authReady = !waitForAuth || authStatus !== "pending";
 
   const key =
     chain && authReady
-      ? `${chain.__modelType}:${authVersion}:${JSON.stringify(chain.__steps ?? [])}`
+      ? `${chain.__modelType}:${userId ?? "anon"}:${JSON.stringify(chain.__steps ?? [])}`
       : null;
 
   // Refs for callbacks that need the latest chain/client without re-subscribing
