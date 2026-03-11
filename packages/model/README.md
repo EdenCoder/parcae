@@ -16,12 +16,12 @@ import { Model } from "@parcae/model";
 class Post extends Model {
   static type = "post" as const;
 
-  user!: User;              // reference -> VARCHAR storing ID
-  title: string = "";       // string -> VARCHAR
-  body: PostBody = {};      // object -> JSONB
-  tags: string[] = [];      // array -> JSONB
+  user!: User; // reference -> VARCHAR storing ID
+  title: string = ""; // string -> VARCHAR
+  body: PostBody = {}; // object -> JSONB
+  tags: string[] = []; // array -> JSONB
   published: boolean = false; // boolean -> BOOLEAN
-  views: number = 0;        // number -> DOUBLE PRECISION
+  views: number = 0; // number -> DOUBLE PRECISION
 }
 ```
 
@@ -34,11 +34,11 @@ The Model constructor returns a Proxy. Data properties read/write to an internal
 ```typescript
 const post = await Post.findById("abc");
 
-post.title;              // "Hello" — reads from data store
-post.title = "Updated";  // change tracked automatically
-post.published;          // false — typed as boolean
+post.title; // "Hello" — reads from data store
+post.title = "Updated"; // change tracked automatically
+post.published; // false — typed as boolean
 
-await post.save();       // flushes tracked changes
+await post.save(); // flushes tracked changes
 ```
 
 ## References
@@ -46,12 +46,12 @@ await post.save();       // flushes tracked changes
 Properties typed as another Model class become lazy-loading proxies. The `$` prefix gives raw ID access.
 
 ```typescript
-post.user;   // User proxy — loads on property access, Suspense-compatible
-post.$user;  // "user_k8f2m9x" — raw string ID, no loading
+post.user; // User proxy — loads on property access, Suspense-compatible
+post.$user; // "user_k8f2m9x" — raw string ID, no loading
 
 // Setting a reference accepts a Model instance or raw ID
-post.user = someUser;        // extracts someUser.id
-post.$user = "user_abc123";  // sets raw ID directly
+post.user = someUser; // extracts someUser.id
+post.$user = "user_abc123"; // sets raw ID directly
 ```
 
 The reference proxy throws a Promise on first property access for React Suspense integration:
@@ -93,7 +93,7 @@ Post.basic(25, "createdAt", "desc", 0);
 ```typescript
 // Create
 const post = Post.create({ title: "New Post" });
-post.id;  // auto-generated 20-char ID
+post.id; // auto-generated 20-char ID
 
 // Save (insert or update)
 await post.save();
@@ -101,7 +101,7 @@ await post.save();
 // Save with debounce (frontend batching)
 post.__debounceMs = 500;
 post.title = "A";
-post.title = "AB";    // batched into single save
+post.title = "AB"; // batched into single save
 await post.save();
 
 // Atomic JSON Patch (RFC 6902)
@@ -117,7 +117,7 @@ await post.remove();
 await post.refresh();
 
 // Serialize
-post.toJSON();           // { type, id, title, ... }
+post.toJSON(); // { type, id, title, ... }
 await post.sanitize(user); // override in subclass to strip fields
 ```
 
@@ -154,10 +154,10 @@ interface ModelAdapter {
 }
 ```
 
-| Adapter | Store | Persistence |
-| --- | --- | --- |
+| Adapter           | Store                   | Persistence                     |
+| ----------------- | ----------------------- | ------------------------------- |
 | `FrontendAdapter` | Valtio proxy (reactive) | Transport RPC (Socket.IO / SSE) |
-| `BackendAdapter` | Plain object | Knex + PostgreSQL |
+| `BackendAdapter`  | Plain object            | Knex + PostgreSQL               |
 
 Set the adapter once at startup:
 
@@ -201,27 +201,27 @@ interface Transport {
 
 ## Static Properties
 
-| Property | Type | Description |
-| --- | --- | --- |
-| `type` | `string` | Model identifier. Used for table naming and routing. |
-| `path` | `string?` | Custom API path. Defaults to `/v1/{type}s`. |
-| `scope` | `ModelScope?` | Row-level security rules. |
-| `indexes` | `IndexDefinition[]?` | Database index definitions. |
-| `managed` | `boolean` | `false` for externally managed tables (e.g. auth). Default: `true`. |
-| `__schema` | `SchemaDefinition?` | Resolved at startup by RTTIST. Maps properties to column types. |
+| Property   | Type                 | Description                                                         |
+| ---------- | -------------------- | ------------------------------------------------------------------- |
+| `type`     | `string`             | Model identifier. Used for table naming and routing.                |
+| `path`     | `string?`            | Custom API path. Defaults to `/v1/{type}s`.                         |
+| `scope`    | `ModelScope?`        | Row-level security rules.                                           |
+| `indexes`  | `IndexDefinition[]?` | Database index definitions.                                         |
+| `managed`  | `boolean`            | `false` for externally managed tables (e.g. auth). Default: `true`. |
+| `__schema` | `SchemaDefinition?`  | Resolved at startup by RTTIST. Maps properties to column types.     |
 
 ## Type Mapping
 
-| TypeScript | ColumnType | Postgres |
-| --- | --- | --- |
-| `string` | `"string"` | VARCHAR(2048) |
-| `string` (long) | `"text"` | TEXT |
-| `number` (int) | `"integer"` | INTEGER |
-| `number` (float) | `"number"` | DOUBLE PRECISION |
-| `boolean` | `"boolean"` | BOOLEAN |
-| `Date` | `"datetime"` | TIMESTAMP |
-| `SomeModel` | `{ kind: "ref" }` | VARCHAR (foreign key) |
-| object / array | `"json"` | JSONB |
+| TypeScript       | ColumnType        | Postgres              |
+| ---------------- | ----------------- | --------------------- |
+| `string`         | `"string"`        | VARCHAR(2048)         |
+| `string` (long)  | `"text"`          | TEXT                  |
+| `number` (int)   | `"integer"`       | INTEGER               |
+| `number` (float) | `"number"`        | DOUBLE PRECISION      |
+| `boolean`        | `"boolean"`       | BOOLEAN               |
+| `Date`           | `"datetime"`      | TIMESTAMP             |
+| `SomeModel`      | `{ kind: "ref" }` | VARCHAR (foreign key) |
+| object / array   | `"json"`          | JSONB                 |
 
 ## Exports
 

@@ -33,9 +33,12 @@ export class PubSub {
   }
 
   private async buildRedis(url: string): Promise<void> {
-    this.redisLock = new Client(url);
-    this.redisRead = new Client(url);
-    this.redisWrite = new Client(url);
+    const isTLS = url.startsWith("rediss://");
+    const opts = isTLS ? { tls: { rejectUnauthorized: false } } : {};
+
+    this.redisLock = new Client(url, opts);
+    this.redisRead = new Client(url, opts);
+    this.redisWrite = new Client(url, opts);
 
     this.redlock = new Redlock([this.redisLock], {
       retryCount: 25,

@@ -6,7 +6,7 @@
  */
 
 import { Model, FrontendAdapter } from "@parcae/model";
-import type { Transport } from "@parcae/model";
+import type { Transport, RequestOptions } from "@parcae/model";
 import { SocketTransport } from "./transports/socket";
 import { SSETransport } from "./transports/sse";
 
@@ -20,11 +20,11 @@ export interface ClientConfig {
 
 export interface ParcaeClient {
   transport: Transport;
-  get(path: string, data?: any): Promise<any>;
-  post(path: string, data?: any): Promise<any>;
-  put(path: string, data?: any): Promise<any>;
-  patch(path: string, data?: any): Promise<any>;
-  delete(path: string, data?: any): Promise<any>;
+  get(path: string, data?: any, options?: RequestOptions): Promise<any>;
+  post(path: string, data?: any, options?: RequestOptions): Promise<any>;
+  put(path: string, data?: any, options?: RequestOptions): Promise<any>;
+  patch(path: string, data?: any, options?: RequestOptions): Promise<any>;
+  delete(path: string, data?: any, options?: RequestOptions): Promise<any>;
   subscribe(event: string, handler: (...args: any[]) => void): () => void;
   unsubscribe(event: string, handler?: (...args: any[]) => void): void;
   send(event: string, ...args: any[]): void;
@@ -62,11 +62,11 @@ export function createClient(config: ClientConfig): ParcaeClient {
 
   const client: ParcaeClient = {
     transport,
-    get: (p, d) => transport.get(p, d),
-    post: (p, d) => transport.post(p, d),
-    put: (p, d) => transport.put(p, d),
-    patch: (p, d) => transport.patch(p, d),
-    delete: (p, d) => transport.delete(p, d),
+    get: (p, d, o) => transport.get(p, d, o),
+    post: (p, d, o) => transport.post(p, d, o),
+    put: (p, d, o) => transport.put(p, d, o),
+    patch: (p, d, o) => transport.patch(p, d, o),
+    delete: (p, d, o) => transport.delete(p, d, o),
     subscribe: (e, h) => transport.subscribe?.(e, h) ?? (() => {}),
     unsubscribe: (e, h) => transport.unsubscribe?.(e, h),
     send: (e, ...a) => transport.send?.(e, ...a),
