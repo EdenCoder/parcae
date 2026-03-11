@@ -1,4 +1,5 @@
 import { log } from "../logger";
+
 /**
  * BackendAdapter — Knex + Postgres persistence for Parcae Model.
  *
@@ -7,26 +8,26 @@ import { log } from "../logger";
  * and Parcae's hook/pubsub systems.
  */
 
-import pluralize from "pluralize";
-import equal from "deep-equal";
-import { type Operation as PatchOp } from "fast-json-patch";
-import { Model, generateId } from "@parcae/model";
 import type {
+  ChangeSet,
+  ColumnType,
   ModelAdapter,
   ModelConstructor,
-  ChangeSet,
   QueryChain,
   QueryStep,
   SchemaDefinition,
-  ColumnType,
 } from "@parcae/model";
-import { hook, getHooksFor } from "../routing/hook";
+import { generateId, type Model } from "@parcae/model";
+import equal from "deep-equal";
+import type { Operation as PatchOp } from "fast-json-patch";
+import pluralize from "pluralize";
+import { ClientError } from "../helpers";
 import type { HookAction, HookTiming } from "../routing/hook";
+import { getHooksFor, hook } from "../routing/hook";
 import {
   enqueue as globalEnqueue,
   lock as globalLock,
 } from "../services/context";
-import { ClientError } from "../helpers";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -455,8 +456,22 @@ export class BackendAdapter implements ModelAdapter {
       ...Object.keys(schema),
     ]);
 
-    // Start with scope — always first, never overridable
-    let chain = this.query(modelClass).where(scope);
+    // Start with scope — always first, never overridable.
+    // Scope can be an object { org: "xxx" } or a function (qb) => qb.where(...)
+    let chain: QueryChain<T>;
+    if (typeof scope === "function") {
+      const table = tableName(modelClass);
+      const knexQuery = this.read(table);
+      scope(knexQuery);
+      try {
+        console.log("[qFC] fn scope applied. SQL:", knexQuery.toSQL().sql);
+      } catch (e: any) {
+        console.error("[qFC] fn scope SQL failed:", e.message);
+      }
+      chain = this._buildQuery(modelClass, knexQuery);
+    } else {
+      chain = this.query(modelClass).where(scope);
+    }
 
     let hasLimit = false;
 
@@ -474,15 +489,19 @@ export class BackendAdapter implements ModelAdapter {
 
       const args = this._sanitizeStepArgs(step, validColumns, modelClass.type);
 
+      // Skip empty where({}) — sanitizer returns [] to signal "no-op"
+      if (args.length === 0 && step.method !== "limit") continue;
+
       // Clamp limit
       if (step.method === "limit") {
         hasLimit = true;
         args[0] = Math.min(
-          Math.max(parseInt(args[0]) || BackendAdapter.DEFAULT_LIMIT, 1),
+          Math.max(Number.parseInt(args[0]) || BackendAdapter.DEFAULT_LIMIT, 1),
           BackendAdapter.MAX_LIMIT,
         );
       }
 
+      console.log(`[qFC] step: ${step.method}(${JSON.stringify(args)})`);
       chain = (chain as any)[step.method](...args);
     }
 
@@ -505,6 +524,21 @@ export class BackendAdapter implements ModelAdapter {
     modelType: string,
   ): any[] {
     const args = [...(step.args ?? [])];
+
+    // Skip no-op where: where() with no args or where({}) with empty object
+    if (BackendAdapter.COLUMN_ARG_METHODS.has(step.method)) {
+      if (args.length === 0) return [];
+      const firstArg = args[0];
+      if (typeof firstArg === "undefined") return [];
+      if (
+        typeof firstArg === "object" &&
+        firstArg !== null &&
+        !Array.isArray(firstArg) &&
+        !firstArg.__nested &&
+        Object.keys(firstArg).length === 0
+      )
+        return [];
+    }
 
     // Handle nested builder: .where((builder) => builder.where(...).orWhere(...))
     // Serialized as: { __nested: [{ method, args }, ...] }
@@ -580,8 +614,6 @@ export class BackendAdapter implements ModelAdapter {
     modelClass: ModelConstructor<T>,
     knexQuery: any,
   ): QueryChain<T> {
-    const adapter = this;
-
     const CHAINABLE = [
       "select",
       "where",
@@ -627,7 +659,7 @@ export class BackendAdapter implements ModelAdapter {
 
     for (const method of CHAINABLE) {
       chain[method] = (...args: any[]) => {
-        return adapter._buildQuery(modelClass, knexQuery[method](...args));
+        return this._buildQuery(modelClass, knexQuery[method](...args));
       };
     }
 
@@ -637,19 +669,19 @@ export class BackendAdapter implements ModelAdapter {
         | string[]
         | undefined;
       if (!searchFields?.length || !term.trim()) {
-        return adapter._buildQuery(modelClass, knexQuery);
+        return this._buildQuery(modelClass, knexQuery);
       }
-      const modified = adapter._applySearch(knexQuery, term, modelClass);
-      return adapter._buildQuery(modelClass, modified);
+      const modified = this._applySearch(knexQuery, term, modelClass);
+      return this._buildQuery(modelClass, modified);
     };
 
     chain.basic = (
-      limit: number = 25,
-      sort: string = "createdAt",
+      limit = 25,
+      sort = "createdAt",
       direction: "asc" | "desc" = "desc",
-      page: number = 0,
+      page = 0,
     ) => {
-      return adapter._buildQuery(
+      return this._buildQuery(
         modelClass,
         knexQuery
           .orderBy(sort, direction)
@@ -661,23 +693,23 @@ export class BackendAdapter implements ModelAdapter {
     chain.find = async (): Promise<T[]> => {
       const rows = await knexQuery;
       return Array.isArray(rows)
-        ? rows.map((row: any) => hydrate(modelClass, adapter, row))
+        ? rows.map((row: any) => hydrate(modelClass, this, row))
         : [];
     };
 
     chain.first = async (): Promise<T | null> => {
       const row = await knexQuery.first();
-      return row ? hydrate(modelClass, adapter, row) : null;
+      return row ? hydrate(modelClass, this, row) : null;
     };
 
     chain.count = async (column?: string): Promise<number> => {
       const clone = knexQuery.clone();
       const result = await clone.clearSelect().count(column || "*");
-      return parseInt(`${Object.values(result[0] || {})[0] || "0"}`, 10);
+      return Number.parseInt(`${Object.values(result[0] || {})[0] || "0"}`, 10);
     };
 
     chain.exec = () => knexQuery;
-    chain.clone = () => adapter._buildQuery(modelClass, knexQuery.clone());
+    chain.clone = () => this._buildQuery(modelClass, knexQuery.clone());
 
     return chain as QueryChain<T>;
   }
@@ -787,7 +819,7 @@ export class BackendAdapter implements ModelAdapter {
                 JSON.stringify((o as any).value),
               );
             } else if (innerSegments.length === 0) {
-              sql = `?::jsonb`;
+              sql = "?::jsonb";
               bindings.push(JSON.stringify((o as any).value));
             } else {
               this._ensureIntermediates(
@@ -809,7 +841,7 @@ export class BackendAdapter implements ModelAdapter {
           }
           case "replace": {
             if (innerSegments.length === 0) {
-              sql = `?::jsonb`;
+              sql = "?::jsonb";
               bindings.push(JSON.stringify((o as any).value));
             } else {
               this._ensureIntermediates(
@@ -870,11 +902,7 @@ export class BackendAdapter implements ModelAdapter {
 
   // ── Increment/Decrement ──────────────────────────────────────────────
 
-  async increment(
-    model: any,
-    field: string,
-    amount: number = 1,
-  ): Promise<void> {
+  async increment(model: any, field: string, amount = 1): Promise<void> {
     const ModelClass = model.constructor as typeof Model;
     const table = tableName(ModelClass as unknown as ModelConstructor);
     await this.write(table).where("id", model.id).increment(field, amount);
@@ -885,11 +913,7 @@ export class BackendAdapter implements ModelAdapter {
     if (row) model.__data[field] = row[field];
   }
 
-  async decrement(
-    model: any,
-    field: string,
-    amount: number = 1,
-  ): Promise<void> {
+  async decrement(model: any, field: string, amount = 1): Promise<void> {
     const ModelClass = model.constructor as typeof Model;
     const table = tableName(ModelClass as unknown as ModelConstructor);
     await this.write(table).where("id", model.id).decrement(field, amount);
@@ -974,7 +998,7 @@ export class BackendAdapter implements ModelAdapter {
     let existingIndexes: string[] = [];
     try {
       const result = await this.write.raw(
-        `SELECT * FROM pg_indexes WHERE tablename = ?`,
+        "SELECT * FROM pg_indexes WHERE tablename = ?",
         [table],
       );
       existingIndexes = result.rows.map((r: any) => r.indexname);
@@ -1115,7 +1139,7 @@ export class BackendAdapter implements ModelAdapter {
       );
       if (!hasEmbedding) {
         await this.write.raw(
-          `ALTER TABLE ?? ADD COLUMN _embedding vector(768)`,
+          "ALTER TABLE ?? ADD COLUMN _embedding vector(768)",
           [table],
         );
         log.info(
@@ -1169,7 +1193,6 @@ export class BackendAdapter implements ModelAdapter {
       if ((modelClass as any).managed === false) continue;
 
       const table = tableName(modelClass);
-      const adapter = this;
 
       // Register via hook.after() — the standard Parcae hook API
       hook.after(
@@ -1184,7 +1207,7 @@ export class BackendAdapter implements ModelAdapter {
               .trim();
             if (!text) return;
 
-            await adapter.write.raw(
+            await this.write.raw(
               `UPDATE ?? SET _embedding = embedding('gemini-embedding-001', ?)::vector WHERE id = ?`,
               [table, text, model.id],
             );
@@ -1209,7 +1232,7 @@ export class BackendAdapter implements ModelAdapter {
               .trim();
             if (!text) return;
 
-            await adapter.write.raw(
+            await this.write.raw(
               `UPDATE ?? SET _embedding = embedding('gemini-embedding-001', ?)::vector WHERE id = ?`,
               [table, text, model.id],
             );
