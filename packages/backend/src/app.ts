@@ -280,7 +280,6 @@ export function createApp(config: AppConfig): ParcaeApp {
 
       // ── Step 9: Set up QuerySubscriptionManager ────────────────────
       const subscriptions = new QuerySubscriptionManager(
-        adapter,
         (socketId, event, data) => {
           server?.io.to(socketId).emit(event, data);
         },

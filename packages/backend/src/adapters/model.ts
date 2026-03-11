@@ -462,8 +462,8 @@ export class BackendAdapter implements ModelAdapter {
     let chain: QueryChain<T>;
     if (typeof scope === "function") {
       const table = tableName(modelClass);
-      const knexQuery = this.read(table);
-      scope(knexQuery);
+      let knexQuery = this.read(table);
+      knexQuery = knexQuery.where(scope);
       chain = this._buildQuery(modelClass, knexQuery);
     } else {
       chain = this.query(modelClass).where(scope);
@@ -627,21 +627,6 @@ export class BackendAdapter implements ModelAdapter {
       }
       const modified = this._applySearch(knexQuery, term, modelClass);
       return this._buildQuery(modelClass, modified);
-    };
-
-    chain.basic = (
-      limit = 25,
-      sort = "createdAt",
-      direction: "asc" | "desc" = "desc",
-      page = 0,
-    ) => {
-      return this._buildQuery(
-        modelClass,
-        knexQuery
-          .orderBy(sort, direction)
-          .limit(limit)
-          .offset(page * limit),
-      );
     };
 
     chain.find = async (): Promise<T[]> => {

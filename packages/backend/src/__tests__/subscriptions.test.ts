@@ -7,32 +7,23 @@ function row(id: string, data: Record<string, any> = {}) {
   return { id, ...data };
 }
 
-// ─── Mock Adapter ────────────────────────────────────────────────────────────
+// ─── Mock Query Chain ────────────────────────────────────────────────────────
 
 /**
- * Creates a mock BackendAdapter with controllable query results.
- * Call setResults() to change what _runQuery returns before triggering reeval.
+ * Creates a mock QueryChain that returns results from a mutable source.
+ * Supports exec().toSQL() for hashing, clone() for re-evaluation,
+ * and __modelType for type indexing.
  */
-function createMockAdapter(initialResults: Record<string, any>[] = []) {
-  let currentResults = initialResults;
-
-  const adapter: any = {
-    setResults(results: Record<string, any>[]) {
-      currentResults = results;
-    },
-    query(_modelClass: any) {
-      return makeMockChain(() => currentResults);
-    },
-  };
-
-  return adapter;
-}
-
-function makeMockChain(getResults: () => Record<string, any>[]) {
+function makeMockQuery(
+  modelType: string,
+  getResults: () => Record<string, any>[],
+  sqlIdentity: string = "default",
+) {
   const chain: any = new Proxy(
     {},
     {
       get(_target, prop: string) {
+        if (prop === "__modelType") return modelType;
         if (prop === "find") {
           return async () =>
             getResults().map((r) => ({
@@ -49,6 +40,15 @@ function makeMockChain(getResults: () => Record<string, any>[]) {
           };
         }
         if (prop === "count") return async () => getResults().length;
+        if (prop === "exec") {
+          return () => ({
+            toSQL: () => ({
+              sql: `SELECT * FROM ${modelType}s WHERE ${sqlIdentity}`,
+              bindings: [],
+            }),
+          });
+        }
+        if (prop === "clone") return () => chain;
         // All chainable methods return the chain
         return (..._args: any[]) => chain;
       },
@@ -57,22 +57,31 @@ function makeMockChain(getResults: () => Record<string, any>[]) {
   return chain;
 }
 
-// ─── Mock Model Class ────────────────────────────────────────────────────────
+// ─── Helper to create queries with mutable results ───────────────────────────
 
-const ProjectModel: any = { type: "project" };
-const FileModel: any = { type: "file" };
+function createQuerySource(initialResults: Record<string, any>[] = []) {
+  let currentResults = initialResults;
+  return {
+    setResults(results: Record<string, any>[]) {
+      currentResults = results;
+    },
+    query(modelType: string, sqlIdentity?: string) {
+      return makeMockQuery(modelType, () => currentResults, sqlIdentity);
+    },
+  };
+}
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 describe("QuerySubscriptionManager", () => {
-  let adapter: ReturnType<typeof createMockAdapter>;
+  let source: ReturnType<typeof createQuerySource>;
   let emitted: Array<{ socketId: string; event: string; data: any }>;
   let manager: QuerySubscriptionManager;
 
   beforeEach(() => {
-    adapter = createMockAdapter([]);
+    source = createQuerySource([]);
     emitted = [];
-    manager = new QuerySubscriptionManager(adapter, (socketId, event, data) => {
+    manager = new QuerySubscriptionManager((socketId, event, data) => {
       emitted.push({ socketId, event, data });
     });
   });
@@ -81,16 +90,14 @@ describe("QuerySubscriptionManager", () => {
 
   describe("subscribe", () => {
     it("should return initial query results and a hash", async () => {
-      adapter.setResults([
+      source.setResults([
         row("p1", { name: "Project 1" }),
         row("p2", { name: "Project 2" }),
       ]);
 
       const sub = await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [],
-        scopeFilter: { userId: "u1" },
+        query: source.query("project"),
       });
 
       expect(sub.hash).toBeTruthy();
@@ -101,17 +108,15 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("should deduplicate subscriptions with same query", async () => {
-      adapter.setResults([row("p1")]);
+      source.setResults([row("p1")]);
 
       const sub1 = await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
       const sub2 = await manager.subscribe({
         socketId: "s2",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
 
       expect(sub1.hash).toBe(sub2.hash);
@@ -120,35 +125,31 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("should create separate subscriptions for different queries", async () => {
-      adapter.setResults([row("p1")]);
+      source.setResults([row("p1")]);
 
       await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [{ method: "where", args: [{ status: "active" }] }],
+        query: source.query("project", "status = 'active'"),
       });
 
       await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [{ method: "where", args: [{ status: "draft" }] }],
+        query: source.query("project", "status = 'draft'"),
       });
 
       expect(manager.stats.queries).toBe(2);
     });
 
     it("should create separate subscriptions for different model types", async () => {
-      adapter.setResults([row("p1")]);
+      source.setResults([row("p1")]);
 
       await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
       await manager.subscribe({
         socketId: "s1",
-        modelClass: FileModel,
-        steps: [],
+        query: source.query("file"),
       });
 
       expect(manager.stats.queries).toBe(2);
@@ -159,11 +160,10 @@ describe("QuerySubscriptionManager", () => {
 
   describe("unsubscribe", () => {
     it("should remove a socket from a query subscription", async () => {
-      adapter.setResults([row("p1")]);
+      source.setResults([row("p1")]);
       const sub = await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
 
       manager.unsubscribe("s1", sub.hash);
@@ -174,16 +174,14 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("should keep query alive if other subscribers remain", async () => {
-      adapter.setResults([row("p1")]);
+      source.setResults([row("p1")]);
       const sub = await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
       await manager.subscribe({
         socketId: "s2",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
 
       manager.unsubscribe("s1", sub.hash);
@@ -193,17 +191,15 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("unsubscribeAll should clean up all queries for a socket", async () => {
-      adapter.setResults([row("p1")]);
+      source.setResults([row("p1")]);
 
       await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
       await manager.subscribe({
         socketId: "s1",
-        modelClass: FileModel,
-        steps: [],
+        query: source.query("file"),
       });
 
       manager.unsubscribeAll("s1");
@@ -218,12 +214,11 @@ describe("QuerySubscriptionManager", () => {
   describe("onModelChange", () => {
     it("should emit nothing when data has not changed", async () => {
       const items = [row("p1", { name: "A" }), row("p2", { name: "B" })];
-      adapter.setResults(items);
+      source.setResults(items);
 
       await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
 
       // Re-eval with same data
@@ -234,15 +229,14 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("should emit 'add' op when a new item appears in results", async () => {
-      adapter.setResults([row("p1", { name: "A" })]);
+      source.setResults([row("p1", { name: "A" })]);
       await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
 
       // New item appears
-      adapter.setResults([row("p1", { name: "A" }), row("p2", { name: "B" })]);
+      source.setResults([row("p1", { name: "A" }), row("p2", { name: "B" })]);
       manager.onModelChange("project");
       await tick();
 
@@ -257,15 +251,14 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("should emit 'remove' op when an item disappears from results", async () => {
-      adapter.setResults([row("p1", { name: "A" }), row("p2", { name: "B" })]);
+      source.setResults([row("p1", { name: "A" }), row("p2", { name: "B" })]);
       await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
 
       // p2 no longer matches
-      adapter.setResults([row("p1", { name: "A" })]);
+      source.setResults([row("p1", { name: "A" })]);
       manager.onModelChange("project");
       await tick();
 
@@ -276,15 +269,14 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("should emit 'update' op with JSON Patch when an item's data changes", async () => {
-      adapter.setResults([row("p1", { name: "A", views: 10 })]);
+      source.setResults([row("p1", { name: "A", views: 10 })]);
       await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
 
       // p1's data changed
-      adapter.setResults([row("p1", { name: "A", views: 42 })]);
+      source.setResults([row("p1", { name: "A", views: 42 })]);
       manager.onModelChange("project");
       await tick();
 
@@ -302,18 +294,17 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("should emit multiple ops in a single event (add + remove + update)", async () => {
-      adapter.setResults([
+      source.setResults([
         row("p1", { name: "A" }),
         row("p2", { name: "B" }),
         row("p3", { name: "C" }),
       ]);
       await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
 
-      adapter.setResults([
+      source.setResults([
         row("p1", { name: "A-updated" }), // update
         // p2 removed
         row("p3", { name: "C" }), // unchanged
@@ -344,19 +335,17 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("should only emit to subscribed sockets, not all sockets", async () => {
-      adapter.setResults([row("p1", { name: "A" })]);
+      source.setResults([row("p1", { name: "A" })]);
       await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
       await manager.subscribe({
         socketId: "s2",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
 
-      adapter.setResults([row("p1", { name: "A-updated" })]);
+      source.setResults([row("p1", { name: "A-updated" })]);
       manager.onModelChange("project");
       await tick();
 
@@ -368,19 +357,17 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("should NOT emit to sockets subscribed to a different model type", async () => {
-      adapter.setResults([row("p1", { name: "A" })]);
+      source.setResults([row("p1", { name: "A" })]);
       await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
       await manager.subscribe({
         socketId: "s2",
-        modelClass: FileModel,
-        steps: [],
+        query: source.query("file"),
       });
 
-      adapter.setResults([row("p1", { name: "A-updated" })]);
+      source.setResults([row("p1", { name: "A-updated" })]);
       // Only project changed
       manager.onModelChange("project");
       await tick();
@@ -391,14 +378,13 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("should emit correct event name with query hash", async () => {
-      adapter.setResults([row("p1", { name: "A" })]);
+      source.setResults([row("p1", { name: "A" })]);
       const sub = await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
 
-      adapter.setResults([row("p1", { name: "A-updated" })]);
+      source.setResults([row("p1", { name: "A-updated" })]);
       manager.onModelChange("project");
       await tick();
 
@@ -406,16 +392,15 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("should not emit after socket unsubscribes", async () => {
-      adapter.setResults([row("p1", { name: "A" })]);
+      source.setResults([row("p1", { name: "A" })]);
       const sub = await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
 
       manager.unsubscribe("s1", sub.hash);
 
-      adapter.setResults([row("p1", { name: "A-updated" })]);
+      source.setResults([row("p1", { name: "A-updated" })]);
       manager.onModelChange("project");
       await tick();
 
@@ -427,15 +412,14 @@ describe("QuerySubscriptionManager", () => {
 
   describe("minimal data transfer", () => {
     it("should only include patch in update ops and nothing in remove", async () => {
-      adapter.setResults([row("p1", { name: "A" }), row("p2", { name: "B" })]);
+      source.setResults([row("p1", { name: "A" }), row("p2", { name: "B" })]);
       await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
 
       // Remove p1, update p2
-      adapter.setResults([row("p2", { name: "B-updated" })]);
+      source.setResults([row("p2", { name: "B-updated" })]);
       manager.onModelChange("project");
       await tick();
 
@@ -455,19 +439,18 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("should not re-send unchanged items", async () => {
-      adapter.setResults([
+      source.setResults([
         row("p1", { name: "A" }),
         row("p2", { name: "B" }),
         row("p3", { name: "C" }),
       ]);
       await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
 
       // Only p2 changed, p1 and p3 are the same
-      adapter.setResults([
+      source.setResults([
         row("p1", { name: "A" }),
         row("p2", { name: "B-updated" }),
         row("p3", { name: "C" }),
@@ -503,22 +486,21 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("should update cached results after reeval for next diff", async () => {
-      adapter.setResults([row("p1", { name: "A" })]);
+      source.setResults([row("p1", { name: "A" })]);
       await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
 
       // First change
-      adapter.setResults([row("p1", { name: "B" })]);
+      source.setResults([row("p1", { name: "B" })]);
       manager.onModelChange("project");
       await tick();
 
       emitted.length = 0;
 
       // Second change — diff should be against "B", not "A"
-      adapter.setResults([row("p1", { name: "C" })]);
+      source.setResults([row("p1", { name: "C" })]);
       manager.onModelChange("project");
       await tick();
 
@@ -530,15 +512,14 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("should not emit if reeval returns same results after a previous change", async () => {
-      adapter.setResults([row("p1", { name: "A" })]);
+      source.setResults([row("p1", { name: "A" })]);
       await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
 
       // Change to B
-      adapter.setResults([row("p1", { name: "B" })]);
+      source.setResults([row("p1", { name: "B" })]);
       manager.onModelChange("project");
       await tick();
 
@@ -562,11 +543,10 @@ describe("QuerySubscriptionManager", () => {
         sockets: 0,
       });
 
-      adapter.setResults([row("p1")]);
+      source.setResults([row("p1")]);
       await manager.subscribe({
         socketId: "s1",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
 
       expect(manager.stats).toEqual({
@@ -577,8 +557,7 @@ describe("QuerySubscriptionManager", () => {
 
       await manager.subscribe({
         socketId: "s2",
-        modelClass: ProjectModel,
-        steps: [],
+        query: source.query("project"),
       });
 
       expect(manager.stats).toEqual({

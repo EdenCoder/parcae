@@ -93,9 +93,7 @@ export function registerModelRoutes(
           if (socketId && adapter.subscriptions) {
             const sub = await adapter.subscriptions.subscribe({
               socketId,
-              modelClass: ModelClass,
-              steps,
-              scopeFilter: scopeResult,
+              query,
             });
 
             const items = [...sub.items];

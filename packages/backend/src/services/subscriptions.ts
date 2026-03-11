@@ -13,38 +13,28 @@ import { log } from "../logger";
  */
 
 import { createHash } from "node:crypto";
-import type { ModelConstructor, QueryStep } from "@parcae/model";
+import type { QueryChain } from "@parcae/model";
 import { compare, type Operation } from "fast-json-patch";
-import pluralize from "pluralize";
-import type { BackendAdapter } from "../adapters/model";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 interface CachedQuery {
   hash: string;
   modelType: string;
-  modelClass: ModelConstructor;
-  steps: QueryStep[];
+  query: QueryChain<any>;
   result: Map<string, Record<string, any>>;
   subscribers: Set<string>;
-  scopeFilter: Record<string, any> | ((qb: any) => any) | null;
 }
 
 interface SubscriptionOptions {
   socketId: string;
-  modelClass: ModelConstructor;
-  steps: QueryStep[];
-  scopeFilter?: Record<string, any> | ((qb: any) => any) | null;
+  query: QueryChain<any>;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function hashQuery(
-  modelType: string,
-  steps: QueryStep[],
-  scopeFilter: any,
-): string {
-  const payload = JSON.stringify({ modelType, steps, scopeFilter });
+function hashFrom(toSQL: { sql: string; bindings: any[] }): string {
+  const payload = JSON.stringify({ sql: toSQL.sql, bindings: toSQL.bindings });
   return createHash("sha256").update(payload).digest("hex").slice(0, 16);
 }
 
@@ -60,14 +50,11 @@ export class QuerySubscriptionManager {
   private socketQueries = new Map<string, Set<string>>();
   private typeIndex = new Map<string, Set<string>>();
 
-  private adapter: BackendAdapter;
   private emitToSocket: (socketId: string, event: string, data: any) => void;
 
   constructor(
-    adapter: BackendAdapter,
     emitToSocket: (socketId: string, event: string, data: any) => void,
   ) {
-    this.adapter = adapter;
     this.emitToSocket = emitToSocket;
   }
 
@@ -76,15 +63,16 @@ export class QuerySubscriptionManager {
   async subscribe(
     opts: SubscriptionOptions,
   ): Promise<{ hash: string; items: Record<string, any>[] }> {
-    const { socketId, modelClass, steps, scopeFilter = null } = opts;
-    const hash = hashQuery(modelClass.type, steps, scopeFilter);
+    const { socketId, query } = opts;
+    const modelType = (query as any).__modelType;
+    const hash = hashFrom(query.exec().toSQL());
 
     let cached = this.queries.get(hash);
 
     if (cached) {
       cached.subscribers.add(socketId);
     } else {
-      const rows = await this._runQuery(modelClass, steps, scopeFilter);
+      const rows = await this._execQuery(query);
       const result = new Map<string, Record<string, any>>();
       for (const row of rows) {
         const clean = jsonClone(row);
@@ -93,19 +81,17 @@ export class QuerySubscriptionManager {
 
       cached = {
         hash,
-        modelType: modelClass.type,
-        modelClass,
-        steps,
+        modelType,
+        query,
         result,
         subscribers: new Set([socketId]),
-        scopeFilter,
       };
       this.queries.set(hash, cached);
 
-      if (!this.typeIndex.has(modelClass.type)) {
-        this.typeIndex.set(modelClass.type, new Set());
+      if (!this.typeIndex.has(modelType)) {
+        this.typeIndex.set(modelType, new Set());
       }
-      this.typeIndex.get(modelClass.type)!.add(hash);
+      this.typeIndex.get(modelType)!.add(hash);
     }
 
     if (!this.socketQueries.has(socketId)) {
@@ -168,11 +154,7 @@ export class QuerySubscriptionManager {
   private async _reeval(cached: CachedQuery): Promise<void> {
     if (cached.subscribers.size === 0) return;
 
-    const rows = await this._runQuery(
-      cached.modelClass,
-      cached.steps,
-      cached.scopeFilter,
-    );
+    const rows = await this._execQuery(cached.query);
     const newResult = new Map<string, Record<string, any>>();
     for (const row of rows) {
       const clean = jsonClone(row);
@@ -212,41 +194,10 @@ export class QuerySubscriptionManager {
 
   // ── Query Execution ────────────────────────────────────────────────
 
-  private async _runQuery(
-    modelClass: ModelConstructor,
-    steps: QueryStep[],
-    scopeFilter: Record<string, any> | ((qb: any) => any) | null,
+  private async _execQuery(
+    query: QueryChain<any>,
   ): Promise<Record<string, any>[]> {
-    let chain: any;
-
-    // Apply scope: function scopes go directly to knex builder
-    if (typeof scopeFilter === "function") {
-      const table = pluralize(modelClass.type);
-      const knexQuery = (this.adapter as any).read(table);
-      scopeFilter(knexQuery);
-      chain = (this.adapter as any)._buildQuery(modelClass, knexQuery);
-    } else {
-      chain = this.adapter.query(modelClass);
-      if (scopeFilter) chain = chain.where(scopeFilter);
-    }
-
-    for (const step of steps) {
-      // Skip empty where() / where({})
-      const args = step.args ?? [];
-      if (args.length === 0) continue;
-      if (
-        args.length === 1 &&
-        typeof args[0] === "object" &&
-        args[0] !== null &&
-        !Array.isArray(args[0]) &&
-        Object.keys(args[0]).length === 0
-      )
-        continue;
-      const method = (chain as any)[step.method];
-      if (typeof method === "function") chain = method.apply(chain, args);
-    }
-
-    const models = await chain.find();
+    const models = await query.clone().find();
     return Promise.all(
       (models as any[]).map((m: any) => m.sanitize?.() ?? m.__data ?? m),
     );

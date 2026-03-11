@@ -213,6 +213,12 @@ export interface QueryChain<T> {
   first(): Promise<T | null>;
   count(): Promise<number>;
 
+  // Introspection — access underlying query builder
+  /** @internal Return the underlying query builder (e.g. Knex QueryBuilder). */
+  exec(): any;
+  /** @internal Create an independent copy of this chain. */
+  clone(): QueryChain<T>;
+
   // Internal — used by hooks and subscription manager
   /** @internal */ __steps: QueryStep[];
   /** @internal */ __modelType: string;
