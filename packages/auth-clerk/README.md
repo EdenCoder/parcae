@@ -88,7 +88,7 @@ clerk({
     image: clerkUser.imageUrl,
     // Map any Clerk field to your Model's fields
   }),
-})
+});
 ```
 
 ## Configuration
@@ -112,11 +112,11 @@ clerk({
 
 ## Environment Variables
 
-| Variable | Required | Description |
-| --- | --- | --- |
-| `CLERK_SECRET_KEY` | Yes | Clerk secret key (sk_...) |
-| `CLERK_PUBLISHABLE_KEY` | Yes | Clerk publishable key (pk_...) |
-| `CLERK_WEBHOOK_SECRET` | No | Svix webhook signing secret (whsec_...) |
+| Variable                | Required | Description                              |
+| ----------------------- | -------- | ---------------------------------------- |
+| `CLERK_SECRET_KEY`      | Yes      | Clerk secret key (sk\_...)               |
+| `CLERK_PUBLISHABLE_KEY` | Yes      | Clerk publishable key (pk\_...)          |
+| `CLERK_WEBHOOK_SECRET`  | No       | Svix webhook signing secret (whsec\_...) |
 
 ## License
 

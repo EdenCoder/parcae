@@ -9,10 +9,5 @@ export default defineConfig({
   target: "es2022",
   splitting: true,
   treeshake: true,
-  external: [
-    "@parcae/backend",
-    "@parcae/model",
-    "@clerk/backend",
-    "svix",
-  ],
+  external: ["@parcae/backend", "@parcae/model", "@clerk/backend", "svix"],
 });

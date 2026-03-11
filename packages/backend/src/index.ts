@@ -57,7 +57,12 @@ export type {
 } from "./routing/hook";
 
 export { job, getJobs, getJob, clearJobs } from "./routing/job";
-export type { JobHandler, JobContext, JobEntry } from "./routing/job";
+export type {
+  JobHandler,
+  JobContext,
+  JobOptions,
+  JobEntry,
+} from "./routing/job";
 
 // Search
 export { searchAll } from "./search";

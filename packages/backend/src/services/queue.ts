@@ -83,11 +83,13 @@ export class QueueService {
   private async build(url: string): Promise<void> {
     // Parse Redis URL into connection options
     const parsed = new URL(url);
+    const isTLS = parsed.protocol === "rediss:";
     this.connection = {
       host: parsed.hostname,
       port: parseInt(parsed.port || "6379"),
       password: parsed.password || undefined,
       username: parsed.username || undefined,
+      ...(isTLS ? { tls: { rejectUnauthorized: false } } : {}),
     };
   }
 

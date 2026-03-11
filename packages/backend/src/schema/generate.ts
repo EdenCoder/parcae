@@ -172,9 +172,7 @@ export async function generateSchemas(
   }
 
   // Resolve schemas from source using ts-morph
-  log.info(
-    `Resolving schemas from ${sourceFiles.length} source file(s)...`,
-  );
+  log.info(`Resolving schemas from ${sourceFiles.length} source file(s)...`);
 
   // Find tsconfig.json near the models dir
   let tsConfigPath: string | undefined;

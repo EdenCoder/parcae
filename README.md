@@ -37,18 +37,18 @@ That's a running server. Tables exist. CRUD routes are live. WebSocket is ready.
 
 Supabase is a platform. You write SQL, generate types, deploy edge functions, configure RLS policies, and hope the dashboard doesn't drift from your code. When you need a complex join, a multi-table transaction, or a background job — you're reaching outside the platform.
 
-Parcae is the opposite. Everything is TypeScript. The class *is* the schema. The scope *is* the access rule. The hook *is* the side effect. It runs in your process, lives in your repo, and you debug it with a breakpoint.
+Parcae is the opposite. Everything is TypeScript. The class _is_ the schema. The scope _is_ the access rule. The hook _is_ the side effect. It runs in your process, lives in your repo, and you debug it with a breakpoint.
 
-| | Supabase | Parcae |
-| --- | --- | --- |
-| **Schema** | SQL migrations or dashboard | TypeScript classes. That's it. |
-| **Types** | Generated from DB, always one step behind | Flow from the class. Nothing to generate. |
-| **Business logic** | Edge Functions or Postgres triggers | Hooks, jobs, routes — same codebase, same types |
-| **Realtime** | Postgres CDC (row-level) | Query-level subs — re-evaluates and pushes diffs |
-| **Auth** | Proprietary, tied to their infra | Pluggable — Better Auth, Clerk, or roll your own |
-| **Row-level security** | SQL policies (hard to test) | TypeScript scope functions (composable, testable) |
-| **Background jobs** | Not built in | BullMQ with retries and backoff |
-| **Lock-in** | Deep | Zero. Postgres + Redis. Swap anything. |
+|                        | Supabase                                  | Parcae                                            |
+| ---------------------- | ----------------------------------------- | ------------------------------------------------- |
+| **Schema**             | SQL migrations or dashboard               | TypeScript classes. That's it.                    |
+| **Types**              | Generated from DB, always one step behind | Flow from the class. Nothing to generate.         |
+| **Business logic**     | Edge Functions or Postgres triggers       | Hooks, jobs, routes — same codebase, same types   |
+| **Realtime**           | Postgres CDC (row-level)                  | Query-level subs — re-evaluates and pushes diffs  |
+| **Auth**               | Proprietary, tied to their infra          | Pluggable — Better Auth, Clerk, or roll your own  |
+| **Row-level security** | SQL policies (hard to test)               | TypeScript scope functions (composable, testable) |
+| **Background jobs**    | Not built in                              | BullMQ with retries and backoff                   |
+| **Lock-in**            | Deep                                      | Zero. Postgres + Redis. Swap anything.            |
 
 ```typescript
 // supabase: types are generated. schema lives in SQL. business logic is elsewhere.
@@ -114,13 +114,13 @@ GET    /v1/health         status, uptime, model count
 
 ## Packages
 
-| Package | Description |
-| --- | --- |
-| [`@parcae/model`](./packages/model) | Model base class, Proxy system, query builder, adapter interface |
-| [`@parcae/backend`](./packages/backend) | createApp, auto-CRUD, hooks, jobs, PubSub, queue, schema resolution |
-| [`@parcae/sdk`](./packages/sdk) | Client SDK — Socket.IO and SSE transports, React hooks |
-| [`@parcae/auth-betterauth`](./packages/auth-betterauth) | Better Auth adapter — self-hosted, same Postgres |
-| [`@parcae/auth-clerk`](./packages/auth-clerk) | Clerk adapter — external auth proxied to your User model |
+| Package                                                 | Description                                                         |
+| ------------------------------------------------------- | ------------------------------------------------------------------- |
+| [`@parcae/model`](./packages/model)                     | Model base class, Proxy system, query builder, adapter interface    |
+| [`@parcae/backend`](./packages/backend)                 | createApp, auto-CRUD, hooks, jobs, PubSub, queue, schema resolution |
+| [`@parcae/sdk`](./packages/sdk)                         | Client SDK — Socket.IO and SSE transports, React hooks              |
+| [`@parcae/auth-betterauth`](./packages/auth-betterauth) | Better Auth adapter — self-hosted, same Postgres                    |
+| [`@parcae/auth-clerk`](./packages/auth-clerk)           | Clerk adapter — external auth proxied to your User model            |
 
 ## Models
 
@@ -132,12 +132,12 @@ import { Model } from "@parcae/model";
 class Post extends Model {
   static type = "post" as const;
 
-  user!: User;                      // -> VARCHAR (foreign key, lazy-loads User)
-  title: string = "";               // -> VARCHAR
+  user!: User; // -> VARCHAR (foreign key, lazy-loads User)
+  title: string = ""; // -> VARCHAR
   body: PostBody = { content: "" }; // -> JSONB
-  tags: string[] = [];              // -> JSONB
-  published: boolean = false;       // -> BOOLEAN
-  views: number = 0;                // -> DOUBLE PRECISION
+  tags: string[] = []; // -> JSONB
+  published: boolean = false; // -> BOOLEAN
+  views: number = 0; // -> DOUBLE PRECISION
 }
 ```
 
@@ -146,9 +146,9 @@ Direct property access. No `.get()`, no `.data.title`. Just `post.title`.
 ```typescript
 const post = await Post.findById("abc");
 
-post.title;         // "Hello" — typed as string
-post.user;          // User proxy — loads on access, works with Suspense
-post.$user;         // "user_k8f2m9x" — raw ID, no loading
+post.title; // "Hello" — typed as string
+post.user; // User proxy — loads on access, works with Suspense
+post.$user; // "user_k8f2m9x" — raw ID, no loading
 post.title = "New"; // change tracked automatically
 
 await post.save();

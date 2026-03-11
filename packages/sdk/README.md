@@ -20,7 +20,10 @@ const client = createClient({ url: "http://localhost:3000" });
 const client = createClient({ url: "http://localhost:3000", transport: "sse" });
 
 // Custom transport
-const client = createClient({ url: "http://localhost:3000", transport: myTransport });
+const client = createClient({
+  url: "http://localhost:3000",
+  transport: myTransport,
+});
 ```
 
 ### ClientConfig
@@ -29,8 +32,8 @@ const client = createClient({ url: "http://localhost:3000", transport: myTranspo
 interface ClientConfig {
   url: string;
   key?: string | null | (() => Promise<string | null>);
-  version?: string;              // default: "v1"
-  transport?: "socket" | "sse" | Transport;  // default: "socket"
+  version?: string; // default: "v1"
+  transport?: "socket" | "sse" | Transport; // default: "socket"
 }
 ```
 
@@ -132,7 +135,7 @@ import { useQuery } from "@parcae/sdk/react";
 
 function PostList() {
   const { items, loading, error, refetch } = useQuery(
-    Post.where({ published: true }).orderBy("createdAt", "desc")
+    Post.where({ published: true }).orderBy("createdAt", "desc"),
   );
 
   if (loading) return <p>Loading...</p>;

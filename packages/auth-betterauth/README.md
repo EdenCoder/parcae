@@ -75,7 +75,7 @@ betterAuth({
   // Session config
   session: {
     expiresIn: 60 * 60 * 24 * 30, // 30 days (default)
-    updateAge: 60 * 60 * 24,       // refresh daily (default)
+    updateAge: 60 * 60 * 24, // refresh daily (default)
   },
 
   // Additional trusted origins (added to TRUSTED_ORIGINS env var)
@@ -86,16 +86,16 @@ betterAuth({
 
   // Base URL for OAuth callbacks. Auto-detected from PORT if not set.
   baseURL: "https://api.myapp.com",
-})
+});
 ```
 
 ## Environment Variables
 
-| Variable | Required | Description |
-| --- | --- | --- |
-| `AUTH_SECRET` | Yes | Secret for session signing |
-| `DATABASE_URL` | Yes | PostgreSQL connection (shared with Parcae) |
-| `TRUSTED_ORIGINS` | No | Additional CORS origins |
+| Variable          | Required | Description                                |
+| ----------------- | -------- | ------------------------------------------ |
+| `AUTH_SECRET`     | Yes      | Secret for session signing                 |
+| `DATABASE_URL`    | Yes      | PostgreSQL connection (shared with Parcae) |
+| `TRUSTED_ORIGINS` | No       | Additional CORS origins                    |
 
 ## License
 

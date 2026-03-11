@@ -34,11 +34,12 @@ interface CacheEntry {
   error: Error | null;
   /**
    * Hash that changes when the consumer should re-render.
-   * Encodes: loading flag, error presence, and item id list.
-   * Property-level changes on individual items flow through valtio
-   * proxies and do NOT need a re-render at the list level.
+   * Encodes: loading flag, error presence, item id list, and version.
+   * Version increments on every subscription op batch so property-level
+   * changes (update ops) also trigger re-renders.
    */
   hash: string;
+  version: number;
   refs: number;
   listeners: Set<() => void>;
   dispose: (() => void) | null;
@@ -60,8 +61,9 @@ const INITIAL_HASH = "L"; // loading=true, no items
 function buildHash(e: CacheEntry): string {
   if (e.loading) return "L";
   if (e.error) return `E:${e.error.message}`;
-  // id list preserves order — a reorder or add/remove changes the hash
-  let h = "D:";
+  // id list + version — version increments on every subscription op batch
+  // so property-level updates also trigger re-renders
+  let h = `D:v${e.version}:`;
   for (let i = 0; i < e.items.length; i++) {
     if (i > 0) h += ",";
     h += e.items[i]?.id ?? i;
@@ -77,6 +79,7 @@ function getOrCreate(key: string): CacheEntry {
       loading: true,
       error: null,
       hash: INITIAL_HASH,
+      version: 0,
       refs: 0,
       listeners: new Set(),
       dispose: null,
@@ -207,6 +210,7 @@ function doFetch(
         const unsub = client.subscribe(`query:${hash}`, (ops: QueryOp[]) => {
           if (!Array.isArray(ops) || ops.length === 0) return;
           entry.items = applyOps(entry.items, ops, chain.__modelClass, adapter);
+          entry.version++;
           notify(entry);
         });
         entry.dispose = unsub;
