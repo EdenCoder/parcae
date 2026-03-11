@@ -124,7 +124,7 @@ export class FrontendAdapter implements ModelAdapter {
 
     if (changes.creating) {
       const result = await this.transport.post(path, model.__data);
-      if (result?.id) model.__data.id = result.id;
+      if (result?.id) (model as any).id = result.id;
     } else if (changes.ops.length > 0) {
       await this.transport.patch(`${path}/${model.id}`, { ops: changes.ops });
     } else if (changes.updates.length > 0) {

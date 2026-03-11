@@ -317,9 +317,9 @@ export class BackendAdapter implements ModelAdapter {
 
     await this.runHooks(model, creating ? "create" : "save", "before");
 
-    model.__data.updatedAt = new Date();
-    if (creating && !model.__data.createdAt) {
-      model.__data.createdAt = new Date();
+    (model as any).updatedAt = new Date();
+    if (creating && !(model as any).createdAt) {
+      (model as any).createdAt = new Date();
     }
 
     const row = serialize(model);
@@ -864,7 +864,7 @@ export class BackendAdapter implements ModelAdapter {
       .where("id", model.id)
       .select(field)
       .first();
-    if (row) model.__data[field] = row[field];
+    if (row) (model as any)[field] = row[field];
   }
 
   async decrement(model: any, field: string, amount = 1): Promise<void> {
@@ -875,7 +875,7 @@ export class BackendAdapter implements ModelAdapter {
       .where("id", model.id)
       .select(field)
       .first();
-    if (row) model.__data[field] = row[field];
+    if (row) (model as any)[field] = row[field];
   }
 
   // ── Hooks ────────────────────────────────────────────────────────────

@@ -233,7 +233,7 @@ export function clerk(config: ClerkConfig): AuthAdapter {
                   if (existing) {
                     // Update existing local user
                     for (const [key, value] of Object.entries(userData)) {
-                      (existing as any).__data[key] = value;
+                      (existing as any)[key] = value;
                     }
                     await (existing as any).save();
                   } else {
