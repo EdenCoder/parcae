@@ -8,14 +8,15 @@ import { log } from "../logger";
  * and Parcae's hook/pubsub systems.
  */
 
-import type {
-  ChangeSet,
-  ColumnType,
-  ModelAdapter,
-  ModelConstructor,
-  QueryChain,
-  QueryStep,
-  SchemaDefinition,
+import {
+  CHAINABLE_METHODS,
+  type ChangeSet,
+  type ColumnType,
+  type ModelAdapter,
+  type ModelConstructor,
+  type QueryChain,
+  type QueryStep,
+  type SchemaDefinition,
 } from "@parcae/model";
 import { generateId, type Model } from "@parcae/model";
 import equal from "deep-equal";
@@ -101,7 +102,7 @@ function serialize(model: any): Record<string, any> {
   const raw = model.__data;
 
   if (!model.id) {
-    model.__data.id = generateId();
+    (model as any).id = generateId();
   }
 
   const row: Record<string, any> = {
@@ -463,11 +464,6 @@ export class BackendAdapter implements ModelAdapter {
       const table = tableName(modelClass);
       const knexQuery = this.read(table);
       scope(knexQuery);
-      try {
-        console.log("[qFC] fn scope applied. SQL:", knexQuery.toSQL().sql);
-      } catch (e: any) {
-        console.error("[qFC] fn scope SQL failed:", e.message);
-      }
       chain = this._buildQuery(modelClass, knexQuery);
     } else {
       chain = this.query(modelClass).where(scope);
@@ -501,7 +497,6 @@ export class BackendAdapter implements ModelAdapter {
         );
       }
 
-      console.log(`[qFC] step: ${step.method}(${JSON.stringify(args)})`);
       chain = (chain as any)[step.method](...args);
     }
 
@@ -614,50 +609,9 @@ export class BackendAdapter implements ModelAdapter {
     modelClass: ModelConstructor<T>,
     knexQuery: any,
   ): QueryChain<T> {
-    const CHAINABLE = [
-      "select",
-      "where",
-      "andWhere",
-      "orWhere",
-      "whereIn",
-      "whereNot",
-      "whereNotIn",
-      "whereNull",
-      "whereNotNull",
-      "whereBetween",
-      "whereRaw",
-      "orWhereRaw",
-      "orWhereIn",
-      "orWhereNull",
-      "whereExists",
-      "orderBy",
-      "orderByRaw",
-      "groupBy",
-      "groupByRaw",
-      "having",
-      "havingRaw",
-      "limit",
-      "offset",
-      "distinct",
-      "distinctOn",
-      "join",
-      "innerJoin",
-      "leftJoin",
-      "rightJoin",
-      "clearOrder",
-      "clearSelect",
-      "from",
-      "sum",
-      "avg",
-      "min",
-      "max",
-      "increment",
-      "decrement",
-    ] as const;
-
     const chain: any = {};
 
-    for (const method of CHAINABLE) {
+    for (const method of CHAINABLE_METHODS) {
       chain[method] = (...args: any[]) => {
         return this._buildQuery(modelClass, knexQuery[method](...args));
       };
@@ -1194,56 +1148,36 @@ export class BackendAdapter implements ModelAdapter {
 
       const table = tableName(modelClass);
 
-      // Register via hook.after() — the standard Parcae hook API
-      hook.after(
-        modelClass,
-        "save",
-        async (ctx: any) => {
-          try {
-            const model = ctx.model;
-            const text = searchFields
-              .map((f: string) => (model as any)[f] || "")
-              .join(" ")
-              .trim();
-            if (!text) return;
+      const generateEmbedding = async (ctx: any) => {
+        try {
+          const model = ctx.model;
+          const text = searchFields
+            .map((f: string) => (model as any)[f] || "")
+            .join(" ")
+            .trim();
+          if (!text) return;
 
-            await this.write.raw(
-              `UPDATE ?? SET _embedding = embedding('gemini-embedding-001', ?)::vector WHERE id = ?`,
-              [table, text, model.id],
-            );
-          } catch (err: any) {
-            log.warn(
-              `search: embedding generation failed — model=${modelClass.type} id=${ctx.model?.id}: ${err.message}`,
-            );
-          }
-        },
-        { async: true, priority: 999 },
-      );
+          await this.write.raw(
+            `UPDATE ?? SET _embedding = embedding('gemini-embedding-001', ?)::vector WHERE id = ?`,
+            [table, text, model.id],
+          );
+        } catch (err: any) {
+          log.warn(
+            `search: embedding generation failed — model=${modelClass.type} id=${ctx.model?.id}: ${err.message}`,
+          );
+        }
+      };
 
-      hook.after(
-        modelClass,
-        "create",
-        async (ctx: any) => {
-          try {
-            const model = ctx.model;
-            const text = searchFields
-              .map((f: string) => (model as any)[f] || "")
-              .join(" ")
-              .trim();
-            if (!text) return;
-
-            await this.write.raw(
-              `UPDATE ?? SET _embedding = embedding('gemini-embedding-001', ?)::vector WHERE id = ?`,
-              [table, text, model.id],
-            );
-          } catch (err: any) {
-            log.warn(
-              `search: embedding generation failed — model=${modelClass.type} id=${ctx.model?.id}: ${err.message}`,
-            );
-          }
-        },
-        { async: true, priority: 999 },
-      );
+      // Register for both save (updates) and create (new records).
+      // BackendAdapter.save() fires one or the other, never both.
+      hook.after(modelClass, "save", generateEmbedding, {
+        async: true,
+        priority: 999,
+      });
+      hook.after(modelClass, "create", generateEmbedding, {
+        async: true,
+        priority: 999,
+      });
 
       log.info(`search: registered embedding hook — model=${modelClass.type}`);
     }

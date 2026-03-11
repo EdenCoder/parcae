@@ -15,6 +15,7 @@
 
 import { EventEmitter } from "eventemitter3";
 import type { Transport, RequestOptions } from "@parcae/model";
+import { AuthGate } from "../auth-gate";
 
 export interface SSETransportConfig {
   /** Base URL of the Parcae backend. */
@@ -26,6 +27,8 @@ export interface SSETransportConfig {
 }
 
 export class SSETransport extends EventEmitter implements Transport {
+  public auth = new AuthGate();
+
   private url: string;
   private version: string;
   private apiKey: string | null | (() => Promise<string | null>);
@@ -47,6 +50,7 @@ export class SSETransport extends EventEmitter implements Transport {
     try {
       this.key =
         typeof this.apiKey === "function" ? await this.apiKey() : this.apiKey;
+      this.isConnected = true;
       this.emit("connected");
     } catch (err) {
       this.emit("error", err);
@@ -61,6 +65,30 @@ export class SSETransport extends EventEmitter implements Transport {
 
   private fullUrl(path: string): string {
     return `${this.url}/${this.version}${path}`;
+  }
+
+  // ── Auth ─────────────────────────────────────────────────────────────
+
+  async authenticate(
+    token: string | null,
+  ): Promise<{ userId: string | null }> {
+    this.auth.reset();
+
+    if (token === null) {
+      this.key = null;
+      this.auth.resolveUnauthenticated();
+      return { userId: null };
+    }
+
+    // Set the bearer token for subsequent requests
+    this.key = token;
+
+    // Verify by hitting a lightweight endpoint (or just resolve as authenticated).
+    // SSE doesn't have a socket handshake — the token is used per-request.
+    // Resolve as authenticated; the server will reject individual requests
+    // with 401 if the token is invalid.
+    this.auth.resolve("sse-user");
+    return { userId: "sse-user" };
   }
 
   // ── Request/Response ──────────────────────────────────────────────────

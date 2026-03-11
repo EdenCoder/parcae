@@ -15,6 +15,7 @@ import { log } from "../logger";
 import { createHash } from "node:crypto";
 import type { ModelConstructor, QueryStep } from "@parcae/model";
 import { compare, type Operation } from "fast-json-patch";
+import pluralize from "pluralize";
 import type { BackendAdapter } from "../adapters/model";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -220,7 +221,7 @@ export class QuerySubscriptionManager {
 
     // Apply scope: function scopes go directly to knex builder
     if (typeof scopeFilter === "function") {
-      const table = (modelClass.type ?? "") + "s";
+      const table = pluralize(modelClass.type);
       const knexQuery = (this.adapter as any).read(table);
       scopeFilter(knexQuery);
       chain = (this.adapter as any)._buildQuery(modelClass, knexQuery);

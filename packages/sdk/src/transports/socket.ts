@@ -114,18 +114,19 @@ export class SocketTransport extends EventEmitter implements Transport {
       return { userId: null };
     }
 
+    // Wait for connection if not connected (with timeout)
     if (!this.socket.connected) {
-      return new Promise((resolve) => {
-        const handler = () => {
-          this.socket.off("connect", handler);
-          this.socket.emit("authenticate", token, (response: any) => {
-            const userId = response?.userId ?? null;
-            if (userId) this.auth.resolve(userId);
-            else this.auth.resolveUnauthenticated();
-            resolve({ userId });
-          });
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          this.socket.off("connect", onConnect);
+          this.auth.resolveUnauthenticated();
+          reject(new Error("Authentication timeout: socket not connected"));
+        }, DEFAULT_TIMEOUT);
+        const onConnect = () => {
+          clearTimeout(timeout);
+          resolve();
         };
-        this.socket.once("connect", handler);
+        this.socket.once("connect", onConnect);
       });
     }
 

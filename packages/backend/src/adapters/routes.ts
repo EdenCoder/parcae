@@ -79,24 +79,7 @@ export function registerModelRoutes(
         const steps = data.__query ?? [];
 
         try {
-          console.log(
-            `[routes] GET ${path} — scope:`,
-            typeof scopeResult,
-            scopeResult instanceof Function
-              ? "(fn)"
-              : JSON.stringify(scopeResult),
-            "steps:",
-            JSON.stringify(steps).slice(0, 200),
-          );
           const query = adapter.queryFromClient(ModelClass, scopeResult, steps);
-          try {
-            console.log(
-              "[routes] SQL preview:",
-              (query as any)._knex?.toSQL?.()?.sql ?? "n/a",
-            );
-          } catch (e: any) {
-            console.error("[routes] SQL preview failed:", e.message);
-          }
 
           if (data.__count === "true" || data.__count === true) {
             const total = await query.count();
@@ -268,9 +251,8 @@ export function registerModelRoutes(
           ]);
           for (const [key, value] of Object.entries(data)) {
             if (!systemFields.has(key)) {
-              (item as any).__data[key] = value;
-              (item as any).__updates = (item as any).__updates || [];
-              (item as any).__updates.push(key);
+              // Write through the proxy so change tracking picks it up
+              (item as any)[key] = value;
             }
           }
 

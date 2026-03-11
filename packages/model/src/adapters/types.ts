@@ -260,3 +260,52 @@ export interface ModelAdapter {
 }
 
 export type { PatchOp };
+
+// ─── Chainable Methods ───────────────────────────────────────────────────────
+
+/**
+ * The set of query chain methods that are chainable (return a new QueryChain).
+ * Shared across lazyQuery, FrontendAdapter, and BackendAdapter to avoid
+ * the same 37-element array being duplicated three times.
+ */
+export const CHAINABLE_METHODS = [
+  "select",
+  "where",
+  "andWhere",
+  "orWhere",
+  "whereIn",
+  "whereNot",
+  "whereNotIn",
+  "whereNull",
+  "whereNotNull",
+  "whereBetween",
+  "whereRaw",
+  "orWhereRaw",
+  "orWhereIn",
+  "orWhereNull",
+  "whereExists",
+  "search",
+  "orderBy",
+  "orderByRaw",
+  "groupBy",
+  "groupByRaw",
+  "having",
+  "havingRaw",
+  "limit",
+  "offset",
+  "distinct",
+  "distinctOn",
+  "join",
+  "innerJoin",
+  "leftJoin",
+  "rightJoin",
+  "clearOrder",
+  "clearSelect",
+  "from",
+  "sum",
+  "avg",
+  "min",
+  "max",
+  "increment",
+  "decrement",
+] as const;

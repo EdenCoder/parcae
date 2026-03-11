@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useCallback, useMemo, useSyncExternalStore } from "react";
 import { useParcae } from "./context";
 import { useAuthStatus } from "./useAuth";
 
@@ -25,5 +25,24 @@ export function useSDK() {
 export function useConnectionStatus() {
   const client = useParcae();
   const { status } = useAuthStatus();
-  return { isConnected: client.isConnected, authStatus: status };
+
+  // Subscribe to transport connect/disconnect events so React re-renders
+  // when the connection state changes.
+  const subscribe = useCallback(
+    (onChange: () => void) => {
+      client.on("connected", onChange);
+      client.on("disconnected", onChange);
+      return () => {
+        client.off("connected", onChange);
+        client.off("disconnected", onChange);
+      };
+    },
+    [client],
+  );
+
+  const getSnapshot = useCallback(() => client.isConnected, [client]);
+
+  const isConnected = useSyncExternalStore(subscribe, getSnapshot, () => false);
+
+  return { isConnected, authStatus: status };
 }

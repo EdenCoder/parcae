@@ -10,6 +10,7 @@ export { Model, generateId } from "./Model";
 export { FrontendAdapter } from "./adapters/client";
 export type { Transport, RequestOptions } from "./adapters/client";
 
+export { CHAINABLE_METHODS } from "./adapters/types";
 export type {
   ModelAdapter,
   ModelConstructor,

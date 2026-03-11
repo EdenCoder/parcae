@@ -9,13 +9,14 @@
  */
 
 import { proxy } from "valtio";
-import type {
-  ModelAdapter,
-  ModelConstructor,
-  ChangeSet,
-  QueryChain,
-  QueryStep,
-  PatchOp,
+import {
+  CHAINABLE_METHODS,
+  type ModelAdapter,
+  type ModelConstructor,
+  type ChangeSet,
+  type QueryChain,
+  type QueryStep,
+  type PatchOp,
 } from "./types";
 
 // ─── Transport Interface ─────────────────────────────────────────────────────
@@ -171,51 +172,9 @@ export class FrontendAdapter implements ModelAdapter {
   ): QueryChain<T> {
     const adapter = this;
 
-    const CHAINABLE = [
-      "select",
-      "where",
-      "andWhere",
-      "orWhere",
-      "whereIn",
-      "whereNot",
-      "whereNotIn",
-      "whereNull",
-      "whereNotNull",
-      "whereBetween",
-      "whereRaw",
-      "orWhereRaw",
-      "orWhereIn",
-      "orWhereNull",
-      "whereExists",
-      "search",
-      "orderBy",
-      "orderByRaw",
-      "groupBy",
-      "groupByRaw",
-      "having",
-      "havingRaw",
-      "limit",
-      "offset",
-      "distinct",
-      "distinctOn",
-      "join",
-      "innerJoin",
-      "leftJoin",
-      "rightJoin",
-      "clearOrder",
-      "clearSelect",
-      "from",
-      "sum",
-      "avg",
-      "min",
-      "max",
-      "increment",
-      "decrement",
-    ] as const;
-
     const chain: any = {};
 
-    for (const method of CHAINABLE) {
+    for (const method of CHAINABLE_METHODS) {
       chain[method] = (...args: any[]) => {
         return adapter._buildQuery(modelClass, [
           ...steps,

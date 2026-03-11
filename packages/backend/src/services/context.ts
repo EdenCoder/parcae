@@ -111,21 +111,10 @@ export async function lock(
   ttl: number = 120000,
 ): Promise<() => Promise<void>> {
   if (!_pubsub) {
-    // No-op fallback
     return async () => {};
   }
 
-  const result = await _pubsub.lock(key, ttl);
-  if (!result) return async () => {};
-
-  // PubSub.lock returns (() => void) | null — normalize to async
-  if (typeof result === "function") {
-    return async () => {
-      result();
-    };
-  }
-
-  return async () => {};
+  return _pubsub.lock(key, ttl);
 }
 
 // ─── getQueue() / getPubSub() — escape hatches ──────────────────────────────

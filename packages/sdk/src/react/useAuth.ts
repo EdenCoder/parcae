@@ -2,10 +2,12 @@
 
 /**
  * Internal hook to read auth state reactively.
- * No Valtio — just reads the gate state and re-renders when it changes.
+ * Subscribes to valtio proxy changes on the AuthGate state so any
+ * status/userId/version mutation triggers a React re-render.
  */
 
-import { useState, useEffect } from "react";
+import { useSyncExternalStore } from "react";
+import { subscribe as valtioSubscribe, snapshot } from "valtio";
 import { useParcae } from "./context";
 import type { AuthStatus } from "../auth-gate";
 
@@ -17,24 +19,28 @@ export function useAuthStatus(): {
   const client = useParcae();
   const transport = client.transport as any;
   const gate = transport?.auth;
+  const state = gate?.state;
 
-  const [, forceRender] = useState(0);
+  // Subscribe to valtio proxy mutations.
+  // valtioSubscribe fires synchronously on any property change.
+  const sub = (onChange: () => void) => {
+    if (!state) return () => {};
+    return valtioSubscribe(state, onChange);
+  };
 
-  useEffect(() => {
-    if (!gate) return;
-    let mounted = true;
-    const check = () => {
-      if (mounted) forceRender((n) => n + 1);
-    };
-    gate.ready.then(check);
-    return () => {
-      mounted = false;
-    };
-  }, [gate, gate?.state?.version]);
+  // Snapshot returns an immutable copy — useSyncExternalStore compares by reference.
+  // A new snapshot object is created on every proxy mutation, so Object.is fails
+  // and React re-renders.
+  const getSnapshot = () => {
+    if (!state) return null;
+    return snapshot(state);
+  };
+
+  const snap = useSyncExternalStore(sub, getSnapshot, getSnapshot);
 
   return {
-    status: gate?.state?.status ?? "pending",
-    userId: gate?.state?.userId ?? null,
-    version: gate?.state?.version ?? 0,
+    status: (snap as any)?.status ?? "pending",
+    userId: (snap as any)?.userId ?? null,
+    version: (snap as any)?.version ?? 0,
   };
 }

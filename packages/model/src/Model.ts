@@ -12,13 +12,14 @@
 import { EventEmitter } from "eventemitter3";
 import ShortId from "short-unique-id";
 import { applyPatch } from "fast-json-patch";
-import type {
-  ModelAdapter,
-  ModelConstructor,
-  ChangeSet,
-  QueryChain,
-  SchemaDefinition,
-  PatchOp,
+import {
+  CHAINABLE_METHODS,
+  type ModelAdapter,
+  type ModelConstructor,
+  type ChangeSet,
+  type QueryChain,
+  type SchemaDefinition,
+  type PatchOp,
 } from "./adapters/types";
 
 // ─── ID Generation ───────────────────────────────────────────────────────────
@@ -65,51 +66,9 @@ function lazyQuery<T>(
   modelClass: ModelConstructor<T>,
   steps: any[] = [],
 ): QueryChain<T> {
-  const CHAINABLE = [
-    "select",
-    "where",
-    "andWhere",
-    "orWhere",
-    "whereIn",
-    "whereNot",
-    "whereNotIn",
-    "whereNull",
-    "whereNotNull",
-    "whereBetween",
-    "whereRaw",
-    "orWhereRaw",
-    "orWhereIn",
-    "orWhereNull",
-    "whereExists",
-    "search",
-    "orderBy",
-    "orderByRaw",
-    "groupBy",
-    "groupByRaw",
-    "having",
-    "havingRaw",
-    "limit",
-    "offset",
-    "distinct",
-    "distinctOn",
-    "join",
-    "innerJoin",
-    "leftJoin",
-    "rightJoin",
-    "clearOrder",
-    "clearSelect",
-    "from",
-    "sum",
-    "avg",
-    "min",
-    "max",
-    "increment",
-    "decrement",
-  ] as const;
-
   const chain: any = {};
 
-  for (const method of CHAINABLE) {
+  for (const method of CHAINABLE_METHODS) {
     chain[method] = (...args: any[]) =>
       lazyQuery(modelClass, [...steps, { method, args }]);
   }
@@ -669,17 +628,20 @@ export class Model extends EventEmitter {
 
   // ── Reference Proxy ──────────────────────────────────────────────────
 
-  private static __refCache = new Map<string, any>();
+  private static __refCache = new Map<string, { value: any; expires: number }>();
+  private static REF_CACHE_TTL = 30_000; // 30 seconds
 
   private _createRefProxy(targetClass: ModelConstructor, refId: string): any {
     const cacheKey = `${targetClass.type}:${refId}`;
     const cached = Model.__refCache.get(cacheKey);
-    if (cached) return cached;
+    if (cached && cached.expires > Date.now()) return cached.value;
+    // Expired — remove stale entry
+    if (cached) Model.__refCache.delete(cacheKey);
 
     let loaded: any = null;
     let loading: Promise<any> | null = null;
 
-    return new Proxy({} as any, {
+    const proxy = new Proxy({} as any, {
       get(_target, prop) {
         if (prop === "id") return refId;
         if (prop === "type") return targetClass.type;
@@ -695,7 +657,10 @@ export class Model extends EventEmitter {
             .findById(targetClass, refId)
             .then((result) => {
               loaded = result;
-              Model.__refCache.set(cacheKey, loaded);
+              Model.__refCache.set(cacheKey, {
+                value: proxy,
+                expires: Date.now() + Model.REF_CACHE_TTL,
+              });
               return result;
             });
         }
@@ -703,6 +668,8 @@ export class Model extends EventEmitter {
         throw loading;
       },
     });
+
+    return proxy;
   }
 }
 
