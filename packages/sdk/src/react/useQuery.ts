@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
-import { type Operation } from "fast-json-patch";
+import { applyPatch, type Operation } from "fast-json-patch";
 import { Model, SYM_SERVER_MERGE } from "@parcae/model";
 import { useParcae } from "./context";
 import { useAuthStatus } from "./useAuth";
@@ -114,50 +114,6 @@ interface ApplyResult {
   changed: boolean;
 }
 
-/**
- * Convert RFC 6902 JSON Patch operations into a flat key→value map.
- * Only handles "replace" and "add" ops with top-level paths (e.g. "/name").
- * Nested paths are applied to a shallow clone of the current top-level value.
- */
-function patchToData(
-  patches: Operation[],
-  current: Record<string, any>,
-): Record<string, any> {
-  const data: Record<string, any> = {};
-
-  for (const op of patches) {
-    if (op.op !== "replace" && op.op !== "add") continue;
-    const segments = op.path.split("/").filter(Boolean);
-    if (segments.length === 0) continue;
-
-    const topKey = segments[0]!;
-    if (segments.length === 1) {
-      // Top-level property — direct assignment
-      data[topKey] = (op as any).value;
-    } else {
-      // Nested path — build/merge into the top-level object
-      if (!(topKey in data)) {
-        // Start from a shallow clone of the current value so we don't
-        // lose sibling keys that aren't in this patch batch.
-        const cur = current[topKey];
-        data[topKey] =
-          cur != null && typeof cur === "object"
-            ? Array.isArray(cur) ? [...cur] : { ...cur }
-            : {};
-      }
-      let cursor: any = data[topKey];
-      for (let i = 1; i < segments.length - 1; i++) {
-        const seg = segments[i]!;
-        if (cursor[seg] == null) cursor[seg] = {};
-        cursor = cursor[seg];
-      }
-      cursor[segments[segments.length - 1]!] = (op as any).value;
-    }
-  }
-
-  return data;
-}
-
 function applyOps(
   items: any[],
   ops: QueryOp[],
@@ -199,39 +155,49 @@ function applyOps(
 
   const hasRemoves = removeIds.size > 0;
   const hasAdds = addOps.size > 0;
-  let hasRelevantUpdates = false;
 
-  // Apply updates in-place — mutate existing instances atomically,
-  // preserving any pending local changes via SYM_SERVER_MERGE.
+  // Apply updates atomically — mutate existing instances in-place via
+  // SYM_SERVER_MERGE, which preserves pending local changes and returns
+  // a new Proxy reference (for React.memo compatibility).
+  const updated = new Map<string, any>();
   for (const [id, patches] of updateOps) {
     const existing = byId.get(id);
     if (!existing) continue;
-    hasRelevantUpdates = true;
 
-    const currentData = existing.__data ?? {};
-    const merged = patchToData(patches, currentData);
+    // Build the full server-authoritative snapshot by applying the RFC
+    // 6902 patches onto a deep clone of the current data.
+    const snapshot = JSON.parse(JSON.stringify(existing.__data ?? {}));
+    applyPatch(snapshot, patches, false, true);
+
+    // SYM_SERVER_MERGE writes values onto the raw target (skipping
+    // locally-pending keys), deletes server-removed properties, and
+    // returns a new Proxy reference around the same target.
     const serverMerge = existing[SYM_SERVER_MERGE];
     if (serverMerge) {
-      serverMerge(merged);
+      updated.set(id, serverMerge(snapshot));
     } else {
-      // Fallback: write through the proxy (shouldn't happen for Model instances)
-      for (const [k, v] of Object.entries(merged)) {
+      // Fallback (non-Model objects)
+      for (const [k, v] of Object.entries(snapshot)) {
         existing[k] = v;
       }
     }
   }
 
-  // If only updates (no membership changes), return the same array reference
-  // but signal that data was mutated in-place.
-  if (!hasRemoves && !hasAdds) {
-    return { items, changed: hasRelevantUpdates };
+  const hasRelevantUpdates = updated.size > 0;
+
+  // Build the result array.  Even for update-only batches we need a new
+  // array because the updated items have new Proxy references.
+  if (!hasRemoves && !hasAdds && !hasRelevantUpdates) {
+    return { items, changed: false };
   }
 
-  // Membership changed — build a new array, reusing existing instances
   const result: any[] = [];
 
   for (const item of items) {
-    if (!removeIds.has(item.id)) result.push(item);
+    const id = item.id;
+    if (removeIds.has(id)) continue;
+    // Swap in the new Proxy reference for updated items
+    result.push(updated.get(id) ?? item);
   }
 
   for (const [id, data] of addOps) {
@@ -247,6 +213,7 @@ function applyOps(
  * Reconcile a fresh fetch result with the previous items array.
  * For items that exist in both, merges server data into the existing instance
  * in-place (via SYM_SERVER_MERGE) so local pending changes are preserved.
+ * SYM_SERVER_MERGE returns a new Proxy reference for React.memo compat.
  * Only creates new instances for items not previously present.
  */
 function reconcile(prev: any[], next: any[]): any[] {
@@ -255,29 +222,33 @@ function reconcile(prev: any[], next: any[]): any[] {
   const prevById = new Map<string, any>();
   for (const item of prev) prevById.set(item.id, item);
 
-  let membershipChanged = prev.length !== next.length;
+  let changed = false;
   const result: any[] = new Array(next.length);
 
   for (let i = 0; i < next.length; i++) {
     const fresh = next[i];
     const existing = prevById.get(fresh.id);
     if (existing) {
-      // Merge server data in-place, respecting local pending changes
+      // Merge server data in-place, respecting local pending changes.
+      // Returns a new Proxy reference around the same target.
       const serverMerge = existing[SYM_SERVER_MERGE];
       if (serverMerge) {
         const freshData = fresh.__data ?? fresh;
-        serverMerge(freshData);
+        result[i] = serverMerge(freshData);
+        // New reference means the array is different
+        changed = true;
+      } else {
+        result[i] = existing;
       }
-      result[i] = existing;
-      if (!membershipChanged && prev[i]?.id !== fresh.id) membershipChanged = true;
+      if (!changed && prev[i]?.id !== fresh.id) changed = true;
     } else {
       result[i] = fresh;
-      membershipChanged = true;
+      changed = true;
     }
   }
 
-  // If same items in same order, return the original array reference
-  return membershipChanged ? result : prev;
+  if (!changed && prev.length === next.length) return prev;
+  return result;
 }
 
 function resolveAdapter(chain: QueryChain<any>): any {

@@ -222,10 +222,15 @@ export function createApp(config: AppConfig): ParcaeApp {
       log.info("Database connected");
 
       // ── Step 4: Connect Redis (PubSub + Queue) ─────────────────────
+      log.info("Connecting PubSub...");
       const pubsub = new PubSub({ url: envConfig.REDIS_URL });
       await pubsub.building;
+      log.info("PubSub ready");
+
+      log.info("Connecting Queue...");
       const queue = new QueueService({ url: envConfig.REDIS_URL });
       await queue.building;
+      log.info("Queue ready");
 
       // Make queue + pubsub available globally via enqueue() and lock()
       _setServices(queue, pubsub);
@@ -245,7 +250,9 @@ export function createApp(config: AppConfig): ParcaeApp {
       Model.use(adapter);
 
       // Detect AlloyDB vs standard Postgres (for search features)
+      log.info("Detecting database engine...");
       await adapter.detectEngine();
+      log.info("Database engine detected");
 
       // ── Step 6: Set up auth (opt-in) ───────────────────────────────
       // Auth runs BEFORE ensureAllTables so that auth-owned tables

@@ -395,17 +395,41 @@ export class Model extends EventEmitter {
       },
 
       get(target, prop) {
-        // Return a closure that writes directly to the raw target,
-        // bypassing the Proxy set trap (no dirty-tracking).
-        // Skips keys with pending local changes.
+        // Return a closure that atomically merges server-authoritative
+        // data onto this instance.  Writes directly to the raw target,
+        // bypassing the Proxy set trap (no dirty-tracking pollution).
+        // Skips keys with pending local changes (SYM_UPDATES / SYM_PATCHING).
+        // Deletes keys that exist locally but are absent in the server
+        // snapshot (unless they have pending local changes).
+        // Returns a NEW Proxy around the same target so React.memo sees
+        // a fresh reference while the underlying object (and its pending
+        // local state) is preserved.
         if (prop === SYM_SERVER_MERGE) {
-          return (data: Record<string, any>) => {
+          return (serverData: Record<string, any>) => {
             const pendingUpdates = new Set(target[SYM_UPDATES]);
             const pendingPatches = target[SYM_PATCHING];
-            for (const key of Object.keys(data)) {
+            const serverKeys = new Set(Object.keys(serverData));
+
+            // Write new/changed values
+            for (const key of serverKeys) {
               if (pendingUpdates.has(key) || pendingPatches.has(key)) continue;
-              (target as any)[key] = data[key];
+              (target as any)[key] = serverData[key];
             }
+
+            // Delete keys that the server no longer has
+            for (const key of Object.keys(target)) {
+              if (SYSTEM_DATA_KEYS.has(key)) continue;
+              if (INSTANCE_METHODS.has(key)) continue;
+              if (EVENTEMITTER_KEYS.has(key)) continue;
+              if (key.startsWith("_")) continue;
+              if (serverKeys.has(key)) continue;
+              if (pendingUpdates.has(key) || pendingPatches.has(key)) continue;
+              delete (target as any)[key];
+            }
+
+            // Return a new Proxy around the same target — new reference
+            // identity for React.memo, same underlying data + pending state.
+            return new Proxy(target, this);
           };
         }
 

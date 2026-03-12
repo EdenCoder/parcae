@@ -9,6 +9,7 @@ import Client from "ioredis";
 import AsyncLock from "async-lock";
 import { Redlock } from "@sesamecare-oss/redlock";
 import { EventEmitter } from "events";
+import { log } from "../logger";
 
 export interface PubSubConfig {
   /** Redis URL. If not provided, falls back to in-process events only. */
@@ -36,9 +37,29 @@ export class PubSub {
     const isTLS = url.startsWith("rediss://");
     const opts = isTLS ? { tls: { rejectUnauthorized: false } } : {};
 
+    log.info(`PubSub connecting to Redis (TLS=${isTLS})...`);
+    const t0 = Date.now();
+
     this.redisLock = new Client(url, opts);
     this.redisRead = new Client(url, opts);
     this.redisWrite = new Client(url, opts);
+
+    // Log connection lifecycle for each client
+    for (const [name, client] of [
+      ["lock", this.redisLock],
+      ["read", this.redisRead],
+      ["write", this.redisWrite],
+    ] as const) {
+      (client as Client).on("connect", () =>
+        log.info(`PubSub redis:${name} connected (${Date.now() - t0}ms)`),
+      );
+      (client as Client).on("error", (err) =>
+        log.info(`PubSub redis:${name} error: ${err.message}`),
+      );
+      (client as Client).on("ready", () =>
+        log.info(`PubSub redis:${name} ready (${Date.now() - t0}ms)`),
+      );
+    }
 
     this.redlock = new Redlock([this.redisLock], {
       retryCount: 25,
@@ -47,7 +68,9 @@ export class PubSub {
       retryJitter: 200,
     });
 
+    log.info("PubSub subscribing to events channel...");
     await this.redisRead.subscribe("events");
+    log.info(`PubSub subscribed (${Date.now() - t0}ms)`);
 
     this.redisRead.on("message", (_channel: string, message: string) => {
       try {
