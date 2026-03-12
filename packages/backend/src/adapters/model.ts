@@ -650,6 +650,11 @@ export class BackendAdapter implements ModelAdapter {
     chain.exec = () => knexQuery;
     chain.clone = () => this._buildQuery(modelClass, knexQuery.clone());
 
+    // Internal metadata — used by subscription manager for type indexing
+    chain.__modelType = modelClass.type;
+    chain.__modelClass = modelClass;
+    chain.__adapter = this;
+
     return chain as QueryChain<T>;
   }
 

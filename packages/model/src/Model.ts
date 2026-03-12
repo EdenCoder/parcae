@@ -41,6 +41,17 @@ const SYM_DEBOUNCE = Symbol("parcae:debounceMs");
 const SYM_IS_PROXY = Symbol("parcae:isProxy");
 const SYM_INIT_DATA = Symbol("parcae:initData");
 
+/**
+ * Symbol used to atomically merge server-authoritative data onto a Model
+ * instance, bypassing the Proxy set trap so that SYM_UPDATES (local
+ * dirty-tracking) is not polluted. Skips any keys that have pending
+ * local changes (SYM_UPDATES or SYM_PATCHING).
+ *
+ * Accessed via the Proxy get trap, which returns a closure over the raw
+ * target so writes bypass the Proxy entirely.
+ */
+export const SYM_SERVER_MERGE = Symbol("parcae:serverMerge");
+
 // ─── Keys that should NOT be treated as data ─────────────────────────────────
 
 const INSTANCE_METHODS = new Set([
@@ -384,6 +395,20 @@ export class Model extends EventEmitter {
       },
 
       get(target, prop) {
+        // Return a closure that writes directly to the raw target,
+        // bypassing the Proxy set trap (no dirty-tracking).
+        // Skips keys with pending local changes.
+        if (prop === SYM_SERVER_MERGE) {
+          return (data: Record<string, any>) => {
+            const pendingUpdates = new Set(target[SYM_UPDATES]);
+            const pendingPatches = target[SYM_PATCHING];
+            for (const key of Object.keys(data)) {
+              if (pendingUpdates.has(key) || pendingPatches.has(key)) continue;
+              (target as any)[key] = data[key];
+            }
+          };
+        }
+
         if (typeof prop === "symbol") {
           return (target as any)[prop];
         }
@@ -609,11 +634,11 @@ export class Model extends EventEmitter {
     );
     if (fresh) {
       const freshData = (fresh as any).__data;
-      const pendingKeys = this.__pendingKeys;
-      for (const key of Object.keys(freshData)) {
-        if (!pendingKeys.has(key)) {
-          (this as any)[key] = freshData[key];
-        }
+      // Use SYM_SERVER_MERGE to write directly to the target, bypassing
+      // the Proxy set trap so we don't pollute SYM_UPDATES.
+      const merge = (this as any)[SYM_SERVER_MERGE];
+      if (merge) {
+        merge(freshData);
       }
     }
   }

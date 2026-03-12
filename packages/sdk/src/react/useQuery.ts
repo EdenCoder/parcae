@@ -1,8 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
-import { applyPatch, type Operation } from "fast-json-patch";
-import { Model } from "@parcae/model";
+import { type Operation } from "fast-json-patch";
+import { Model, SYM_SERVER_MERGE } from "@parcae/model";
 import { useParcae } from "./context";
 import { useAuthStatus } from "./useAuth";
 import { log } from "../log";
@@ -100,11 +100,6 @@ function notify(e: CacheEntry): void {
   }
 }
 
-function forceNotify(e: CacheEntry): void {
-  e.hash = buildHash(e);
-  for (const fn of e.listeners) fn();
-}
-
 // ── Ops application ──────────────────────────────────────────────────────────
 
 type QueryOp =
@@ -112,41 +107,177 @@ type QueryOp =
   | { op: "remove"; id: string }
   | { op: "update"; id: string; patch: Operation[] };
 
+/** Result from applyOps indicating what changed */
+interface ApplyResult {
+  items: any[];
+  /** Whether any items were mutated in-place or membership changed */
+  changed: boolean;
+}
+
+/**
+ * Convert RFC 6902 JSON Patch operations into a flat key→value map.
+ * Only handles "replace" and "add" ops with top-level paths (e.g. "/name").
+ * Nested paths are applied to a shallow clone of the current top-level value.
+ */
+function patchToData(
+  patches: Operation[],
+  current: Record<string, any>,
+): Record<string, any> {
+  const data: Record<string, any> = {};
+
+  for (const op of patches) {
+    if (op.op !== "replace" && op.op !== "add") continue;
+    const segments = op.path.split("/").filter(Boolean);
+    if (segments.length === 0) continue;
+
+    const topKey = segments[0]!;
+    if (segments.length === 1) {
+      // Top-level property — direct assignment
+      data[topKey] = (op as any).value;
+    } else {
+      // Nested path — build/merge into the top-level object
+      if (!(topKey in data)) {
+        // Start from a shallow clone of the current value so we don't
+        // lose sibling keys that aren't in this patch batch.
+        const cur = current[topKey];
+        data[topKey] =
+          cur != null && typeof cur === "object"
+            ? Array.isArray(cur) ? [...cur] : { ...cur }
+            : {};
+      }
+      let cursor: any = data[topKey];
+      for (let i = 1; i < segments.length - 1; i++) {
+        const seg = segments[i]!;
+        if (cursor[seg] == null) cursor[seg] = {};
+        cursor = cursor[seg];
+      }
+      cursor[segments[segments.length - 1]!] = (op as any).value;
+    }
+  }
+
+  return data;
+}
+
 function applyOps(
   items: any[],
   ops: QueryOp[],
   modelClass: any,
   adapter: any,
-): any[] {
-  const byId = new Map<string, any>();
-  for (const item of items) byId.set(item.id, item);
+): ApplyResult {
+  // Fast path: nothing to do
+  if (ops.length === 0) return { items, changed: false };
+
+  // Collect which IDs are touched and how
+  const addOps = new Map<string, Record<string, any>>();
+  const updateOps = new Map<string, Operation[]>();
+  const removeIds = new Set<string>();
 
   for (const op of ops) {
     switch (op.op) {
       case "add":
-        if (op.data && !byId.has(op.id)) {
-          const instance = new modelClass(adapter, op.data);
-          byId.set(op.id, instance);
+        if (op.data) addOps.set(op.id, op.data);
+        break;
+      case "update":
+        if (op.patch) {
+          const existing = updateOps.get(op.id);
+          if (existing) {
+            existing.push(...op.patch);
+          } else {
+            updateOps.set(op.id, [...op.patch]);
+          }
         }
         break;
-      case "update": {
-        const existing = byId.get(op.id);
-        if (existing && op.patch) {
-          const rawData = JSON.parse(
-            JSON.stringify(existing.__data ?? existing),
-          );
-          applyPatch(rawData, op.patch);
-          byId.set(op.id, new modelClass(adapter, rawData));
-        }
-        break;
-      }
       case "remove":
-        byId.delete(op.id);
+        removeIds.add(op.id);
         break;
     }
   }
 
-  return [...byId.values()];
+  // Index existing items
+  const byId = new Map<string, any>();
+  for (const item of items) byId.set(item.id, item);
+
+  const hasRemoves = removeIds.size > 0;
+  const hasAdds = addOps.size > 0;
+  let hasRelevantUpdates = false;
+
+  // Apply updates in-place — mutate existing instances atomically,
+  // preserving any pending local changes via SYM_SERVER_MERGE.
+  for (const [id, patches] of updateOps) {
+    const existing = byId.get(id);
+    if (!existing) continue;
+    hasRelevantUpdates = true;
+
+    const currentData = existing.__data ?? {};
+    const merged = patchToData(patches, currentData);
+    const serverMerge = existing[SYM_SERVER_MERGE];
+    if (serverMerge) {
+      serverMerge(merged);
+    } else {
+      // Fallback: write through the proxy (shouldn't happen for Model instances)
+      for (const [k, v] of Object.entries(merged)) {
+        existing[k] = v;
+      }
+    }
+  }
+
+  // If only updates (no membership changes), return the same array reference
+  // but signal that data was mutated in-place.
+  if (!hasRemoves && !hasAdds) {
+    return { items, changed: hasRelevantUpdates };
+  }
+
+  // Membership changed — build a new array, reusing existing instances
+  const result: any[] = [];
+
+  for (const item of items) {
+    if (!removeIds.has(item.id)) result.push(item);
+  }
+
+  for (const [id, data] of addOps) {
+    if (!byId.has(id)) {
+      result.push(new modelClass(adapter, data));
+    }
+  }
+
+  return { items: result, changed: true };
+}
+
+/**
+ * Reconcile a fresh fetch result with the previous items array.
+ * For items that exist in both, merges server data into the existing instance
+ * in-place (via SYM_SERVER_MERGE) so local pending changes are preserved.
+ * Only creates new instances for items not previously present.
+ */
+function reconcile(prev: any[], next: any[]): any[] {
+  if (prev === EMPTY || prev.length === 0) return next;
+
+  const prevById = new Map<string, any>();
+  for (const item of prev) prevById.set(item.id, item);
+
+  let membershipChanged = prev.length !== next.length;
+  const result: any[] = new Array(next.length);
+
+  for (let i = 0; i < next.length; i++) {
+    const fresh = next[i];
+    const existing = prevById.get(fresh.id);
+    if (existing) {
+      // Merge server data in-place, respecting local pending changes
+      const serverMerge = existing[SYM_SERVER_MERGE];
+      if (serverMerge) {
+        const freshData = fresh.__data ?? fresh;
+        serverMerge(freshData);
+      }
+      result[i] = existing;
+      if (!membershipChanged && prev[i]?.id !== fresh.id) membershipChanged = true;
+    } else {
+      result[i] = fresh;
+      membershipChanged = true;
+    }
+  }
+
+  // If same items in same order, return the original array reference
+  return membershipChanged ? result : prev;
 }
 
 function resolveAdapter(chain: QueryChain<any>): any {
@@ -195,7 +326,7 @@ function doFetch(
     .find()
     .then((result: any[]) => {
       log.debug("useQuery: got", result.length, "items for", chain.__modelType);
-      entry.items = result;
+      entry.items = reconcile(entry.items, result);
       entry.loading = false;
       entry.retryCount = 0; // Reset retries on success
       if (entry.retryTimer) {
@@ -213,20 +344,22 @@ function doFetch(
 
         const unsub = client.subscribe(`query:${hash}`, (ops: QueryOp[]) => {
           if (!Array.isArray(ops) || ops.length === 0) return;
-          entry.items = applyOps(entry.items, ops, chain.__modelClass, adapter);
+          const result = applyOps(entry.items, ops, chain.__modelClass, adapter);
+          if (!result.changed) return;
+          entry.items = result.items;
           entry.version++;
           notify(entry);
         });
         entry.dispose = unsub;
       }
 
-      forceNotify(entry);
+      notify(entry);
     })
     .catch((err: Error) => {
       log.error("useQuery: error", err.message);
       entry.error = err;
       entry.loading = false;
-      forceNotify(entry);
+      notify(entry);
 
       // Auto-retry on failure
       scheduleRetry(key, entry);
@@ -244,10 +377,18 @@ export function useQuery<T>(
   const { status: authStatus, userId } = useAuthStatus();
   const authReady = !waitForAuth || authStatus !== "pending";
 
-  const key =
+  // Compute the "live" key when auth is ready.
+  const liveKey =
     chain && authReady
       ? `${chain.__modelType}:${userId ?? "anon"}:${JSON.stringify(chain.__steps ?? [])}`
       : null;
+
+  // Hold on to the last valid key so we keep showing stale data during
+  // disconnects (when auth temporarily resets to "pending").  Only null
+  // the key out if we've *never* had a valid key (initial auth pending).
+  const lastKeyRef = useRef<string | null>(null);
+  if (liveKey !== null) lastKeyRef.current = liveKey;
+  const key = liveKey ?? lastKeyRef.current;
 
   // Refs for callbacks that need the latest chain/client without re-subscribing
   const chainRef = useRef(chain);

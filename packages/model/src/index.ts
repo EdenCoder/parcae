@@ -5,7 +5,7 @@
  * Class properties ARE the schema. Direct property access. Full type safety.
  */
 
-export { Model, generateId } from "./Model";
+export { Model, generateId, SYM_SERVER_MERGE } from "./Model";
 
 export { FrontendAdapter } from "./adapters/client";
 export type { Transport, RequestOptions } from "./adapters/client";
