@@ -1,12 +1,11 @@
 /**
  * AuthGate — auth state container with awaitable resolution.
  *
- * The transport writes to this directly. React reads via useAuthStatus()
- * which polls gate.state.version to detect changes.
+ * The transport writes to this directly.  React reads via useAuthStatus()
+ * which subscribes through gate.subscribe().
  */
 
 import { log } from "./log";
-import { proxy } from "valtio";
 
 export type AuthStatus = "pending" | "authenticated" | "unauthenticated";
 
@@ -17,20 +16,33 @@ export interface AuthState {
 }
 
 export class AuthGate {
-  /** Reactive state — subscribe with valtio useSnapshot() */
-  public state = proxy<AuthState>({
+  /** Reactive state — plain object, mutated in place. */
+  public state: AuthState = {
     status: "pending",
     userId: null,
     version: 0,
-  });
+  };
 
   /** Awaitable — resolves when auth is confirmed (either way) */
   public ready: Promise<void>;
 
   private _resolve: (() => void) | null = null;
+  private _listeners = new Set<() => void>();
 
   constructor() {
     this.ready = this._makePending();
+  }
+
+  /**
+   * Subscribe to state changes.  Returns an unsubscribe function.
+   * The callback is invoked synchronously whenever resolve /
+   * resolveUnauthenticated / reset mutates the state.
+   */
+  subscribe(fn: () => void): () => void {
+    this._listeners.add(fn);
+    return () => {
+      this._listeners.delete(fn);
+    };
   }
 
   /** Auth confirmed — user is authenticated */
@@ -41,6 +53,7 @@ export class AuthGate {
     this.state.version++;
     this._resolve?.();
     this._resolve = null;
+    this._notify();
   }
 
   /** Auth confirmed — no user */
@@ -51,6 +64,7 @@ export class AuthGate {
     this.state.version++;
     this._resolve?.();
     this._resolve = null;
+    this._notify();
   }
 
   /** Reset to pending (disconnect, token change) */
@@ -61,7 +75,12 @@ export class AuthGate {
       this.state.userId = null;
       this.state.version++;
       this.ready = this._makePending();
+      this._notify();
     }
+  }
+
+  private _notify(): void {
+    for (const fn of this._listeners) fn();
   }
 
   private _makePending(): Promise<void> {

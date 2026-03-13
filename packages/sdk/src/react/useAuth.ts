@@ -2,45 +2,71 @@
 
 /**
  * Internal hook to read auth state reactively.
- * Subscribes to valtio proxy changes on the AuthGate state so any
- * status/userId/version mutation triggers a React re-render.
+ *
+ * Subscribes to AuthGate.subscribe() which fires synchronously on every
+ * resolve / resolveUnauthenticated / reset call.  We deliberately avoid
+ * valtio's snapshot() and subscribe() helpers because their internal proxy
+ * metadata (Symbol-keyed iterable state) is stripped when the proxy
+ * crosses module/bundler boundaries (Turbopack, Next.js RSC), causing
+ * "proxyState is not iterable".
  */
 
-import { useSyncExternalStore } from "react";
-import { subscribe as valtioSubscribe, snapshot } from "valtio";
+import { useCallback, useRef, useSyncExternalStore } from "react";
 import { useParcae } from "./context";
+import type { AuthGate } from "../auth-gate";
 import type { AuthStatus } from "../auth-gate";
 
-export function useAuthStatus(): {
+interface AuthSnap {
   status: AuthStatus;
   userId: string | null;
   version: number;
-} {
+}
+
+const DEFAULT_SNAP: AuthSnap = { status: "pending", userId: null, version: 0 };
+
+/** Read current values directly from the state object. */
+function readState(gate: AuthGate): AuthSnap {
+  const s = gate.state;
+  return {
+    status: s.status,
+    userId: s.userId,
+    version: s.version,
+  };
+}
+
+export function useAuthStatus(): AuthSnap {
   const client = useParcae();
   const transport = client.transport as any;
-  const gate = transport?.auth;
-  const state = gate?.state;
+  const gate: AuthGate | undefined = transport?.auth;
 
-  // Subscribe to valtio proxy mutations.
-  // valtioSubscribe fires synchronously on any property change.
-  const sub = (onChange: () => void) => {
-    if (!state) return () => {};
-    return valtioSubscribe(state, onChange);
-  };
+  // Mutable ref that caches the latest snapshot.  getSnapshot returns
+  // this reference — it only changes when the gate notifies us.
+  const ref = useRef<AuthSnap>(gate ? readState(gate) : DEFAULT_SNAP);
 
-  // Snapshot returns an immutable copy — useSyncExternalStore compares by reference.
-  // A new snapshot object is created on every proxy mutation, so Object.is fails
-  // and React re-renders.
-  const getSnapshot = () => {
-    if (!state) return null;
-    return snapshot(state);
-  };
+  const subscribe = useCallback(
+    (onChange: () => void) => {
+      if (!gate) return () => {};
+      return gate.subscribe(() => {
+        ref.current = readState(gate);
+        onChange();
+      });
+    },
+    [gate],
+  );
 
-  const snap = useSyncExternalStore(sub, getSnapshot, getSnapshot);
+  const getSnapshot = useCallback(() => {
+    // On first render (or if gate appeared between renders), sync the ref.
+    if (gate) {
+      const s = gate.state;
+      if (
+        ref.current.version !== s.version ||
+        ref.current.status !== s.status
+      ) {
+        ref.current = readState(gate);
+      }
+    }
+    return ref.current;
+  }, [gate]);
 
-  return {
-    status: (snap as any)?.status ?? "pending",
-    userId: (snap as any)?.userId ?? null,
-    version: (snap as any)?.version ?? 0,
-  };
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
