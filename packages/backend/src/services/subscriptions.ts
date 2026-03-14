@@ -14,7 +14,8 @@ import { log } from "../logger";
 
 import { createHash } from "node:crypto";
 import type { QueryChain } from "@parcae/model";
-import { compare, type Operation } from "fast-json-patch";
+import fastJsonPatch from "fast-json-patch";
+import type { Operation } from "fast-json-patch";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -172,7 +173,7 @@ export class QuerySubscriptionManager {
       if (!prev) {
         ops.push({ op: "add", id, data });
       } else {
-        const patch = compare(prev, data);
+        const patch = fastJsonPatch.compare(prev, data);
         if (patch.length > 0) {
           ops.push({ op: "update", id, patch });
         }
