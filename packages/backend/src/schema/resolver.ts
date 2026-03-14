@@ -39,7 +39,27 @@ function resolveType(type: Type): ColumnType {
     if (nonNullTypes.length === 1) {
       return resolveType(nonNullTypes[0]!);
     }
-    // Multi-type union that isn't just T | null → json
+    // Check if all members are the same primitive type
+    // e.g. "active" | "pending" | "completed" → string
+    if (
+      nonNullTypes.length > 1 &&
+      nonNullTypes.every((t) => t.isStringLiteral() || t.isString())
+    ) {
+      return "string";
+    }
+    if (
+      nonNullTypes.length > 1 &&
+      nonNullTypes.every((t) => t.isNumberLiteral() || t.isNumber())
+    ) {
+      return "number";
+    }
+    if (
+      nonNullTypes.length > 1 &&
+      nonNullTypes.every((t) => t.isBooleanLiteral() || t.isBoolean())
+    ) {
+      return "boolean";
+    }
+    // Mixed-type union → json
     return "json";
   }
 
