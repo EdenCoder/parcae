@@ -63,6 +63,13 @@ function resolveType(type: Type): ColumnType {
     return "json";
   }
 
+  // Text — unlimited text column (vs string which is VARCHAR 2048)
+  if (text === "Text" || text.includes("Text")) return "text";
+
+  // Text — branded string type for unlimited TEXT columns
+  // Matches `Text` (string & { __brand: "Text" }) from @parcae/model
+  if (text === "Text" || text.includes('"Text"')) return "text";
+
   // Primitives
   if (type.isString() || type.isStringLiteral()) return "string";
   if (type.isNumber() || type.isNumberLiteral()) return "number";
