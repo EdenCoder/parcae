@@ -19,10 +19,15 @@
  * route.get("/health", (req, res) => {
  *   res.json({ ok: true });
  * }, { priority: 0 });
+ *
+ * // Socket.IO event handlers:
+ * route.on("chat:message", requireSocketAuth, async (ctx) => {
+ *   ctx.emit("chat:chunk", { delta: "hello" });
+ * });
  * ```
  */
 
-// ─── Types ───────────────────────────────────────────────────────────────────
+// ─── HTTP Types ──────────────────────────────────────────────────────────────
 
 export type RouteHandler = (req: any, res: any, next?: () => void) => any;
 export type Middleware = (req: any, res: any, next: () => void) => any;
@@ -38,6 +43,36 @@ export interface RouteEntry {
   middlewares: Middleware[];
   handler: RouteHandler;
   priority: number;
+}
+
+// ─── Socket Types ────────────────────────────────────────────────────────────
+
+/** Context passed to every route.on() handler. */
+export interface SocketContext {
+  /** The raw Socket.IO socket. */
+  socket: any;
+  /** The Socket.IO server instance (for targeted emits, rooms, etc.). */
+  io: any;
+  /** The event payload sent by the client. */
+  data: any;
+  /** Resolved auth session (same shape as req.session from HTTP routes). */
+  session: any;
+  /** Sugar for socket.id. */
+  socketId: string;
+  /** Emit an event back to this specific client. */
+  emit: (event: string, ...args: any[]) => void;
+}
+
+export type SocketHandler = (ctx: SocketContext) => void | Promise<void>;
+export type SocketMiddleware = (
+  ctx: SocketContext,
+  next: () => void | Promise<void>,
+) => void | Promise<void>;
+
+export interface SocketEntry {
+  event: string;
+  middlewares: SocketMiddleware[];
+  handler: SocketHandler;
 }
 
 // ─── Global Route Registry ───────────────────────────────────────────────────
@@ -56,6 +91,47 @@ export function getRoutes(): RouteEntry[] {
  */
 export function clearRoutes(): void {
   registeredRoutes.length = 0;
+}
+
+// ─── Global Socket Handler Registry ─────────────────────────────────────────
+
+const registeredSocketHandlers: SocketEntry[] = [];
+
+/**
+ * Get all registered socket handlers.
+ */
+export function getSocketHandlers(): SocketEntry[] {
+  return [...registeredSocketHandlers];
+}
+
+/**
+ * Clear all registered socket handlers (for testing).
+ */
+export function clearSocketHandlers(): void {
+  registeredSocketHandlers.length = 0;
+}
+
+/**
+ * Run a socket middleware chain then the handler.
+ * Middleware calls next() to proceed; throwing or not calling next() aborts.
+ */
+export async function runSocketChain(
+  middlewares: SocketMiddleware[],
+  handler: SocketHandler,
+  ctx: SocketContext,
+): Promise<void> {
+  let idx = 0;
+
+  const next = async (): Promise<void> => {
+    if (idx < middlewares.length) {
+      const mw = middlewares[idx++]!;
+      await mw(ctx, next);
+    } else {
+      await handler(ctx);
+    }
+  };
+
+  await next();
 }
 
 // ─── Route registration ─────────────────────────────────────────────────────
@@ -115,6 +191,11 @@ function registerRoute(method: string, path: string, ...args: any[]): void {
  * route.get("/health", (req, res) => res.json({ ok: true }));
  * route.post("/upload", requireAuth, (req, res) => { ... });
  * route.post("/upload", requireAuth, (req, res) => { ... }, { priority: 50 });
+ *
+ * // Socket.IO event handlers (registered once per connection):
+ * route.on("chat:message", requireSocketAuth, async (ctx) => {
+ *   ctx.emit("chat:chunk", { text: "..." });
+ * });
  * ```
  */
 export const route = {
@@ -142,6 +223,40 @@ export const route = {
   all(path: string, ...args: any[]) {
     registerRoute("ALL", path, ...args);
   },
+
+  /**
+   * Register a Socket.IO event handler.
+   *
+   * The handler is registered on every new socket connection.
+   * Uses the same flexible argument signature as HTTP routes:
+   *   route.on("event", handler)
+   *   route.on("event", middleware1, middleware2, handler)
+   */
+  on(event: string, ...args: any[]) {
+    // Last arg is always the handler; everything in between is middleware
+    const handler = args.pop() as SocketHandler;
+    const middlewares = args as SocketMiddleware[];
+
+    registeredSocketHandlers.push({
+      event,
+      middlewares,
+      handler,
+    });
+  },
+};
+
+// ─── Socket Auth Middleware ──────────────────────────────────────────────────
+
+/**
+ * Socket middleware that requires an authenticated session.
+ * Equivalent to requireAuth for HTTP routes.
+ */
+export const requireSocketAuth: SocketMiddleware = (ctx, next) => {
+  if (!ctx.session?.user?.id) {
+    ctx.emit("error", { message: "Unauthorized" });
+    return;
+  }
+  return next();
 };
 
 // ─── Controller class (optional sugar) ───────────────────────────────────────

@@ -20,7 +20,12 @@ import { parseConfig } from "./config";
 import type { Config } from "./config";
 import { createServer_ } from "./server";
 import type { ServerContext } from "./server";
-import { getRoutes } from "./routing/route";
+import {
+  getRoutes,
+  getSocketHandlers,
+  runSocketChain,
+  type SocketContext,
+} from "./routing/route";
 import { BackendAdapter } from "./adapters/model";
 import { registerModelRoutes } from "./adapters/routes";
 import { PubSub } from "./services/pubsub";
@@ -515,6 +520,34 @@ export function createApp(config: AppConfig): ParcaeApp {
             callback?.({ userId: null });
           }
         });
+
+        // ── route.on() — custom Socket.IO event handlers ──────────
+        const socketHandlers = getSocketHandlers();
+        for (const entry of socketHandlers) {
+          socket.on(entry.event, async (data: any) => {
+            const ctx: SocketContext = {
+              socket,
+              io: server!.io,
+              data,
+              session: socketSession,
+              socketId: socket.id,
+              emit: (event: string, ...args: any[]) =>
+                socket.emit(event, ...args),
+            };
+            try {
+              await runSocketChain(entry.middlewares, entry.handler, ctx);
+            } catch (err: any) {
+              log.error(`[socket] ${entry.event} error:`, err);
+              socket.emit("error", {
+                event: entry.event,
+                message:
+                  err instanceof ClientError
+                    ? err.message
+                    : "An error occurred",
+              });
+            }
+          });
+        }
 
         // Query subscriptions
         socket.on("unsubscribe:query", (data: any) => {

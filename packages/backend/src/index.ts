@@ -38,12 +38,25 @@ export { SchemaResolver } from "./schema/resolver";
 export { generateSchemas, loadCachedSchemas } from "./schema/generate";
 
 // Routing
-export { route, Controller, getRoutes, clearRoutes } from "./routing/route";
+export {
+  route,
+  Controller,
+  getRoutes,
+  clearRoutes,
+  getSocketHandlers,
+  clearSocketHandlers,
+  runSocketChain,
+  requireSocketAuth,
+} from "./routing/route";
 export type {
   RouteHandler,
   Middleware,
   RouteOptions,
   RouteEntry,
+  SocketContext,
+  SocketHandler,
+  SocketMiddleware,
+  SocketEntry,
 } from "./routing/route";
 
 export { hook, getHooks, getHooksFor, clearHooks } from "./routing/hook";
