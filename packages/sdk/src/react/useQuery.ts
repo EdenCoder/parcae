@@ -105,6 +105,34 @@ function notify(e: CacheEntry): void {
   }
 }
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Ensure every intermediate segment of each patch path exists as a plain
+ * object on `doc`.  `fast-json-patch` does NOT auto-vivify parents, so a
+ * patch like `{ op:"add", path:"/a/b/c" }` will throw if `doc.a` is `null`
+ * or missing.  We walk the path segments and replace any `null` / non-object
+ * intermediates with `{}` so the subsequent `applyPatch` call can succeed.
+ */
+function ensureIntermediates(
+  doc: Record<string, any>,
+  patches: readonly { path: string }[],
+): void {
+  for (const { path } of patches) {
+    const segments = path.split("/").filter(Boolean);
+    // We only need to guarantee *parents* exist (all but the last segment).
+    let cursor: any = doc;
+    for (let i = 0; i < segments.length - 1; i++) {
+      const seg = segments[i]!;
+      const val = cursor[seg];
+      if (val === null || val === undefined || typeof val !== "object") {
+        cursor[seg] = {};
+      }
+      cursor = cursor[seg];
+    }
+  }
+}
+
 // ── Ops application ──────────────────────────────────────────────────────────
 
 type QueryOp =
@@ -172,6 +200,7 @@ function applyOps(
     // Build the full server-authoritative snapshot by applying the RFC
     // 6902 patches onto a deep clone of the current data.
     const snapshot = JSON.parse(JSON.stringify(existing.__data ?? {}));
+    ensureIntermediates(snapshot, patches);
     applyPatch(snapshot, patches, false, true);
 
     // SYM_SERVER_MERGE writes values onto the raw target (skipping
