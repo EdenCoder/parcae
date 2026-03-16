@@ -20,7 +20,9 @@ import {
 } from "@parcae/model";
 import { generateId, type Model } from "@parcae/model";
 import equal from "deep-equal";
-import { applyPatch, type Operation as PatchOp } from "fast-json-patch";
+import fastJsonPatch from "fast-json-patch";
+import type { Operation as PatchOp } from "fast-json-patch";
+const { applyPatch } = fastJsonPatch;
 import pluralize from "pluralize";
 import { ClientError } from "../helpers";
 import type { HookAction, HookTiming } from "../routing/hook";
