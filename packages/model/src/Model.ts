@@ -132,6 +132,12 @@ const SYSTEM_DATA_KEYS = new Set(["id", "type", "createdAt", "updatedAt"]);
 // ─── Model Class ─────────────────────────────────────────────────────────────
 
 export class Model extends EventEmitter {
+  // ── Instance (set dynamically in constructor) ─────────────────────
+
+  declare id: string;
+  declare createdAt: string;
+  declare updatedAt: string;
+
   // ── Static ─────────────────────────────────────────────────────────
 
   static type: string = "";

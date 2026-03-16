@@ -677,7 +677,7 @@ export class BackendAdapter implements ModelAdapter {
 
     chain.count = async (column?: string): Promise<number> => {
       const clone = knexQuery.clone();
-      const result = await clone.clearSelect().count(column || "*");
+      const result = await clone.clearSelect().clearOrder().count(column || "*");
       return Number.parseInt(`${Object.values(result[0] || {})[0] || "0"}`, 10);
     };
 
