@@ -86,20 +86,34 @@ export function registerModelRoutes(
             return json(res, 200, { result: { total }, success: true });
           }
 
+          // Build a parallel count query (same filters, no limit/offset)
+          // so clients can compute page counts.
+          const stepsWithoutPagination = Array.isArray(steps)
+            ? steps.filter(
+                (s: any) => s.method !== "limit" && s.method !== "offset",
+              )
+            : [];
+          const countQuery = adapter.queryFromClient(
+            ModelClass,
+            scopeResult,
+            stepsWithoutPagination,
+          );
+
           // For socket RPC, subscribe to query-level change notifications.
           // The subscription manager will re-eval this query on model changes
           // and emit surgical add/remove/update ops to this socket.
           const socketId = req._socketId;
           if (socketId && adapter.subscriptions) {
-            const sub = await adapter.subscriptions.subscribe({
-              socketId,
-              query,
-            });
+            const [sub, totalCount] = await Promise.all([
+              adapter.subscriptions.subscribe({ socketId, query }),
+              countQuery.count(),
+            ]);
 
             const items = [...sub.items];
             json(res, 200, {
               result: {
                 total: items.length,
+                totalCount,
                 __queryHash: sub.hash,
                 [type + "s"]: items,
               },
@@ -108,11 +122,15 @@ export function registerModelRoutes(
             return;
           }
 
-          const items = await query.find();
+          const [items, totalCount] = await Promise.all([
+            query.find(),
+            countQuery.count(),
+          ]);
 
           json(res, 200, {
             result: {
               total: items.length,
+              totalCount,
               [type + "s"]: await Promise.all(
                 (items as any[]).map(
                   (m: any) => m.sanitize?.(ctx.user) ?? m.__data,

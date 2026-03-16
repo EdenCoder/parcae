@@ -1,12 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
-import { applyPatch, type Operation } from "fast-json-patch";
 import { Model, SYM_SERVER_MERGE } from "@parcae/model";
+import { applyPatch, type Operation } from "fast-json-patch";
+import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+import type { ParcaeClient } from "../client";
+import { log } from "../log";
 import { useParcae } from "./context";
 import { useAuthStatus } from "./useAuth";
-import { log } from "../log";
-import type { ParcaeClient } from "../client";
 
 interface QueryChain<T> {
   find(): Promise<T[]>;
@@ -25,6 +25,8 @@ interface UseQueryResult<T> {
   loading: boolean;
   error: Error | null;
   refetch: () => void;
+  /** Total matching records on the server (before limit/offset). */
+  total: number;
 }
 
 // ── Cache ────────────────────────────────────────────────────────────────────
@@ -40,6 +42,8 @@ interface CacheEntry {
   dispose: (() => void) | null;
   gcTimer: ReturnType<typeof setTimeout> | null;
   queryHash: string | null;
+  /** Total matching records on the server (before limit/offset). */
+  totalCount: number;
   /** The chain used for the last fetch — stored so retry/refetch don't need a closure. */
   chain: QueryChain<any> | null;
   /** The client used for the last fetch. */
@@ -82,6 +86,7 @@ function getOrCreate(key: string): CacheEntry {
       dispose: null,
       gcTimer: null,
       queryHash: null,
+      totalCount: 0,
       chain: null,
       client: null,
       retryCount: 0,
@@ -263,8 +268,11 @@ function scheduleRetry(key: string, entry: CacheEntry): void {
   // Don't retry if nobody is listening
   if (entry.refs <= 0) return;
 
-  const delay = RETRY_DELAYS[Math.min(entry.retryCount, RETRY_DELAYS.length - 1)]!;
-  log.debug(`useQuery: scheduling retry ${entry.retryCount + 1}/${MAX_RETRIES} in ${delay}ms`);
+  const delay =
+    RETRY_DELAYS[Math.min(entry.retryCount, RETRY_DELAYS.length - 1)]!;
+  log.debug(
+    `useQuery: scheduling retry ${entry.retryCount + 1}/${MAX_RETRIES} in ${delay}ms`,
+  );
 
   entry.retryTimer = setTimeout(() => {
     entry.retryTimer = null;
@@ -300,6 +308,10 @@ function doFetch(
       entry.items = reconcile(entry.items, result);
       entry.loading = false;
       entry.retryCount = 0; // Reset retries on success
+      // Capture totalCount from the server response (set by FrontendAdapter)
+      if (typeof (result as any).__totalCount === "number") {
+        entry.totalCount = (result as any).__totalCount;
+      }
       if (entry.retryTimer) {
         clearTimeout(entry.retryTimer);
         entry.retryTimer = null;
@@ -315,7 +327,12 @@ function doFetch(
 
         const unsub = client.subscribe(`query:${hash}`, (ops: QueryOp[]) => {
           if (!Array.isArray(ops) || ops.length === 0) return;
-          const result = applyOps(entry.items, ops, chain.__modelClass, adapter);
+          const result = applyOps(
+            entry.items,
+            ops,
+            chain.__modelClass,
+            adapter,
+          );
           if (!result.changed) return;
           entry.items = result.items;
           entry.version++;
@@ -371,30 +388,33 @@ export function useQuery<T>(
 
   // subscribe and getSnapshot must depend on `key` so useSyncExternalStore
   // re-subscribes when the cache key changes (e.g. null -> real key after auth).
-  const subscribe = useCallback((onChange: () => void) => {
-    if (!key) return () => {};
-    const e = getOrCreate(key);
-    e.refs++;
-    e.listeners.add(onChange);
-    if (e.gcTimer) {
-      clearTimeout(e.gcTimer);
-      e.gcTimer = null;
-    }
-    return () => {
-      e.listeners.delete(onChange);
-      e.refs--;
-      if (e.refs <= 0) {
-        if (e.retryTimer) {
-          clearTimeout(e.retryTimer);
-          e.retryTimer = null;
-        }
-        e.gcTimer = setTimeout(() => {
-          e.dispose?.();
-          cache.delete(key);
-        }, GC_DELAY);
+  const subscribe = useCallback(
+    (onChange: () => void) => {
+      if (!key) return () => {};
+      const e = getOrCreate(key);
+      e.refs++;
+      e.listeners.add(onChange);
+      if (e.gcTimer) {
+        clearTimeout(e.gcTimer);
+        e.gcTimer = null;
       }
-    };
-  }, [key]);
+      return () => {
+        e.listeners.delete(onChange);
+        e.refs--;
+        if (e.refs <= 0) {
+          if (e.retryTimer) {
+            clearTimeout(e.retryTimer);
+            e.retryTimer = null;
+          }
+          e.gcTimer = setTimeout(() => {
+            e.dispose?.();
+            cache.delete(key);
+          }, GC_DELAY);
+        }
+      };
+    },
+    [key],
+  );
 
   const getSnapshot = useCallback((): string => {
     if (!key) return INITIAL_HASH;
@@ -420,7 +440,11 @@ export function useQuery<T>(
     if (entry.items === EMPTY && !entry.loading) {
       // Entry was created but never fetched (or was reset)
       doFetch(key, entry, currentChain, clientRef.current);
-    } else if (entry.items === EMPTY && entry.error === null && !entry.dispose) {
+    } else if (
+      entry.items === EMPTY &&
+      entry.error === null &&
+      !entry.dispose
+    ) {
       // Fresh entry — needs initial fetch
       doFetch(key, entry, currentChain, clientRef.current);
     }
@@ -467,6 +491,7 @@ export function useQuery<T>(
       items: EMPTY as T[],
       loading: !authReady,
       error: null,
+      total: 0,
       refetch: () => {},
     };
 
@@ -475,6 +500,7 @@ export function useQuery<T>(
     items: entry?.items ?? (EMPTY as T[]),
     loading: entry?.loading ?? true,
     error: entry?.error ?? null,
+    total: entry?.totalCount ?? 0,
     refetch,
   };
 }

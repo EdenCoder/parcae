@@ -11,12 +11,12 @@
 import { proxy } from "valtio";
 import {
   CHAINABLE_METHODS,
+  type ChangeSet,
   type ModelAdapter,
   type ModelConstructor,
-  type ChangeSet,
+  type PatchOp,
   type QueryChain,
   type QueryStep,
-  type PatchOp,
 } from "./types";
 
 // ─── Transport Interface ─────────────────────────────────────────────────────
@@ -170,28 +170,33 @@ export class FrontendAdapter implements ModelAdapter {
     modelClass: ModelConstructor<T>,
     steps: QueryStep[],
   ): QueryChain<T> {
-    const adapter = this;
-
     const chain: any = {};
 
     for (const method of CHAINABLE_METHODS) {
       chain[method] = (...args: any[]) => {
-        return adapter._buildQuery(modelClass, [
+        return this._buildQuery(modelClass, [
           ...steps,
-          { method, args: adapter._serializeArgs(args) },
+          { method, args: this._serializeArgs(args) },
         ]);
       };
     }
 
     chain.find = async (): Promise<T[]> => {
-      const path = adapter.resolvePath(modelClass);
-      const result = await adapter.transport.get(path, { __query: steps });
+      const path = this.resolvePath(modelClass);
+      const result = await this.transport.get(path, { __query: steps });
       const items = result?.[modelClass.type + "s"] ?? result?.items ?? [];
-      const models = items.map((row: any) => new modelClass(adapter, row));
+      const models = items.map((row: any) => new modelClass(this, row));
       // Attach query subscription hash if backend provided one
       if (result?.__queryHash) {
         Object.defineProperty(models, "__queryHash", {
           value: result.__queryHash,
+          enumerable: false,
+        });
+      }
+      // Attach total count for pagination
+      if (typeof result?.totalCount === "number") {
+        Object.defineProperty(models, "__totalCount", {
+          value: result.totalCount,
           enumerable: false,
         });
       }
@@ -204,8 +209,8 @@ export class FrontendAdapter implements ModelAdapter {
     };
 
     chain.count = async (): Promise<number> => {
-      const path = adapter.resolvePath(modelClass);
-      const result = await adapter.transport.get(path, {
+      const path = this.resolvePath(modelClass);
+      const result = await this.transport.get(path, {
         __query: steps,
         __count: true,
       });
@@ -215,7 +220,7 @@ export class FrontendAdapter implements ModelAdapter {
     chain.__steps = steps;
     chain.__modelType = modelClass.type;
     chain.__modelClass = modelClass;
-    chain.__adapter = adapter;
+    chain.__adapter = this;
 
     return chain as QueryChain<T>;
   }
@@ -258,7 +263,7 @@ export class FrontendAdapter implements ModelAdapter {
 
   private resolvePath(modelClass: ModelConstructor): string {
     if (!modelClass.path && !modelClass.type) {
-      throw new Error(`Model has no path or type`);
+      throw new Error("Model has no path or type");
     }
     const fullPath = modelClass.path ?? `/v1/${modelClass.type}s`;
     return this.p(fullPath);
