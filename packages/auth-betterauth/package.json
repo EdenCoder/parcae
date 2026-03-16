@@ -1,6 +1,6 @@
 {
   "name": "@parcae/auth-betterauth",
-  "version": "0.3.0",
+  "version": "0.8.0",
   "description": "Better Auth adapter for Parcae — self-hosted auth with your User model",
   "type": "module",
   "main": "./dist/index.js",

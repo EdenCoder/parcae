@@ -1,6 +1,6 @@
 {
   "name": "@parcae/auth-clerk",
-  "version": "0.1.0",
+  "version": "0.8.0",
   "description": "Clerk adapter for Parcae — external auth proxied to your User model",
   "type": "module",
   "main": "./dist/index.js",
