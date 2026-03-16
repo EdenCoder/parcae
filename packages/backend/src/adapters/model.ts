@@ -20,7 +20,7 @@ import {
 } from "@parcae/model";
 import { generateId, type Model } from "@parcae/model";
 import equal from "deep-equal";
-import type { Operation as PatchOp } from "fast-json-patch";
+import { applyPatch, type Operation as PatchOp } from "fast-json-patch";
 import pluralize from "pluralize";
 import { ClientError } from "../helpers";
 import type { HookAction, HookTiming } from "../routing/hook";
@@ -141,7 +141,7 @@ export class BackendAdapter implements ModelAdapter {
   public subscriptions: any | null = null;
 
   /** Detected database engine — set by detectEngine(). */
-  public engine: "alloydb" | "postgres" = "postgres";
+  public engine: "alloydb" | "postgres" | "sqlite" = "postgres";
 
   /** Whether search extensions have been enabled for this database. */
   private _searchExtensionsReady = false;
@@ -166,10 +166,19 @@ export class BackendAdapter implements ModelAdapter {
   // ── Engine Detection ────────────────────────────────────────────────
 
   /**
-   * Detect whether we're running on AlloyDB or standard Postgres.
+   * Detect database engine: SQLite, AlloyDB, or standard Postgres.
    * Should be called once at startup, before ensureAllTables().
+   * Pass hint="sqlite" when the Knex client is better-sqlite3.
    */
-  async detectEngine(): Promise<"alloydb" | "postgres"> {
+  async detectEngine(
+    hint?: "sqlite",
+  ): Promise<"alloydb" | "postgres" | "sqlite"> {
+    if (hint === "sqlite") {
+      this.engine = "sqlite";
+      log.info("Database engine detected: sqlite");
+      return this.engine;
+    }
+
     try {
       const { rows } = await this.write.raw(`
         SELECT EXISTS (
@@ -184,14 +193,24 @@ export class BackendAdapter implements ModelAdapter {
     return this.engine;
   }
 
+  /** Whether the engine is SQLite. */
+  get isSqlite(): boolean {
+    return this.engine === "sqlite";
+  }
+
   // ── Search Extensions ───────────────────────────────────────────────
 
   /**
    * Enable search extensions (idempotent). Called once when the first
    * model with `static searchFields` is encountered during ensureTable().
+   * No-op for SQLite (uses LIKE fallback instead).
    */
   private async _ensureSearchExtensions(): Promise<void> {
     if (this._searchExtensionsReady) return;
+    if (this.isSqlite) {
+      this._searchExtensionsReady = true;
+      return;
+    }
 
     // Standard Postgres — trigram fuzzy matching
     await this.write.raw("CREATE EXTENSION IF NOT EXISTS pg_trgm");
@@ -234,6 +253,19 @@ export class BackendAdapter implements ModelAdapter {
     if (!searchFields?.length || !term.trim()) return knexQuery;
 
     const table = tableName(modelClass);
+
+    // ── SQLite: LIKE-based fallback ─────────────────────────────────
+    if (this.isSqlite) {
+      const likeTerm = `%${term}%`;
+      const whereParts = searchFields.map((f) => `${table}.${f} LIKE ?`);
+      const whereBindings = searchFields.map(() => likeTerm);
+      return knexQuery.whereRaw(
+        `(${whereParts.join(" OR ")})`,
+        whereBindings,
+      );
+    }
+
+    // ── Postgres: full-text + trigram + optional vector ──────────────
 
     // Build the ranking expression
     // 1. Full-text rank (weight: 2x)
@@ -667,6 +699,12 @@ export class BackendAdapter implements ModelAdapter {
     const table = tableName(ModelClass as unknown as ModelConstructor);
     const schema = ((ModelClass as any).__schema as SchemaDefinition) ?? {};
 
+    // ── SQLite: read-modify-write (no native JSONB operators) ──────
+    if (this.isSqlite) {
+      await this._patchSqlite(model, ops, table, schema);
+      return;
+    }
+
     await this.runHooks(model, "patch", "before");
 
     type ParsedOp = {
@@ -844,6 +882,82 @@ export class BackendAdapter implements ModelAdapter {
     }
   }
 
+  /**
+   * SQLite patch fallback: read-modify-write.
+   * Reads the current row, applies RFC 6902 ops per-column in JS,
+   * then writes back. Safe for SQLite's single-writer model.
+   */
+  private async _patchSqlite(
+    model: any,
+    ops: PatchOp[],
+    table: string,
+    schema: SchemaDefinition,
+  ): Promise<void> {
+    await this.runHooks(model, "patch", "before");
+
+    // Read current row
+    const row = await this.write(table).where("id", model.id).first();
+    if (!row) throw new ClientError(`patch: row not found id=${model.id}`);
+
+    const updateFields: Record<string, any> = { updatedAt: new Date() };
+
+    // Group ops by top-level column
+    const byColumn = new Map<string, PatchOp[]>();
+    for (const op of ops) {
+      const column = op.path.slice(1).split("/")[0]!;
+      if (!byColumn.has(column)) byColumn.set(column, []);
+      byColumn.get(column)!.push(op);
+    }
+
+    for (const [column, columnOps] of byColumn) {
+      if (!(column in schema)) {
+        throw new ClientError(
+          `patch: unknown column "${column}" on model "${(model.constructor as typeof Model).type}"`,
+        );
+      }
+
+      const colType = resolveColType(schema[column]!);
+
+      // Scalar columns: just take the last replace/add value
+      if (colType !== "json") {
+        const lastOp = columnOps[columnOps.length - 1]!;
+        if (lastOp.op === "test") continue;
+        const value = (lastOp as any).value;
+        updateFields[column] =
+          colType === "datetime"
+            ? value
+              ? new Date(value)
+              : null
+            : (value ?? null);
+        continue;
+      }
+
+      // JSON columns: apply RFC 6902 patch in JS
+      let current = row[column];
+      if (typeof current === "string") {
+        try {
+          current = JSON.parse(current);
+        } catch {
+          current = {};
+        }
+      }
+      if (current == null) current = {};
+
+      // Wrap column ops as a proper JSON Patch document (paths relative to column root)
+      const subOps: PatchOp[] = columnOps.map((op) => ({
+        ...op,
+        path: op.path.slice(1 + column.length), // strip /<column> prefix
+      }));
+
+      const result = applyPatch(current, subOps, true, false);
+      updateFields[column] = JSON.stringify(result.newDocument);
+    }
+
+    await this.write(table).where("id", model.id).update(updateFields);
+    await this.runHooks(model, "patch", "after");
+    this._notifyChange(model);
+  }
+
   // ── Increment/Decrement ──────────────────────────────────────────────
 
   async increment(model: any, field: string, amount = 1): Promise<void> {
@@ -941,11 +1055,19 @@ export class BackendAdapter implements ModelAdapter {
 
     let existingIndexes: string[] = [];
     try {
-      const result = await this.write.raw(
-        "SELECT * FROM pg_indexes WHERE tablename = ?",
-        [table],
-      );
-      existingIndexes = result.rows.map((r: any) => r.indexname);
+      if (this.isSqlite) {
+        const rows = await this.write.raw(
+          "SELECT name FROM pragma_index_list(?)",
+          [table],
+        );
+        existingIndexes = (rows ?? []).map((r: any) => r.name);
+      } else {
+        const result = await this.write.raw(
+          "SELECT * FROM pg_indexes WHERE tablename = ?",
+          [table],
+        );
+        existingIndexes = result.rows.map((r: any) => r.indexname);
+      }
     } catch {}
 
     await this.write.schema[hasTable ? "alterTable" : "createTable"](
@@ -953,7 +1075,7 @@ export class BackendAdapter implements ModelAdapter {
       (t: any) => {
         if (!hasTable) {
           t.string("id").primary().unique();
-          t.jsonb("data");
+          this.isSqlite ? t.text("data") : t.jsonb("data");
           t.datetime("createdAt");
           t.datetime("updatedAt");
         }
@@ -975,7 +1097,7 @@ export class BackendAdapter implements ModelAdapter {
           const resolved = resolveColType(colDef);
           switch (resolved) {
             case "json":
-              t.jsonb(key);
+              this.isSqlite ? t.text(key) : t.jsonb(key);
               break;
             case "string":
               t.string(key, 2048);
@@ -1027,6 +1149,14 @@ export class BackendAdapter implements ModelAdapter {
     table: string,
     fields: string[],
   ): Promise<void> {
+    // SQLite: no tsvector/trigram/GIN. Search uses LIKE at query time.
+    if (this.isSqlite) {
+      log.info(
+        `search: sqlite mode — using LIKE fallback — table=${table} fields=[${fields.join(", ")}]`,
+      );
+      return;
+    }
+
     await this._ensureSearchExtensions();
 
     // Weights by field order: A (highest), B, C, D

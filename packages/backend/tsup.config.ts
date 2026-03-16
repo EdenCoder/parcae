@@ -9,5 +9,5 @@ export default defineConfig({
   target: "es2022",
   splitting: true,
   treeshake: true,
-  external: ["@parcae/model", "knex", "socket.io", "bullmq", "ioredis"],
+  external: ["@parcae/model", "knex", "better-sqlite3", "socket.io", "bullmq", "ioredis"],
 });

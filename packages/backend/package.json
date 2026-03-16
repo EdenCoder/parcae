@@ -33,6 +33,7 @@
     "deep-equal": "^2.2.3",
     "fast-json-patch": "^3.1.1",
     "ioredis": "^5.4.0",
+    "better-sqlite3": "^11.0.0",
     "knex": "^3.1.0",
     "pako": "^2.1.0",
     "pluralize": "^8.0.0",
@@ -43,6 +44,7 @@
   },
   "devDependencies": {
     "@types/async-lock": "^1.4.2",
+    "@types/better-sqlite3": "^7.6.0",
     "@types/body-parser": "^1.19.5",
     "@types/deep-equal": "^1.0.4",
     "@types/node": "^22.0.0",

@@ -16,7 +16,7 @@ import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
 import { log } from "./logger";
 import { ClientError } from "./helpers";
 import { generateSchemas } from "./schema/generate";
-import { parseConfig } from "./config";
+import { parseConfig, isSqliteUrl, sqliteFilename } from "./config";
 import type { Config } from "./config";
 import { createServer_ } from "./server";
 import type { ServerContext } from "./server";
@@ -211,18 +211,34 @@ export function createApp(config: AppConfig): ParcaeApp {
       );
 
       // ── Step 3: Connect database ───────────────────────────────────
-      const writeDb = knex({
-        client: "pg",
-        connection: envConfig.DATABASE_URL,
-        pool: { min: 2, max: 10 },
-      });
-      const readDb = envConfig.DATABASE_READ_URL
-        ? knex({
-            client: "pg",
-            connection: envConfig.DATABASE_READ_URL,
-            pool: { min: 2, max: 10 },
-          })
-        : writeDb;
+      const useSqlite = isSqliteUrl(envConfig.DATABASE_URL);
+
+      let writeDb: ReturnType<typeof knex>;
+      let readDb: ReturnType<typeof knex>;
+
+      if (useSqlite) {
+        const filename = sqliteFilename(envConfig.DATABASE_URL);
+        writeDb = knex({
+          client: "better-sqlite3",
+          connection: { filename },
+          useNullAsDefault: true,
+        });
+        readDb = writeDb; // SQLite has no read replica
+        log.info(`SQLite database: ${filename}`);
+      } else {
+        writeDb = knex({
+          client: "pg",
+          connection: envConfig.DATABASE_URL,
+          pool: { min: 2, max: 10 },
+        });
+        readDb = envConfig.DATABASE_READ_URL
+          ? knex({
+              client: "pg",
+              connection: envConfig.DATABASE_READ_URL,
+              pool: { min: 2, max: 10 },
+            })
+          : writeDb;
+      }
 
       log.info("Database connected");
 
@@ -254,9 +270,9 @@ export function createApp(config: AppConfig): ParcaeApp {
       });
       Model.use(adapter);
 
-      // Detect AlloyDB vs standard Postgres (for search features)
+      // Detect database engine (SQLite / Postgres / AlloyDB)
       log.info("Detecting database engine...");
-      await adapter.detectEngine();
+      await adapter.detectEngine(useSqlite ? "sqlite" : undefined);
       log.info("Database engine detected");
 
       // ── Step 6: Set up auth (opt-in) ───────────────────────────────

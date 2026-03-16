@@ -10,7 +10,7 @@ export { createApp } from "./app";
 export type { ParcaeApp, AppConfig } from "./app";
 
 // Config
-export { parseConfig, configSchema } from "./config";
+export { parseConfig, configSchema, isSqliteUrl, sqliteFilename } from "./config";
 export type { Config } from "./config";
 
 // Server
