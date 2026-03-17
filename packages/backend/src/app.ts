@@ -268,6 +268,7 @@ export function createApp(config: AppConfig): ParcaeApp {
         write: writeDb,
         pubsub,
       });
+      adapter.registerModels(models);
       Model.use(adapter);
 
       // Detect database engine (SQLite / Postgres / AlloyDB)

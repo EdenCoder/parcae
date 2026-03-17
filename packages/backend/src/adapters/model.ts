@@ -142,6 +142,9 @@ export class BackendAdapter implements ModelAdapter {
   private services: BackendServices;
   public subscriptions: any | null = null;
 
+  /** Registered model constructors, keyed by type. Set via registerModels(). */
+  private _models = new Map<string, ModelConstructor>();
+
   /** Detected database engine — set by detectEngine(). */
   public engine: "alloydb" | "postgres" | "sqlite" = "postgres";
 
@@ -163,6 +166,13 @@ export class BackendAdapter implements ModelAdapter {
 
   constructor(services: BackendServices) {
     this.services = services;
+  }
+
+  /** Register model constructors so the adapter can resolve refs by type. */
+  registerModels(models: ModelConstructor[]): void {
+    for (const m of models) {
+      this._models.set(m.type, m);
+    }
   }
 
   // ── Engine Detection ────────────────────────────────────────────────
@@ -682,25 +692,27 @@ export class BackendAdapter implements ModelAdapter {
     if (!colDef || typeof colDef === "string" || colDef.kind !== "ref")
       return null;
 
-    // Resolve the target model and its schema
-    const targetModel = colDef.target;
-    if (!targetModel?.type) return null;
+    // Resolve the target model — prefer the registry, fall back to the ref's target
+    const targetType = colDef.target?.type;
+    if (!targetType) return null;
+    const resolvedTarget = this._models.get(targetType) ?? colDef.target;
     const targetSchema =
-      (targetModel as any).__schema as SchemaDefinition | undefined;
-    if (!targetSchema) return null;
-    const targetTable = pluralize(targetModel.type);
+      ((resolvedTarget as any).__schema as SchemaDefinition) ?? null;
+    const targetTable = pluralize(targetType);
 
     // Validate the nested column exists on the target model
-    const targetValidColumns = new Set([
-      "id",
-      "createdAt",
-      "updatedAt",
-      ...Object.keys(targetSchema),
-    ]);
-    if (!targetValidColumns.has(refColumn)) {
-      throw new ClientError(
-        `Invalid column "${refColumn}" on referenced model "${targetModel.type}"`,
-      );
+    if (targetSchema) {
+      const targetValidColumns = new Set([
+        "id",
+        "createdAt",
+        "updatedAt",
+        ...Object.keys(targetSchema),
+      ]);
+      if (!targetValidColumns.has(refColumn)) {
+        throw new ClientError(
+          `Invalid column "${refColumn}" on referenced model "${targetType}"`,
+        );
+      }
     }
 
     // Build the subquery: SELECT id FROM <target_table> WHERE <refColumn> ...
