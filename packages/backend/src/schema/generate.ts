@@ -162,11 +162,35 @@ export async function generateSchemas(
     if (cache && cache.hash === currentHash) {
       // Inject cached schemas onto model classes
       const schemas = new Map<string, SchemaDefinition>();
+      const modelsByType = new Map(models.map((m) => [m.type, m]));
+      const modelsByName = new Map(models.map((m) => [m.name, m]));
+
       for (const [type, schema] of Object.entries(cache.schemas)) {
         schemas.set(type, schema);
-        const ModelClass = models.find((m) => m.type === type);
+        const ModelClass = modelsByType.get(type);
         if (ModelClass) (ModelClass as any).__schema = schema;
       }
+
+      // Wire ref targets to actual constructors (cache stores them as plain { type } stubs)
+      for (const [, schema] of schemas) {
+        for (const [key, colDef] of Object.entries(schema)) {
+          if (
+            typeof colDef === "object" &&
+            colDef !== null &&
+            "kind" in colDef &&
+            colDef.kind === "ref"
+          ) {
+            const targetName = (colDef.target as any)?.type;
+            const target = modelsByName.get(targetName) ?? modelsByType.get(targetName);
+            if (target) {
+              schema[key] = { kind: "ref", target };
+            } else {
+              schema[key] = "string";
+            }
+          }
+        }
+      }
+
       return { schemas, cached: true };
     }
   }

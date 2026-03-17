@@ -684,8 +684,10 @@ export class BackendAdapter implements ModelAdapter {
 
     // Resolve the target model and its schema
     const targetModel = colDef.target;
+    if (!targetModel?.type) return null;
     const targetSchema =
-      ((targetModel as any).__schema as SchemaDefinition) ?? {};
+      (targetModel as any).__schema as SchemaDefinition | undefined;
+    if (!targetSchema) return null;
     const targetTable = pluralize(targetModel.type);
 
     // Validate the nested column exists on the target model
