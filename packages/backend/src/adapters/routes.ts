@@ -168,12 +168,22 @@ export function registerModelRoutes(
           const scopeResult = scope.read!(ctx);
           if (!scopeResult) return forbidden(res);
 
-          const item = await adapter
+          // Look up by id first, then by tmp
+          let item = await adapter
             .query(ModelClass)
             .select("*")
             .where("id", req.params.id)
             .where(scopeResult)
             .first();
+
+          if (!item) {
+            item = await adapter
+              .query(ModelClass)
+              .select("*")
+              .where("tmp", req.params.id)
+              .where(scopeResult)
+              .first();
+          }
 
           if (!item) return notFound(res, type);
 
@@ -249,12 +259,22 @@ export function registerModelRoutes(
           const scopeResult = scope.update!(ctx);
           if (!scopeResult) return forbidden(res);
 
-          const item = await adapter
+          // Look up by id first, then by tmp (for optimistic updates)
+          let item = await adapter
             .query(ModelClass)
             .select("*")
             .where("id", req.params.id)
             .where(scopeResult)
             .first();
+
+          if (!item) {
+            item = await adapter
+              .query(ModelClass)
+              .select("*")
+              .where("tmp", req.params.id)
+              .where(scopeResult)
+              .first();
+          }
 
           if (!item) return notFound(res, type);
 
@@ -309,12 +329,22 @@ export function registerModelRoutes(
           const scopeResult = scope.delete!(ctx);
           if (!scopeResult) return forbidden(res);
 
-          const item = await adapter
+          // Look up by id first, then by tmp
+          let item = await adapter
             .query(ModelClass)
             .select("*")
             .where("id", req.params.id)
             .where(scopeResult)
             .first();
+
+          if (!item) {
+            item = await adapter
+              .query(ModelClass)
+              .select("*")
+              .where("tmp", req.params.id)
+              .where(scopeResult)
+              .first();
+          }
 
           if (!item) return notFound(res, type);
 
@@ -359,12 +389,22 @@ export function registerModelRoutes(
             });
           }
 
-          const item = await adapter
+          // Look up by id first, then by tmp (for optimistic updates)
+          let item = await adapter
             .query(ModelClass)
             .select("*")
             .where("id", req.params.id)
             .where(scopeResult)
             .first();
+
+          if (!item) {
+            item = await adapter
+              .query(ModelClass)
+              .select("*")
+              .where("tmp", req.params.id)
+              .where(scopeResult)
+              .first();
+          }
 
           if (!item) return notFound(res, type);
 

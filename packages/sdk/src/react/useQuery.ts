@@ -1,6 +1,6 @@
 "use client";
 
-import { Model, SYM_SERVER_MERGE } from "@parcae/model";
+import { Model, SYM_SERVER_MERGE, generateId } from "@parcae/model";
 import { applyPatch, type Operation } from "fast-json-patch";
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import type { ParcaeClient } from "../client";
@@ -27,12 +27,30 @@ interface UseQueryResult<T> {
   refetch: () => void;
   /** Total matching records on the server (before limit/offset). */
   total: number;
+  /**
+   * Add an item optimistically to the query results.
+   * Accepts a Model instance or a plain data object (which will be wrapped
+   * in a new Model instance automatically).
+   *
+   * If the item has no `tmp` field, one is generated automatically so the
+   * server can reconcile the optimistic version with the real one.
+   *
+   * Returns the Model instance (useful when a plain object was passed in).
+   */
+  addOptimistic: (item: T | Record<string, any>) => T;
+  /**
+   * Remove an optimistic item (e.g. on save failure / rollback).
+   * Matches by `tmp` or `id`.
+   */
+  removeOptimistic: (item: T | string) => void;
 }
 
 // ── Cache ────────────────────────────────────────────────────────────────────
 
 interface CacheEntry {
   items: any[];
+  /** Optimistic items awaiting server confirmation. Matched by `tmp`. */
+  optimistic: any[];
   loading: boolean;
   error: Error | null;
   hash: string;
@@ -65,6 +83,11 @@ function buildHash(e: CacheEntry): string {
   if (e.loading) return "L";
   if (e.error) return `E:${e.error.message}`;
   let h = `D:v${e.version}:`;
+  for (let i = 0; i < e.optimistic.length; i++) {
+    if (i > 0) h += ",";
+    h += `o:${e.optimistic[i]?.tmp ?? e.optimistic[i]?.id ?? i}`;
+  }
+  if (e.optimistic.length > 0 && e.items.length > 0) h += ",";
   for (let i = 0; i < e.items.length; i++) {
     if (i > 0) h += ",";
     h += e.items[i]?.id ?? i;
@@ -77,6 +100,7 @@ function getOrCreate(key: string): CacheEntry {
   if (!e) {
     e = {
       items: EMPTY,
+      optimistic: [],
       loading: true,
       error: null,
       hash: INITIAL_HASH,
@@ -152,6 +176,7 @@ function applyOps(
   ops: QueryOp[],
   modelClass: any,
   adapter: any,
+  entry?: CacheEntry,
 ): ApplyResult {
   // Fast path: nothing to do
   if (ops.length === 0) return { items, changed: false };
@@ -186,6 +211,14 @@ function applyOps(
   const byId = new Map<string, any>();
   for (const item of items) byId.set(item.id, item);
 
+  // Index optimistic items by tmp for reconciliation
+  const optimisticByTmp = new Map<string, any>();
+  if (entry?.optimistic) {
+    for (const item of entry.optimistic) {
+      if (item.tmp) optimisticByTmp.set(item.tmp, item);
+    }
+  }
+
   const hasRemoves = removeIds.size > 0;
   const hasAdds = addOps.size > 0;
 
@@ -194,7 +227,11 @@ function applyOps(
   // a new Proxy reference (for React.memo compatibility).
   const updated = new Map<string, any>();
   for (const [id, patches] of updateOps) {
-    const existing = byId.get(id);
+    // Check both server items and optimistic items
+    let existing = byId.get(id);
+    if (!existing && entry?.optimistic) {
+      existing = entry.optimistic.find((o: any) => o.id === id);
+    }
     if (!existing) continue;
 
     // Build the full server-authoritative snapshot by applying the RFC
@@ -235,7 +272,31 @@ function applyOps(
   }
 
   for (const [id, data] of addOps) {
-    if (!byId.has(id)) {
+    if (byId.has(id)) continue;
+
+    // Reconcile with optimistic items by tmp match.
+    // If a server add has a `tmp` matching an optimistic item, merge the
+    // server data into the existing optimistic instance (giving it the
+    // real id, server timestamps, etc.) and move it from optimistic → items.
+    const serverTmp = data.tmp;
+    const optimistic = serverTmp ? optimisticByTmp.get(serverTmp) : null;
+
+    if (optimistic) {
+      // Merge server data into the optimistic instance in-place
+      const serverMerge = optimistic[SYM_SERVER_MERGE];
+      if (serverMerge) {
+        result.push(serverMerge(data));
+      } else {
+        result.push(new modelClass(adapter, data));
+      }
+      // Remove from optimistic array
+      if (entry) {
+        entry.optimistic = entry.optimistic.filter(
+          (o: any) => o.tmp !== serverTmp,
+        );
+      }
+      optimisticByTmp.delete(serverTmp);
+    } else {
       result.push(new modelClass(adapter, data));
     }
   }
@@ -250,8 +311,14 @@ function applyOps(
  * SYM_SERVER_MERGE returns a new Proxy reference for React.memo compat.
  * Only creates new instances for items not previously present.
  */
-function reconcile(prev: any[], next: any[]): any[] {
-  if (prev === EMPTY || prev.length === 0) return next;
+function reconcile(prev: any[], next: any[], entry?: CacheEntry): any[] {
+  if (prev === EMPTY || prev.length === 0) {
+    // Even on first fetch, drain optimistic items that the server now has
+    if (entry?.optimistic.length) {
+      drainOptimistic(next, entry);
+    }
+    return next;
+  }
 
   const prevById = new Map<string, any>();
   for (const item of prev) prevById.set(item.id, item);
@@ -281,8 +348,32 @@ function reconcile(prev: any[], next: any[]): any[] {
     }
   }
 
+  // Drain optimistic items whose tmp appears in server results
+  if (entry?.optimistic.length) {
+    drainOptimistic(next, entry);
+  }
+
   if (!changed && prev.length === next.length) return prev;
   return result;
+}
+
+/**
+ * Remove optimistic items that have been confirmed by the server.
+ * Matches by `tmp` field — if any server item has the same `tmp`,
+ * the optimistic version is removed and the server data is merged
+ * into the existing instance.
+ */
+function drainOptimistic(serverItems: any[], entry: CacheEntry): void {
+  if (entry.optimistic.length === 0) return;
+
+  const serverTmps = new Set<string>();
+  for (const item of serverItems) {
+    if (item.tmp) serverTmps.add(item.tmp);
+  }
+
+  entry.optimistic = entry.optimistic.filter(
+    (o: any) => !o.tmp || !serverTmps.has(o.tmp),
+  );
 }
 
 function resolveAdapter(chain: QueryChain<any>): any {
@@ -334,7 +425,7 @@ function doFetch(
     .find()
     .then((result: any[]) => {
       log.debug("useQuery: got", result.length, "items for", chain.__modelType);
-      entry.items = reconcile(entry.items, result);
+      entry.items = reconcile(entry.items, result, entry);
       entry.loading = false;
       entry.retryCount = 0; // Reset retries on success
       // Capture totalCount from the server response (set by FrontendAdapter)
@@ -361,6 +452,7 @@ function doFetch(
             ops,
             chain.__modelClass,
             adapter,
+            entry,
           );
           if (!result.changed) return;
           entry.items = result.items;
@@ -515,21 +607,83 @@ export function useQuery<T>(
     doFetch(k, entry, currentChain, clientRef.current);
   }, []);
 
+  const addOptimistic = useCallback(
+    (item: T | Record<string, any>): T => {
+      const k = keyRef.current;
+      if (!k) return item as T;
+      const entry = getOrCreate(k);
+      const ModelClass = chainRef.current?.__modelClass;
+
+      let instance: any;
+      if (item instanceof Model) {
+        instance = item;
+      } else if (ModelClass) {
+        // Use Model.create() so the instance is marked as new (SYM_IS_NEW)
+        // and will POST on save() instead of PUT.
+        instance = ModelClass.create(item);
+      } else {
+        instance = item;
+      }
+
+      // Ensure tmp is set for reconciliation
+      if (!instance.tmp) {
+        instance.tmp = generateId();
+      }
+
+      entry.optimistic.push(instance);
+      entry.version++;
+      notify(entry);
+      return instance as T;
+    },
+    [],
+  );
+
+  const removeOptimistic = useCallback((item: T | string): void => {
+    const k = keyRef.current;
+    if (!k) return;
+    const entry = cache.get(k);
+    if (!entry) return;
+
+    const match =
+      typeof item === "string"
+        ? (o: any) => o.tmp !== item && o.id !== item
+        : (o: any) => o !== item && o.tmp !== (item as any).tmp;
+
+    const before = entry.optimistic.length;
+    entry.optimistic = entry.optimistic.filter(match);
+    if (entry.optimistic.length !== before) {
+      entry.version++;
+      notify(entry);
+    }
+  }, []);
+
+  const noop = useCallback(() => {}, []);
+  const noopAdd = useCallback((item: T | Record<string, any>) => item as T, []);
+
   if (!key)
     return {
       items: EMPTY as T[],
       loading: !authReady,
       error: null,
       total: 0,
-      refetch: () => {},
+      refetch: noop,
+      addOptimistic: noopAdd,
+      removeOptimistic: noop,
     };
 
   const entry = cache.get(key);
+  const serverItems = entry?.items ?? (EMPTY as T[]);
+  const optimisticItems = entry?.optimistic ?? [];
   return {
-    items: entry?.items ?? (EMPTY as T[]),
+    items:
+      optimisticItems.length > 0
+        ? ([...optimisticItems, ...serverItems] as T[])
+        : (serverItems as T[]),
     loading: entry?.loading ?? true,
     error: entry?.error ?? null,
     total: entry?.totalCount ?? 0,
     refetch,
+    addOptimistic,
+    removeOptimistic,
   };
 }

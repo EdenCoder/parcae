@@ -214,10 +214,13 @@ export async function generateSchemas(
 
   const resolver = new SchemaResolver(tsConfigPath);
   const schemas = resolver.resolveFromFiles(models, sourceFiles);
-  resolver.resolveRefTargets(schemas, models);
 
-  // Cache
+  // Cache BEFORE resolving ref targets — writeCache serializes to JSON,
+  // which can't represent constructor references. Ref targets are stored
+  // as plain { type: "Name" } stubs in the cache and wired up on load.
   writeCache(parcaeDir, currentHash, schemas);
+
+  resolver.resolveRefTargets(schemas, models);
 
   log.info(
     `Resolved schemas: ${[...schemas.entries()].map(([t, s]) => `${t}(${Object.keys(s).length})`).join(", ")}`,

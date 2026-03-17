@@ -137,6 +137,8 @@ export class Model extends EventEmitter {
   declare id: string;
   declare createdAt: string;
   declare updatedAt: string;
+  /** Temporary client-side ID for optimistic matching. Stored in JSONB overflow. */
+  declare tmp?: string;
 
   // ── Static ─────────────────────────────────────────────────────────
 
