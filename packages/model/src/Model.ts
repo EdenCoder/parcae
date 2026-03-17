@@ -335,6 +335,7 @@ export class Model extends EventEmitter {
     (this as any).type = (this.constructor as typeof Model).type;
     (this as any).createdAt = data?.createdAt ?? new Date().toISOString();
     (this as any).updatedAt = data?.updatedAt ?? new Date().toISOString();
+    if (data?.tmp) (this as any).tmp = data.tmp;
 
     // Set all provided data on the instance BEFORE the Proxy wraps it.
     // These go directly on `this`, bypassing the Proxy.
