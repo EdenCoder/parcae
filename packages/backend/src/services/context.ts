@@ -26,11 +26,17 @@ import type { PubSub } from "./pubsub";
 
 let _queue: QueueService | null = null;
 let _pubsub: PubSub | null = null;
+let _io: any = null;
 
 /** @internal — called by createApp() */
 export function _setServices(queue: QueueService, pubsub: PubSub): void {
   _queue = queue;
   _pubsub = pubsub;
+}
+
+/** @internal — called by createApp() after server creation */
+export function _setIo(io: any): void {
+  _io = io;
 }
 
 // ─── enqueue() ───────────────────────────────────────────────────────────────
@@ -127,4 +133,9 @@ export function getQueue(): QueueService | null {
 /** Get the raw PubSub instance. */
 export function getPubSub(): PubSub | null {
   return _pubsub;
+}
+
+/** Get the Socket.IO server instance. */
+export function getIo(): any {
+  return _io;
 }

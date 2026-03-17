@@ -10,7 +10,12 @@ export { createApp } from "./app";
 export type { ParcaeApp, AppConfig } from "./app";
 
 // Config
-export { parseConfig, configSchema, isSqliteUrl, sqliteFilename } from "./config";
+export {
+  parseConfig,
+  configSchema,
+  isSqliteUrl,
+  sqliteFilename,
+} from "./config";
 export type { Config } from "./config";
 
 // Server
@@ -27,7 +32,7 @@ export type { PubSubConfig } from "./services/pubsub";
 export { QueueService, addJobIfNotExists } from "./services/queue";
 export type { QueueConfig } from "./services/queue";
 export { QuerySubscriptionManager } from "./services/subscriptions";
-export { enqueue, lock, getQueue, getPubSub } from "./services/context";
+export { enqueue, lock, getQueue, getPubSub, getIo } from "./services/context";
 export type { EnqueueOptions } from "./services/context";
 
 // Auth (adapter interface — implementations in @parcae/auth-betterauth, @parcae/auth-clerk)

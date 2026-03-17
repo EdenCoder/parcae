@@ -91,6 +91,13 @@ export class PubSub {
     }
   }
 
+  on(event: string, handler: (...args: any[]) => void): () => void {
+    this.__events.on(event, handler);
+    return () => {
+      this.__events.off(event, handler);
+    };
+  }
+
   // ── Distributed Lock ─────────────────────────────────────────────────
 
   async lock(

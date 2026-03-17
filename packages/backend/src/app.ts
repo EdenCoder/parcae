@@ -31,7 +31,7 @@ import { registerModelRoutes } from "./adapters/routes";
 import { PubSub } from "./services/pubsub";
 import { QueueService } from "./services/queue";
 import { QuerySubscriptionManager } from "./services/subscriptions";
-import { _setServices } from "./services/context";
+import { _setServices, _setIo } from "./services/context";
 import { getJobs } from "./routing/job";
 import { getHooks } from "./routing/hook";
 import type { AuthAdapter } from "./auth";
@@ -305,6 +305,7 @@ export function createApp(config: AppConfig): ParcaeApp {
 
       // ── Step 8: Create server ──────────────────────────────────────
       server = createServer_({ config: envConfig, version });
+      _setIo(server.io);
 
       // ── Step 9: Set up QuerySubscriptionManager ────────────────────
       const subscriptions = new QuerySubscriptionManager(
