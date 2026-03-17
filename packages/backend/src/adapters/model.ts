@@ -517,10 +517,17 @@ export class BackendAdapter implements ModelAdapter {
         continue;
       }
 
-      const args = this._sanitizeStepArgs(step, validColumns, modelClass.type);
+      const args = this._sanitizeStepArgs(step, validColumns, modelClass.type, schema);
 
       // Skip empty where({}) — sanitizer returns [] to signal "no-op"
       if (args.length === 0 && step.method !== "limit") continue;
+
+      // Handle rewritten ref subqueries: ["__rewrite:whereIn", refKey, subquery]
+      if (typeof args[0] === "string" && args[0].startsWith("__rewrite:")) {
+        const rewriteMethod = args[0].slice("__rewrite:".length);
+        chain = (chain as any)[rewriteMethod](args[1], args[2]);
+        continue;
+      }
 
       // Clamp limit
       if (step.method === "limit") {
@@ -551,6 +558,7 @@ export class BackendAdapter implements ModelAdapter {
     step: QueryStep,
     validColumns: Set<string>,
     modelType: string,
+    schema?: SchemaDefinition,
   ): any[] {
     const args = [...(step.args ?? [])];
 
@@ -597,6 +605,18 @@ export class BackendAdapter implements ModelAdapter {
       }
 
       if (typeof firstArg === "string") {
+        // ── Dot-notation ref subquery rewriting ───────────────────
+        // "test.category" → whereIn("test", subquery on tests table)
+        if (firstArg.includes(".") && schema) {
+          const rewritten = this._rewriteRefDotNotation(
+            step,
+            args,
+            schema,
+          );
+          if (rewritten) return rewritten;
+          // Falls through if not a valid ref (throws below)
+        }
+
         if (!validColumns.has(firstArg)) {
           throw new ClientError(
             `Invalid column "${firstArg}" on model "${modelType}"`,
@@ -639,6 +659,110 @@ export class BackendAdapter implements ModelAdapter {
     return args;
   }
 
+  /**
+   * Rewrite dot-notation ref columns into subqueries.
+   *
+   * "test.category" on a Result model (which has `test: Test` ref) becomes:
+   *   whereIn("test", knex("tests").select("id").where("category", value))
+   *
+   * Returns rewritten args array, or null if the column isn't a valid ref.
+   */
+  private _rewriteRefDotNotation(
+    step: QueryStep,
+    args: any[],
+    schema: SchemaDefinition,
+  ): any[] | null {
+    const dot = (args[0] as string).indexOf(".");
+    const refKey = (args[0] as string).slice(0, dot);
+    const refColumn = (args[0] as string).slice(dot + 1);
+    if (!refKey || !refColumn) return null;
+
+    // Ref key must exist in the current model's schema as a ref
+    const colDef = schema[refKey];
+    if (!colDef || typeof colDef === "string" || colDef.kind !== "ref")
+      return null;
+
+    // Resolve the target model and its schema
+    const targetModel = colDef.target;
+    const targetSchema =
+      ((targetModel as any).__schema as SchemaDefinition) ?? {};
+    const targetTable = pluralize(targetModel.type);
+
+    // Validate the nested column exists on the target model
+    const targetValidColumns = new Set([
+      "id",
+      "createdAt",
+      "updatedAt",
+      ...Object.keys(targetSchema),
+    ]);
+    if (!targetValidColumns.has(refColumn)) {
+      throw new ClientError(
+        `Invalid column "${refColumn}" on referenced model "${targetModel.type}"`,
+      );
+    }
+
+    // Build the subquery: SELECT id FROM <target_table> WHERE <refColumn> ...
+    const subquery = this.read(targetTable).select("id");
+
+    const method = step.method;
+
+    // where("test.category", value)  → whereIn("test", sub.where("category", value))
+    // where("test.category", "=", v) → whereIn("test", sub.where("category", v))
+    // where("test.category", "!=", v)→ whereNotIn("test", sub.where("category", v))
+    // whereIn("test.cat", [...])     → whereIn("test", sub.whereIn("category", [...]))
+    // whereNot("test.cat", v)        → whereNotIn("test", sub.where("category", v))
+    // whereNotIn("test.cat", [...])  → whereNotIn("test", sub.whereIn("category", [...]))
+    if (method === "where" || method === "andWhere" || method === "orWhere") {
+      if (args.length === 3) {
+        // 3-arg: where("test.cat", op, value)
+        const op = String(args[1]).toLowerCase();
+        if (!BackendAdapter.SAFE_OPERATORS.has(op)) {
+          throw new ClientError(`Invalid operator "${args[1]}"`);
+        }
+        const negate = op === "!=" || op === "<>";
+        return [
+          negate ? "__rewrite:whereNotIn" : "__rewrite:whereIn",
+          refKey,
+          negate
+            ? subquery.where(refColumn, args[2])
+            : subquery.where(refColumn, args[1], args[2]),
+        ];
+      }
+      // 2-arg: where("test.cat", value)
+      return [
+        "__rewrite:whereIn",
+        refKey,
+        subquery.where(refColumn, args[1]),
+      ];
+    }
+
+    if (method === "whereIn" || method === "orWhereIn") {
+      return [
+        "__rewrite:whereIn",
+        refKey,
+        subquery.whereIn(refColumn, args[1]),
+      ];
+    }
+
+    if (method === "whereNot") {
+      return [
+        "__rewrite:whereNotIn",
+        refKey,
+        subquery.where(refColumn, args[1]),
+      ];
+    }
+
+    if (method === "whereNotIn") {
+      return [
+        "__rewrite:whereNotIn",
+        refKey,
+        subquery.whereIn(refColumn, args[1]),
+      ];
+    }
+
+    return null;
+  }
+
   private _buildQuery<T>(
     modelClass: ModelConstructor<T>,
     knexQuery: any,
@@ -647,6 +771,29 @@ export class BackendAdapter implements ModelAdapter {
 
     for (const method of CHAINABLE_METHODS) {
       chain[method] = (...args: any[]) => {
+        // Dot-notation ref subquery rewriting for server-side queries
+        if (
+          typeof args[0] === "string" &&
+          args[0].includes(".") &&
+          BackendAdapter.COLUMN_ARG_METHODS.has(method)
+        ) {
+          const schema =
+            ((modelClass as any).__schema as SchemaDefinition) ?? {};
+          const rewritten = this._rewriteRefDotNotation(
+            { method, args },
+            args,
+            schema,
+          );
+          if (rewritten) {
+            const rewriteMethod = (rewritten[0] as string).slice(
+              "__rewrite:".length,
+            );
+            return this._buildQuery(
+              modelClass,
+              knexQuery[rewriteMethod](rewritten[1], rewritten[2]),
+            );
+          }
+        }
         return this._buildQuery(modelClass, knexQuery[method](...args));
       };
     }
