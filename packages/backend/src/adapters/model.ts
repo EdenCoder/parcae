@@ -111,10 +111,11 @@ function serialize(model: any): Record<string, any> {
     id: model.id,
     createdAt: raw.createdAt || new Date(),
     updatedAt: new Date(),
+    tmp: raw.tmp || null,
   };
 
   const overflow: Record<string, any> = {};
-  const systemKeys = new Set(["id", "createdAt", "updatedAt", "type"]);
+  const systemKeys = new Set(["id", "createdAt", "updatedAt", "type", "tmp"]);
 
   for (const [key, value] of Object.entries(raw)) {
     if (systemKeys.has(key)) continue;
@@ -271,10 +272,7 @@ export class BackendAdapter implements ModelAdapter {
       const likeTerm = `%${term}%`;
       const whereParts = searchFields.map((f) => `${table}.${f} LIKE ?`);
       const whereBindings = searchFields.map(() => likeTerm);
-      return knexQuery.whereRaw(
-        `(${whereParts.join(" OR ")})`,
-        whereBindings,
-      );
+      return knexQuery.whereRaw(`(${whereParts.join(" OR ")})`, whereBindings);
     }
 
     // ── Postgres: full-text + trigram + optional vector ──────────────
@@ -527,7 +525,12 @@ export class BackendAdapter implements ModelAdapter {
         continue;
       }
 
-      const args = this._sanitizeStepArgs(step, validColumns, modelClass.type, schema);
+      const args = this._sanitizeStepArgs(
+        step,
+        validColumns,
+        modelClass.type,
+        schema,
+      );
 
       // Skip empty where({}) — sanitizer returns [] to signal "no-op"
       if (args.length === 0 && step.method !== "limit") continue;
@@ -618,11 +621,7 @@ export class BackendAdapter implements ModelAdapter {
         // ── Dot-notation ref subquery rewriting ───────────────────
         // "test.category" → whereIn("test", subquery on tests table)
         if (firstArg.includes(".") && schema) {
-          const rewritten = this._rewriteRefDotNotation(
-            step,
-            args,
-            schema,
-          );
+          const rewritten = this._rewriteRefDotNotation(step, args, schema);
           if (rewritten) return rewritten;
           // Falls through if not a valid ref (throws below)
         }
@@ -743,11 +742,7 @@ export class BackendAdapter implements ModelAdapter {
         ];
       }
       // 2-arg: where("test.cat", value)
-      return [
-        "__rewrite:whereIn",
-        refKey,
-        subquery.where(refColumn, args[1]),
-      ];
+      return ["__rewrite:whereIn", refKey, subquery.where(refColumn, args[1])];
     }
 
     if (method === "whereIn" || method === "orWhereIn") {
@@ -838,7 +833,10 @@ export class BackendAdapter implements ModelAdapter {
 
     chain.count = async (column?: string): Promise<number> => {
       const clone = knexQuery.clone();
-      const result = await clone.clearSelect().clearOrder().count(column || "*");
+      const result = await clone
+        .clearSelect()
+        .clearOrder()
+        .count(column || "*");
       return Number.parseInt(`${Object.values(result[0] || {})[0] || "0"}`, 10);
     };
 
@@ -1210,7 +1208,7 @@ export class BackendAdapter implements ModelAdapter {
         if (await this.write.schema.hasColumn(table, key))
           existingColumns.push(key);
       }
-      for (const sys of ["createdAt", "updatedAt"]) {
+      for (const sys of ["createdAt", "updatedAt", "tmp"]) {
         if (await this.write.schema.hasColumn(table, sys))
           existingColumns.push(sys);
       }
@@ -1241,6 +1239,7 @@ export class BackendAdapter implements ModelAdapter {
           this.isSqlite ? t.text("data") : t.jsonb("data");
           t.datetime("createdAt");
           t.datetime("updatedAt");
+          t.string("tmp", 2048).nullable();
         }
 
         const originalIndex = t.index.bind(t);
@@ -1253,9 +1252,15 @@ export class BackendAdapter implements ModelAdapter {
         t.index("createdAt", "createdAt");
         t.index("updatedAt", "updatedAt");
 
+        // Add tmp column for optimistic update reconciliation
+        if (!existingColumns.includes("tmp")) {
+          t.string("tmp", 2048).nullable();
+        }
+
         for (const [key, colDef] of Object.entries(schema)) {
           if (existingColumns.includes(key)) continue;
-          if (["createdAt", "updatedAt", "data", "id"].includes(key)) continue;
+          if (["createdAt", "updatedAt", "data", "id", "tmp"].includes(key))
+            continue;
 
           const resolved = resolveColType(colDef);
           switch (resolved) {

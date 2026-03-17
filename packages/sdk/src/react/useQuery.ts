@@ -289,15 +289,20 @@ function applyOps(
       } else {
         result.push(new modelClass(adapter, data));
       }
-      // Remove from optimistic array
-      if (entry) {
-        entry.optimistic = entry.optimistic.filter(
-          (o: any) => o.tmp !== serverTmp,
-        );
-      }
       optimisticByTmp.delete(serverTmp);
     } else {
       result.push(new modelClass(adapter, data));
+    }
+  }
+
+  // Drain optimistic items that have been confirmed (present in result)
+  // or removed by the server (present in removeIds).
+  if (entry?.optimistic.length) {
+    drainOptimistic(result, entry);
+    if (removeIds.size > 0) {
+      entry.optimistic = entry.optimistic.filter(
+        (o: any) => !removeIds.has(o.id) && (!o.tmp || !removeIds.has(o.tmp)),
+      );
     }
   }
 
@@ -359,20 +364,21 @@ function reconcile(prev: any[], next: any[], entry?: CacheEntry): any[] {
 
 /**
  * Remove optimistic items that have been confirmed by the server.
- * Matches by `tmp` field — if any server item has the same `tmp`,
- * the optimistic version is removed and the server data is merged
- * into the existing instance.
+ * Matches by both `id` and `tmp` — if any server item shares the same
+ * `id` or `tmp`, the optimistic version is removed.
  */
 function drainOptimistic(serverItems: any[], entry: CacheEntry): void {
   if (entry.optimistic.length === 0) return;
 
+  const serverIds = new Set<string>();
   const serverTmps = new Set<string>();
   for (const item of serverItems) {
+    if (item.id) serverIds.add(item.id);
     if (item.tmp) serverTmps.add(item.tmp);
   }
 
   entry.optimistic = entry.optimistic.filter(
-    (o: any) => !o.tmp || !serverTmps.has(o.tmp),
+    (o: any) => !serverIds.has(o.id) && (!o.tmp || !serverTmps.has(o.tmp)),
   );
 }
 
@@ -607,36 +613,33 @@ export function useQuery<T>(
     doFetch(k, entry, currentChain, clientRef.current);
   }, []);
 
-  const addOptimistic = useCallback(
-    (item: T | Record<string, any>): T => {
-      const k = keyRef.current;
-      if (!k) return item as T;
-      const entry = getOrCreate(k);
-      const ModelClass = chainRef.current?.__modelClass;
+  const addOptimistic = useCallback((item: T | Record<string, any>): T => {
+    const k = keyRef.current;
+    if (!k) return item as T;
+    const entry = getOrCreate(k);
+    const ModelClass = chainRef.current?.__modelClass;
 
-      let instance: any;
-      if (item instanceof Model) {
-        instance = item;
-      } else if (ModelClass) {
-        // Use Model.create() so the instance is marked as new (SYM_IS_NEW)
-        // and will POST on save() instead of PUT.
-        instance = ModelClass.create(item);
-      } else {
-        instance = item;
-      }
+    let instance: any;
+    if (item instanceof Model) {
+      instance = item;
+    } else if (ModelClass) {
+      // Use Model.create() so the instance is marked as new (SYM_IS_NEW)
+      // and will POST on save() instead of PUT.
+      instance = ModelClass.create(item);
+    } else {
+      instance = item;
+    }
 
-      // Ensure tmp is set for reconciliation
-      if (!instance.tmp) {
-        instance.tmp = generateId();
-      }
+    // Ensure tmp is set for reconciliation
+    if (!instance.tmp) {
+      instance.tmp = generateId();
+    }
 
-      entry.optimistic.push(instance);
-      entry.version++;
-      notify(entry);
-      return instance as T;
-    },
-    [],
-  );
+    entry.optimistic.push(instance);
+    entry.version++;
+    notify(entry);
+    return instance as T;
+  }, []);
 
   const removeOptimistic = useCallback((item: T | string): void => {
     const k = keyRef.current;
@@ -674,11 +677,26 @@ export function useQuery<T>(
   const entry = cache.get(key);
   const serverItems = entry?.items ?? (EMPTY as T[]);
   const optimisticItems = entry?.optimistic ?? [];
+
+  // Merge server + optimistic, deduplicating by id or tmp (server wins).
+  const items: T[] =
+    optimisticItems.length > 0
+      ? ([...serverItems, ...optimisticItems].reduce(
+          (acc: any[], item: any) => {
+            if (
+              !acc.some(
+                (a: any) => a.id === item.id || (a.tmp && a.tmp === item.tmp),
+              )
+            )
+              acc.push(item);
+            return acc;
+          },
+          [],
+        ) as T[])
+      : (serverItems as T[]);
+
   return {
-    items:
-      optimisticItems.length > 0
-        ? ([...optimisticItems, ...serverItems] as T[])
-        : (serverItems as T[]),
+    items,
     loading: entry?.loading ?? true,
     error: entry?.error ?? null,
     total: entry?.totalCount ?? 0,

@@ -127,7 +127,13 @@ const EVENTEMITTER_KEYS = new Set([
 ]);
 
 /** Properties that are part of the data but handled specially. */
-const SYSTEM_DATA_KEYS = new Set(["id", "type", "createdAt", "updatedAt"]);
+const SYSTEM_DATA_KEYS = new Set([
+  "id",
+  "type",
+  "createdAt",
+  "updatedAt",
+  "tmp",
+]);
 
 // ─── Model Class ─────────────────────────────────────────────────────────────
 
@@ -685,7 +691,10 @@ export class Model extends EventEmitter {
 
   // ── Reference Proxy ──────────────────────────────────────────────────
 
-  private static __refCache = new Map<string, { value: any; expires: number }>();
+  private static __refCache = new Map<
+    string,
+    { value: any; expires: number }
+  >();
   private static REF_CACHE_TTL = 30_000; // 30 seconds
 
   private _createRefProxy(targetClass: ModelConstructor, refId: string): any {
