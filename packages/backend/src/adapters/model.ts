@@ -1253,7 +1253,9 @@ export class BackendAdapter implements ModelAdapter {
         t.index("updatedAt", "updatedAt");
 
         // Add tmp column for optimistic update reconciliation
-        if (!existingColumns.includes("tmp")) {
+        // Only add when altering an existing table — new tables already have
+        // tmp created above in the !hasTable block.
+        if (hasTable && !existingColumns.includes("tmp")) {
           t.string("tmp", 2048).nullable();
         }
 
