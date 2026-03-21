@@ -468,6 +468,7 @@ export class BackendAdapter implements ModelAdapter {
     "not in",
     "is",
     "is not",
+    "@>",
   ]);
 
   private static MAX_LIMIT = 100;
