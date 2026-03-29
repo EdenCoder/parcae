@@ -438,6 +438,7 @@ export class BackendAdapter implements ModelAdapter {
     "orderBy",
     "limit",
     "offset",
+    "clearLimit",
   ]);
 
   /** Methods whose first arg is a column name (or object of column→value). */
@@ -514,9 +515,25 @@ export class BackendAdapter implements ModelAdapter {
     }
 
     let hasLimit = false;
+    let hasClearLimit = false;
+
+    // Pre-scan for clearLimit to know whether to bypass clamping
+    for (const step of steps) {
+      if (step.method === "clearLimit") {
+        hasClearLimit = true;
+        break;
+      }
+    }
 
     for (const step of steps) {
       if (!BackendAdapter.SAFE_CLIENT_METHODS.has(step.method)) continue;
+
+      // clearLimit — bypass default limit, cap at 10,000 as safety net
+      if (step.method === "clearLimit") {
+        hasLimit = true;
+        chain = chain.limit(10_000);
+        continue;
+      }
 
       // search() is handled specially — not a Knex method
       if (step.method === "search") {
@@ -544,13 +561,15 @@ export class BackendAdapter implements ModelAdapter {
         continue;
       }
 
-      // Clamp limit
+      // Clamp limit (skip clamping if clearLimit was used)
       if (step.method === "limit") {
         hasLimit = true;
-        args[0] = Math.min(
-          Math.max(Number.parseInt(args[0]) || BackendAdapter.DEFAULT_LIMIT, 1),
-          BackendAdapter.MAX_LIMIT,
-        );
+        if (!hasClearLimit) {
+          args[0] = Math.min(
+            Math.max(Number.parseInt(args[0]) || BackendAdapter.DEFAULT_LIMIT, 1),
+            BackendAdapter.MAX_LIMIT,
+          );
+        }
       }
 
       chain = (chain as any)[step.method](...args);

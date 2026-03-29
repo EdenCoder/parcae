@@ -190,6 +190,7 @@ export interface QueryChain<T> {
   // Chainable — modifiers
   clearOrder(): QueryChain<T>;
   clearSelect(): QueryChain<T>;
+  clearLimit(): QueryChain<T>;
   from(table: string): QueryChain<T>;
 
   // Chainable — aggregates (chainable versions)
@@ -307,6 +308,7 @@ export const CHAINABLE_METHODS = [
   "rightJoin",
   "clearOrder",
   "clearSelect",
+  "clearLimit",
   "from",
   "sum",
   "avg",
