@@ -982,6 +982,45 @@ describe("BackendAdapter.queryFromClient", () => {
     });
   });
 
+  describe("clearLimit", () => {
+    it("should bypass default limit and set 10,000 ceiling", () => {
+      const steps: QueryStep[] = [{ method: "clearLimit", args: [] }];
+
+      adapter.queryFromClient(ProjectModel, { userId: "u1" }, steps);
+
+      const limitCall = calls.find((c) => c.method === "limit");
+      expect(limitCall).toBeDefined();
+      expect(limitCall!.args[0]).toBe(10_000);
+    });
+
+    it("should allow explicit limit after clearLimit without clamping", () => {
+      const steps: QueryStep[] = [
+        { method: "clearLimit", args: [] },
+        { method: "limit", args: [500] },
+      ];
+
+      adapter.queryFromClient(ProjectModel, { userId: "u1" }, steps);
+
+      const limitCalls = calls.filter((c) => c.method === "limit");
+      // clearLimit sets 10,000, then explicit limit sets 500 unclamped
+      expect(limitCalls).toHaveLength(2);
+      expect(limitCalls[0]!.args[0]).toBe(10_000);
+      expect(limitCalls[1]!.args[0]).toBe(500);
+    });
+
+    it("should not clamp large limit when clearLimit is present", () => {
+      const steps: QueryStep[] = [
+        { method: "clearLimit", args: [] },
+        { method: "limit", args: [5000] },
+      ];
+
+      adapter.queryFromClient(ProjectModel, { userId: "u1" }, steps);
+
+      const limitCalls = calls.filter((c) => c.method === "limit");
+      expect(limitCalls[1]!.args[0]).toBe(5000);
+    });
+  });
+
   describe("adversarial: malformed step payloads", () => {
     it("should handle step with missing args", () => {
       const steps = [{ method: "where" }] as any;
