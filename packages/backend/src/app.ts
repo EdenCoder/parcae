@@ -31,7 +31,11 @@ import { registerModelRoutes } from "./adapters/routes";
 import { PubSub } from "./services/pubsub";
 import { QueueService } from "./services/queue";
 import { QuerySubscriptionManager } from "./services/subscriptions";
-import { _setServices, _setIo } from "./services/context";
+import {
+  _setServices,
+  _setIo,
+  runWithRequestContext,
+} from "./services/context";
 import { getJobs } from "./routing/job";
 import { getHooks } from "./routing/hook";
 import type { AuthAdapter } from "./auth";
@@ -337,6 +341,16 @@ export function createApp(config: AppConfig): ParcaeApp {
           next();
         });
       }
+
+      // Middleware: propagate request user via AsyncLocalStorage so hooks
+      // can access it regardless of whether the save originates from
+      // auto-CRUD routes or custom controllers.
+      server.polka.use((req: any, res: any, next: any) => {
+        const user = req.session?.user ?? null;
+        runWithRequestContext({ user }, () => {
+          next();
+        });
+      });
 
       // ── Step 11: Default routes ────────────────────────────────────
       server.polka.get(`/${version}/health`, (_req: any, res: any) => {

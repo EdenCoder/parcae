@@ -32,7 +32,15 @@ export type { PubSubConfig } from "./services/pubsub";
 export { QueueService, addJobIfNotExists } from "./services/queue";
 export type { QueueConfig } from "./services/queue";
 export { QuerySubscriptionManager } from "./services/subscriptions";
-export { enqueue, lock, getQueue, getPubSub, getIo } from "./services/context";
+export {
+  enqueue,
+  lock,
+  getQueue,
+  getPubSub,
+  getIo,
+  runWithRequestContext,
+  getRequestUser,
+} from "./services/context";
 export type { EnqueueOptions } from "./services/context";
 
 // Auth (adapter interface — implementations in @parcae/auth-betterauth, @parcae/auth-clerk)
