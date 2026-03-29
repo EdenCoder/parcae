@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { log } from "../logger";
 /**
  * @parcae/backend — Global service context
@@ -21,6 +22,30 @@ import { log } from "../logger";
 import type { QueueService } from "./queue";
 import { addJobIfNotExists } from "./queue";
 import type { PubSub } from "./pubsub";
+
+// ─── Request context (per-request user via AsyncLocalStorage) ────────────────
+
+interface RequestContext {
+  user: { id: string; [key: string]: any } | null;
+}
+
+const _requestContext = new AsyncLocalStorage<RequestContext>();
+
+/** Run a callback with request context (user) available to all downstream code. */
+export function runWithRequestContext<T>(
+  ctx: RequestContext,
+  fn: () => T,
+): T {
+  return _requestContext.run(ctx, fn);
+}
+
+/** Get the current request's user, if available. */
+export function getRequestUser(): {
+  id: string;
+  [key: string]: any;
+} | null {
+  return _requestContext.getStore()?.user ?? null;
+}
 
 // ─── Global context (set by createApp at startup) ────────────────────────────
 

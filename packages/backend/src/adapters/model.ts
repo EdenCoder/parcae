@@ -30,6 +30,7 @@ import { getHooksFor, hook } from "../routing/hook";
 import {
   enqueue as globalEnqueue,
   lock as globalLock,
+  getRequestUser,
 } from "../services/context";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -1162,12 +1163,15 @@ export class BackendAdapter implements ModelAdapter {
       action as HookAction,
     );
 
+    // Resolve user: explicit extra > AsyncLocalStorage request context
+    const user = extra?.user ?? getRequestUser() ?? undefined;
+
     for (const hookEntry of hooks) {
       const ctx = {
         model,
         action: action as HookAction,
         data: extra?.data,
-        user: extra?.user,
+        user,
         lock: globalLock,
         enqueue: globalEnqueue,
       };
