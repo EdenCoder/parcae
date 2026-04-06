@@ -6,6 +6,7 @@
  */
 
 export { Model, generateId, SYM_SERVER_MERGE } from "./Model";
+export type { WithRefs } from "./Model";
 
 /**
  * Branded type for unlimited TEXT columns (vs string which is VARCHAR 2048).
