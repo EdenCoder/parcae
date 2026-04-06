@@ -238,26 +238,26 @@ export class Model extends EventEmitter {
   static create<T extends Model>(
     this: ModelConstructor<T>,
     data?: Record<string, any>,
-  ): T {
+  ): WithRefs<T> {
     const instance = new this(Model.getAdapter(), {
       ...data,
       id: data?.id ?? generateId(),
     });
     (instance as any)[SYM_IS_NEW] = true;
-    return instance;
+    return instance as WithRefs<T>;
   }
 
   static findById<T extends Model>(
     this: ModelConstructor<T>,
     id: string,
-  ): Promise<T | null> {
-    return Model.getAdapter().findById(this, id);
+  ): Promise<WithRefs<T> | null> {
+    return Model.getAdapter().findById(this, id) as Promise<WithRefs<T> | null>;
   }
 
   static where<T extends Model>(
     this: ModelConstructor<T>,
     ...args: any[]
-  ): QueryChain<T> {
+  ): QueryChain<WithRefs<T>> {
     return (this as any)._query().where(...args);
   }
 
@@ -265,7 +265,7 @@ export class Model extends EventEmitter {
     this: ModelConstructor<T>,
     query: string,
     ...bindings: any[]
-  ): QueryChain<T> {
+  ): QueryChain<WithRefs<T>> {
     return (this as any)._query().whereRaw(query, ...bindings);
   }
 
@@ -273,14 +273,14 @@ export class Model extends EventEmitter {
     this: ModelConstructor<T>,
     column: string,
     values: any[],
-  ): QueryChain<T> {
+  ): QueryChain<WithRefs<T>> {
     return (this as any)._query().whereIn(column, values);
   }
 
   static whereNot<T extends Model>(
     this: ModelConstructor<T>,
     ...args: any[]
-  ): QueryChain<T> {
+  ): QueryChain<WithRefs<T>> {
     return (this as any)._query().whereNot(...args);
   }
 
@@ -288,14 +288,14 @@ export class Model extends EventEmitter {
     this: ModelConstructor<T>,
     column: string,
     values: any[],
-  ): QueryChain<T> {
+  ): QueryChain<WithRefs<T>> {
     return (this as any)._query().whereNotIn(column, values);
   }
 
   static select<T extends Model>(
     this: ModelConstructor<T>,
     ...columns: string[]
-  ): QueryChain<T> {
+  ): QueryChain<WithRefs<T>> {
     return (this as any)._query().select(...columns);
   }
 
@@ -306,7 +306,7 @@ export class Model extends EventEmitter {
   static search<T extends Model>(
     this: ModelConstructor<T>,
     term: string,
-  ): QueryChain<T> {
+  ): QueryChain<WithRefs<T>> {
     return (this as any)._query().search(term);
   }
 
@@ -739,6 +739,15 @@ export class Model extends EventEmitter {
     return proxy;
   }
 }
+
+/**
+ * Adds typed $-prefixed string accessors for all reference fields.
+ * The Proxy get trap already provides these at runtime — this type
+ * surfaces them to TypeScript so no casting is needed.
+ */
+export type WithRefs<T extends Model> = T & {
+  [K in keyof T as T[K] extends Model ? `$${string & K}` : never]: string;
+};
 
 // Symbol declarations for TypeScript
 declare module "./Model" {
