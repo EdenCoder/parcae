@@ -43,13 +43,20 @@ export interface ClerkClientAdapterOptions {
  * function for background contexts). The adapter satisfies Parcae's
  * `AuthClientAdapter` and can be handed straight to `<ParcaeProvider auth={…}>`.
  */
+
+/** WeakMap to associate adapters with their internal listener sets. */
+const adapterListeners = new WeakMap<
+  AuthClientAdapter,
+  Set<TokenChangeCallback>
+>();
+
 export function createClerkAuthAdapter(
   getToken: GetTokenFn,
   options: ClerkClientAdapterOptions = {},
 ): AuthClientAdapter {
   const listeners = new Set<TokenChangeCallback>();
 
-  return {
+  const adapter: AuthClientAdapter = {
     init() {
       // No initialization needed — Clerk manages sessions externally.
     },
@@ -72,6 +79,9 @@ export function createClerkAuthAdapter(
       };
     },
   };
+
+  adapterListeners.set(adapter, listeners);
+  return adapter;
 }
 
 /**
@@ -82,10 +92,11 @@ export function notifyClerkTokenChange(
   adapter: AuthClientAdapter,
   token: string | null,
 ) {
-  // The onChange listeners are internal to the adapter instance.
-  // Re-resolve via getToken so ParcaeProvider picks up the change.
-  adapter.getToken().then(() => {});
-  // Force a direct notification — cast to access internal listeners
-  // (the adapter is created by us, so this is safe).
-  void token;
+  const listeners = adapterListeners.get(adapter);
+
+  if (listeners) {
+    for (const cb of listeners) {
+      cb(token);
+    }
+  }
 }
