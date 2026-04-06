@@ -65,6 +65,7 @@ export class SocketTransport extends EventEmitter implements Transport {
 
     this.socket.on("disconnect", () => {
       this.isConnected = false;
+      this.token = undefined;
       log.debug("socket disconnected");
       this.auth.reset();
       this.emit("disconnected");
