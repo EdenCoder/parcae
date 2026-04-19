@@ -566,7 +566,10 @@ export class BackendAdapter implements ModelAdapter {
         hasLimit = true;
         if (!hasClearLimit) {
           args[0] = Math.min(
-            Math.max(Number.parseInt(args[0]) || BackendAdapter.DEFAULT_LIMIT, 1),
+            Math.max(
+              Number.parseInt(args[0]) || BackendAdapter.DEFAULT_LIMIT,
+              1,
+            ),
             BackendAdapter.MAX_LIMIT,
           );
         }
@@ -887,7 +890,7 @@ export class BackendAdapter implements ModelAdapter {
       return;
     }
 
-    await this.runHooks(model, "patch", "before");
+    await this.runHooks(model, "patch", "before", { data: { ops } });
 
     type ParsedOp = {
       op: PatchOp;
@@ -1045,7 +1048,7 @@ export class BackendAdapter implements ModelAdapter {
     }
 
     await this.write(table).where("id", model.id).update(updateFields);
-    await this.runHooks(model, "patch", "after");
+    await this.runHooks(model, "patch", "after", { data: { ops } });
     this._notifyChange(model);
   }
 
@@ -1075,7 +1078,7 @@ export class BackendAdapter implements ModelAdapter {
     table: string,
     schema: SchemaDefinition,
   ): Promise<void> {
-    await this.runHooks(model, "patch", "before");
+    await this.runHooks(model, "patch", "before", { data: { ops } });
 
     // Read current row
     const row = await this.write(table).where("id", model.id).first();
@@ -1136,7 +1139,7 @@ export class BackendAdapter implements ModelAdapter {
     }
 
     await this.write(table).where("id", model.id).update(updateFields);
-    await this.runHooks(model, "patch", "after");
+    await this.runHooks(model, "patch", "after", { data: { ops } });
     this._notifyChange(model);
   }
 

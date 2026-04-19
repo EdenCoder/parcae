@@ -43,6 +43,11 @@ interface UseQueryResult<T> {
    * Matches by `tmp` or `id`.
    */
   removeOptimistic: (item: T | string) => void;
+  /**
+   * Register a listener for raw subscription ops.
+   * Fires after the cache is updated. Returns an unsubscribe function.
+   */
+  onOps: (listener: (ops: QueryOp[]) => void) => () => void;
 }
 
 // ── Cache ────────────────────────────────────────────────────────────────────
@@ -69,6 +74,8 @@ interface CacheEntry {
   /** Retry state */
   retryCount: number;
   retryTimer: ReturnType<typeof setTimeout> | null;
+  /** External ops listeners — called after cache is updated with raw subscription ops. */
+  opsListeners: Set<(ops: QueryOp[]) => void>;
 }
 
 const cache = new Map<string, CacheEntry>();
@@ -115,6 +122,7 @@ function getOrCreate(key: string): CacheEntry {
       client: null,
       retryCount: 0,
       retryTimer: null,
+      opsListeners: new Set(),
     };
     cache.set(key, e);
   }
@@ -234,11 +242,25 @@ function applyOps(
     }
     if (!existing) continue;
 
+    // Filter out patches whose exact path is currently in-flight from
+    // a local patch() call. This prevents the server echo from
+    // overwriting optimistic local state for those specific sub-paths,
+    // while letting all other server updates (e.g. background jobs
+    // writing to different sub-paths) flow through immediately.
+    const pendingPaths: ReadonlySet<string> | undefined =
+      existing.__patchingPaths;
+    const filtered =
+      pendingPaths && pendingPaths.size > 0
+        ? patches.filter((p) => !pendingPaths.has(p.path))
+        : patches;
+
+    if (filtered.length === 0) continue;
+
     // Build the full server-authoritative snapshot by applying the RFC
     // 6902 patches onto a deep clone of the current data.
     const snapshot = JSON.parse(JSON.stringify(existing.__data ?? {}));
-    ensureIntermediates(snapshot, patches);
-    applyPatch(snapshot, patches, false, true);
+    ensureIntermediates(snapshot, filtered);
+    applyPatch(snapshot, filtered, false, true);
 
     // SYM_SERVER_MERGE writes values onto the raw target (skipping
     // locally-pending keys), deletes server-removed properties, and
@@ -464,6 +486,12 @@ function doFetch(
           entry.items = result.items;
           entry.version++;
           notify(entry);
+          // Fire ops listeners after cache is updated
+          for (const listener of entry.opsListeners) {
+            try {
+              listener(ops);
+            } catch {}
+          }
         });
         entry.dispose = unsub;
       }
@@ -663,6 +691,19 @@ export function useQuery<T>(
   const noop = useCallback(() => {}, []);
   const noopAdd = useCallback((item: T | Record<string, any>) => item as T, []);
 
+  // Must be before early return to maintain hook order.
+  const entryForOps = key ? cache.get(key) : undefined;
+  const onOps = useCallback(
+    (listener: (ops: QueryOp[]) => void): (() => void) => {
+      if (!entryForOps) return () => {};
+      entryForOps.opsListeners.add(listener);
+      return () => {
+        entryForOps.opsListeners.delete(listener);
+      };
+    },
+    [entryForOps],
+  );
+
   if (!key)
     return {
       items: EMPTY as T[],
@@ -672,6 +713,7 @@ export function useQuery<T>(
       refetch: noop,
       addOptimistic: noopAdd,
       removeOptimistic: noop,
+      onOps,
     };
 
   const entry = cache.get(key);
@@ -703,5 +745,6 @@ export function useQuery<T>(
     refetch,
     addOptimistic,
     removeOptimistic,
+    onOps,
   };
 }

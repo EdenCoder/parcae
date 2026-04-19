@@ -6,4 +6,5 @@ export { useSocket } from "./useSocket";
 export type { SocketHook } from "./useSocket";
 export { useSetting } from "./useSetting";
 export { useAuthStatus } from "./useAuth";
+export { useSaving } from "./useSaving";
 export { Authenticated, Unauthenticated, AuthLoading } from "./gates";

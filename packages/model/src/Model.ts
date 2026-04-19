@@ -65,6 +65,7 @@ const INSTANCE_METHODS = new Set([
   "_flush",
   "_createRefProxy",
   "constructor",
+  "__savingCount",
 ]);
 
 // ─── Lazy Query Chain ────────────────────────────────────────────────────────
@@ -145,6 +146,8 @@ export class Model extends EventEmitter {
   declare updatedAt: string;
   /** Temporary client-side ID for optimistic matching. Stored in JSONB overflow. */
   declare tmp?: string;
+  /** Number of in-flight save/patch operations. 0 = idle. Reactive on frontend (Valtio). */
+  __savingCount: number = 0;
 
   // ── Static ─────────────────────────────────────────────────────────
 
@@ -422,12 +425,13 @@ export class Model extends EventEmitter {
         if (prop === SYM_SERVER_MERGE) {
           return (serverData: Record<string, any>) => {
             const pendingUpdates = new Set(target[SYM_UPDATES]);
-            const pendingPatches = target[SYM_PATCHING];
             const serverKeys = new Set(Object.keys(serverData));
 
-            // Write new/changed values
+            // Write new/changed values — only skip keys with unsaved
+            // direct property writes (SYM_UPDATES). Patch ops are
+            // handled at the RFC 6902 path level in useQuery, not here.
             for (const key of serverKeys) {
-              if (pendingUpdates.has(key) || pendingPatches.has(key)) continue;
+              if (pendingUpdates.has(key)) continue;
               (target as any)[key] = serverData[key];
             }
 
@@ -438,7 +442,7 @@ export class Model extends EventEmitter {
               if (EVENTEMITTER_KEYS.has(key)) continue;
               if (key.startsWith("_")) continue;
               if (serverKeys.has(key)) continue;
-              if (pendingUpdates.has(key) || pendingPatches.has(key)) continue;
+              if (pendingUpdates.has(key)) continue;
               delete (target as any)[key];
             }
 
@@ -574,15 +578,17 @@ export class Model extends EventEmitter {
     this[SYM_DEBOUNCE] = v;
   }
 
-  /** @internal */
-  get __patchingColumns(): Set<string> {
+  /** @internal — full RFC 6902 paths currently in-flight via patch() */
+  get __patchingPaths(): ReadonlySet<string> {
     return this[SYM_PATCHING];
   }
 
   /** @internal */
   get __pendingKeys(): ReadonlySet<string> {
+    // SYM_UPDATES: top-level property names from direct writes
+    // SYM_PATCHING: full RFC 6902 paths from patch() calls
     const keys = new Set(this[SYM_UPDATES]);
-    for (const col of this[SYM_PATCHING]) keys.add(col);
+    for (const p of this[SYM_PATCHING]) keys.add(p);
     return keys;
   }
 
@@ -617,23 +623,30 @@ export class Model extends EventEmitter {
     };
 
     (this as any).updatedAt = new Date().toISOString();
+    this.__savingCount++;
+    this.emit("saving", this);
 
-    await this[SYM_ADAPTER].save(this, changes);
-    this[SYM_IS_NEW] = false;
-    this.emit("saved", this);
+    try {
+      await this[SYM_ADAPTER].save(this, changes);
+      this[SYM_IS_NEW] = false;
+      this.emit("saved", this);
+    } finally {
+      this.__savingCount = Math.max(0, this.__savingCount - 1);
+    }
   }
 
   async patch(ops: PatchOp[]): Promise<void> {
-    const columns = new Set<string>();
-    for (const op of ops) {
-      const parts = op.path.split("/").filter(Boolean);
-      if (parts[0]) columns.add(parts[0]);
-    }
+    // Track the exact RFC 6902 paths that are in-flight so
+    // SYM_SERVER_MERGE can skip only those specific sub-paths.
+    const paths = new Set<string>();
+    for (const op of ops) paths.add(op.path);
 
-    for (const col of columns) this[SYM_PATCHING].add(col);
+    for (const p of paths) this[SYM_PATCHING].add(p);
+    this.__savingCount++;
+    this.emit("saving", this);
 
     try {
-      // Apply locally (optimistic) — build a data object for applyPatch
+      // Apply locally (optimistic) — mutates __data in place
       const localData = this.__data;
 
       // Ensure intermediate objects exist for nested paths
@@ -648,15 +661,14 @@ export class Model extends EventEmitter {
       }
 
       applyPatch(localData, ops, false, true);
-      // Write patched values back
-      for (const col of columns) {
-        if (col in localData) (this as any)[col] = localData[col];
-      }
+      // localData IS this.__data (same reference), already mutated.
+      // No write-back through the Proxy — avoids polluting SYM_UPDATES.
 
       await this[SYM_ADAPTER].patch(this, ops);
       this.emit("patched", this);
     } finally {
-      for (const col of columns) this[SYM_PATCHING].delete(col);
+      for (const p of paths) this[SYM_PATCHING].delete(p);
+      this.__savingCount = Math.max(0, this.__savingCount - 1);
     }
   }
 
