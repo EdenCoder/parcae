@@ -31,6 +31,7 @@
     "bullmq": "^5.0.0",
     "compress-json": "^3.1.0",
     "deep-equal": "^2.2.3",
+    "eventemitter3": "^5.0.1",
     "fast-json-patch": "^3.1.1",
     "ioredis": "^5.4.0",
     "better-sqlite3": "^11.0.0",
