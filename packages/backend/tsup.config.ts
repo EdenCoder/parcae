@@ -7,7 +7,15 @@ export default defineConfig({
   sourcemap: true,
   clean: true,
   target: "es2022",
+  platform: "node",
   splitting: true,
   treeshake: true,
-  external: ["@parcae/model", "knex", "better-sqlite3", "socket.io", "bullmq", "ioredis"],
+  external: [
+    "@parcae/model",
+    "knex",
+    "better-sqlite3",
+    "socket.io",
+    "bullmq",
+    "ioredis",
+  ],
 });

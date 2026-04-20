@@ -8,8 +8,23 @@
 import Client from "ioredis";
 import AsyncLock from "async-lock";
 import { Redlock } from "@sesamecare-oss/redlock";
-import { EventEmitter } from "events";
+import { createRequire } from "node:module";
 import { log } from "../logger";
+
+// Resolve EventEmitter via createRequire rather than a static ESM import.
+//
+// Why: the bundled ESM dist is re-transpiled by tsx/esbuild when consumed
+// from a CJS-default app (no `"type": "module"` in package.json). That
+// re-transpile mangles `import { EventEmitter } from "events"` into a
+// broken `import_events.EventEmitter` / `nodeEvents.EventEmitter` reference
+// that throws `is not a constructor` at class-field initializer time.
+//
+// `createRequire` yields a genuine `require()` that tsx doesn't intercept,
+// so we always get the real EventEmitter class back.
+const nodeRequire = createRequire(import.meta.url);
+const { EventEmitter } = nodeRequire(
+  "node:events",
+) as typeof import("node:events");
 
 export interface PubSubConfig {
   /** Redis URL. If not provided, falls back to in-process events only. */
@@ -18,7 +33,7 @@ export interface PubSubConfig {
 
 export class PubSub {
   private __lock = new AsyncLock();
-  private __events = new EventEmitter();
+  private __events: InstanceType<typeof EventEmitter>;
   private redlock: Redlock | null = null;
   private redisLock: Client | null = null;
   private redisRead: Client | null = null;
@@ -27,6 +42,7 @@ export class PubSub {
   public building: Promise<void>;
 
   constructor(config: PubSubConfig = {}) {
+    this.__events = new EventEmitter();
     this.__events.setMaxListeners(0);
     this.building = config.url
       ? this.buildRedis(config.url)
