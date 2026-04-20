@@ -1,0 +1,24 @@
+{
+  "//": "This tsconfig exists only to silence LSP noise on template files.",
+  "//2": "These files are shadcn registry templates that get copied into consumer",
+  "//3": "projects. They typecheck correctly in their final destination where",
+  "//4": "@parcae/model and @parcae/sdk are installed. Here we loosen strictness",
+  "//5": "so we don't need to proliferate `as any` casts everywhere.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM"],
+    "jsx": "preserve",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "strict": false,
+    "noImplicitAny": false,
+    "noEmit": true,
+    "allowImportingTsExtensions": false
+  },
+  "include": ["src/**/*", "scripts/**/*"]
+}
