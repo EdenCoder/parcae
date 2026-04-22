@@ -417,8 +417,15 @@ export class BackendAdapter implements ModelAdapter {
    *  1. Scope is always applied first (non-negotiable).
    *  2. Only whitelisted methods are replayed.
    *  3. Column names are validated against the model schema.
-   *  4. Limit is clamped to a maximum value.
-   *  5. A default limit is injected if the client omits one.
+   *  4. A default limit is injected if the client omits one — clients
+   *     that want more must call `.limit(N)` explicitly with the exact
+   *     ceiling they need (or `.clearLimit()` to opt out entirely).
+   *
+   * No upper clamp on client-provided limits. The scope is the security
+   * boundary — it already restricts which rows the client can see; a
+   * row ceiling on top of that is defense-in-depth that mostly just
+   * silently truncates legitimate queries and forces callers to add
+   * `.clearLimit()` everywhere.
    *
    * Throws on invalid column references (fail loud during development).
    */
@@ -473,7 +480,13 @@ export class BackendAdapter implements ModelAdapter {
     "@>",
   ]);
 
-  private static MAX_LIMIT = 100;
+  /**
+   * Default limit injected when a client query has no `.limit()` call.
+   * Bounded enough to prevent an unbounded sequential-scan from a
+   * scope-wide `Model.where(...).find()` with no pagination. Clients
+   * that want more set an explicit `.limit(N)` (no upper clamp) or
+   * `.clearLimit()` to disable the injection.
+   */
   private static DEFAULT_LIMIT = 25;
 
   queryFromClient<T>(
@@ -561,16 +574,17 @@ export class BackendAdapter implements ModelAdapter {
         continue;
       }
 
-      // Clamp limit (skip clamping if clearLimit was used)
+      // Sanitize limit — coerce to a positive integer, fall back to
+      // DEFAULT_LIMIT on parse failure. No upper clamp; clients that
+      // need an unusually large window pass it explicitly. Skipped
+      // entirely when `clearLimit()` was used — that path sets the
+      // 10 000 safety cap below.
       if (step.method === "limit") {
         hasLimit = true;
         if (!hasClearLimit) {
-          args[0] = Math.min(
-            Math.max(
-              Number.parseInt(args[0]) || BackendAdapter.DEFAULT_LIMIT,
-              1,
-            ),
-            BackendAdapter.MAX_LIMIT,
+          args[0] = Math.max(
+            Number.parseInt(args[0]) || BackendAdapter.DEFAULT_LIMIT,
+            1,
           );
         }
       }
