@@ -8,6 +8,9 @@
 export { Model, generateId, SYM_SERVER_MERGE } from "./Model";
 export type { WithRefs } from "./Model";
 
+export { ops } from "./patch";
+export type { OpBuilder } from "./patch";
+
 /**
  * Branded type for unlimited TEXT columns (vs string which is VARCHAR 2048).
  * Use `content: Text = ""` on a Model property to get a TEXT column in Postgres.
