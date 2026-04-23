@@ -8,9 +8,6 @@
  */
 
 import type { Knex } from "knex";
-import {
-  MIGRATIONS_TABLE,
-} from "../../adapters/migrations";
 import { META_TABLE, sha256File } from "../../adapters/migration-meta";
 import type { MigrationEntry } from "../../routing/migration";
 import { bootstrap, readApplied, type CliRuntime } from "../runtime";
@@ -166,7 +163,3 @@ async function stampAsApplied(
       .merge();
   });
 }
-
-// MIGRATIONS_TABLE import retained for clarity even though `rt.tableName`
-// is preferred inside the function.
-void MIGRATIONS_TABLE;

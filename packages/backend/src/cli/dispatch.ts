@@ -8,6 +8,7 @@
  */
 
 import { emit, type CommandResult } from "./output";
+import { redactSecrets } from "./redact";
 import { run as runMake } from "./commands/make";
 import { run as runList } from "./commands/list";
 import { run as runStatus } from "./commands/status";
@@ -86,11 +87,20 @@ export async function dispatch(parsed: ParsedArgs): Promise<void> {
     process.exit(2);
   }
 
+  // DATABASE_URL either from env or the --db override — whichever this run
+  // is about to use. We scrub verbatim occurrences of it from any error
+  // output, as belt-and-braces on top of the URL-shaped regex in redactSecrets.
+  const dbUrl =
+    typeof flags.db === "string"
+      ? flags.db
+      : (process.env.DATABASE_URL ?? undefined);
+
   try {
     const result = await handler(positional, flags);
     emit(result, { json });
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const rawMessage = err instanceof Error ? err.message : String(err);
+    const message = redactSecrets(rawMessage, dbUrl);
     if (json) {
       process.stderr.write(
         JSON.stringify({ ok: false, error: message }, null, 2) + "\n",
@@ -99,7 +109,7 @@ export async function dispatch(parsed: ParsedArgs): Promise<void> {
       process.stderr.write(message + "\n");
     }
     if (process.env.PARCAE_DEBUG && err instanceof Error && err.stack) {
-      process.stderr.write(err.stack + "\n");
+      process.stderr.write(redactSecrets(err.stack, dbUrl) + "\n");
     }
     process.exit(1);
   }

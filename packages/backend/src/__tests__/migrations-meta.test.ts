@@ -79,8 +79,36 @@ describe("sha256File", () => {
     expect(sha256File(null)).toBe("");
   });
 
-  it("returns empty string for missing files", () => {
-    expect(sha256File("/nonexistent/path")).toBe("");
+  it("throws for missing files (prevents silent drift bypass)", () => {
+    expect(() => sha256File("/nonexistent/path")).toThrow(
+      /cannot read migration file for checksum/,
+    );
+  });
+
+  it("throws for unreadable files (prevents chmod-bypass)", () => {
+    const path = tempFile("some content");
+    // Make the file unreadable. On systems that ignore chmod for root, we
+    // skip rather than fail.
+    try {
+      require("node:fs").chmodSync(path, 0o000);
+    } catch {
+      return;
+    }
+    // Verify the chmod actually denied access before asserting.
+    try {
+      require("node:fs").readFileSync(path);
+      // Read succeeded — user is likely root. Skip the assertion.
+      return;
+    } catch {
+      // Good — read failed. Now sha256File should throw too.
+    }
+    try {
+      expect(() => sha256File(path)).toThrow(
+        /cannot read migration file for checksum/,
+      );
+    } finally {
+      require("node:fs").chmodSync(path, 0o644);
+    }
   });
 
   it("differs when content differs", () => {
@@ -131,6 +159,19 @@ describe("ensureMetaTable", () => {
     expect(row.durationMs).toBe(42);
     expect(row.writes).toBe(3);
     expect(row.rowsAffected).toBe(5);
+  });
+
+  it("does not throw when called concurrently (CREATE TABLE IF NOT EXISTS)", async () => {
+    // Two replicas can race this at boot. The CREATE TABLE IF NOT EXISTS +
+    // ensureColumn wrappers must tolerate duplicate-table / duplicate-column.
+    await expect(
+      Promise.all([
+        ensureMetaTable(db),
+        ensureMetaTable(db),
+        ensureMetaTable(db),
+      ]),
+    ).resolves.not.toThrow();
+    expect(await db.schema.hasTable(META_TABLE)).toBe(true);
   });
 });
 

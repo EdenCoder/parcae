@@ -47,9 +47,9 @@ export function success(...args: any[]): void {
 }
 
 /**
- * Debug logging. Suppressed unless PARCAE_DEBUG is truthy or the process is
- * running with `--verbose` via the CLI. Kept out of the default log stream
- * so production output stays readable.
+ * Debug logging. Suppressed unless `PARCAE_DEBUG` is truthy in the
+ * environment. Kept out of the default log stream so production output stays
+ * readable.
  */
 export function debug(...args: any[]): void {
   if (!process.env.PARCAE_DEBUG) return;

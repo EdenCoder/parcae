@@ -14,6 +14,16 @@
  *
  * Writes to the meta table happen inside the migration's transaction so
  * Knex's row, the meta row, and the user's schema changes commit atomically.
+ *
+ * ⚠️  `{ transaction: false }` migrations are an exception to the atomicity
+ *     contract above: the user's DDL/DML commits immediately, then the meta
+ *     write runs against the bare connection. If that write fails, Knex sees
+ *     the migration as failed but the schema change is already on disk.
+ *     Such migrations MUST be idempotent at the DB level — every statement
+ *     guarded with `IF EXISTS` / `IF NOT EXISTS`, so a re-run against the
+ *     mutated schema is a no-op. The wrapper retries the meta write once on
+ *     failure before surfacing the error, and logs loudly so operators can
+ *     manually reconcile if needed.
  */
 
 import type { Knex } from "knex";
@@ -36,20 +46,56 @@ import {
   type MigrationMetaRow,
 } from "./migration-meta";
 
-/** Knex's MigrationSource interface — see knex/lib/migrations/migrate/sources. */
-interface KnexMigrationSource<T> {
-  getMigrations(loadExtensions?: readonly string[]): Promise<T[]>;
-  getMigrationName(migration: T): string;
-  getMigration(
-    migration: T,
-  ): Promise<{
-    up: (knex: Knex) => Promise<unknown>;
-    down: (knex: Knex) => Promise<unknown>;
-    config?: { transaction?: boolean };
-  }>;
+export const MIGRATIONS_TABLE = "parcae_migrations";
+
+/**
+ * Meta write for a `{ transaction: false }` migration. The user's schema
+ * change has already committed — we do not want a transient meta-write glitch
+ * to lose that row and leave drift silently uncontested. Try once, wait 100ms,
+ * try again; on both failures log an error pointing operators at the manual
+ * recovery path (insert the meta row by hand) and rethrow so Knex treats the
+ * migration as failed.
+ *
+ * `writer` is injectable for tests; production calls fall through to
+ * `writeMetaRow`.
+ */
+export async function writeMetaRowWithRetry(
+  db: Knex,
+  row: MigrationMetaRow,
+  writer: (db: Knex, row: MigrationMetaRow) => Promise<void> = writeMetaRow,
+): Promise<void> {
+  try {
+    await writer(db, row);
+    return;
+  } catch (err) {
+    log.warn(
+      `[parcae] meta write for non-tx migration "${row.name}" failed, retrying in 100ms — ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+  await new Promise((r) => setTimeout(r, 100));
+  try {
+    await writer(db, row);
+  } catch (err) {
+    log.error(
+      `[parcae] meta write for non-tx migration "${row.name}" failed on retry — ` +
+        `the schema change has ALREADY committed but parcae_migration_meta has no row. ` +
+        `Manual recovery: insert a row into parcae_migration_meta matching the succeeded migration. ` +
+        `Error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    throw err;
+  }
 }
 
-export const MIGRATIONS_TABLE = "parcae_migrations";
+/**
+ * Shape Knex actually hands back from `getMigration` — the public `Migration`
+ * type omits the `config` field that Knex's Migrator inspects to decide
+ * whether to wrap the migration in a transaction (see `_useTransaction`).
+ */
+type ParcaeMigrationSpec = Knex.Migration & {
+  config?: { transaction?: boolean };
+};
 
 /**
  * Adapts the in-memory migration registry to Knex's MigrationSource contract.
@@ -63,14 +109,14 @@ export const MIGRATIONS_TABLE = "parcae_migrations";
  * atomicity, documented as an exception users opt into.
  */
 export class ParcaeMigrationSource
-  implements KnexMigrationSource<MigrationEntry>
+  implements Knex.MigrationSource<MigrationEntry>
 {
   constructor(
     private readonly entries: readonly MigrationEntry[],
     private readonly engine: Engine,
   ) {}
 
-  getMigrations(): Promise<MigrationEntry[]> {
+  getMigrations(_loadExtensions: readonly string[]): Promise<MigrationEntry[]> {
     return Promise.resolve([...this.entries]);
   }
 
@@ -78,7 +124,7 @@ export class ParcaeMigrationSource
     return entry.name;
   }
 
-  getMigration(entry: MigrationEntry) {
+  getMigration(entry: MigrationEntry): Promise<ParcaeMigrationSpec> {
     const engine = this.engine;
     // Knex inspects `config.transaction` on this object to decide whether to
     // wrap the migration in a transaction. See Migrator._useTransaction.
@@ -144,10 +190,18 @@ export class ParcaeMigrationSource
           rowsAffected,
           appliedAt: new Date().toISOString(),
         };
-        // `knex` here is either a plain connection or a transactional handle —
-        // either way, `writeMetaRow` uses it verbatim. Meta writes that happen
-        // inside a tx commit atomically with the user's DDL/DML.
-        await writeMetaRow(knex, row);
+        // `knex` here is either a plain connection or a transactional handle.
+        // Inside a tx, meta write commits atomically with the user's DDL/DML.
+        // For `{ transaction: false }` migrations, the user's change has
+        // already committed — a meta write failure here leaves us with the
+        // schema mutation persisted but no meta row. We retry once, log
+        // loudly on each failure, and ultimately rethrow so Knex marks the
+        // migration failed (matching existing failure semantics).
+        if (entry.transaction === false) {
+          await writeMetaRowWithRetry(knex, row);
+        } else {
+          await writeMetaRow(knex, row);
+        }
       },
       down: async (knex: Knex): Promise<void> => {
         if (!entry.down) {
@@ -238,7 +292,7 @@ export async function runMigrations(
 
   const result = (await opts.db.migrate.latest({
     tableName,
-    migrationSource: source as unknown as Knex.MigrationSource<unknown>,
+    migrationSource: source,
   })) as [number, string[]];
 
   const applied = Array.isArray(result) ? (result[1] ?? []) : [];

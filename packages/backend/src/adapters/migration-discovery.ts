@@ -20,7 +20,6 @@ import { pathToFileURL } from "node:url";
 import { log } from "../logger";
 import {
   _getInsertionOrdered,
-  getMigrations,
   type MigrationEntry,
 } from "../routing/migration";
 
@@ -56,7 +55,6 @@ export async function discoverMigrations(
   dir: string,
 ): Promise<MigrationEntry[]> {
   const files = listMigrationFiles(dir);
-  const preexistingNames = new Set(getMigrations().map((e) => e.name));
   const added: MigrationEntry[] = [];
 
   for (const file of files) {
@@ -92,7 +90,5 @@ export async function discoverMigrations(
     }
   }
 
-  // The public getMigrations() returns all entries (including ones added
-  // before this call); we only want the ones we just registered.
-  return added.filter((e) => !preexistingNames.has(e.name));
+  return added;
 }

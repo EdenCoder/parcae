@@ -18,7 +18,6 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { Knex } from "knex";
-import type { Engine } from "./engine";
 import type { MigrationEntry } from "../routing/migration";
 
 export const META_TABLE = "parcae_migration_meta";
@@ -45,55 +44,103 @@ export interface MigrationMetaRow {
 }
 
 /**
- * Create the meta table if it doesn't exist. Idempotent — safe to call on
- * every boot. Uses Knex's `hasTable` for cross-engine compatibility (SQLite,
- * Postgres, AlloyDB).
+ * Create the meta table if it doesn't exist. Idempotent and race-safe —
+ * `CREATE TABLE IF NOT EXISTS` is atomic in both Postgres and SQLite, so two
+ * replicas booting simultaneously won't collide. Same treatment for the
+ * additive column upgrades: the `hasColumn` → `alterTable` sequence is
+ * wrapped in try/catch so the second caller's "duplicate column" is tolerated.
  *
  * Applies additive column upgrades for older DBs that already have the
  * table but predate newer columns (`writes`, `rowsAffected`). Existing rows
  * get `0` defaults for both — correct for "applied, effect unknown".
  */
 export async function ensureMetaTable(db: Knex): Promise<void> {
-  if (!(await db.schema.hasTable(META_TABLE))) {
-    await db.schema.createTable(META_TABLE, (t) => {
-      t.string("name", 512).primary();
-      t.string("checksum", 64).notNullable(); // sha256 hex = 64 chars
-      t.text("description").nullable();
-      t.string("ticket", 128).nullable();
-      t.integer("durationMs").notNullable();
-      t.integer("writes").notNullable().defaultTo(0);
-      t.integer("rowsAffected").notNullable().defaultTo(0);
-      // ISO string — portable across SQLite (TEXT) and Postgres (timestamp)
-      t.string("appliedAt", 32).notNullable();
-    });
-    return;
+  const dialect = (db.client?.config?.client as string | undefined) ?? "";
+  const isPg = dialect === "pg" || dialect === "pg-native";
+
+  if (isPg) {
+    await db.raw(`
+      CREATE TABLE IF NOT EXISTS "${META_TABLE}" (
+        "name"         VARCHAR(512) PRIMARY KEY,
+        "checksum"     VARCHAR(64)  NOT NULL,
+        "description"  TEXT,
+        "ticket"       VARCHAR(128),
+        "durationMs"   INTEGER      NOT NULL,
+        "writes"       INTEGER      NOT NULL DEFAULT 0,
+        "rowsAffected" INTEGER      NOT NULL DEFAULT 0,
+        "appliedAt"    VARCHAR(32)  NOT NULL
+      )
+    `);
+  } else {
+    // SQLite + better-sqlite3. Text columns suffice; SQLite doesn't enforce
+    // the length anyway.
+    await db.raw(`
+      CREATE TABLE IF NOT EXISTS "${META_TABLE}" (
+        "name"         TEXT    PRIMARY KEY,
+        "checksum"     TEXT    NOT NULL,
+        "description"  TEXT,
+        "ticket"       TEXT,
+        "durationMs"   INTEGER NOT NULL,
+        "writes"       INTEGER NOT NULL DEFAULT 0,
+        "rowsAffected" INTEGER NOT NULL DEFAULT 0,
+        "appliedAt"    TEXT    NOT NULL
+      )
+    `);
   }
-  // Additive upgrade — add newer columns to an existing meta table.
-  if (!(await db.schema.hasColumn(META_TABLE, "writes"))) {
+
+  // Additive upgrade — add newer columns to an existing meta table. The
+  // try/catch tolerates the "duplicate column" a racing second caller hits
+  // when its `hasColumn` was false at check-time but true at alter-time.
+  await ensureColumn(db, "writes", async () => {
     await db.schema.alterTable(META_TABLE, (t) => {
       t.integer("writes").notNullable().defaultTo(0);
     });
-  }
-  if (!(await db.schema.hasColumn(META_TABLE, "rowsAffected"))) {
+  });
+  await ensureColumn(db, "rowsAffected", async () => {
     await db.schema.alterTable(META_TABLE, (t) => {
       t.integer("rowsAffected").notNullable().defaultTo(0);
     });
+  });
+}
+
+async function ensureColumn(
+  db: Knex,
+  column: string,
+  add: () => Promise<void>,
+): Promise<void> {
+  if (await db.schema.hasColumn(META_TABLE, column)) return;
+  try {
+    await add();
+  } catch (err) {
+    // Another replica won the race and added the column first. Re-check —
+    // if the column really exists now, swallow; otherwise, rethrow.
+    if (!(await db.schema.hasColumn(META_TABLE, column))) throw err;
   }
 }
 
 /**
  * Compute the sha256 of a file's bytes, as a 64-char hex string.
- * Returns an empty string for a null/missing path — the caller treats this
- * as "unknown origin" (programmatic registration) and skips verification.
+ *
+ * Returns `""` for a null path — the caller treats this as "unknown origin"
+ * (programmatic registration, no source file) and skips verification.
+ *
+ * Throws when a path is given but the file can't be read. A silent `""` on
+ * read failure would let an attacker bypass drift detection by making a
+ * migration file unreadable (e.g. `chmod 000`); `verifyChecksums` would then
+ * compare `""` to the recorded hash and silently skip the entry.
  */
 export function sha256File(path: string | null): string {
   if (!path) return "";
+  let buf: Buffer;
   try {
-    const buf = readFileSync(path);
-    return createHash("sha256").update(buf).digest("hex");
-  } catch {
-    return "";
+    buf = readFileSync(path);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `[parcae] cannot read migration file for checksum: ${path} — ${reason}`,
+    );
   }
+  return createHash("sha256").update(buf).digest("hex");
 }
 
 /**
@@ -413,9 +460,3 @@ export function buildListing(
   result.sort((a, b) => a.name.localeCompare(b.name));
   return result;
 }
-
-export const ENGINES_SUPPORTED: readonly Engine[] = [
-  "sqlite",
-  "postgres",
-  "alloydb",
-];

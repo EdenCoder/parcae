@@ -107,7 +107,7 @@ export async function bootstrap(
       })
     : knexFactory({
         client: "pg",
-        connection: dbUrl,
+        connection: pgConnectionFromUrl(dbUrl),
         pool: { min: 1, max: 2 }, // CLI = short-lived, minimal pool
       });
 
@@ -158,6 +158,44 @@ export function slugify(input: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
+}
+
+/**
+ * Parse a Postgres connection URL into the object shape pg accepts. Passing an
+ * object rather than the raw URL reduces the chance the driver echoes the
+ * password back in error messages. Unparseable URLs fall through to the
+ * original string — pg will attempt its own parse and fail loudly.
+ */
+export function pgConnectionFromUrl(
+  url: string,
+): string | {
+  host: string;
+  port?: number;
+  user?: string;
+  password?: string;
+  database?: string;
+  ssl?: boolean | { rejectUnauthorized: boolean };
+} {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return url;
+  }
+  const params = parsed.searchParams;
+  const sslParam = params.get("ssl") ?? params.get("sslmode");
+  let ssl: boolean | { rejectUnauthorized: boolean } | undefined;
+  if (sslParam === "true" || sslParam === "require") ssl = true;
+  else if (sslParam === "no-verify")
+    ssl = { rejectUnauthorized: false };
+  return {
+    host: parsed.hostname,
+    port: parsed.port ? Number(parsed.port) : undefined,
+    user: parsed.username ? decodeURIComponent(parsed.username) : undefined,
+    password: parsed.password ? decodeURIComponent(parsed.password) : undefined,
+    database: parsed.pathname.replace(/^\//, "") || undefined,
+    ...(ssl !== undefined ? { ssl } : {}),
+  };
 }
 
 /** Produce a `YYYYMMDDHHMMSS` timestamp used for migration filenames. */

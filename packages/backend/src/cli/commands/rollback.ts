@@ -7,6 +7,10 @@
  */
 
 import { ParcaeMigrationSource } from "../../adapters/migrations";
+import {
+  readMetaRows,
+  verifyChecksums,
+} from "../../adapters/migration-meta";
 import { bootstrap, type CliRuntime } from "../runtime";
 import type { CommandResult } from "../output";
 
@@ -70,11 +74,18 @@ export async function run(
       );
     }
 
+    // Re-verify checksums before running any down(). An operator who edits a
+    // migration's file post-apply and then rolls back would otherwise run
+    // the modified down() against the DB with no warning.
+    const allowDrift = flags["allow-checksum-drift"] === true;
+    const meta = await readMetaRows(rt.db);
+    verifyChecksums(rt.entries, meta, allowDrift);
+
     const source = new ParcaeMigrationSource(rt.entries, rt.engine);
     const result = (await rt.db.migrate.rollback(
       {
         tableName: rt.tableName,
-        migrationSource: source as any,
+        migrationSource: source,
       },
       false,
     )) as [number, string[]];

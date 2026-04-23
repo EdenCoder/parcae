@@ -29,7 +29,8 @@ import { run as runUnlock } from "../cli/commands/unlock";
 import { run as runRollback } from "../cli/commands/rollback";
 import { run as runPlan } from "../cli/commands/plan";
 import { parseArgv } from "../cli/argv";
-import type { CliRuntime } from "../cli/runtime";
+import { redactSecrets } from "../cli/redact";
+import { pgConnectionFromUrl, type CliRuntime } from "../cli/runtime";
 import {
   clearMigrations,
   getMigrations,
@@ -518,6 +519,127 @@ describe("migrate:rollback", () => {
     expect(result.data.rolledBack).toEqual(["20260101000000-reversible"]);
     expect(downCalled).toBe(true);
     expect(await rt.db.schema.hasTable("t_rev")).toBe(false);
+  });
+
+  it("refuses to rollback when a migration's file has drifted", async () => {
+    const path = registerAndWrite(
+      dir,
+      "20260101000000-drifted",
+      async ({ db }) => {
+        await db.schema.createTable("t_drift", (t) =>
+          t.string("id").primary(),
+        );
+      },
+      {
+        down: async ({ db }) => {
+          await db.schema.dropTableIfExists("t_drift");
+        },
+      },
+    );
+    rt = await makeRuntime(dbPath, dir);
+    await runLatest([], {}, rt);
+    // Edit the file post-apply — simulates an operator modifying the source
+    // of a migration whose down() has already run in the DB.
+    writeFileSync(path, "// tampered content\n", "utf8");
+    await expect(runRollback([], {}, rt)).rejects.toThrow(
+      /checksum drift/,
+    );
+  });
+
+  it("rolls back despite drift when --allow-checksum-drift is passed", async () => {
+    const path = registerAndWrite(
+      dir,
+      "20260101000000-drifted-allowed",
+      async ({ db }) => {
+        await db.schema.createTable("t_drift_ok", (t) =>
+          t.string("id").primary(),
+        );
+      },
+      {
+        down: async ({ db }) => {
+          await db.schema.dropTableIfExists("t_drift_ok");
+        },
+      },
+    );
+    rt = await makeRuntime(dbPath, dir);
+    await runLatest([], {}, rt);
+    writeFileSync(path, "// tampered but allowed\n", "utf8");
+    const result = await runRollback(
+      [],
+      { "allow-checksum-drift": true },
+      rt,
+    );
+    expect(result.data.rolledBack).toEqual(["20260101000000-drifted-allowed"]);
+  });
+});
+
+// ─── Secret redaction ────────────────────────────────────────────────────────
+
+describe("redactSecrets", () => {
+  it("masks the password inside a Postgres URL", () => {
+    const msg =
+      "connect ECONNREFUSED postgres://app:hunter2@db.internal:5432/prod";
+    const out = redactSecrets(msg);
+    expect(out).not.toContain("hunter2");
+    expect(out).toContain("app:***@db.internal");
+  });
+
+  it("masks passwords across multiple URL schemes", () => {
+    const msg =
+      "postgres://a:b@x/y ... mysql://u:p@h/d ... redis://u:pw@r:6379";
+    const out = redactSecrets(msg);
+    expect(out).not.toMatch(/:[bp]@/);
+    expect(out).not.toContain("pw");
+  });
+
+  it("scrubs an exact URL when provided as the dbUrl arg", () => {
+    const url = "postgres://app:secret@db.internal/prod";
+    const stack =
+      "Error: connect failed\n  at tcp (native)\n  url was " +
+      url +
+      " (retrying)";
+    const out = redactSecrets(stack, url);
+    expect(out).not.toContain("secret");
+  });
+
+  it("is a no-op on strings without URL-shaped credentials", () => {
+    expect(redactSecrets("plain error")).toBe("plain error");
+  });
+});
+
+describe("pgConnectionFromUrl", () => {
+  it("parses a URL into the pg object shape", () => {
+    const cfg = pgConnectionFromUrl(
+      "postgres://app:hunter2@db.internal:5432/prod",
+    );
+    expect(cfg).toEqual({
+      host: "db.internal",
+      port: 5432,
+      user: "app",
+      password: "hunter2",
+      database: "prod",
+    });
+  });
+
+  it("decodes percent-encoded credentials", () => {
+    const cfg = pgConnectionFromUrl("postgres://u%40:p%3A@h/d") as {
+      user: string;
+      password: string;
+    };
+    expect(cfg.user).toBe("u@");
+    expect(cfg.password).toBe("p:");
+  });
+
+  it("falls back to the string on parse failure", () => {
+    const garbage = "not-a-url";
+    expect(pgConnectionFromUrl(garbage)).toBe(garbage);
+  });
+
+  it("maps ssl=require to ssl: true", () => {
+    const cfg = pgConnectionFromUrl(
+      "postgres://a:b@h/d?sslmode=require",
+    ) as { ssl: boolean };
+    expect(cfg.ssl).toBe(true);
   });
 });
 

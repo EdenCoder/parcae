@@ -12,7 +12,9 @@ import {
   MIGRATIONS_TABLE,
   ParcaeMigrationSource,
   runMigrations,
+  writeMetaRowWithRetry,
 } from "../adapters/migrations";
+import * as metaModule from "../adapters/migration-meta";
 import { ensureMetaTable } from "../adapters/migration-meta";
 import {
   clearMigrations,
@@ -106,7 +108,7 @@ describe("ParcaeMigrationSource", () => {
   it("returns entries verbatim", async () => {
     const entries = [makeEntry({ name: "a" }), makeEntry({ name: "b" })];
     const source = new ParcaeMigrationSource(entries, "sqlite");
-    expect(await source.getMigrations()).toEqual(entries);
+    expect(await source.getMigrations([])).toEqual(entries);
     expect(source.getMigrationName(entries[0]!)).toBe("a");
   });
 
@@ -156,7 +158,7 @@ describe("ParcaeMigrationSource", () => {
     const entry = makeEntry({ name: "forward-only" });
     const source = new ParcaeMigrationSource([entry], "sqlite");
     const content = await source.getMigration(entry);
-    await expect(content.down({} as Knex)).rejects.toThrow(/forward-only/);
+    await expect(content.down!({} as Knex)).rejects.toThrow(/forward-only/);
   });
 
   it("invokes user-provided down() and deletes the meta row", async () => {
@@ -183,7 +185,7 @@ describe("ParcaeMigrationSource", () => {
       const entry = makeEntry({ name: "reversible", down });
       const source = new ParcaeMigrationSource([entry], "sqlite");
       const content = await source.getMigration(entry);
-      await content.down(db);
+      await content.down!(db);
       expect(down).toHaveBeenCalledTimes(1);
 
       const rows = await db("parcae_migration_meta").select("*");
@@ -455,5 +457,55 @@ describe("runMigrations", () => {
       engine: "sqlite",
     });
     expect(await db.schema.hasTable("no_tx")).toBe(true);
+  });
+});
+
+describe("writeMetaRowWithRetry (non-tx meta atomicity)", () => {
+  const row: metaModule.MigrationMetaRow = {
+    name: "some-migration",
+    checksum: "a".repeat(64),
+    description: null,
+    ticket: null,
+    durationMs: 1,
+    writes: 0,
+    rowsAffected: 0,
+    appliedAt: new Date().toISOString(),
+  };
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("returns after a successful first attempt", async () => {
+    const writer = vi.fn().mockResolvedValue(undefined);
+    await writeMetaRowWithRetry({} as Knex, row, writer);
+    expect(writer).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries once on failure, succeeds on retry, and warns", async () => {
+    const warn = vi.spyOn(console, "log").mockImplementation(() => {});
+    const writer = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("transient"))
+      .mockResolvedValueOnce(undefined);
+
+    await writeMetaRowWithRetry({} as Knex, row, writer);
+
+    expect(writer).toHaveBeenCalledTimes(2);
+    const warnCalls = warn.mock.calls.flat().join(" ");
+    expect(warnCalls).toMatch(/retrying/);
+  });
+
+  it("rethrows on second failure and logs error with manual-recovery hint", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    const writer = vi.fn().mockRejectedValue(new Error("persistent failure"));
+
+    await expect(
+      writeMetaRowWithRetry({} as Knex, row, writer),
+    ).rejects.toThrow(/persistent failure/);
+    expect(writer).toHaveBeenCalledTimes(2);
+    const errCalls = errorLog.mock.calls.flat().join(" ");
+    expect(errCalls).toMatch(/Manual recovery/);
   });
 });
