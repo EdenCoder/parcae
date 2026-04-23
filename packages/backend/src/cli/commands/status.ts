@@ -3,15 +3,16 @@
  */
 
 import { buildListing, readMetaRows } from "../../adapters/migration-meta";
-import { bootstrap, readApplied, type CliRuntime } from "../runtime";
+import { readApplied, type CliRuntime } from "../runtime";
+import { withRuntime } from "../with-runtime";
 import type { CommandResult } from "../output";
 
 export interface StatusResult {
-  total: number;
-  applied: number;
-  pending: number;
-  drift: number;
-  orphans: number;
+  readonly total: number;
+  readonly applied: number;
+  readonly pending: number;
+  readonly drift: number;
+  readonly orphans: number;
 }
 
 export async function run(
@@ -19,14 +20,7 @@ export async function run(
   flags: Record<string, string | boolean>,
   runtime?: CliRuntime,
 ): Promise<CommandResult<StatusResult>> {
-  const rt =
-    runtime ??
-    (await bootstrap({
-      dir: typeof flags.dir === "string" ? flags.dir : undefined,
-      db: typeof flags.db === "string" ? flags.db : undefined,
-    }));
-  const ownsRuntime = runtime === undefined;
-  try {
+  return withRuntime(flags, runtime, async (rt) => {
     const [applied, meta] = await Promise.all([
       readApplied(rt.db, rt.tableName),
       readMetaRows(rt.db),
@@ -47,7 +41,5 @@ export async function run(
       ` (${counts.total} total)`;
 
     return { text, data: counts };
-  } finally {
-    if (ownsRuntime) await rt.close();
-  }
+  });
 }

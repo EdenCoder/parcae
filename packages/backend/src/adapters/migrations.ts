@@ -49,6 +49,60 @@ import {
 export const MIGRATIONS_TABLE = "parcae_migrations";
 
 /**
+ * Attach effect-tracking listeners to a Knex connection. Call `detach()`
+ * (typically from a `finally`) to remove the listeners and collect the totals.
+ *
+ * Counts every non-noise, non-read statement executed through `knex` and sums
+ * any driver-reported row counts. Exported so counting behaviour can be unit
+ * tested without a full migration run.
+ */
+export function attachEffectTracking(knex: Knex): {
+  detach(): { writes: number; rowsAffected: number };
+} {
+  let writes = 0;
+  let rowsAffected = 0;
+  const sqlById = new Map<string, string>();
+
+  const onQuery = (q: { __knexQueryUid?: string; sql?: string }) => {
+    if (!q.sql || !q.__knexQueryUid) return;
+    sqlById.set(q.__knexQueryUid, q.sql);
+  };
+  const onResponse = (
+    response: unknown,
+    q: {
+      __knexQueryUid?: string;
+      sql?: string;
+      response?: unknown;
+      context?: unknown;
+    },
+  ) => {
+    const sql =
+      (q.__knexQueryUid && sqlById.get(q.__knexQueryUid)) || q.sql || "";
+    if (!sql) return;
+    const kind = classifyStatement(sql);
+    if (kind === "noise" || kind === "read") return;
+    writes += 1;
+    // Prefer the raw driver response (q.response / q.context) set by the
+    // dialect's _query before Knex's post-processing — it's consistent
+    // across pg + sqlite for DML row counts. Fall back to the
+    // post-processed response for SQLite's "update returns plain N" path.
+    const rc = extractRowCount(response, q.response ?? q.context, sql);
+    if (typeof rc === "number" && rc > 0) rowsAffected += rc;
+  };
+
+  knex.on("query", onQuery);
+  knex.on("query-response", onResponse);
+
+  return {
+    detach() {
+      knex.removeListener("query", onQuery);
+      knex.removeListener("query-response", onResponse);
+      return { writes, rowsAffected };
+    },
+  };
+}
+
+/**
  * Meta write for a `{ transaction: false }` migration. The user's schema
  * change has already committed — we do not want a transient meta-write glitch
  * to lose that row and leave drift silently uncontested. Try once, wait 100ms,
@@ -131,52 +185,14 @@ export class ParcaeMigrationSource
     return Promise.resolve({
       config: { transaction: entry.transaction },
       up: async (knex: Knex): Promise<void> => {
-        // Attach an effect counter before running the user's up(). We listen
-        // for every statement Knex executes through this (possibly
-        // transactional) handle, classify it, and sum any row counts. The
-        // result tells us what the migration ACTUALLY did — a read-only
-        // migration differs meaningfully from one that wrote N rows.
-        let writes = 0;
-        let rowsAffected = 0;
-        const sqlById = new Map<string, string>();
-
-        const onQuery = (q: { __knexQueryUid?: string; sql?: string }) => {
-          if (!q.sql || !q.__knexQueryUid) return;
-          sqlById.set(q.__knexQueryUid, q.sql);
-        };
-        const onResponse = (
-          response: unknown,
-          q: {
-            __knexQueryUid?: string;
-            sql?: string;
-            response?: unknown;
-            context?: unknown;
-          },
-        ) => {
-          const sql =
-            (q.__knexQueryUid && sqlById.get(q.__knexQueryUid)) || q.sql || "";
-          if (!sql) return;
-          const kind = classifyStatement(sql);
-          if (kind === "noise" || kind === "read") return;
-          writes += 1;
-          // Prefer the raw driver response (q.response / q.context) set by the
-          // dialect's _query before Knex's post-processing — it's consistent
-          // across pg + sqlite for DML row counts. Fall back to the
-          // post-processed response for SQLite's "update returns plain N" path.
-          const rc = extractRowCount(response, q.response ?? q.context, sql);
-          if (typeof rc === "number" && rc > 0) rowsAffected += rc;
-        };
-
-        knex.on("query", onQuery);
-        knex.on("query-response", onResponse);
-
+        const tracker = attachEffectTracking(knex);
         const ctx: MigrationContext = { db: knex, engine, log };
         const started = performance.now();
+        let effect: { writes: number; rowsAffected: number };
         try {
           await entry.up(ctx);
         } finally {
-          knex.removeListener("query", onQuery);
-          knex.removeListener("query-response", onResponse);
+          effect = tracker.detach();
         }
         const durationMs = Math.max(1, Math.round(performance.now() - started));
 
@@ -186,8 +202,8 @@ export class ParcaeMigrationSource
           description: entry.description,
           ticket: entry.ticket,
           durationMs,
-          writes,
-          rowsAffected,
+          writes: effect.writes,
+          rowsAffected: effect.rowsAffected,
           appliedAt: new Date().toISOString(),
         };
         // `knex` here is either a plain connection or a transactional handle.

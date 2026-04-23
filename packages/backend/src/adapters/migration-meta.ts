@@ -18,6 +18,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { Knex } from "knex";
+import { log } from "../logger";
 import type { MigrationEntry } from "../routing/migration";
 
 export const META_TABLE = "parcae_migration_meta";
@@ -176,11 +177,11 @@ export async function readMetaRows(
  */
 export class MigrationChecksumError extends Error {
   constructor(
-    public readonly drifted: Array<{
-      name: string;
-      expected: string;
-      actual: string;
-    }>,
+    public readonly drifted: readonly {
+      readonly name: string;
+      readonly expected: string;
+      readonly actual: string;
+    }[],
   ) {
     const lines = drifted
       .map(
@@ -215,8 +216,6 @@ export function verifyChecksums(
   meta: Map<string, MigrationMetaRow>,
   allowDrift: boolean,
 ): void {
-  if (allowDrift) return;
-
   const drifted: Array<{ name: string; expected: string; actual: string }> = [];
 
   for (const entry of entries) {
@@ -235,9 +234,21 @@ export function verifyChecksums(
     }
   }
 
-  if (drifted.length > 0) {
-    throw new MigrationChecksumError(drifted);
+  if (drifted.length === 0) return;
+
+  if (allowDrift) {
+    // Audit-log every bypassed drift so operators leave a trail instead of
+    // silently ignoring checksum mismatches.
+    for (const d of drifted) {
+      log.warn(
+        `[parcae] checksum drift bypassed for "${d.name}" — ` +
+          `expected ${d.expected.slice(0, 12)}…, actual ${d.actual.slice(0, 12)}…`,
+      );
+    }
+    return;
   }
+
+  throw new MigrationChecksumError(drifted);
 }
 
 /**
@@ -331,6 +342,10 @@ export function classifyStatement(sql: string): StatementKind {
   if (READ_PREFIX.test(sql)) return "read";
   // Unknown statement — default to "write" so we don't hide effects in
   // edge cases (e.g. dialect-specific statements we haven't listed above).
+  // Emit a debug line so dialect-specific additions are discoverable.
+  log.debug(
+    `[parcae] unknown statement kind, counting as write: ${sql.slice(0, 120)}`,
+  );
   return "write";
 }
 

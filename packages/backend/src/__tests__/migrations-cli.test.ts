@@ -156,9 +156,13 @@ describe("argv parser", () => {
 // ─── migrate:make ───────────────────────────────────────────────────────────
 
 describe("migrate:make", () => {
+  // Tests write to /tmp (outside the cwd-based guard in make.ts); opt in with
+  // --allow-outside-cwd for the harness to reflect what CI would do.
+  const outsideCwd = { "allow-outside-cwd": true } as const;
+
   it("creates a timestamped migration file with a stub body", async () => {
     const dir = tempMigrationsDir();
-    const result = await runMake(["rename-types"], { dir });
+    const result = await runMake(["rename-types"], { dir, ...outsideCwd });
     expect(result.data.path).toMatch(/\d{14}-rename-types\.ts$/);
     expect(existsSync(result.data.path)).toBe(true);
 
@@ -171,20 +175,27 @@ describe("migrate:make", () => {
   it("creates the migrations directory if missing", async () => {
     const parent = mkdtempSync(join(tmpdir(), "parcae-make-"));
     const dir = join(parent, "nested", "migrations");
-    const result = await runMake(["x"], { dir });
+    const result = await runMake(["x"], { dir, ...outsideCwd });
     expect(existsSync(dir)).toBe(true);
     expect(existsSync(result.data.path)).toBe(true);
   });
 
   it("rejects empty slugs", async () => {
     const dir = tempMigrationsDir();
-    await expect(runMake(["!!!"], { dir })).rejects.toThrow(
-      /slugifies to empty/,
-    );
+    await expect(
+      runMake(["!!!"], { dir, ...outsideCwd }),
+    ).rejects.toThrow(/slugifies to empty/);
   });
 
   it("requires a name", async () => {
     await expect(runMake([], {})).rejects.toThrow(/Usage/);
+  });
+
+  it("refuses --dir outside cwd by default (path-traversal guard)", async () => {
+    const dir = tempMigrationsDir();
+    await expect(runMake(["x"], { dir })).rejects.toThrow(
+      /refusing to write outside cwd/,
+    );
   });
 });
 

@@ -12,36 +12,46 @@
 
 import type { Knex } from "knex";
 import { log } from "../../logger";
+import {
+  classifyStatement,
+} from "../../adapters/migration-meta";
 import type {
   MigrationContext,
   MigrationEntry,
 } from "../../routing/migration";
-import { bootstrap, readApplied, type CliRuntime } from "../runtime";
+import { readApplied, type CliRuntime } from "../runtime";
+import { withRuntime } from "../with-runtime";
 import { renderList, type CommandResult } from "../output";
 
 export interface PlanResult {
-  migration: string | null;
-  statements: string[];
+  readonly migration: string | null;
+  readonly statements: readonly string[];
   /** True when the next pending migration is non-transactional (skipped). */
-  skipped: boolean;
-  skipReason?: string;
+  readonly skipped: boolean;
+  readonly skipReason?: string;
 }
 
-class RollbackMarker extends Error {}
+/**
+ * Unique Symbol we stamp on the error thrown to force the transaction to roll
+ * back. `err instanceof X` is fragile across Knex/pg's error-wrapping layers;
+ * a Symbol property survives wrapping because it's a non-enumerable own
+ * property, not bound to a prototype chain.
+ */
+const ROLLBACK_TAG: unique symbol = Symbol("parcae-plan-rollback");
+function isRollbackSentinel(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { [ROLLBACK_TAG]?: true })[ROLLBACK_TAG] === true
+  );
+}
 
 export async function run(
   _positional: readonly string[],
   flags: Record<string, string | boolean>,
   runtime?: CliRuntime,
 ): Promise<CommandResult<PlanResult>> {
-  const rt =
-    runtime ??
-    (await bootstrap({
-      dir: typeof flags.dir === "string" ? flags.dir : undefined,
-      db: typeof flags.db === "string" ? flags.db : undefined,
-    }));
-  const ownsRuntime = runtime === undefined;
-  try {
+  return withRuntime(flags, runtime, async (rt) => {
     const applied = await readApplied(rt.db, rt.tableName);
     const next = rt.entries.find((e) => !applied.has(e.name));
 
@@ -76,9 +86,7 @@ export async function run(
       text,
       data: { migration: next.name, statements, skipped: false },
     };
-  } finally {
-    if (ownsRuntime) await rt.close();
-  }
+  });
 }
 
 /**
@@ -102,24 +110,20 @@ async function captureSql(
       trx.on("query", listener);
       const ctx: MigrationContext = { db: trx, engine, log };
       await entry.up(ctx);
-      throw new RollbackMarker();
+      const sentinel: { [ROLLBACK_TAG]: true } & Error = Object.assign(
+        new Error("parcae: planned rollback"),
+        { [ROLLBACK_TAG]: true as const },
+      );
+      throw sentinel;
     });
   } catch (err) {
-    if (!(err instanceof RollbackMarker)) {
+    if (!isRollbackSentinel(err)) {
       throw err;
     }
   }
 
   // Filter out the transaction's own BEGIN/COMMIT/ROLLBACK boilerplate — the
-  // user only cares about the migration's statements.
-  return statements.filter((s) => {
-    const trimmed = s.trim().toUpperCase();
-    return !(
-      trimmed === "BEGIN" ||
-      trimmed === "COMMIT" ||
-      trimmed === "ROLLBACK" ||
-      trimmed.startsWith("BEGIN;") ||
-      trimmed.startsWith("ROLLBACK;")
-    );
-  });
+  // user only cares about the migration's statements. Reuse the same
+  // classifier the runner uses to avoid maintaining a parallel noise list.
+  return statements.filter((s) => classifyStatement(s) !== "noise");
 }

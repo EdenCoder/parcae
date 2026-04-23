@@ -4,18 +4,28 @@
  * Errors loudly if any migration in the last batch lacks a `down` handler —
  * we don't silently skip because that'd leave the app in an inconsistent
  * state (some rolled back, some not).
+ *
+ * Safety rails:
+ *   - `--dry-run` prints what would be reversed and returns without running.
+ *   - When stdin is a TTY and `--yes` wasn't passed, prompts the operator to
+ *     confirm with the list of migrations that will roll back.
+ *   - In `--json` mode, `--yes` is required when writing — non-interactive
+ *     scripts must opt in explicitly.
  */
 
+import { createInterface } from "node:readline/promises";
 import { ParcaeMigrationSource } from "../../adapters/migrations";
 import {
   readMetaRows,
   verifyChecksums,
 } from "../../adapters/migration-meta";
-import { bootstrap, type CliRuntime } from "../runtime";
+import type { CliRuntime } from "../runtime";
+import { withRuntime } from "../with-runtime";
 import type { CommandResult } from "../output";
 
 export interface RollbackResult {
-  rolledBack: string[];
+  readonly rolledBack: readonly string[];
+  readonly dryRun: boolean;
 }
 
 export async function run(
@@ -23,19 +33,17 @@ export async function run(
   flags: Record<string, string | boolean>,
   runtime?: CliRuntime,
 ): Promise<CommandResult<RollbackResult>> {
-  const rt =
-    runtime ??
-    (await bootstrap({
-      dir: typeof flags.dir === "string" ? flags.dir : undefined,
-      db: typeof flags.db === "string" ? flags.db : undefined,
-    }));
-  const ownsRuntime = runtime === undefined;
-  try {
-    // Determine which migrations are in the last batch — that's what a
-    // rollback will reverse.
+  const dryRun = flags["dry-run"] === true;
+  const confirmed = flags.yes === true;
+  const json = flags.json === true;
+
+  return withRuntime(flags, runtime, async (rt) => {
     const hasTable = await rt.db.schema.hasTable(rt.tableName);
     if (!hasTable) {
-      return { text: "Nothing to roll back — no migrations applied.", data: { rolledBack: [] } };
+      return {
+        text: "Nothing to roll back — no migrations applied.",
+        data: { rolledBack: [], dryRun },
+      };
     }
 
     const rows = await rt.db<{ name: string; batch: number }>(rt.tableName)
@@ -44,11 +52,16 @@ export async function run(
       .orderBy("id", "desc");
 
     if (rows.length === 0) {
-      return { text: "Nothing to roll back — no migrations applied.", data: { rolledBack: [] } };
+      return {
+        text: "Nothing to roll back — no migrations applied.",
+        data: { rolledBack: [], dryRun },
+      };
     }
 
     const lastBatch = rows[0]!.batch;
-    const lastBatchNames = rows.filter((r) => r.batch === lastBatch).map((r) => r.name);
+    const lastBatchNames = rows
+      .filter((r) => r.batch === lastBatch)
+      .map((r) => r.name);
 
     // Validate every last-batch migration has a down() handler before starting.
     const registered = new Map(rt.entries.map((e) => [e.name, e]));
@@ -81,6 +94,35 @@ export async function run(
     const meta = await readMetaRows(rt.db);
     verifyChecksums(rt.entries, meta, allowDrift);
 
+    if (dryRun) {
+      return {
+        text:
+          `Would roll back ${lastBatchNames.length} migration(s) (dry run):\n` +
+          lastBatchNames.map((n) => `  • ${n}`).join("\n"),
+        data: { rolledBack: lastBatchNames, dryRun: true },
+      };
+    }
+
+    // Confirmation gate. JSON mode requires `--yes` explicitly (no TTY
+    // prompt possible from scripts). Interactive TTYs without `--yes` prompt.
+    if (!confirmed) {
+      if (json) {
+        throw new Error(
+          `[parcae] --json rollback requires --yes to confirm. Would reverse: ` +
+            lastBatchNames.join(", "),
+        );
+      }
+      if (process.stdin.isTTY) {
+        const proceed = await promptConfirm(lastBatchNames);
+        if (!proceed) {
+          return {
+            text: "Rollback cancelled.",
+            data: { rolledBack: [], dryRun: false },
+          };
+        }
+      }
+    }
+
     const source = new ParcaeMigrationSource(rt.entries, rt.engine);
     const result = (await rt.db.migrate.rollback(
       {
@@ -98,9 +140,24 @@ export async function run(
           ? "Nothing was rolled back."
           : `Rolled back ${rolledBack.length} migration(s):\n` +
             rolledBack.map((n) => `  • ${n}`).join("\n"),
-      data: { rolledBack },
+      data: { rolledBack, dryRun: false },
     };
+  });
+}
+
+async function promptConfirm(names: readonly string[]): Promise<boolean> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const list = names.map((n) => `  - ${n}`).join("\n");
+    const answer = (
+      await rl.question(
+        `About to roll back ${names.length} migration(s):\n${list}\n\nContinue? [y/N] `,
+      )
+    )
+      .trim()
+      .toLowerCase();
+    return answer === "y" || answer === "yes";
   } finally {
-    if (ownsRuntime) await rt.close();
+    rl.close();
   }
 }

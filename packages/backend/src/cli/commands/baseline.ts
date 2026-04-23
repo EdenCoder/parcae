@@ -10,13 +10,14 @@
 import type { Knex } from "knex";
 import { META_TABLE, sha256File } from "../../adapters/migration-meta";
 import type { MigrationEntry } from "../../routing/migration";
-import { bootstrap, readApplied, type CliRuntime } from "../runtime";
+import { readApplied, type CliRuntime } from "../runtime";
+import { withRuntime } from "../with-runtime";
 import type { CommandResult } from "../output";
 
 export interface BaselineResult {
-  stamped: string[];
-  alreadyApplied: string[];
-  dryRun: boolean;
+  readonly stamped: readonly string[];
+  readonly alreadyApplied: readonly string[];
+  readonly dryRun: boolean;
 }
 
 export async function run(
@@ -34,14 +35,7 @@ export async function run(
   }
 
   const dryRun = flags["dry-run"] === true;
-  const rt =
-    runtime ??
-    (await bootstrap({
-      dir: typeof flags.dir === "string" ? flags.dir : undefined,
-      db: typeof flags.db === "string" ? flags.db : undefined,
-    }));
-  const ownsRuntime = runtime === undefined;
-  try {
+  return withRuntime(flags, runtime, async (rt) => {
     const applied = await readApplied(rt.db, rt.tableName);
 
     const candidates = rt.entries.filter((e) => e.name.localeCompare(target) <= 0);
@@ -105,9 +99,7 @@ export async function run(
         dryRun: false,
       },
     };
-  } finally {
-    if (ownsRuntime) await rt.close();
-  }
+  });
 }
 
 /**

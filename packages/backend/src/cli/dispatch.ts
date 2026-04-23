@@ -74,9 +74,14 @@ export async function dispatch(parsed: ParsedArgs): Promise<void> {
 
   const handler = commands[command];
   if (!handler) {
-    const suggestions = Object.keys(commands)
-      .filter((k) => k.includes(command))
-      .slice(0, 3);
+    const keys = Object.keys(commands);
+    // Prefer prefix matches ("migrate:stat" → "migrate:status"); fall back to
+    // substring only if nothing starts with what the user typed. Substring
+    // alone matches everything for a query like "migrate".
+    let suggestions = keys.filter((k) => k.startsWith(command)).slice(0, 3);
+    if (suggestions.length === 0) {
+      suggestions = keys.filter((k) => k.includes(command)).slice(0, 3);
+    }
     const hint =
       suggestions.length > 0
         ? `Did you mean: ${suggestions.join(", ")}?\n\n`

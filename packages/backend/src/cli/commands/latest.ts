@@ -4,12 +4,13 @@
  */
 
 import { runMigrations } from "../../adapters/migrations";
-import { bootstrap, type CliRuntime } from "../runtime";
+import type { CliRuntime } from "../runtime";
+import { withRuntime } from "../with-runtime";
 import type { CommandResult } from "../output";
 
 export interface LatestResult {
-  applied: string[];
-  total: number;
+  readonly applied: readonly string[];
+  readonly total: number;
 }
 
 export async function run(
@@ -17,14 +18,7 @@ export async function run(
   flags: Record<string, string | boolean>,
   runtime?: CliRuntime,
 ): Promise<CommandResult<LatestResult>> {
-  const rt =
-    runtime ??
-    (await bootstrap({
-      dir: typeof flags.dir === "string" ? flags.dir : undefined,
-      db: typeof flags.db === "string" ? flags.db : undefined,
-    }));
-  const ownsRuntime = runtime === undefined;
-  try {
+  return withRuntime(flags, runtime, async (rt) => {
     const result = await runMigrations({
       db: rt.db,
       entries: rt.entries,
@@ -39,7 +33,5 @@ export async function run(
           result.applied.map((n) => `  • ${n}`).join("\n");
 
     return { text, data: result };
-  } finally {
-    if (ownsRuntime) await rt.close();
-  }
+  });
 }

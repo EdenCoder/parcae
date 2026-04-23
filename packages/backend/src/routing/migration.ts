@@ -188,6 +188,8 @@ export function getMigrations(): MigrationEntry[] {
  * the file that was just imported — a sorted view breaks that correlation
  * because sort position is not insertion position. Not part of the public
  * API; prefer `getMigrations()` for anything user-facing.
+ *
+ * @internal
  */
 export function _getInsertionOrdered(): MigrationEntry[] {
   return registered;

@@ -6,13 +6,13 @@
  */
 
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { relative, resolve } from "node:path";
 import type { CommandResult } from "../output";
 import { slugify, timestamp } from "../runtime";
 
 export interface MakeResult {
-  path: string;
-  name: string;
+  readonly path: string;
+  readonly name: string;
 }
 
 export async function run(
@@ -38,6 +38,19 @@ export async function run(
   const dir = resolve(
     typeof flags.dir === "string" ? flags.dir : "./migrations",
   );
+  // Guard against typos or malicious --dir values resolving outside the cwd.
+  // The explicit `--allow-outside-cwd` escape hatch exists for legitimate
+  // cases (e.g. a monorepo where migrations live in a sibling package).
+  const cwd = process.cwd();
+  const rel = relative(cwd, dir);
+  const outside =
+    rel === "" ? false : rel.startsWith("..") || rel.startsWith("/");
+  if (outside && flags["allow-outside-cwd"] !== true) {
+    throw new Error(
+      `[parcae] refusing to write outside cwd — resolved --dir to ${dir} ` +
+        `(cwd: ${cwd}). Pass --allow-outside-cwd to override.`,
+    );
+  }
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
   const ts = timestamp();

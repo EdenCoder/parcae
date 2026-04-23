@@ -8,11 +8,12 @@ import {
   readMetaRows,
   type MigrationListing,
 } from "../../adapters/migration-meta";
-import { bootstrap, readApplied, type CliRuntime } from "../runtime";
+import { readApplied, type CliRuntime } from "../runtime";
+import { withRuntime } from "../with-runtime";
 import { renderTable, type CommandResult } from "../output";
 
 export interface ListResult {
-  migrations: MigrationListing[];
+  readonly migrations: readonly MigrationListing[];
 }
 
 export async function run(
@@ -20,14 +21,7 @@ export async function run(
   flags: Record<string, string | boolean>,
   runtime?: CliRuntime,
 ): Promise<CommandResult<ListResult>> {
-  const rt =
-    runtime ??
-    (await bootstrap({
-      dir: typeof flags.dir === "string" ? flags.dir : undefined,
-      db: typeof flags.db === "string" ? flags.db : undefined,
-    }));
-  const ownsRuntime = runtime === undefined;
-  try {
+  return withRuntime(flags, runtime, async (rt) => {
     const [applied, meta] = await Promise.all([
       readApplied(rt.db, rt.tableName),
       readMetaRows(rt.db),
@@ -51,7 +45,5 @@ export async function run(
           );
 
     return { text, data: { migrations: listing } };
-  } finally {
-    if (ownsRuntime) await rt.close();
-  }
+  });
 }
