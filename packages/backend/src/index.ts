@@ -122,16 +122,22 @@ export {
   META_TABLE,
   MigrationChecksumError,
   buildListing,
+  classifyStatement,
+  effectFromMeta,
+  effectLabel,
   ensureMetaTable,
+  extractRowCount,
   readMetaRows,
   sha256File,
   verifyChecksums,
   writeMetaRow,
 } from "./adapters/migration-meta";
 export type {
+  MigrationEffect,
   MigrationListing,
   MigrationMetaRow,
   MigrationState,
+  StatementKind,
 } from "./adapters/migration-meta";
 
 export { detectEngine } from "./adapters/engine";

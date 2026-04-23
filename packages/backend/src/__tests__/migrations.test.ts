@@ -13,6 +13,7 @@ import {
   ParcaeMigrationSource,
   runMigrations,
 } from "../adapters/migrations";
+import { ensureMetaTable } from "../adapters/migration-meta";
 import {
   clearMigrations,
   getMigrations,
@@ -132,14 +133,7 @@ describe("ParcaeMigrationSource", () => {
       const content = await source.getMigration(entry);
 
       // Meta table must exist for the up() wrapper's insert to succeed.
-      await db.schema.createTable("parcae_migration_meta", (t) => {
-        t.string("name").primary();
-        t.string("checksum").notNullable();
-        t.text("description").nullable();
-        t.string("ticket").nullable();
-        t.integer("durationMs").notNullable();
-        t.string("appliedAt").notNullable();
-      });
+      await ensureMetaTable(db);
 
       await content.up(db);
       expect(capturedCtx).not.toBeNull();
@@ -335,6 +329,98 @@ describe("runMigrations", () => {
     await expect(
       runMigrations({ db, entries, engine: "sqlite" }),
     ).rejects.toThrow(/duplicate/);
+  });
+
+  it("records effect: read-only migration writes writes=0, rowsAffected=0", async () => {
+    migration("001-probe-only", async ({ db }) => {
+      // Only probes — simulates Freia's idempotent `SELECT FROM information_schema` guard
+      const r = await db.raw("SELECT 1 AS n");
+      void r;
+    });
+
+    await runMigrations({
+      db,
+      entries: getMigrations(),
+      engine: "sqlite",
+    });
+
+    const rows = await db("parcae_migration_meta").select("*");
+    expect(rows[0]!.writes).toBe(0);
+    expect(rows[0]!.rowsAffected).toBe(0);
+  });
+
+  it("records effect: DDL-only migration has writes>0 but rowsAffected=0", async () => {
+    migration("001-ddl-only", async ({ db }) => {
+      await db.schema.createTable("effect_ddl", (t) => t.string("id").primary());
+    });
+
+    await runMigrations({
+      db,
+      entries: getMigrations(),
+      engine: "sqlite",
+    });
+
+    const rows = await db("parcae_migration_meta").select("*");
+    expect(rows[0]!.writes).toBeGreaterThan(0);
+    expect(rows[0]!.rowsAffected).toBe(0);
+  });
+
+  it("records effect: data migration counts rowsAffected", async () => {
+    await db.schema.createTable("effect_data", (t) => {
+      t.string("id").primary();
+      t.string("name");
+    });
+    await db("effect_data").insert([
+      { id: "a", name: "old" },
+      { id: "b", name: "old" },
+      { id: "c", name: "keep" },
+    ]);
+
+    migration("001-update-rows", async ({ db }) => {
+      await db("effect_data").where({ name: "old" }).update({ name: "new" });
+    });
+
+    await runMigrations({
+      db,
+      entries: getMigrations(),
+      engine: "sqlite",
+    });
+
+    const rows = await db("parcae_migration_meta").select("*");
+    expect(rows[0]!.writes).toBe(1);
+    expect(rows[0]!.rowsAffected).toBe(2); // only "old" rows updated
+  });
+
+  it("effect counters are scoped per migration — no cross-contamination", async () => {
+    await db.schema.createTable("effect_iso", (t) => {
+      t.string("id").primary();
+      t.string("tag");
+    });
+
+    migration("001-seed", async ({ db }) => {
+      await db("effect_iso").insert([
+        { id: "a", tag: "x" },
+        { id: "b", tag: "x" },
+      ]);
+    });
+    migration("002-noop", async ({ db }) => {
+      // Probe only
+      await db("effect_iso").count("* as n").first();
+    });
+
+    await runMigrations({
+      db,
+      entries: getMigrations(),
+      engine: "sqlite",
+    });
+
+    const rows = await db("parcae_migration_meta").select("*").orderBy("name");
+    expect(rows[0]!.name).toBe("001-seed");
+    expect(rows[0]!.writes).toBe(1);
+    expect(rows[0]!.rowsAffected).toBe(2);
+    expect(rows[1]!.name).toBe("002-noop");
+    expect(rows[1]!.writes).toBe(0);
+    expect(rows[1]!.rowsAffected).toBe(0);
   });
 
   it("passes engine through to migration context", async () => {

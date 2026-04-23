@@ -153,7 +153,12 @@ async function stampAsApplied(
           checksum: sha256File(e.path),
           description: e.description,
           ticket: e.ticket,
+          // durationMs=0, writes=0, rowsAffected=0 together flag this as a
+          // baselined entry (never executed). `effectFromMeta` picks up on
+          // that combination and labels it "baseline" in `migrate:list`.
           durationMs: 0,
+          writes: 0,
+          rowsAffected: 0,
           appliedAt: appliedAt.toISOString(),
         })),
       )

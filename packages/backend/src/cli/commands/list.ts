@@ -4,6 +4,7 @@
 
 import {
   buildListing,
+  effectLabel,
   readMetaRows,
   type MigrationListing,
 } from "../../adapters/migration-meta";
@@ -37,12 +38,13 @@ export async function run(
       listing.length === 0
         ? "(no migrations)"
         : renderTable(
-            ["name", "state", "ticket", "duration", "applied", "description"],
+            ["name", "state", "effect", "duration", "ticket", "applied", "description"],
             listing.map((m) => [
               m.name,
               m.state,
-              m.ticket,
+              effectLabel(m.effect) || null,
               m.durationMs != null ? `${m.durationMs}ms` : null,
+              m.ticket,
               m.appliedAt,
               m.description,
             ]),

@@ -24,7 +24,11 @@ import type {
   MigrationEntry,
 } from "../routing/migration";
 import {
+  classifyStatement,
+  effectFromMeta,
+  effectLabel,
   ensureMetaTable,
+  extractRowCount,
   readMetaRows,
   sha256File,
   verifyChecksums,
@@ -81,10 +85,54 @@ export class ParcaeMigrationSource
     return Promise.resolve({
       config: { transaction: entry.transaction },
       up: async (knex: Knex): Promise<void> => {
+        // Attach an effect counter before running the user's up(). We listen
+        // for every statement Knex executes through this (possibly
+        // transactional) handle, classify it, and sum any row counts. The
+        // result tells us what the migration ACTUALLY did — a read-only
+        // migration differs meaningfully from one that wrote N rows.
+        let writes = 0;
+        let rowsAffected = 0;
+        const sqlById = new Map<string, string>();
+
+        const onQuery = (q: { __knexQueryUid?: string; sql?: string }) => {
+          if (!q.sql || !q.__knexQueryUid) return;
+          sqlById.set(q.__knexQueryUid, q.sql);
+        };
+        const onResponse = (
+          response: unknown,
+          q: {
+            __knexQueryUid?: string;
+            sql?: string;
+            response?: unknown;
+            context?: unknown;
+          },
+        ) => {
+          const sql =
+            (q.__knexQueryUid && sqlById.get(q.__knexQueryUid)) || q.sql || "";
+          if (!sql) return;
+          const kind = classifyStatement(sql);
+          if (kind === "noise" || kind === "read") return;
+          writes += 1;
+          // Prefer the raw driver response (q.response / q.context) set by the
+          // dialect's _query before Knex's post-processing — it's consistent
+          // across pg + sqlite for DML row counts. Fall back to the
+          // post-processed response for SQLite's "update returns plain N" path.
+          const rc = extractRowCount(response, q.response ?? q.context, sql);
+          if (typeof rc === "number" && rc > 0) rowsAffected += rc;
+        };
+
+        knex.on("query", onQuery);
+        knex.on("query-response", onResponse);
+
         const ctx: MigrationContext = { db: knex, engine, log };
         const started = performance.now();
-        await entry.up(ctx);
-        const durationMs = Math.round(performance.now() - started);
+        try {
+          await entry.up(ctx);
+        } finally {
+          knex.removeListener("query", onQuery);
+          knex.removeListener("query-response", onResponse);
+        }
+        const durationMs = Math.max(1, Math.round(performance.now() - started));
 
         const row: MigrationMetaRow = {
           name: entry.name,
@@ -92,6 +140,8 @@ export class ParcaeMigrationSource
           description: entry.description,
           ticket: entry.ticket,
           durationMs,
+          writes,
+          rowsAffected,
           appliedAt: new Date().toISOString(),
         };
         // `knex` here is either a plain connection or a transactional handle —
@@ -196,12 +246,16 @@ export async function runMigrations(
   if (applied.length === 0) {
     log.info(`Migrations up to date — ${total} total, 0 applied`);
   } else {
-    const durationByName = await readMetaRows(opts.db);
+    const postMeta = await readMetaRows(opts.db);
     for (const name of applied) {
-      const ms = durationByName.get(name)?.durationMs;
-      log.success(
-        `Applied migration: ${name}${ms !== undefined ? ` (${ms}ms)` : ""}`,
-      );
+      const row = postMeta.get(name);
+      const ms = row?.durationMs;
+      const effect = effectLabel(effectFromMeta(row));
+      const parts: string[] = [];
+      if (ms !== undefined) parts.push(`${ms}ms`);
+      if (effect) parts.push(effect);
+      const suffix = parts.length > 0 ? ` (${parts.join(", ")})` : "";
+      log.success(`Applied migration: ${name}${suffix}`);
     }
     log.info(
       `Migrations complete — ${applied.length} applied, ${total - applied.length} already up to date`,

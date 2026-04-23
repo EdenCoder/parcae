@@ -29,6 +29,18 @@ export interface MigrationMetaRow {
   description: string | null;
   ticket: string | null;
   durationMs: number;
+  /**
+   * Count of non-SELECT statements the migration executed (ALTER, INSERT,
+   * UPDATE, DELETE, DROP, CREATE, etc). `0` means the migration only
+   * probed — classic read-only no-op. See `classifyStatement`.
+   */
+  writes: number;
+  /**
+   * Sum of `rowCount` across every DML statement in the migration. `0` means
+   * either nothing matched (zero-row UPDATE/DELETE/INSERT) or only DDL ran,
+   * which doesn't carry a row count.
+   */
+  rowsAffected: number;
   appliedAt: string; // ISO 8601
 }
 
@@ -36,18 +48,37 @@ export interface MigrationMetaRow {
  * Create the meta table if it doesn't exist. Idempotent — safe to call on
  * every boot. Uses Knex's `hasTable` for cross-engine compatibility (SQLite,
  * Postgres, AlloyDB).
+ *
+ * Applies additive column upgrades for older DBs that already have the
+ * table but predate newer columns (`writes`, `rowsAffected`). Existing rows
+ * get `0` defaults for both — correct for "applied, effect unknown".
  */
 export async function ensureMetaTable(db: Knex): Promise<void> {
-  if (await db.schema.hasTable(META_TABLE)) return;
-  await db.schema.createTable(META_TABLE, (t) => {
-    t.string("name", 512).primary();
-    t.string("checksum", 64).notNullable(); // sha256 hex = 64 chars
-    t.text("description").nullable();
-    t.string("ticket", 128).nullable();
-    t.integer("durationMs").notNullable();
-    // ISO string — portable across SQLite (TEXT) and Postgres (timestamp)
-    t.string("appliedAt", 32).notNullable();
-  });
+  if (!(await db.schema.hasTable(META_TABLE))) {
+    await db.schema.createTable(META_TABLE, (t) => {
+      t.string("name", 512).primary();
+      t.string("checksum", 64).notNullable(); // sha256 hex = 64 chars
+      t.text("description").nullable();
+      t.string("ticket", 128).nullable();
+      t.integer("durationMs").notNullable();
+      t.integer("writes").notNullable().defaultTo(0);
+      t.integer("rowsAffected").notNullable().defaultTo(0);
+      // ISO string — portable across SQLite (TEXT) and Postgres (timestamp)
+      t.string("appliedAt", 32).notNullable();
+    });
+    return;
+  }
+  // Additive upgrade — add newer columns to an existing meta table.
+  if (!(await db.schema.hasColumn(META_TABLE, "writes"))) {
+    await db.schema.alterTable(META_TABLE, (t) => {
+      t.integer("writes").notNullable().defaultTo(0);
+    });
+  }
+  if (!(await db.schema.hasColumn(META_TABLE, "rowsAffected"))) {
+    await db.schema.alterTable(META_TABLE, (t) => {
+      t.integer("rowsAffected").notNullable().defaultTo(0);
+    });
+  }
 }
 
 /**
@@ -167,6 +198,25 @@ export function verifyChecksums(
  */
 export type MigrationState = "applied" | "pending" | "orphan" | "drift";
 
+/**
+ * Human-readable summary of what a migration actually did when it ran, used
+ * by `migrate:list` and friends. Derived from `(writes, rowsAffected)`.
+ *
+ *   read-only      → writes == 0 — migration only probed, skipped any writes
+ *   no rows        → writes > 0  but rowsAffected == 0 — DDL ran (or DML
+ *                    matched zero rows); structurally possible no-op at the
+ *                    data level
+ *   N rows         → rowsAffected > 0 — real data changes
+ *   baseline       → stamped via `migrate:baseline`, never executed
+ *   unknown        → applied but meta row predates effect tracking
+ */
+export type MigrationEffect =
+  | { kind: "read-only" }
+  | { kind: "no rows"; writes: number }
+  | { kind: "rows"; rows: number; writes: number }
+  | { kind: "baseline" }
+  | { kind: "unknown" };
+
 export interface MigrationListing {
   name: string;
   state: MigrationState;
@@ -175,6 +225,126 @@ export interface MigrationListing {
   durationMs: number | null;
   appliedAt: string | null;
   path: string | null;
+  effect: MigrationEffect | null;
+}
+
+/** One-line human label for a MigrationEffect, used by CLI output. */
+export function effectLabel(effect: MigrationEffect | null): string {
+  if (!effect) return "";
+  switch (effect.kind) {
+    case "read-only":
+      return "read-only";
+    case "no rows":
+      return "no rows changed";
+    case "rows":
+      return effect.rows === 1 ? "1 row" : `${effect.rows} rows`;
+    case "baseline":
+      return "baseline";
+    case "unknown":
+      return "unknown";
+  }
+}
+
+/**
+ * Extract a MigrationEffect from a meta row. A meta row with a durationMs
+ * of exactly 0 AND writes=0 AND rowsAffected=0 is interpreted as a baseline
+ * entry (stamped via `migrate:baseline`, never run). Otherwise the
+ * writes/rowsAffected numbers drive the classification.
+ */
+export function effectFromMeta(
+  row: MigrationMetaRow | undefined,
+): MigrationEffect | null {
+  if (!row) return null;
+  // Baselines are stamped with durationMs=0; any real run takes at least
+  // 1ms end-to-end by the time we round().
+  if (row.durationMs === 0 && row.writes === 0 && row.rowsAffected === 0) {
+    return { kind: "baseline" };
+  }
+  if (row.writes === 0) return { kind: "read-only" };
+  if (row.rowsAffected === 0) return { kind: "no rows", writes: row.writes };
+  return { kind: "rows", rows: row.rowsAffected, writes: row.writes };
+}
+
+// ── Statement classifier ──────────────────────────────────────────────────
+
+const WRITE_PREFIX =
+  /^\s*(INSERT|UPDATE|DELETE|MERGE|ALTER|CREATE|DROP|TRUNCATE|VACUUM|REINDEX|COMMENT|GRANT|REVOKE|ANALYZE|REFRESH|CLUSTER|LOCK)\b/i;
+
+const READ_PREFIX = /^\s*(SELECT|WITH|VALUES|SHOW|EXPLAIN|PRAGMA|DESC|DESCRIBE)\b/i;
+
+const NOISE_PREFIX =
+  /^\s*(BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE|SET|RESET|DEALLOCATE|DISCARD|LISTEN|UNLISTEN|NOTIFY|START TRANSACTION)\b/i;
+
+export type StatementKind = "write" | "read" | "noise";
+
+/** Classify a raw SQL statement by its leading keyword. */
+export function classifyStatement(sql: string): StatementKind {
+  if (NOISE_PREFIX.test(sql)) return "noise";
+  if (WRITE_PREFIX.test(sql)) return "write";
+  if (READ_PREFIX.test(sql)) return "read";
+  // Unknown statement — default to "write" so we don't hide effects in
+  // edge cases (e.g. dialect-specific statements we haven't listed above).
+  return "write";
+}
+
+/**
+ * Pluck a row count from a Knex `query-response` event payload.
+ *
+ * Shapes we need to handle:
+ *
+ *   pg DML           — response `{ rowCount: N, rows, command }` (via obj.response)
+ *   pg post-process  — same as above
+ *   sqlite update    — response is a plain `N` (sqlite processResponse collapses
+ *                      update/del/counter into `ctx.changes`)
+ *   sqlite insert    — response is `[lastID]` (1-element array → 1 row)
+ *   sqlite raw       — response is `{ changes, lastInsertRowid }` (obj.response)
+ *   sqlite DDL       — response is `undefined`
+ *   SELECT           — response is an array of rows OR plain rows
+ *
+ * Rather than probe all those variants from a single arg, we accept both the
+ * post-processed response AND the raw `obj.response` (set by the dialect's
+ * `_query` before `processResponse`). The raw response is consistent enough
+ * across dialects to extract a row count reliably; the post-processed value
+ * is a fallback.
+ *
+ * Returns `null` when the count can't be determined — which the caller must
+ * distinguish from `0` ("DDL or unknown, don't sum").
+ */
+export function extractRowCount(
+  postProcessed: unknown,
+  raw?: unknown,
+  sql?: string,
+): number | null {
+  // Try the raw driver response first — it's the most consistent source.
+  const fromRaw = readRowCount(raw);
+  if (fromRaw !== null) return fromRaw;
+  // Fall back to the post-processed response for SQLite's UPDATE/DEL (plain
+  // number) and INSERT ([lastID]) shapes.
+  if (typeof postProcessed === "number") return postProcessed;
+  if (
+    Array.isArray(postProcessed) &&
+    sql &&
+    /^\s*INSERT\b/i.test(sql)
+  ) {
+    // SQLite insert returns [lastInsertRowId] — so every element is one row.
+    return postProcessed.length;
+  }
+  return readRowCount(postProcessed);
+}
+
+function readRowCount(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number") return value;
+  if (typeof value !== "object") return null;
+  const r = value as {
+    rowCount?: number | null;
+    changes?: number;
+    affectedRows?: number;
+  };
+  if (typeof r.rowCount === "number") return r.rowCount;
+  if (typeof r.changes === "number") return r.changes;
+  if (typeof r.affectedRows === "number") return r.affectedRows;
+  return null;
 }
 
 /**
@@ -205,6 +375,12 @@ export function buildListing(
     } else {
       state = "applied";
     }
+    const effect =
+      state === "pending"
+        ? null
+        : applied.has(entry.name) && !metaRow
+          ? { kind: "unknown" as const }
+          : effectFromMeta(metaRow);
     result.push({
       name: entry.name,
       state,
@@ -213,6 +389,7 @@ export function buildListing(
       durationMs: metaRow?.durationMs ?? null,
       appliedAt: metaRow?.appliedAt ?? null,
       path: entry.path,
+      effect,
     });
   }
 
@@ -229,6 +406,7 @@ export function buildListing(
       durationMs: metaRow?.durationMs ?? null,
       appliedAt: metaRow?.appliedAt ?? null,
       path: null,
+      effect: metaRow ? effectFromMeta(metaRow) : null,
     });
   }
 
