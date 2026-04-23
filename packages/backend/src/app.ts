@@ -38,6 +38,9 @@ import {
 } from "./services/context";
 import { getJobs } from "./routing/job";
 import { getHooks } from "./routing/hook";
+import { getMigrations } from "./routing/migration";
+import { runMigrations } from "./adapters/migrations";
+import { discoverMigrations } from "./adapters/migration-discovery";
 import type { AuthAdapter } from "./auth";
 import knex from "knex";
 
@@ -52,6 +55,12 @@ export interface AppConfig {
   hooks?: string;
   /** Jobs directory for auto-discovery. */
   jobs?: string;
+  /**
+   * Migrations directory for auto-discovery. Files are loaded at startup and
+   * self-register via `migration()`. Runs in lexicographic order, before
+   * `ensureAllTables()`. See routing/migration.ts for the full contract.
+   */
+  migrations?: string;
   /** Authentication adapter. Opt-in — omit to skip auth entirely. */
   auth?: AuthAdapter;
   /** API version prefix. Default: "v1" */
@@ -214,6 +223,18 @@ export function createApp(config: AppConfig): ParcaeApp {
           (result.cached ? " (cached)" : " (resolved)"),
       );
 
+      // ── Step 2.5: Discover migrations ───────────────────────────────
+      // Migrations live in their own directory and are discovered separately
+      // from controllers/hooks/jobs because they need to be registered
+      // before the DB connection opens (so we know how many exist) and run
+      // before ensureAllTables() (so renames happen before the additive
+      // pass creates parallel empty tables). Each entry is tagged with its
+      // source file path so checksum verification can detect drift later.
+      if (config.migrations) {
+        const discovered = await discoverMigrations(config.migrations);
+        log.info(`Discovered ${discovered.length} migration file(s)`);
+      }
+
       // ── Step 3: Connect database ───────────────────────────────────
       const useSqlite = isSqliteUrl(envConfig.DATABASE_URL);
 
@@ -300,6 +321,25 @@ export function createApp(config: AppConfig): ParcaeApp {
         });
 
         log.info("Auth enabled");
+      }
+
+      // ── Step 6.5: Run user migrations ──────────────────────────────
+      // Runs BEFORE ensureAllTables() so that renames/type-changes happen
+      // before the additive schema pass would otherwise create parallel
+      // empty tables next to legacy ones. Gated on ENSURE_SCHEMA for
+      // parity with Better Auth migrations and ensureAllTables below —
+      // operators who prefer out-of-band migration runs (via `parcae
+      // migrate:latest`) can disable.
+      if (ensureSchema) {
+        const migrations = getMigrations();
+        const allowChecksumDrift =
+          process.env.PARCAE_ALLOW_CHECKSUM_DRIFT === "true";
+        await runMigrations({
+          db: writeDb,
+          entries: migrations,
+          engine: adapter.engine,
+          allowChecksumDrift,
+        });
       }
 
       // ── Step 7: Ensure tables (additive migration) ─────────────────

@@ -90,6 +90,58 @@ export type {
   JobEntry,
 } from "./routing/job";
 
+export {
+  migration,
+  getMigrations,
+  clearMigrations,
+} from "./routing/migration";
+export type {
+  Engine,
+  MigrationContext,
+  MigrationHandler,
+  MigrationOptions,
+  MigrationEntry,
+} from "./routing/migration";
+
+export {
+  runMigrations,
+  ParcaeMigrationSource,
+  MIGRATIONS_TABLE,
+} from "./adapters/migrations";
+export type {
+  RunMigrationsOptions,
+  RunMigrationsResult,
+} from "./adapters/migrations";
+
+export {
+  discoverMigrations,
+  listMigrationFiles,
+} from "./adapters/migration-discovery";
+
+export {
+  META_TABLE,
+  MigrationChecksumError,
+  buildListing,
+  classifyStatement,
+  effectFromMeta,
+  effectLabel,
+  ensureMetaTable,
+  extractRowCount,
+  readMetaRows,
+  sha256File,
+  verifyChecksums,
+  writeMetaRow,
+} from "./adapters/migration-meta";
+export type {
+  MigrationEffect,
+  MigrationListing,
+  MigrationMetaRow,
+  MigrationState,
+  StatementKind,
+} from "./adapters/migration-meta";
+
+export { detectEngine } from "./adapters/engine";
+
 // Search
 export { searchAll } from "./search";
 export type { SearchResult, SearchAllOptions } from "./search";

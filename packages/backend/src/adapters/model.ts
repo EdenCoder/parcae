@@ -1,4 +1,5 @@
 import { log } from "../logger";
+import { detectEngine } from "./engine";
 
 /**
  * BackendAdapter — Knex + Postgres persistence for Parcae Model.
@@ -187,22 +188,7 @@ export class BackendAdapter implements ModelAdapter {
   async detectEngine(
     hint?: "sqlite",
   ): Promise<"alloydb" | "postgres" | "sqlite"> {
-    if (hint === "sqlite") {
-      this.engine = "sqlite";
-      log.info("Database engine detected: sqlite");
-      return this.engine;
-    }
-
-    try {
-      const { rows } = await this.write.raw(`
-        SELECT EXISTS (
-          SELECT 1 FROM pg_available_extensions WHERE name = 'alloydb_scann'
-        ) AS has_scann
-      `);
-      this.engine = rows[0]?.has_scann ? "alloydb" : "postgres";
-    } catch {
-      this.engine = "postgres";
-    }
+    this.engine = await detectEngine(this.write, hint);
     log.info(`Database engine detected: ${this.engine}`);
     return this.engine;
   }
