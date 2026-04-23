@@ -22,6 +22,26 @@
  * // With options
  * hook.after(Post, "patch", handler, { async: true, priority: 200 });
  * ```
+ *
+ * @example Compensating actions for external side effects via `ctx.onError`
+ *
+ * When a before-hook performs an external side effect (Clerk user create,
+ * S3 upload, Stripe subscription, etc.) and the subsequent save fails, the
+ * external resource would otherwise leak. Register a cleanup with
+ * `ctx.onError(fn)` co-located with the side effect. Cleanups run in LIFO
+ * order if any later before-hook, the DB write, or an after-hook throws.
+ * Cleanup failures are logged but never replace the original error.
+ *
+ * ```typescript
+ * hook.before(Patient, "create", async ({ model, onError }) => {
+ *   const clerkUser = await clerkClient.users.createUser({ ... });
+ *   onError(() => clerkClient.users.deleteUser(clerkUser.id));
+ *   model.id = clerkUser.id;
+ * });
+ * ```
+ *
+ * `onError` is a no-op when called from an `async: true` hook — those run
+ * outside the caller's error path, so compensation is meaningless there.
  */
 
 import type { ModelConstructor } from "@parcae/model";
@@ -46,6 +66,24 @@ export interface HookContext {
   enqueue: (name: string, data: any, opts?: any) => Promise<boolean>;
   /** The authenticated user (if any). */
   user?: { id: string; [key: string]: any } | null;
+  /**
+   * Register a compensating action for this operation. Runs in LIFO order if
+   * any later before-hook, the DB write, or an after-hook throws. Use this
+   * to roll back external side effects (Clerk users, S3 uploads, Stripe
+   * subscriptions, Slack messages, etc.) when a subsequent step fails.
+   *
+   * Errors from cleanups are logged but never replace the original error.
+   *
+   * No-op when called from a hook registered with `{ async: true }` — those
+   * run fire-and-forget, outside the caller's error path. A warning is
+   * logged in that case.
+   *
+   * Note: this primitive does NOT provide DB atomicity. The adapter's own
+   * INSERT/UPDATE/DELETE is not wrapped in a transaction, so DB writes
+   * from hooks are not rolled back. Use `onError` specifically for
+   * compensating external (non-DB) side effects.
+   */
+  onError: (fn: () => Promise<void> | void) => void;
 }
 
 export interface HookOptions {

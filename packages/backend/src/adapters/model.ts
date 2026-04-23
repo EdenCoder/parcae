@@ -358,19 +358,27 @@ export class BackendAdapter implements ModelAdapter {
       return;
     }
 
-    await this.runHooks(model, creating ? "create" : "save", "before");
+    const action = creating ? "create" : "save";
+    const cleanups: Array<() => Promise<void> | void> = [];
 
-    (model as any).updatedAt = new Date();
-    if (creating && !(model as any).createdAt) {
-      (model as any).createdAt = new Date();
+    try {
+      await this.runHooks(model, action, "before", { cleanups });
+
+      (model as any).updatedAt = new Date();
+      if (creating && !(model as any).createdAt) {
+        (model as any).createdAt = new Date();
+      }
+
+      const row = serialize(model);
+      await this.write(table).insert(row).onConflict("id").merge();
+
+      await this.runHooks(model, action, "after", { cleanups });
+    } catch (err) {
+      await this._runCleanups(cleanups, `${ModelClass.type}:${action}`);
+      throw err;
     }
 
-    const row = serialize(model);
-    await this.write(table).insert(row).onConflict("id").merge();
-
     log.info(`model saved model=${ModelClass.type}, id=${model.id}`);
-
-    await this.runHooks(model, creating ? "create" : "save", "after");
     this._notifyChange(model);
   }
 
@@ -379,10 +387,16 @@ export class BackendAdapter implements ModelAdapter {
   async remove(model: any): Promise<void> {
     const ModelClass = model.constructor as typeof Model;
     const table = tableName(ModelClass as unknown as ModelConstructor);
+    const cleanups: Array<() => Promise<void> | void> = [];
 
-    await this.runHooks(model, "remove", "before");
-    await this.write(table).where("id", model.id).del();
-    await this.runHooks(model, "remove", "after");
+    try {
+      await this.runHooks(model, "remove", "before", { cleanups });
+      await this.write(table).where("id", model.id).del();
+      await this.runHooks(model, "remove", "after", { cleanups });
+    } catch (err) {
+      await this._runCleanups(cleanups, `${ModelClass.type}:remove`);
+      throw err;
+    }
 
     this.pubsub?.emit?.(`delete+${ModelClass.type}:${model.id}`, model.__data);
     this._notifyChange(model);
@@ -904,7 +918,30 @@ export class BackendAdapter implements ModelAdapter {
       return;
     }
 
-    await this.runHooks(model, "patch", "before", { data: { ops } });
+    const cleanups: Array<() => Promise<void> | void> = [];
+
+    try {
+      await this._patchPostgres(model, ops, table, schema, cleanups);
+    } catch (err) {
+      await this._runCleanups(cleanups, `${ModelClass.type}:patch`);
+      throw err;
+    }
+
+    this._notifyChange(model);
+  }
+
+  private async _patchPostgres(
+    model: any,
+    ops: PatchOp[],
+    table: string,
+    schema: SchemaDefinition,
+    cleanups: Array<() => Promise<void> | void>,
+  ): Promise<void> {
+    const ModelClass = model.constructor as typeof Model;
+    await this.runHooks(model, "patch", "before", {
+      data: { ops },
+      cleanups,
+    });
 
     type ParsedOp = {
       op: PatchOp;
@@ -1062,8 +1099,10 @@ export class BackendAdapter implements ModelAdapter {
     }
 
     await this.write(table).where("id", model.id).update(updateFields);
-    await this.runHooks(model, "patch", "after", { data: { ops } });
-    this._notifyChange(model);
+    await this.runHooks(model, "patch", "after", {
+      data: { ops },
+      cleanups,
+    });
   }
 
   private _ensureIntermediates(
@@ -1092,8 +1131,33 @@ export class BackendAdapter implements ModelAdapter {
     table: string,
     schema: SchemaDefinition,
   ): Promise<void> {
-    await this.runHooks(model, "patch", "before", { data: { ops } });
+    const ModelClass = model.constructor as typeof Model;
+    const cleanups: Array<() => Promise<void> | void> = [];
 
+    try {
+      await this.runHooks(model, "patch", "before", {
+        data: { ops },
+        cleanups,
+      });
+      await this._patchSqliteBody(model, ops, table, schema);
+      await this.runHooks(model, "patch", "after", {
+        data: { ops },
+        cleanups,
+      });
+    } catch (err) {
+      await this._runCleanups(cleanups, `${ModelClass.type}:patch`);
+      throw err;
+    }
+
+    this._notifyChange(model);
+  }
+
+  private async _patchSqliteBody(
+    model: any,
+    ops: PatchOp[],
+    table: string,
+    schema: SchemaDefinition,
+  ): Promise<void> {
     // Read current row
     const row = await this.write(table).where("id", model.id).first();
     if (!row) throw new ClientError(`patch: row not found id=${model.id}`);
@@ -1153,8 +1217,6 @@ export class BackendAdapter implements ModelAdapter {
     }
 
     await this.write(table).where("id", model.id).update(updateFields);
-    await this.runHooks(model, "patch", "after", { data: { ops } });
-    this._notifyChange(model);
   }
 
   // ── Increment/Decrement ──────────────────────────────────────────────
@@ -1190,6 +1252,7 @@ export class BackendAdapter implements ModelAdapter {
     extra?: {
       data?: Record<string, any>;
       user?: { id: string; [key: string]: any } | null;
+      cleanups?: Array<() => Promise<void> | void>;
     },
   ): Promise<void> {
     const ModelClass = model.constructor as typeof Model;
@@ -1203,6 +1266,24 @@ export class BackendAdapter implements ModelAdapter {
     const user = extra?.user ?? getRequestUser() ?? undefined;
 
     for (const hookEntry of hooks) {
+      const isAsync = hookEntry.async;
+
+      const onError = (fn: () => Promise<void> | void) => {
+        if (isAsync) {
+          log.warn(
+            `[hook] ctx.onError() called inside async hook for ${hookEntry.modelType}:${action} — ignored (async hooks run outside the caller's error path)`,
+          );
+          return;
+        }
+        if (!extra?.cleanups) {
+          log.warn(
+            `[hook] ctx.onError() called outside a tracked operation for ${hookEntry.modelType}:${action} — ignored`,
+          );
+          return;
+        }
+        extra.cleanups.push(fn);
+      };
+
       const ctx = {
         model,
         action: action as HookAction,
@@ -1210,9 +1291,10 @@ export class BackendAdapter implements ModelAdapter {
         user,
         lock: globalLock,
         enqueue: globalEnqueue,
+        onError,
       };
 
-      if (hookEntry.async) {
+      if (isAsync) {
         Promise.resolve(hookEntry.handler(ctx)).catch((err) => {
           log.error(
             `[hook] Async error in ${hookEntry.modelType}:${action}:`,
@@ -1221,6 +1303,24 @@ export class BackendAdapter implements ModelAdapter {
         });
       } else {
         await hookEntry.handler(ctx);
+      }
+    }
+  }
+
+  /**
+   * Run compensating actions registered via `ctx.onError` in LIFO order.
+   * Called after a transaction rollback when an operation has failed.
+   * Cleanup errors are logged but never replace the caller's original error.
+   */
+  private async _runCleanups(
+    cleanups: Array<() => Promise<void> | void>,
+    label: string,
+  ): Promise<void> {
+    for (let i = cleanups.length - 1; i >= 0; i--) {
+      try {
+        await cleanups[i]!();
+      } catch (cleanupErr) {
+        log.error(`[parcae/onError] cleanup failed for ${label}:`, cleanupErr);
       }
     }
   }
