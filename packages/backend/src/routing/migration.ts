@@ -101,10 +101,11 @@
 
 import type { Knex } from "knex";
 import type { log as logger } from "../logger";
+import type { Engine as DbEngine } from "../adapters/engine";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-export type Engine = "alloydb" | "postgres" | "sqlite";
+export type Engine = DbEngine;
 
 export interface MigrationContext {
   /**
@@ -139,6 +140,17 @@ export interface MigrationOptions {
    * this migration throws — write a new compensating migration in production.
    */
   down?: MigrationHandler;
+  /**
+   * Human-readable description, surfaced in `parcae migrate:list`. Optional
+   * but recommended — a year from now your future self will thank you.
+   */
+  description?: string;
+  /**
+   * Ticket/PR reference (e.g. `FRE-303`, `#412`). Surfaced in
+   * `parcae migrate:list` so you can jump from a migration back to the context
+   * that produced it.
+   */
+  ticket?: string;
 }
 
 export interface MigrationEntry {
@@ -146,6 +158,15 @@ export interface MigrationEntry {
   up: MigrationHandler;
   down: MigrationHandler | null;
   transaction: boolean;
+  description: string | null;
+  ticket: string | null;
+  /**
+   * Absolute path to the migration file on disk. Set by the discovery helper
+   * (`discoverMigrations()`) and used to compute the checksum recorded in
+   * `parcae_migration_meta`. `null` for programmatically-registered migrations
+   * (e.g. unit tests) — checksum verification is skipped in that case.
+   */
+  path: string | null;
 }
 
 // ─── Global Migration Registry ───────────────────────────────────────────────
@@ -158,6 +179,18 @@ const registered: MigrationEntry[] = [];
  */
 export function getMigrations(): MigrationEntry[] {
   return [...registered].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Internal accessor returning the raw registry in insertion order.
+ *
+ * Used by the discovery helper to correlate newly-registered entries with
+ * the file that was just imported — a sorted view breaks that correlation
+ * because sort position is not insertion position. Not part of the public
+ * API; prefer `getMigrations()` for anything user-facing.
+ */
+export function _getInsertionOrdered(): MigrationEntry[] {
+  return registered;
 }
 
 export function clearMigrations(): void {
@@ -215,12 +248,28 @@ export function migration(
       `[parcae/migration] "${name}": options.down must be a function`,
     );
   }
+  if (
+    options.description !== undefined &&
+    typeof options.description !== "string"
+  ) {
+    throw new Error(
+      `[parcae/migration] "${name}": options.description must be a string`,
+    );
+  }
+  if (options.ticket !== undefined && typeof options.ticket !== "string") {
+    throw new Error(
+      `[parcae/migration] "${name}": options.ticket must be a string`,
+    );
+  }
 
   const entry: MigrationEntry = {
     name,
     up: handler,
     down: options.down ?? null,
     transaction: options.transaction ?? true,
+    description: options.description ?? null,
+    ticket: options.ticket ?? null,
+    path: null,
   };
   registered.push(entry);
   return entry;

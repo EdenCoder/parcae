@@ -6,22 +6,31 @@
  * by `migration()` calls, so Parcae migrations are plain TypeScript modules
  * rather than filesystem-convention scripts.
  *
- * What we get from Knex:
- *   - `parcae_migrations` table — one row per applied migration (name, batch,
- *     migration_time)
- *   - `parcae_migrations_lock` — serialises concurrent runs across replicas
- *     via SELECT ... FOR UPDATE
- *   - Per-migration transactions with per-migration opt-out
- *   - Validation that each migration has up() and down() functions
+ * On top of Knex's tracking (`parcae_migrations`) we maintain a parallel
+ * `parcae_migration_meta` table keyed by the same name. That table stores
+ * checksum, description, ticket, duration, and applied-at — surfaced by
+ * the CLI, and used to detect drift when an already-applied migration's
+ * source file is edited.
+ *
+ * Writes to the meta table happen inside the migration's transaction so
+ * Knex's row, the meta row, and the user's schema changes commit atomically.
  */
 
 import type { Knex } from "knex";
 import { log } from "../logger";
+import type { Engine } from "./engine";
 import type {
-  Engine,
   MigrationContext,
   MigrationEntry,
 } from "../routing/migration";
+import {
+  ensureMetaTable,
+  readMetaRows,
+  sha256File,
+  verifyChecksums,
+  writeMetaRow,
+  type MigrationMetaRow,
+} from "./migration-meta";
 
 /** Knex's MigrationSource interface — see knex/lib/migrations/migrate/sources. */
 interface KnexMigrationSource<T> {
@@ -43,6 +52,11 @@ export const MIGRATIONS_TABLE = "parcae_migrations";
  *
  * Entries are expected to be pre-sorted by the caller (see `runMigrations`) —
  * Knex uses the order `getMigrations()` returns as authoritative.
+ *
+ * The `up()` wrapper times the migration and writes a meta row inside the
+ * same transaction Knex provides. For `{ transaction: false }` migrations,
+ * the wrapper still writes the meta row — just without transactional
+ * atomicity, documented as an exception users opt into.
  */
 export class ParcaeMigrationSource
   implements KnexMigrationSource<MigrationEntry>
@@ -68,7 +82,22 @@ export class ParcaeMigrationSource
       config: { transaction: entry.transaction },
       up: async (knex: Knex): Promise<void> => {
         const ctx: MigrationContext = { db: knex, engine, log };
+        const started = performance.now();
         await entry.up(ctx);
+        const durationMs = Math.round(performance.now() - started);
+
+        const row: MigrationMetaRow = {
+          name: entry.name,
+          checksum: sha256File(entry.path),
+          description: entry.description,
+          ticket: entry.ticket,
+          durationMs,
+          appliedAt: new Date().toISOString(),
+        };
+        // `knex` here is either a plain connection or a transactional handle —
+        // either way, `writeMetaRow` uses it verbatim. Meta writes that happen
+        // inside a tx commit atomically with the user's DDL/DML.
+        await writeMetaRow(knex, row);
       },
       down: async (knex: Knex): Promise<void> => {
         if (!entry.down) {
@@ -79,6 +108,11 @@ export class ParcaeMigrationSource
         }
         const ctx: MigrationContext = { db: knex, engine, log };
         await entry.down(ctx);
+        // Remove the meta row for the rolled-back migration so re-applying
+        // it on the next `up` doesn't see a stale checksum.
+        await knex("parcae_migration_meta")
+          .where({ name: entry.name })
+          .delete();
       },
     });
   }
@@ -93,6 +127,12 @@ export interface RunMigrationsOptions {
   engine: Engine;
   /** Override the table name. Default: `parcae_migrations`. */
   tableName?: string;
+  /**
+   * Skip checksum verification even if drift is detected. Use as an emergency
+   * escape hatch — normal recovery path is to revert the edit, or delete the
+   * file and write a new compensating migration.
+   */
+  allowChecksumDrift?: boolean;
 }
 
 export interface RunMigrationsResult {
@@ -103,14 +143,15 @@ export interface RunMigrationsResult {
 }
 
 /**
- * Validate the registry and invoke `knex.migrate.latest()` against it.
+ * Validate the registry, verify checksums of already-applied migrations,
+ * and invoke `knex.migrate.latest()` against it.
  *
  * Safe to call with an empty registry — no-ops and creates no tables.
  *
  * Throws if:
- *   - Two migrations share the same name (the registry should have caught
- *     this at registration, but we re-validate defensively in case entries
- *     were composed from multiple sources).
+ *   - Two migrations share the same name (defensive re-check).
+ *   - An already-applied migration's file has been edited (checksum drift),
+ *     unless `allowChecksumDrift` is true.
  *   - A migration throws inside its up() — Knex halts and rolls back the
  *     transaction (if enabled), and later migrations do not run.
  */
@@ -127,20 +168,24 @@ export async function runMigrations(
   const seen = new Set<string>();
   for (const entry of sorted) {
     if (seen.has(entry.name)) {
-      throw new Error(
-        `[parcae] duplicate migration name: "${entry.name}"`,
-      );
+      throw new Error(`[parcae] duplicate migration name: "${entry.name}"`);
     }
     seen.add(entry.name);
   }
+
+  // Ensure the meta table exists BEFORE we try to read/write it. Knex's
+  // migration table is created by `migrate.latest()` on first run, so it may
+  // not exist yet — that's fine, readMetaRows() returns an empty map.
+  await ensureMetaTable(opts.db);
+
+  const meta = await readMetaRows(opts.db);
+  verifyChecksums(sorted, meta, opts.allowChecksumDrift ?? false);
 
   const source = new ParcaeMigrationSource(sorted, opts.engine);
   const tableName = opts.tableName ?? MIGRATIONS_TABLE;
 
   log.info(`Running migrations — ${total} registered`);
 
-  // Knex returns [batchNo, appliedNames]. Types from @types/knex wrap this as
-  // any[] on some versions, so we narrow explicitly.
   const result = (await opts.db.migrate.latest({
     tableName,
     migrationSource: source as unknown as Knex.MigrationSource<unknown>,
@@ -151,7 +196,13 @@ export async function runMigrations(
   if (applied.length === 0) {
     log.info(`Migrations up to date — ${total} total, 0 applied`);
   } else {
-    for (const name of applied) log.success(`Applied migration: ${name}`);
+    const durationByName = await readMetaRows(opts.db);
+    for (const name of applied) {
+      const ms = durationByName.get(name)?.durationMs;
+      log.success(
+        `Applied migration: ${name}${ms !== undefined ? ` (${ms}ms)` : ""}`,
+      );
+    }
     log.info(
       `Migrations complete — ${applied.length} applied, ${total - applied.length} already up to date`,
     );

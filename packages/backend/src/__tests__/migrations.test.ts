@@ -90,73 +90,113 @@ describe("migration() registration", () => {
 });
 
 describe("ParcaeMigrationSource", () => {
+  function makeEntry(overrides: Partial<MigrationEntry> = {}): MigrationEntry {
+    return {
+      name: overrides.name ?? "a",
+      up: overrides.up ?? (async () => {}),
+      down: overrides.down ?? null,
+      transaction: overrides.transaction ?? true,
+      description: overrides.description ?? null,
+      ticket: overrides.ticket ?? null,
+      path: overrides.path ?? null,
+    };
+  }
+
   it("returns entries verbatim", async () => {
-    const entries: MigrationEntry[] = [
-      { name: "a", up: async () => {}, down: null, transaction: true },
-      { name: "b", up: async () => {}, down: null, transaction: true },
-    ];
+    const entries = [makeEntry({ name: "a" }), makeEntry({ name: "b" })];
     const source = new ParcaeMigrationSource(entries, "sqlite");
     expect(await source.getMigrations()).toEqual(entries);
     expect(source.getMigrationName(entries[0]!)).toBe("a");
   });
 
   it("forwards transaction config to Knex", async () => {
-    const entry: MigrationEntry = {
-      name: "a",
-      up: async () => {},
-      down: null,
-      transaction: false,
-    };
+    const entry = makeEntry({ transaction: false });
     const source = new ParcaeMigrationSource([entry], "sqlite");
     const content = await source.getMigration(entry);
     expect(content.config).toEqual({ transaction: false });
   });
 
-  it("calls up() with a context including db + engine", async () => {
-    let capturedCtx: Parameters<MigrationEntry["up"]>[0] | null = null;
-    const entry: MigrationEntry = {
-      name: "a",
-      up: async (ctx) => {
-        capturedCtx = ctx;
-      },
-      down: null,
-      transaction: true,
-    };
-    const source = new ParcaeMigrationSource([entry], "postgres");
-    const content = await source.getMigration(entry);
+  it("calls up() with a context including db + engine and writes a meta row", async () => {
+    const db = sqlite();
+    try {
+      let capturedCtx: Parameters<MigrationEntry["up"]>[0] | null = null;
+      const entry = makeEntry({
+        name: "a",
+        description: "probe",
+        ticket: "T-1",
+        up: async (ctx) => {
+          capturedCtx = ctx;
+        },
+      });
+      const source = new ParcaeMigrationSource([entry], "postgres");
+      const content = await source.getMigration(entry);
 
-    const fakeKnex = {} as Knex;
-    await content.up(fakeKnex);
-    expect(capturedCtx).not.toBeNull();
-    expect(capturedCtx!.db).toBe(fakeKnex);
-    expect(capturedCtx!.engine).toBe("postgres");
-    expect(capturedCtx!.log).toBeDefined();
+      // Meta table must exist for the up() wrapper's insert to succeed.
+      await db.schema.createTable("parcae_migration_meta", (t) => {
+        t.string("name").primary();
+        t.string("checksum").notNullable();
+        t.text("description").nullable();
+        t.string("ticket").nullable();
+        t.integer("durationMs").notNullable();
+        t.string("appliedAt").notNullable();
+      });
+
+      await content.up(db);
+      expect(capturedCtx).not.toBeNull();
+      expect(capturedCtx!.db).toBe(db);
+      expect(capturedCtx!.engine).toBe("postgres");
+      expect(capturedCtx!.log).toBeDefined();
+
+      const rows = await db("parcae_migration_meta").select("*");
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.name).toBe("a");
+      expect(rows[0]!.description).toBe("probe");
+      expect(rows[0]!.ticket).toBe("T-1");
+      expect(typeof rows[0]!.durationMs).toBe("number");
+    } finally {
+      await db.destroy();
+    }
   });
 
   it("throws from down() when no down handler provided", async () => {
-    const entry: MigrationEntry = {
-      name: "forward-only",
-      up: async () => {},
-      down: null,
-      transaction: true,
-    };
+    const entry = makeEntry({ name: "forward-only" });
     const source = new ParcaeMigrationSource([entry], "sqlite");
     const content = await source.getMigration(entry);
     await expect(content.down({} as Knex)).rejects.toThrow(/forward-only/);
   });
 
-  it("invokes user-provided down()", async () => {
-    const down = vi.fn(async () => {});
-    const entry: MigrationEntry = {
-      name: "reversible",
-      up: async () => {},
-      down,
-      transaction: true,
-    };
-    const source = new ParcaeMigrationSource([entry], "sqlite");
-    const content = await source.getMigration(entry);
-    await content.down({} as Knex);
-    expect(down).toHaveBeenCalledTimes(1);
+  it("invokes user-provided down() and deletes the meta row", async () => {
+    const db = sqlite();
+    try {
+      await db.schema.createTable("parcae_migration_meta", (t) => {
+        t.string("name").primary();
+        t.string("checksum").notNullable();
+        t.text("description").nullable();
+        t.string("ticket").nullable();
+        t.integer("durationMs").notNullable();
+        t.string("appliedAt").notNullable();
+      });
+      await db("parcae_migration_meta").insert({
+        name: "reversible",
+        checksum: "",
+        description: null,
+        ticket: null,
+        durationMs: 0,
+        appliedAt: new Date().toISOString(),
+      });
+
+      const down = vi.fn(async () => {});
+      const entry = makeEntry({ name: "reversible", down });
+      const source = new ParcaeMigrationSource([entry], "sqlite");
+      const content = await source.getMigration(entry);
+      await content.down(db);
+      expect(down).toHaveBeenCalledTimes(1);
+
+      const rows = await db("parcae_migration_meta").select("*");
+      expect(rows).toHaveLength(0);
+    } finally {
+      await db.destroy();
+    }
   });
 });
 
@@ -282,10 +322,16 @@ describe("runMigrations", () => {
   });
 
   it("detects duplicate names defensively even if registry was bypassed", async () => {
-    const entries: MigrationEntry[] = [
-      { name: "dup", up: async () => {}, down: null, transaction: true },
-      { name: "dup", up: async () => {}, down: null, transaction: true },
-    ];
+    const mk = (): MigrationEntry => ({
+      name: "dup",
+      up: async () => {},
+      down: null,
+      transaction: true,
+      description: null,
+      ticket: null,
+      path: null,
+    });
+    const entries: MigrationEntry[] = [mk(), mk()];
     await expect(
       runMigrations({ db, entries, engine: "sqlite" }),
     ).rejects.toThrow(/duplicate/);

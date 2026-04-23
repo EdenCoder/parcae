@@ -85,31 +85,42 @@ Additive DDL migration:
 
 ### Migrations (`migration()`)
 
-Source: `packages/backend/src/routing/migration.ts`, `packages/backend/src/adapters/migrations.ts`
+Source: `packages/backend/src/routing/migration.ts`, `packages/backend/src/adapters/migrations.ts`, `packages/backend/src/adapters/migration-meta.ts`
 
 For things `ensureTable()` can't do -- renames, type changes, data backfills,
 new constraints against dirty data. Built on Knex's migrator with a custom
 `migrationSource` that reads from the in-memory registry populated by
-`migration()` calls.
+`migration()` calls. A companion `parcae_migration_meta` table stores the
+per-migration data Knex doesn't track (checksum, description, ticket,
+duration).
 
 ```typescript
-// migrations/20260401-rename-type-columns.ts
+// migrations/20260401000000-rename-type-columns.ts
 import { migration } from "@parcae/backend";
 
-migration("20260401-rename-type-columns", async ({ db, engine, log }) => {
-  if (engine === "sqlite") return;                  // pg-only guard
-  await db.raw(`ALTER TABLE activities RENAME COLUMN "type" TO "activityType"`);
-});
+migration(
+  "20260401000000-rename-type-columns",
+  { description: "Legacy type columns -> typed names", ticket: "FRE-200" },
+  async ({ db, engine }) => {
+    if (engine === "sqlite") return;                  // pg-only guard
+    await db.raw(`ALTER TABLE activities RENAME COLUMN "type" TO "activityType"`);
+  },
+);
 
 // Opt out of the default transaction (e.g. CREATE INDEX CONCURRENTLY)
-migration("20260402-concurrent-idx", { transaction: false }, async ({ db }) => {
+migration("20260402000000-concurrent-idx", { transaction: false }, async ({ db }) => {
   await db.raw(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ...`);
 });
 ```
 
-- State lives in `parcae_migrations` (namespaced from knex default).
+- State lives in `parcae_migrations` (Knex) + `parcae_migration_meta` (Parcae);
+  the two are written atomically inside each migration's transaction.
+- **Checksum drift detection**: edit an already-applied migration file and the
+  next run throws `MigrationChecksumError` listing the drifted name(s). Bypass
+  with `--allow-checksum-drift` (CLI) or `PARCAE_ALLOW_CHECKSUM_DRIFT=true`.
 - Multi-replica safe -- Knex's `parcae_migrations_lock` uses `SELECT ... FOR UPDATE`.
-- Sort order is lexicographic by `name` -- date-prefix migrations by convention.
+- Sort order is lexicographic by `name` -- date-prefix migrations by convention
+  (`parcae migrate:make` does this automatically with a `YYYYMMDDHHMMSS-slug` format).
 - Each runs in a transaction by default; opt out with `{ transaction: false }`.
 - Forward-only by default; attempting to roll back a migration without a `down`
   throws a clear error. Provide `{ down: ... }` for local-dev reversibility.
@@ -117,6 +128,39 @@ migration("20260402-concurrent-idx", { transaction: false }, async ({ db }) => {
   `ENSURE_SCHEMA=true`.
 - Use raw SQL (`db.raw(...)`) not Model APIs -- migrations must stay correct
   if a model class is later renamed or removed.
+
+### CLI (`parcae migrate:*`)
+
+Source: `packages/backend/src/cli/**`. Ships as a `bin` in `@parcae/backend`;
+from a consuming app with `@parcae/backend` as a workspace dependency:
+
+```
+pnpm parcae migrate:make rename-type-columns
+pnpm parcae migrate:list
+pnpm parcae migrate:status
+pnpm parcae migrate:latest
+pnpm parcae migrate:baseline 20260401000000-rename-type-columns  # stamp-as-applied
+pnpm parcae migrate:plan                                          # dry-run next pending, capture SQL
+pnpm parcae migrate:rollback                                      # requires down() on every migration in the last batch
+pnpm parcae migrate:unlock                                        # release a stuck lock
+```
+
+Global flags: `--json` (structured output), `--dir <path>`, `--db <url>`,
+`--allow-checksum-drift`. Every command reads `DATABASE_URL` from the cwd's
+`.env` unless `--db` is supplied.
+
+The CLI connects Knex directly -- no schema resolution, no server, no queue --
+so cold starts are fast and safe to run out-of-band (e.g. from CI before
+deploying a new container).
+
+**Adoption path** for apps with pre-existing ad-hoc migrations (e.g. Freia's
+old `app.start().then(...)` block):
+
+1. Port each ad-hoc block into its own file under `migrations/`, using
+   `parcae migrate:make` to name them.
+2. Run `parcae migrate:baseline <latest-historical-name>` against prod so
+   those files don't re-execute.
+3. New migrations after that line run normally on every deploy.
 
 ### queryFromClient()
 

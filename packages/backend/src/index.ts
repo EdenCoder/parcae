@@ -113,6 +113,29 @@ export type {
   RunMigrationsResult,
 } from "./adapters/migrations";
 
+export {
+  discoverMigrations,
+  listMigrationFiles,
+} from "./adapters/migration-discovery";
+
+export {
+  META_TABLE,
+  MigrationChecksumError,
+  buildListing,
+  ensureMetaTable,
+  readMetaRows,
+  sha256File,
+  verifyChecksums,
+  writeMetaRow,
+} from "./adapters/migration-meta";
+export type {
+  MigrationListing,
+  MigrationMetaRow,
+  MigrationState,
+} from "./adapters/migration-meta";
+
+export { detectEngine } from "./adapters/engine";
+
 // Search
 export { searchAll } from "./search";
 export type { SearchResult, SearchAllOptions } from "./search";

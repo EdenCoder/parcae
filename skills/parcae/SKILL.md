@@ -147,7 +147,7 @@ function PostList() {
 
 6. **Socket RPC bridge** -- Socket.IO calls are piped through Polka's HTTP handler as fake requests, so sockets share identical middleware, auth, and routing with HTTP.
 
-7. **Additive-only migration** -- `ensureAllTables()` creates tables, columns, and indexes if missing. Never drops anything. For renames, type changes, data backfills, and new constraints, register a `migration()` -- runs via Knex's migrator against `parcae_migrations` with multi-replica locking and per-migration transactions.
+7. **Additive-only migration** -- `ensureAllTables()` creates tables, columns, and indexes if missing. Never drops anything. For renames, type changes, data backfills, and new constraints, register a `migration()` -- runs via Knex's migrator against `parcae_migrations` with multi-replica locking and per-migration transactions. Companion `parcae_migration_meta` table tracks checksums (drift detection), description, ticket, and duration. CLI surface: `parcae migrate:{make,list,status,latest,baseline,unlock,rollback,plan}`.
 
 8. **Lazy query chains** -- Queries can be built before the adapter is set. Terminal methods (`.find()`, `.first()`, `.count()`) wait for the adapter asynchronously.
 
@@ -178,8 +178,12 @@ packages/
     routing/route.ts         # route.get/post/put/patch/delete + Controller class
     routing/hook.ts          # hook.before/hook.after
     routing/job.ts           # job() registration
-    routing/migration.ts     # migration() registration (Knex-backed runner)
+    routing/migration.ts     # migration() registration
     adapters/migrations.ts   # ParcaeMigrationSource + runMigrations()
+    adapters/migration-meta.ts       # parcae_migration_meta + checksum verification
+    adapters/migration-discovery.ts  # file-based discovery that tags entries with paths
+    adapters/engine.ts       # detectEngine() — shared by BackendAdapter and CLI
+    cli/                     # `parcae migrate:*` CLI entry + commands
     services/pubsub.ts       # Redis pub/sub + distributed lock
     services/queue.ts        # BullMQ queue service
     services/subscriptions.ts # QuerySubscriptionManager

@@ -13,6 +13,9 @@
       "default": "./dist/index.js"
     }
   },
+  "bin": {
+    "parcae": "./dist/cli/index.js"
+  },
   "files": [
     "dist"
   ],

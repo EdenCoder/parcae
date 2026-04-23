@@ -46,6 +46,16 @@ export function success(...args: any[]): void {
   console.log(`${time()} ${c.green("OK ")}`, ...args);
 }
 
+/**
+ * Debug logging. Suppressed unless PARCAE_DEBUG is truthy or the process is
+ * running with `--verbose` via the CLI. Kept out of the default log stream
+ * so production output stays readable.
+ */
+export function debug(...args: any[]): void {
+  if (!process.env.PARCAE_DEBUG) return;
+  console.log(`${time()} ${c.dim("DBG")}`, ...args);
+}
+
 // ─── Logger object ───────────────────────────────────────────────────────────
 
-export const log = { info, warn, error, success };
+export const log = { info, warn, error, success, debug };

@@ -40,6 +40,7 @@ import { getJobs } from "./routing/job";
 import { getHooks } from "./routing/hook";
 import { getMigrations } from "./routing/migration";
 import { runMigrations } from "./adapters/migrations";
+import { discoverMigrations } from "./adapters/migration-discovery";
 import type { AuthAdapter } from "./auth";
 import knex from "knex";
 
@@ -227,10 +228,11 @@ export function createApp(config: AppConfig): ParcaeApp {
       // from controllers/hooks/jobs because they need to be registered
       // before the DB connection opens (so we know how many exist) and run
       // before ensureAllTables() (so renames happen before the additive
-      // pass creates parallel empty tables).
+      // pass creates parallel empty tables). Each entry is tagged with its
+      // source file path so checksum verification can detect drift later.
       if (config.migrations) {
-        const count = await discoverAndImport(config.migrations, "migration");
-        log.info(`Discovered ${count} migration file(s)`);
+        const discovered = await discoverMigrations(config.migrations);
+        log.info(`Discovered ${discovered.length} migration file(s)`);
       }
 
       // ── Step 3: Connect database ───────────────────────────────────
@@ -326,13 +328,17 @@ export function createApp(config: AppConfig): ParcaeApp {
       // before the additive schema pass would otherwise create parallel
       // empty tables next to legacy ones. Gated on ENSURE_SCHEMA for
       // parity with Better Auth migrations and ensureAllTables below —
-      // operators who prefer out-of-band migration runs can disable.
+      // operators who prefer out-of-band migration runs (via `parcae
+      // migrate:latest`) can disable.
       if (ensureSchema) {
         const migrations = getMigrations();
+        const allowChecksumDrift =
+          process.env.PARCAE_ALLOW_CHECKSUM_DRIFT === "true";
         await runMigrations({
           db: writeDb,
           entries: migrations,
           engine: adapter.engine,
+          allowChecksumDrift,
         });
       }
 
