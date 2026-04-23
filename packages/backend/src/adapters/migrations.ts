@@ -27,8 +27,10 @@
  */
 
 import type { Knex } from "knex";
+import type { ModelConstructor } from "@parcae/model";
 import { log } from "../logger";
 import type { Engine } from "./engine";
+import type { BackendAdapter } from "./model";
 import type {
   MigrationContext,
   MigrationEntry,
@@ -152,6 +154,31 @@ type ParcaeMigrationSpec = Knex.Migration & {
 };
 
 /**
+ * Build the `ensureModel` helper exposed on `MigrationContext`. When an
+ * adapter is provided, delegates to its additive schema pass, passing the
+ * migration's knex handle so DDL participates in the migration's
+ * transaction. When absent (e.g. CLI invocation before the server is
+ * booted), returns a stub that throws with a clear recovery hint —
+ * migrations that don't call `ensureModel` are unaffected.
+ */
+function buildEnsureModel(
+  adapter: BackendAdapter | null,
+  knex: Knex,
+): (modelClass: ModelConstructor) => Promise<void> {
+  if (adapter) {
+    return (modelClass) => adapter.ensureTable(modelClass, { knex });
+  }
+  return async () => {
+    throw new Error(
+      "[parcae] ensureModel() is unavailable: runMigrations was called " +
+        "without a BackendAdapter. Run migrations through server boot " +
+        "(which threads the adapter automatically), or add columns " +
+        "explicitly with `db.raw(\"ALTER TABLE ...\")`.",
+    );
+  };
+}
+
+/**
  * Adapts the in-memory migration registry to Knex's MigrationSource contract.
  *
  * Entries are expected to be pre-sorted by the caller (see `runMigrations`) —
@@ -168,6 +195,7 @@ export class ParcaeMigrationSource
   constructor(
     private readonly entries: readonly MigrationEntry[],
     private readonly engine: Engine,
+    private readonly adapter: BackendAdapter | null = null,
   ) {}
 
   getMigrations(_loadExtensions: readonly string[]): Promise<MigrationEntry[]> {
@@ -180,13 +208,15 @@ export class ParcaeMigrationSource
 
   getMigration(entry: MigrationEntry): Promise<ParcaeMigrationSpec> {
     const engine = this.engine;
+    const adapter = this.adapter;
     // Knex inspects `config.transaction` on this object to decide whether to
     // wrap the migration in a transaction. See Migrator._useTransaction.
     return Promise.resolve({
       config: { transaction: entry.transaction },
       up: async (knex: Knex): Promise<void> => {
         const tracker = attachEffectTracking(knex);
-        const ctx: MigrationContext = { db: knex, engine, log };
+        const ensureModel = buildEnsureModel(adapter, knex);
+        const ctx: MigrationContext = { db: knex, engine, log, ensureModel };
         const started = performance.now();
         let effect: { writes: number; rowsAffected: number };
         try {
@@ -226,7 +256,8 @@ export class ParcaeMigrationSource
               `Write a new compensating migration instead of rolling back.`,
           );
         }
-        const ctx: MigrationContext = { db: knex, engine, log };
+        const ensureModel = buildEnsureModel(adapter, knex);
+        const ctx: MigrationContext = { db: knex, engine, log, ensureModel };
         await entry.down(ctx);
         // Remove the meta row for the rolled-back migration so re-applying
         // it on the next `up` doesn't see a stale checksum.
@@ -245,6 +276,12 @@ export interface RunMigrationsOptions {
   entries: readonly MigrationEntry[];
   /** Detected engine — passed to each migration's context. */
   engine: Engine;
+  /**
+   * Backend adapter used to power `MigrationContext.ensureModel()`. Optional
+   * because CLI callers may run migrations without a booted adapter; if
+   * omitted, `ensureModel` throws with a recovery hint when called.
+   */
+  adapter?: BackendAdapter;
   /** Override the table name. Default: `parcae_migrations`. */
   tableName?: string;
   /**
@@ -301,7 +338,11 @@ export async function runMigrations(
   const meta = await readMetaRows(opts.db);
   verifyChecksums(sorted, meta, opts.allowChecksumDrift ?? false);
 
-  const source = new ParcaeMigrationSource(sorted, opts.engine);
+  const source = new ParcaeMigrationSource(
+    sorted,
+    opts.engine,
+    opts.adapter ?? null,
+  );
   const tableName = opts.tableName ?? MIGRATIONS_TABLE;
 
   log.info(`Running migrations — ${total} registered`);
