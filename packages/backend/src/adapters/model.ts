@@ -1313,7 +1313,10 @@ export class BackendAdapter implements ModelAdapter {
 
   // ── Schema Management ────────────────────────────────────────────────
 
-  async ensureTable(modelClass: ModelConstructor): Promise<void> {
+  async ensureTable(
+    modelClass: ModelConstructor,
+    opts: { knex?: any } = {},
+  ): Promise<void> {
     if ((modelClass as any).managed === false) {
       log.info(
         `skipping schema — model=${modelClass.type} (externally managed)`,
@@ -1321,22 +1324,28 @@ export class BackendAdapter implements ModelAdapter {
       return;
     }
 
+    // When a migration calls ensureModel, it passes its transactional handle
+    // here so DDL runs inside the migration's transaction (matters on SQLite
+    // where pool=1 would deadlock against the adapter's outer connection,
+    // and on Postgres where it gives proper rollback semantics).
+    const kx = opts.knex ?? this.write;
+
     const table = tableName(modelClass);
     const schema = ((modelClass as any).__schema as SchemaDefinition) ?? {};
     const indexes = (modelClass as any).indexes || [];
 
     log.info(`ensuring schema — model=${modelClass.type}`);
 
-    const hasTable = await this.write.schema.hasTable(table);
+    const hasTable = await kx.schema.hasTable(table);
 
     const existingColumns: string[] = [];
     if (hasTable) {
       for (const key of Object.keys(schema)) {
-        if (await this.write.schema.hasColumn(table, key))
+        if (await kx.schema.hasColumn(table, key))
           existingColumns.push(key);
       }
       for (const sys of ["createdAt", "updatedAt", "tmp"]) {
-        if (await this.write.schema.hasColumn(table, sys))
+        if (await kx.schema.hasColumn(table, sys))
           existingColumns.push(sys);
       }
     }
@@ -1344,13 +1353,13 @@ export class BackendAdapter implements ModelAdapter {
     let existingIndexes: string[] = [];
     try {
       if (this.isSqlite) {
-        const rows = await this.write.raw(
+        const rows = await kx.raw(
           "SELECT name FROM pragma_index_list(?)",
           [table],
         );
         existingIndexes = (rows ?? []).map((r: any) => r.name);
       } else {
-        const result = await this.write.raw(
+        const result = await kx.raw(
           "SELECT * FROM pg_indexes WHERE tablename = ?",
           [table],
         );
@@ -1358,7 +1367,7 @@ export class BackendAdapter implements ModelAdapter {
       }
     } catch {}
 
-    await this.write.schema[hasTable ? "alterTable" : "createTable"](
+    await kx.schema[hasTable ? "alterTable" : "createTable"](
       table,
       (t: any) => {
         if (!hasTable) {
@@ -1434,7 +1443,7 @@ export class BackendAdapter implements ModelAdapter {
       | string[]
       | undefined;
     if (searchFields?.length) {
-      await this._ensureSearchSchema(table, searchFields);
+      await this._ensureSearchSchema(table, searchFields, kx);
     }
   }
 
@@ -1445,6 +1454,7 @@ export class BackendAdapter implements ModelAdapter {
   private async _ensureSearchSchema(
     table: string,
     fields: string[],
+    kx: any = this.write,
   ): Promise<void> {
     // SQLite: no tsvector/trigram/GIN. Search uses LIKE at query time.
     if (this.isSqlite) {
@@ -1466,9 +1476,9 @@ export class BackendAdapter implements ModelAdapter {
       .join(" || ");
 
     // 1. Generated tsvector column + GIN index
-    const hasSearch = await this.write.schema.hasColumn(table, "_search");
+    const hasSearch = await kx.schema.hasColumn(table, "_search");
     if (!hasSearch) {
-      await this.write.raw(
+      await kx.raw(
         `
         ALTER TABLE ?? ADD COLUMN _search tsvector
         GENERATED ALWAYS AS (${tsvectorParts}) STORED
@@ -1481,7 +1491,7 @@ export class BackendAdapter implements ModelAdapter {
     // GIN index on _search
     const searchIdxName = `${table}__search_gin`;
     try {
-      await this.write.raw(
+      await kx.raw(
         `
         CREATE INDEX IF NOT EXISTS ?? ON ?? USING gin(_search)
       `,
@@ -1493,7 +1503,7 @@ export class BackendAdapter implements ModelAdapter {
     for (const field of fields) {
       const trgmIdxName = `${table}_${field}_trgm`;
       try {
-        await this.write.raw(
+        await kx.raw(
           `
           CREATE INDEX IF NOT EXISTS ?? ON ?? USING gin(?? gin_trgm_ops)
         `,
@@ -1504,12 +1514,12 @@ export class BackendAdapter implements ModelAdapter {
 
     // 3. AlloyDB: vector embedding column + ScaNN index
     if (this.engine === "alloydb") {
-      const hasEmbedding = await this.write.schema.hasColumn(
+      const hasEmbedding = await kx.schema.hasColumn(
         table,
         "_embedding",
       );
       if (!hasEmbedding) {
-        await this.write.raw(
+        await kx.raw(
           "ALTER TABLE ?? ADD COLUMN _embedding vector(768)",
           [table],
         );
@@ -1520,7 +1530,7 @@ export class BackendAdapter implements ModelAdapter {
 
       const embIdxName = `${table}__embedding_scann`;
       try {
-        await this.write.raw(
+        await kx.raw(
           `
           CREATE INDEX IF NOT EXISTS ?? ON ?? USING scann (_embedding cosine)
           WITH (num_leaves = 1000, quantizer = 'SQ8')

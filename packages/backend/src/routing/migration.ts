@@ -46,6 +46,23 @@
  * );
  * ```
  *
+ * @example Backfill a model-declared column
+ *
+ * Migrations run before `ensureAllTables()`, so columns declared on a model's
+ * `__schema` aren't present yet. Call `ensureModel()` first to add them, then
+ * backfill. Idempotent on re-run.
+ *
+ * ```typescript
+ * import { Post } from "../models/post";
+ *
+ * migration("20260423-backfill-slug", async ({ db, ensureModel }) => {
+ *   await ensureModel(Post);
+ *   await db.raw(
+ *     `UPDATE posts SET slug = lower(title) WHERE slug IS NULL`,
+ *   );
+ * });
+ * ```
+ *
  * @example Provide a down() for local dev rollback
  *
  * Migrations are forward-only by default — if you omit `down`, attempting to
@@ -100,6 +117,7 @@
  */
 
 import type { Knex } from "knex";
+import type { ModelConstructor } from "@parcae/model";
 import type { log as logger } from "../logger";
 import type { Engine as DbEngine } from "../adapters/engine";
 
@@ -120,6 +138,26 @@ export interface MigrationContext {
   engine: Engine;
   /** The Parcae logger. */
   log: typeof logger;
+  /**
+   * Ensure a model's table and declared columns exist right now. Idempotent.
+   *
+   * Migrations run BEFORE `ensureAllTables()` (so renames/type-changes aren't
+   * stranded by the additive pass), which means model-declared columns are
+   * not yet present by default. Call `ensureModel(Foo)` at the top of a
+   * migration that needs to read or backfill a column declared on `Foo`'s
+   * `__schema` — the helper runs the same additive pass `ensureAllTables()`
+   * would, scoped to the one model.
+   *
+   * DDL runs on the migration's knex handle, so it participates in the
+   * migration's transaction when one is active. If the migration rolls
+   * back, the column adds roll back with it; on retry, `ensureModel`
+   * re-runs and re-adds them.
+   *
+   * Throws if `runMigrations()` was invoked without an adapter — e.g. from
+   * the CLI before server boot. In that case, run migrations via server
+   * boot, or add the columns explicitly with `db.raw("ALTER TABLE ...")`.
+   */
+  ensureModel: (modelClass: ModelConstructor) => Promise<void>;
 }
 
 export type MigrationHandler = (

@@ -338,6 +338,7 @@ export function createApp(config: AppConfig): ParcaeApp {
           db: writeDb,
           entries: migrations,
           engine: adapter.engine,
+          adapter,
           allowChecksumDrift,
         });
       }

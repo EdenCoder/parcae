@@ -108,7 +108,18 @@ async function captureSql(
   try {
     await db.transaction(async (trx) => {
       trx.on("query", listener);
-      const ctx: MigrationContext = { db: trx, engine, log };
+      const ctx: MigrationContext = {
+        db: trx,
+        engine,
+        log,
+        ensureModel: async () => {
+          throw new Error(
+            "[parcae] ensureModel() is unavailable under `migrate:plan` — " +
+              "the CLI has no adapter. Plan this migration against a staging " +
+              "DB with the server booted, or inline the DDL with `db.raw(...)`.",
+          );
+        },
+      };
       await entry.up(ctx);
       const sentinel: { [ROLLBACK_TAG]: true } & Error = Object.assign(
         new Error("parcae: planned rollback"),

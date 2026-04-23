@@ -16,6 +16,7 @@ import {
 } from "../adapters/migrations";
 import * as metaModule from "../adapters/migration-meta";
 import { ensureMetaTable } from "../adapters/migration-meta";
+import { BackendAdapter } from "../adapters/model";
 import {
   clearMigrations,
   getMigrations,
@@ -142,6 +143,7 @@ describe("ParcaeMigrationSource", () => {
       expect(capturedCtx!.db).toBe(db);
       expect(capturedCtx!.engine).toBe("postgres");
       expect(capturedCtx!.log).toBeDefined();
+      expect(typeof capturedCtx!.ensureModel).toBe("function");
 
       const rows = await db("parcae_migration_meta").select("*");
       expect(rows).toHaveLength(1);
@@ -507,5 +509,128 @@ describe("writeMetaRowWithRetry (non-tx meta atomicity)", () => {
     expect(writer).toHaveBeenCalledTimes(2);
     const errCalls = errorLog.mock.calls.flat().join(" ");
     expect(errCalls).toMatch(/Manual recovery/);
+  });
+});
+
+describe("MigrationContext.ensureModel", () => {
+  class ProbeModel {
+    static type = "probeitem";
+    static __schema = {
+      name: "string" as const,
+      count: "integer" as const,
+    };
+  }
+
+  let db: Knex;
+
+  beforeEach(() => {
+    clearMigrations();
+    db = sqlite();
+  });
+
+  afterEach(async () => {
+    clearMigrations();
+    await db.destroy();
+  });
+
+  it("creates model-declared columns when called from a migration", async () => {
+    const adapter = new BackendAdapter({ read: db, write: db });
+    adapter.engine = "sqlite";
+
+    migration("001-backfill-probe", async ({ db, ensureModel }) => {
+      await ensureModel(ProbeModel as any);
+      // Column declared on __schema should now exist — backfill is safe.
+      await db("probeitems").insert({
+        id: "row-1",
+        name: "seeded",
+        count: 42,
+        data: "{}",
+      });
+    });
+
+    await runMigrations({
+      db,
+      entries: getMigrations(),
+      engine: "sqlite",
+      adapter,
+    });
+
+    expect(await db.schema.hasTable("probeitems")).toBe(true);
+    expect(await db.schema.hasColumn("probeitems", "name")).toBe(true);
+    expect(await db.schema.hasColumn("probeitems", "count")).toBe(true);
+
+    const rows = await db("probeitems").select("*");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.name).toBe("seeded");
+    expect(rows[0]!.count).toBe(42);
+  });
+
+  it("is idempotent — re-running a migration that calls ensureModel is a no-op", async () => {
+    const adapter = new BackendAdapter({ read: db, write: db });
+    adapter.engine = "sqlite";
+
+    // Pre-create the table with the model's columns to mimic a schema that's
+    // already been ensured. ensureModel() should detect and skip.
+    await db.schema.createTable("probeitems", (t) => {
+      t.string("id").primary();
+      t.string("name");
+      t.integer("count");
+      t.text("data");
+      t.datetime("createdAt");
+      t.datetime("updatedAt");
+      t.string("tmp", 2048).nullable();
+    });
+
+    migration("001-idempotent", async ({ ensureModel }) => {
+      await ensureModel(ProbeModel as any);
+    });
+
+    await expect(
+      runMigrations({
+        db,
+        entries: getMigrations(),
+        engine: "sqlite",
+        adapter,
+      }),
+    ).resolves.toBeDefined();
+  });
+
+  it("rolls back ensureModel DDL when the migration fails inside its transaction", async () => {
+    const adapter = new BackendAdapter({ read: db, write: db });
+    adapter.engine = "sqlite";
+
+    migration("001-fail-after-ensure", async ({ ensureModel }) => {
+      await ensureModel(ProbeModel as any);
+      // DDL committed inside the tx — if ensureModel threads the tx handle,
+      // the throw below must roll back the column adds too.
+      throw new Error("boom");
+    });
+
+    await expect(
+      runMigrations({
+        db,
+        entries: getMigrations(),
+        engine: "sqlite",
+        adapter,
+      }),
+    ).rejects.toThrow(/boom/);
+
+    // Table must not exist: the tx rolled back the createTable from ensureModel.
+    expect(await db.schema.hasTable("probeitems")).toBe(false);
+  });
+
+  it("throws with a recovery hint when runMigrations is called without an adapter", async () => {
+    migration("001-needs-adapter", async ({ ensureModel }) => {
+      await ensureModel(ProbeModel as any);
+    });
+
+    await expect(
+      runMigrations({
+        db,
+        entries: getMigrations(),
+        engine: "sqlite",
+        // adapter intentionally omitted
+      }),
+    ).rejects.toThrow(/ensureModel\(\) is unavailable/);
   });
 });
