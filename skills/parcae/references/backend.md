@@ -29,21 +29,23 @@ await app.start({ port: 3000, dev: true });
 1. Parse + validate env config (Zod)
 2. Discover models (array or directory scan)
 3. Generate `.parcae/` type metadata (ts-morph, with SHA-256 caching)
-4. Connect Postgres (Knex, optional read replica)
-5. Connect Redis (PubSub + Queue, optional)
-6. Create `BackendAdapter`, call `Model.use()`
-7. Detect database engine (AlloyDB vs standard Postgres)
-8. Set up auth adapter (runs BEFORE schema migration)
-9. Ensure tables exist (additive DDL -- never drops)
-10. Create HTTP server (Polka) + WebSocket (Socket.IO)
-11. Set up `QuerySubscriptionManager`
-12. Mount auth middleware + routes
-13. Register auto-CRUD routes
-14. Auto-discover and import controllers/hooks/jobs
-15. Apply discovered routes to Polka
-16. Start BullMQ workers
-17. Set up Socket.IO connection handling (RPC, auth, subscriptions)
-18. Start HTTP listener
+4. Auto-discover and import migration files (registered via `migration()`)
+5. Connect Postgres (Knex, optional read replica)
+6. Connect Redis (PubSub + Queue, optional)
+7. Create `BackendAdapter`, call `Model.use()`
+8. Detect database engine (AlloyDB vs standard Postgres)
+9. Set up auth adapter (runs its own migrations if `ENSURE_SCHEMA=true`)
+10. Run user migrations via Knex migrator against `parcae_migrations` (gated on `ENSURE_SCHEMA`)
+11. Ensure tables exist -- additive DDL, never drops (gated on `ENSURE_SCHEMA`)
+12. Create HTTP server (Polka) + WebSocket (Socket.IO)
+13. Set up `QuerySubscriptionManager`
+14. Mount auth middleware + routes
+15. Register auto-CRUD routes
+16. Auto-discover and import controllers/hooks/jobs
+17. Apply discovered routes to Polka
+18. Start BullMQ workers
+19. Set up Socket.IO connection handling (RPC, auth, subscriptions)
+20. Start HTTP listener
 
 ## BackendAdapter
 
@@ -80,6 +82,41 @@ Additive DDL migration:
 - Adds columns if missing (never drops)
 - Creates indexes if missing
 - Skips models with `managed = false`
+
+### Migrations (`migration()`)
+
+Source: `packages/backend/src/routing/migration.ts`, `packages/backend/src/adapters/migrations.ts`
+
+For things `ensureTable()` can't do -- renames, type changes, data backfills,
+new constraints against dirty data. Built on Knex's migrator with a custom
+`migrationSource` that reads from the in-memory registry populated by
+`migration()` calls.
+
+```typescript
+// migrations/20260401-rename-type-columns.ts
+import { migration } from "@parcae/backend";
+
+migration("20260401-rename-type-columns", async ({ db, engine, log }) => {
+  if (engine === "sqlite") return;                  // pg-only guard
+  await db.raw(`ALTER TABLE activities RENAME COLUMN "type" TO "activityType"`);
+});
+
+// Opt out of the default transaction (e.g. CREATE INDEX CONCURRENTLY)
+migration("20260402-concurrent-idx", { transaction: false }, async ({ db }) => {
+  await db.raw(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ...`);
+});
+```
+
+- State lives in `parcae_migrations` (namespaced from knex default).
+- Multi-replica safe -- Knex's `parcae_migrations_lock` uses `SELECT ... FOR UPDATE`.
+- Sort order is lexicographic by `name` -- date-prefix migrations by convention.
+- Each runs in a transaction by default; opt out with `{ transaction: false }`.
+- Forward-only by default; attempting to roll back a migration without a `down`
+  throws a clear error. Provide `{ down: ... }` for local-dev reversibility.
+- Enabled via `migrations: "./migrations"` in `createApp()` config, gated on
+  `ENSURE_SCHEMA=true`.
+- Use raw SQL (`db.raw(...)`) not Model APIs -- migrations must stay correct
+  if a model class is later renamed or removed.
 
 ### queryFromClient()
 

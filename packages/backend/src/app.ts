@@ -38,6 +38,8 @@ import {
 } from "./services/context";
 import { getJobs } from "./routing/job";
 import { getHooks } from "./routing/hook";
+import { getMigrations } from "./routing/migration";
+import { runMigrations } from "./adapters/migrations";
 import type { AuthAdapter } from "./auth";
 import knex from "knex";
 
@@ -52,6 +54,12 @@ export interface AppConfig {
   hooks?: string;
   /** Jobs directory for auto-discovery. */
   jobs?: string;
+  /**
+   * Migrations directory for auto-discovery. Files are loaded at startup and
+   * self-register via `migration()`. Runs in lexicographic order, before
+   * `ensureAllTables()`. See routing/migration.ts for the full contract.
+   */
+  migrations?: string;
   /** Authentication adapter. Opt-in — omit to skip auth entirely. */
   auth?: AuthAdapter;
   /** API version prefix. Default: "v1" */
@@ -214,6 +222,17 @@ export function createApp(config: AppConfig): ParcaeApp {
           (result.cached ? " (cached)" : " (resolved)"),
       );
 
+      // ── Step 2.5: Discover migrations ───────────────────────────────
+      // Migrations live in their own directory and are discovered separately
+      // from controllers/hooks/jobs because they need to be registered
+      // before the DB connection opens (so we know how many exist) and run
+      // before ensureAllTables() (so renames happen before the additive
+      // pass creates parallel empty tables).
+      if (config.migrations) {
+        const count = await discoverAndImport(config.migrations, "migration");
+        log.info(`Discovered ${count} migration file(s)`);
+      }
+
       // ── Step 3: Connect database ───────────────────────────────────
       const useSqlite = isSqliteUrl(envConfig.DATABASE_URL);
 
@@ -300,6 +319,21 @@ export function createApp(config: AppConfig): ParcaeApp {
         });
 
         log.info("Auth enabled");
+      }
+
+      // ── Step 6.5: Run user migrations ──────────────────────────────
+      // Runs BEFORE ensureAllTables() so that renames/type-changes happen
+      // before the additive schema pass would otherwise create parallel
+      // empty tables next to legacy ones. Gated on ENSURE_SCHEMA for
+      // parity with Better Auth migrations and ensureAllTables below —
+      // operators who prefer out-of-band migration runs can disable.
+      if (ensureSchema) {
+        const migrations = getMigrations();
+        await runMigrations({
+          db: writeDb,
+          entries: migrations,
+          engine: adapter.engine,
+        });
       }
 
       // ── Step 7: Ensure tables (additive migration) ─────────────────

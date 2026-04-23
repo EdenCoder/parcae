@@ -90,6 +90,29 @@ export type {
   JobEntry,
 } from "./routing/job";
 
+export {
+  migration,
+  getMigrations,
+  clearMigrations,
+} from "./routing/migration";
+export type {
+  Engine,
+  MigrationContext,
+  MigrationHandler,
+  MigrationOptions,
+  MigrationEntry,
+} from "./routing/migration";
+
+export {
+  runMigrations,
+  ParcaeMigrationSource,
+  MIGRATIONS_TABLE,
+} from "./adapters/migrations";
+export type {
+  RunMigrationsOptions,
+  RunMigrationsResult,
+} from "./adapters/migrations";
+
 // Search
 export { searchAll } from "./search";
 export type { SearchResult, SearchAllOptions } from "./search";
