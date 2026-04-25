@@ -41,7 +41,7 @@ import { getHooks } from "./routing/hook";
 import { getMigrations } from "./routing/migration";
 import { runMigrations } from "./adapters/migrations";
 import { discoverMigrations } from "./adapters/migration-discovery";
-import type { AuthAdapter } from "./auth";
+import type { AuthAdapter, AuthSession } from "./auth";
 import knex from "knex";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -73,6 +73,18 @@ export interface AppConfig {
    * If not set, auto-detected from common monorepo locations.
    */
   modelsPath?: string;
+  /**
+   * Optional callback fired AFTER each authenticated request has its
+   * session resolved (or pre-injected for socket-RPC), and BEFORE
+   * route dispatch. Errors are caught and logged so a faulty hook
+   * cannot break the request path. Sync or async — sockets/HTTP both
+   * fire the same hook. Useful for presence audit logs and similar
+   * cross-cutting capture that needs `req.session` in scope.
+   */
+  onAuthenticatedRequest?: (
+    req: any,
+    session: AuthSession | null,
+  ) => void | Promise<void>;
 }
 
 export interface ParcaeApp {
@@ -392,6 +404,31 @@ export function createApp(config: AppConfig): ParcaeApp {
           next();
         });
       });
+
+      // Middleware: optional post-auth hook. Fires for every request
+      // that has reached this point with a resolved session — covers
+      // both HTTP (after the auth-resolve middleware above) and
+      // socket-RPC (`req._socketRpc` skipped resolve but had session
+      // pre-injected). Errors are swallowed so a faulty hook can never
+      // break the request path.
+      if (config.onAuthenticatedRequest) {
+        const hook = config.onAuthenticatedRequest;
+        server.polka.use((req: any, _res: any, next: any) => {
+          if (req.session?.user) {
+            try {
+              const result = hook(req, req.session ?? null);
+              if (result instanceof Promise) {
+                result.catch((err: unknown) => {
+                  log.warn(`[onAuthenticatedRequest] async error: ${err}`);
+                });
+              }
+            } catch (err) {
+              log.warn(`[onAuthenticatedRequest] error: ${err}`);
+            }
+          }
+          next();
+        });
+      }
 
       // ── Step 11: Default routes ────────────────────────────────────
       server.polka.get(`/${version}/health`, (_req: any, res: any) => {
