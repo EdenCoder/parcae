@@ -158,12 +158,19 @@ export function clerk(config: ClerkConfig): AuthAdapter {
         }
       }
 
+      // Pass through `fva` (factor verification age) — Clerk default JWT
+      // claim that lets a step-up gate know if/when the second factor
+      // was last verified in the current session. `fva[1] === -1` means
+      // no second factor was verified.
+      const fva = (payload as any).fva;
+
       return {
         user: {
           id: userId,
           ...(orgId && { orgId }),
           ...(orgRole && { orgRole }),
           ...(orgSlug && { orgSlug }),
+          ...(Array.isArray(fva) && fva.length === 2 && { fva }),
         },
       };
     } catch (err) {

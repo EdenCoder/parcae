@@ -11,6 +11,7 @@ import { resolve, join } from "node:path";
 import { readdirSync, existsSync, statSync } from "node:fs";
 import pako from "pako";
 import { compress } from "compress-json";
+import { createSocketFakeRes } from "./socket-fake-res";
 import { Model } from "@parcae/model";
 import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
 import { log } from "./logger";
@@ -78,12 +79,23 @@ export interface AppConfig {
    * session resolved (or pre-injected for socket-RPC), and BEFORE
    * route dispatch. Errors are caught and logged so a faulty hook
    * cannot break the request path. Sync or async — sockets/HTTP both
-   * fire the same hook. Useful for presence audit logs and similar
-   * cross-cutting capture that needs `req.session` in scope.
+   * fire the same hook.
+   *
+   * Two main uses:
+   *   1. Telemetry / audit. Return a Promise; async work runs as
+   *      fire-and-forget without blocking the request. Do not write
+   *      to `res`.
+   *   2. Step-up / kill-switch enforcement. Write a response to `res`
+   *      synchronously (e.g. via `error(res, 403, ...)`). When
+   *      `res.writableEnded` is true after the hook returns, the
+   *      framework short-circuits — the route is not dispatched.
+   *      Control-flow uses must finish writing before the hook
+   *      returns; async writes can't short-circuit.
    */
   onAuthenticatedRequest?: (
     req: any,
     session: AuthSession | null,
+    res: any,
   ) => void | Promise<void>;
 }
 
@@ -413,10 +425,10 @@ export function createApp(config: AppConfig): ParcaeApp {
       // break the request path.
       if (config.onAuthenticatedRequest) {
         const hook = config.onAuthenticatedRequest;
-        server.polka.use((req: any, _res: any, next: any) => {
+        server.polka.use((req: any, res: any, next: any) => {
           if (req.session?.user) {
             try {
-              const result = hook(req, req.session ?? null);
+              const result = hook(req, req.session ?? null, res);
               if (result instanceof Promise) {
                 result.catch((err: unknown) => {
                   log.warn(`[onAuthenticatedRequest] async error: ${err}`);
@@ -425,6 +437,11 @@ export function createApp(config: AppConfig): ParcaeApp {
             } catch (err) {
               log.warn(`[onAuthenticatedRequest] error: ${err}`);
             }
+            // If the hook wrote a response synchronously (e.g. a step-up
+            // gate calling `error(res, 403, ...)`), short-circuit. Async
+            // writes can't reach this branch — telemetry stays
+            // fire-and-forget.
+            if (res.writableEnded) return;
           }
           next();
         });
@@ -567,34 +584,15 @@ export function createApp(config: AppConfig): ParcaeApp {
                 _parsedUrl: { pathname, query: qs || "", _raw: path },
               };
 
-              // Build fake res that captures the response
-              let responseBody: any = null;
-              const fakeRes: any = {
-                statusCode: 200,
-                writeHead(code: number, headers?: any) {
-                  this.statusCode = code;
-                  return this;
-                },
-                setHeader() {
-                  return this;
-                },
-                end(body?: string) {
-                  if (body) {
-                    try {
-                      responseBody = JSON.parse(body);
-                    } catch {
-                      responseBody = body;
-                    }
-                  }
-                  // Send compressed response
-                  const compressed = pako.gzip(
-                    JSON.stringify(
-                      compress(responseBody ?? { result: null, success: true }),
-                    ),
-                  );
-                  socket.emit(requestId, compressed);
-                },
-              };
+              // Build fake res that captures the response. See
+              // `socket-fake-res.ts` for the full contract — short
+              // version: a step-up gate that writes 403 to res via
+              // `error(res, 403, …)` sets `writableEnded`, which the
+              // `onAuthenticatedRequest` polka middleware checks to
+              // short-circuit. `writeHead`/`end` are idempotent so a
+              // late write from a downstream handler can't clobber the
+              // first response.
+              const fakeRes = createSocketFakeRes(socket, requestId);
 
               // Run through Polka's full handler (includes middleware, auth, auto-CRUD, custom routes)
               (server!.polka as any).handler(fakeReq, fakeRes);
