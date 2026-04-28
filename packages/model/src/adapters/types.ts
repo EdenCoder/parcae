@@ -110,20 +110,6 @@ export interface ModelScope {
   patch?: ScopeFunction;
 }
 
-// ─── Change Tracking ─────────────────────────────────────────────────────────
-
-/**
- * A set of changes to flush to the adapter.
- */
-export interface ChangeSet {
-  /** Property names that were set via direct assignment */
-  updates: string[];
-  /** RFC 6902 JSON Patch operations */
-  ops: PatchOp[];
-  /** Whether this is a new model being created */
-  creating: boolean;
-}
-
 // ─── Query Chain ─────────────────────────────────────────────────────────────
 
 /**
@@ -225,7 +211,6 @@ export interface QueryChain<T> {
   /** @internal */ __modelType: string;
   /** @internal */ __modelClass: ModelConstructor<T>;
   /** @internal */ __adapter: ModelAdapter;
-  /** @internal */ __debounceMs?: number;
 }
 
 // ─── Model Adapter ───────────────────────────────────────────────────────────
@@ -240,8 +225,13 @@ export interface ModelAdapter {
   /** Create the reactive data store. Frontend: Valtio proxy. Backend: plain object. */
   createStore(data: Record<string, any>): Record<string, any>;
 
-  /** Persist changes (create or update). */
-  save(model: any, changes: ChangeSet): Promise<void>;
+  /**
+   * Upsert the model's entire current state. No diffing, no dirty
+   * tracking — the model carries its full `__data` and (on the
+   * backend) an `__isNew` flag that controls hook routing (create vs
+   * save).
+   */
+  save(model: any): Promise<void>;
 
   /** Delete a model. */
   remove(model: any): Promise<void>;

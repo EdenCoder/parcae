@@ -231,11 +231,16 @@ function applyOps(
   const hasAdds = addOps.size > 0;
 
   // Apply updates atomically — mutate existing instances in-place via
-  // SYM_SERVER_MERGE, which preserves pending local changes and returns
-  // a new Proxy reference (for React.memo compatibility).
-  const updated = new Map<string, any>();
+  // SYM_SERVER_MERGE. Model identity is STABLE across merges (the
+  // cached Proxy is reused). For components that subscribe via
+  // `useModel(model)` / `useModelAtomic(model, path)`, re-render is
+  // scoped to the specific model that changed. For components that
+  // still consume `useQuery` directly, bumping the entry version
+  // below keeps the original cascade-re-render behaviour so non-
+  // migrated consumers still see updates — useModel/useModelAtomic
+  // is an opt-in path, not a required migration.
+  let didUpdate = false;
   for (const [id, patches] of updateOps) {
-    // Check both server items and optimistic items
     let existing = byId.get(id);
     if (!existing && entry?.optimistic) {
       existing = entry.optimistic.find((o: any) => o.id === id);
@@ -262,26 +267,32 @@ function applyOps(
     ensureIntermediates(snapshot, filtered);
     applyPatch(snapshot, filtered, false, true);
 
-    // SYM_SERVER_MERGE writes values onto the raw target (skipping
-    // locally-pending keys), deletes server-removed properties, and
-    // returns a new Proxy reference around the same target.
-    const serverMerge = existing[SYM_SERVER_MERGE];
-    if (serverMerge) {
-      updated.set(id, serverMerge(snapshot));
+    // Merge in place. `this` is stable, so the items array entry
+    // never needs to be swapped — SYM_SERVER_MERGE mutates the same
+    // instance we already hold.
+    if (typeof existing[SYM_SERVER_MERGE] === "function") {
+      existing[SYM_SERVER_MERGE](snapshot);
     } else {
-      // Fallback (non-Model objects)
+      // Fallback (non-Model optimistic items)
       for (const [k, v] of Object.entries(snapshot)) {
         existing[k] = v;
       }
     }
+    didUpdate = true;
   }
 
-  const hasRelevantUpdates = updated.size > 0;
-
-  // Build the result array.  Even for update-only batches we need a new
-  // array because the updated items have new Proxy references.
-  if (!hasRemoves && !hasAdds && !hasRelevantUpdates) {
+  if (!hasRemoves && !hasAdds && !didUpdate) {
     return { items, changed: false };
+  }
+
+  // For update-only ops, the items array reference stays the same
+  // (Model identity is stable) but we still return `changed: true`
+  // so the caller bumps `entry.version` → hash changes → consumers
+  // re-render. The array being the SAME reference is intentional —
+  // any `React.memo(Row)` wrapping the row components short-circuits
+  // for unchanged rows, so the re-render is cheap.
+  if (!hasRemoves && !hasAdds) {
+    return { items, changed: true };
   }
 
   const result: any[] = [];
@@ -289,8 +300,7 @@ function applyOps(
   for (const item of items) {
     const id = item.id;
     if (removeIds.has(id)) continue;
-    // Swap in the new Proxy reference for updated items
-    result.push(updated.get(id) ?? item);
+    result.push(item);
   }
 
   for (const [id, data] of addOps) {
@@ -304,16 +314,18 @@ function applyOps(
     const optimistic = serverTmp ? optimisticByTmp.get(serverTmp) : null;
 
     if (optimistic) {
-      // Merge server data into the optimistic instance in-place
-      const serverMerge = optimistic[SYM_SERVER_MERGE];
-      if (serverMerge) {
-        result.push(serverMerge(data));
+      // Merge server data into the optimistic instance in-place. The
+      // method returns `this`, so identity stays stable — the item we
+      // push into `result` is the same reference the rest of the app
+      // already holds.
+      if (typeof optimistic[SYM_SERVER_MERGE] === "function") {
+        result.push(optimistic[SYM_SERVER_MERGE](data));
       } else {
-        result.push(new modelClass(adapter, data));
+        result.push(modelClass.hydrate(adapter, data));
       }
       optimisticByTmp.delete(serverTmp);
     } else {
-      result.push(new modelClass(adapter, data));
+      result.push(modelClass.hydrate(adapter, data));
     }
   }
 
@@ -333,14 +345,18 @@ function applyOps(
 
 /**
  * Reconcile a fresh fetch result with the previous items array.
- * For items that exist in both, merges server data into the existing instance
- * in-place (via SYM_SERVER_MERGE) so local pending changes are preserved.
- * SYM_SERVER_MERGE returns a new Proxy reference for React.memo compat.
- * Only creates new instances for items not previously present.
+ * For items that exist in both, merges server data into the existing
+ * instance in-place via SYM_SERVER_MERGE (preserves local pending
+ * changes, preserves Proxy identity, emits "change" when data
+ * actually differs).
+ *
+ * The returned array only has a NEW reference when membership or
+ * order changed — same-membership same-order same-identity returns
+ * `prev` unchanged. Per-item reactivity is handled by
+ * `useModel(model)` subscribing to the model's "change" event.
  */
 function reconcile(prev: any[], next: any[], entry?: CacheEntry): any[] {
   if (prev === EMPTY || prev.length === 0) {
-    // Even on first fetch, drain optimistic items that the server now has
     if (entry?.optimistic.length) {
       drainOptimistic(next, entry);
     }
@@ -350,37 +366,35 @@ function reconcile(prev: any[], next: any[], entry?: CacheEntry): any[] {
   const prevById = new Map<string, any>();
   for (const item of prev) prevById.set(item.id, item);
 
-  let changed = false;
+  let membershipChanged = false;
   const result: any[] = new Array(next.length);
 
   for (let i = 0; i < next.length; i++) {
     const fresh = next[i];
     const existing = prevById.get(fresh.id);
     if (existing) {
-      // Merge server data in-place, respecting local pending changes.
-      // Returns a new Proxy reference around the same target.
-      const serverMerge = existing[SYM_SERVER_MERGE];
-      if (serverMerge) {
+      // Merge server data in-place — `this` identity is stable, so
+      // the items array entry stays referentially equal.
+      if (typeof existing[SYM_SERVER_MERGE] === "function") {
         const freshData = fresh.__data ?? fresh;
-        result[i] = serverMerge(freshData);
-        // New reference means the array is different
-        changed = true;
-      } else {
-        result[i] = existing;
+        existing[SYM_SERVER_MERGE](freshData);
       }
-      if (!changed && prev[i]?.id !== fresh.id) changed = true;
+      result[i] = existing;
+      // Order change still counts as membership change.
+      if (!membershipChanged && prev[i]?.id !== fresh.id) {
+        membershipChanged = true;
+      }
     } else {
       result[i] = fresh;
-      changed = true;
+      membershipChanged = true;
     }
   }
 
-  // Drain optimistic items whose tmp appears in server results
   if (entry?.optimistic.length) {
     drainOptimistic(next, entry);
   }
 
-  if (!changed && prev.length === next.length) return prev;
+  if (!membershipChanged && prev.length === next.length) return prev;
   return result;
 }
 

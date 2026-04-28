@@ -298,7 +298,7 @@ export function createApp(config: AppConfig): ParcaeApp {
       log.info("PubSub ready");
 
       log.info("Connecting Queue...");
-      const queue = new QueueService({ url: envConfig.REDIS_URL });
+      const queue = new QueueService({ url: envConfig.REDIS_URL, name: envConfig.JOB_QUEUE_NAME || "parcae" });
       await queue.building;
       log.info("Queue ready");
 

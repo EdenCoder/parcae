@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import type { Job } from "bullmq";
 import { log } from "../logger";
 /**
  * @parcae/backend — Global service context
@@ -89,7 +90,7 @@ export async function enqueue(
   name: string,
   data: any,
   options: EnqueueOptions = {},
-): Promise<boolean> {
+): Promise<Job | false | null> {
   if (!_queue) {
     log.warn(
       `[parcae] enqueue("${name}"): no queue configured (REDIS_URL not set)`,
@@ -104,19 +105,17 @@ export async function enqueue(
   }
 
   if (options.jobId) {
-    const job = await addJobIfNotExists(queue, name, data, {
+    return await addJobIfNotExists(queue, name, data, {
       jobId: options.jobId.replace(/:/g, "."),
       removeOnComplete: options.removeOnComplete,
       removeOnFail: options.removeOnFail,
     });
-    return job !== null;
   }
 
-  await queue.add(name, data, {
+  return await queue.add(name, data, {
     removeOnComplete: options.removeOnComplete ?? 100,
     removeOnFail: options.removeOnFail ?? 50,
   });
-  return true;
 }
 
 // ─── lock() ──────────────────────────────────────────────────────────────────

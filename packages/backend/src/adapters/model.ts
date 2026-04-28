@@ -11,7 +11,6 @@ import { detectEngine } from "./engine";
 
 import {
   CHAINABLE_METHODS,
-  type ChangeSet,
   type ColumnType,
   type ModelAdapter,
   type ModelConstructor,
@@ -57,7 +56,9 @@ function resolveColType(col: ColumnType): string {
 
 /**
  * Hydrate a DB row into a Model instance.
- * Unpacks the `data` JSONB overflow column into top-level fields.
+ * Unpacks the `data` JSONB overflow column into top-level fields and
+ * delegates to `Model.hydrate` so field-initializer defaults don't
+ * clobber the data coming from the DB.
  */
 function hydrate<T>(
   modelClass: ModelConstructor<T>,
@@ -90,9 +91,7 @@ function hydrate<T>(
   data.createdAt = data.createdAt ? new Date(data.createdAt) : new Date();
   data.updatedAt = data.updatedAt ? new Date(data.updatedAt) : new Date();
 
-  const instance = new modelClass(adapter, data);
-  (instance as any).__isNew = false;
-  return instance;
+  return (modelClass as any).hydrate(adapter, data) as T;
 }
 
 /**
@@ -326,23 +325,19 @@ export class BackendAdapter implements ModelAdapter {
 
   // ── save ─────────────────────────────────────────────────────────────
 
-  async save(model: any, changes: ChangeSet): Promise<void> {
+  /**
+   * Upsert the entire current state of `model`. The `__isNew` flag (set
+   * by `Model.create()`, cleared after the first successful save or by
+   * `hydrate()`) controls hook routing: new instances run "create" /
+   * "save" hooks, existing instances run "save" hooks only.
+   *
+   * Targeted RFC 6902 updates go through `.patch()` instead; this path
+   * is intentionally "replace the whole row".
+   */
+  async save(model: any): Promise<void> {
     const ModelClass = model.constructor as typeof Model;
     const table = tableName(ModelClass as unknown as ModelConstructor);
-    const creating = changes.creating;
-
-    if (!creating && changes.ops.length > 0) {
-      const allOps: PatchOp[] = [...changes.ops];
-      for (const key of changes.updates) {
-        allOps.push({
-          op: "replace" as const,
-          path: `/${key}`,
-          value: model.__data[key],
-        });
-      }
-      await this.patch(model, allOps);
-      return;
-    }
+    const creating = Boolean((model as any).__isNew);
 
     const action = creating ? "create" : "save";
     const cleanups: Array<() => Promise<void> | void> = [];
@@ -1288,7 +1283,7 @@ export class BackendAdapter implements ModelAdapter {
           );
         });
       } else {
-        await hookEntry.handler(ctx);
+        await hookEntry.handler(ctx as any);
       }
     }
   }

@@ -224,7 +224,7 @@ export function registerModelRoutes(
 
           const data = { ...(req.body || {}), ...scopeData };
           const item = Model.create.call(ModelClass, data) as any;
-          await item.save(true);
+          await item.save();
 
           json(res, 201, {
             result: (await item.sanitize?.(ctx.user)) ?? item.__data,
@@ -287,12 +287,11 @@ export function registerModelRoutes(
           ]);
           for (const [key, value] of Object.entries(data)) {
             if (!systemFields.has(key)) {
-              // Write through the proxy so change tracking picks it up
               (item as any)[key] = value;
             }
           }
 
-          await (item as any).save(true);
+          await (item as any).save();
 
           json(res, 200, {
             result:

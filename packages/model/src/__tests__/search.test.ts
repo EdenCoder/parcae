@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { Model } from "../Model";
-import type { ModelAdapter, ChangeSet, QueryChain } from "../adapters/types";
+import type { ModelAdapter, QueryChain } from "../adapters/types";
 
 // ─── Mock Adapter ────────────────────────────────────────────────────────────
 

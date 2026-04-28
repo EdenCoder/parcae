@@ -5,7 +5,7 @@
  * Class properties ARE the schema. Direct property access. Full type safety.
  */
 
-export { Model, generateId, SYM_SERVER_MERGE } from "./Model";
+export { Model, generateId, SYM_SERVER_MERGE, SYM_VERSION } from "./Model";
 export type { WithRefs } from "./Model";
 
 export { ops } from "./patch";
@@ -25,7 +25,6 @@ export { CHAINABLE_METHODS } from "./adapters/types";
 export type {
   ModelAdapter,
   ModelConstructor,
-  ChangeSet,
   QueryChain,
   QueryStep,
   SchemaDefinition,

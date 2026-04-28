@@ -1,6 +1,8 @@
 export { ParcaeProvider } from "./Provider";
 
 export { useQuery } from "./useQuery";
+export { useModel } from "./useModel";
+export { useModelAtomic } from "./useModelAtomic";
 export { useApi, useSDK, useConnectionStatus } from "./useApi";
 export { useSocket } from "./useSocket";
 export type { SocketHook } from "./useSocket";

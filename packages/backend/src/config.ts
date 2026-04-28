@@ -71,6 +71,9 @@ export const configSchema = z.object({
 
   /** Frontend URL. */
   FRONTEND_URL: z.string().optional(),
+
+  /** job queue name. Default: "parcae" */
+  JOB_QUEUE_NAME: z.string().optional().default("parcae"),
 });
 
 export type Config = z.infer<typeof configSchema>;

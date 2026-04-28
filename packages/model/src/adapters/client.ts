@@ -11,7 +11,6 @@
 import { proxy } from "valtio";
 import {
   CHAINABLE_METHODS,
-  type ChangeSet,
   type ModelAdapter,
   type ModelConstructor,
   type PatchOp,
@@ -118,22 +117,27 @@ export class FrontendAdapter implements ModelAdapter {
 
   // ── save ─────────────────────────────────────────────────────────────
 
-  async save(model: any, changes: ChangeSet): Promise<void> {
+  /**
+   * Upsert the entire current state of the model.
+   *
+   *  - `__isNew` → POST {full body}. If the server echoes an `id` we
+   *    adopt it (server-minted ids win when the model was created
+   *    locally without one).
+   *  - otherwise → PUT {full body}. Targeted field updates use `patch`
+   *    / `flush` instead; `save` is intentionally "replace the whole
+   *    document".
+   */
+  async save(model: any): Promise<void> {
     const ModelClass = model.constructor as ModelConstructor;
     const path = this.resolvePath(ModelClass);
 
-    if (changes.creating) {
+    if (model.__isNew) {
       const result = await this.transport.post(path, model.__data);
       if (result?.id) (model as any).id = result.id;
-    } else if (changes.ops.length > 0) {
-      await this.transport.patch(`${path}/${model.id}`, { ops: changes.ops });
-    } else if (changes.updates.length > 0) {
-      const data: Record<string, any> = {};
-      for (const key of changes.updates) {
-        data[key] = model.__data[key];
-      }
-      await this.transport.put(`${path}/${model.id}`, data);
+      return;
     }
+
+    await this.transport.put(`${path}/${model.id}`, model.__data);
   }
 
   // ── remove ───────────────────────────────────────────────────────────
@@ -154,7 +158,7 @@ export class FrontendAdapter implements ModelAdapter {
     try {
       const data = await this.transport.get(`${path}/${id}`);
       if (!data) return null;
-      return new modelClass(this, data) as T;
+      return (modelClass as any).hydrate(this, data) as T;
     } catch {
       return null;
     }
@@ -185,7 +189,9 @@ export class FrontendAdapter implements ModelAdapter {
       const path = this.resolvePath(modelClass);
       const result = await this.transport.get(path, { __query: steps });
       const items = result?.[modelClass.type + "s"] ?? result?.items ?? [];
-      const models = items.map((row: any) => new modelClass(this, row));
+      const models = items.map((row: any) =>
+        (modelClass as any).hydrate(this, row),
+      );
       // Attach query subscription hash if backend provided one
       if (result?.__queryHash) {
         Object.defineProperty(models, "__queryHash", {
