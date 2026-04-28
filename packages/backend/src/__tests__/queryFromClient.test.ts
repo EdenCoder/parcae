@@ -166,16 +166,21 @@ describe("BackendAdapter.queryFromClient", () => {
     });
   });
 
-  // ── Limit Clamping ────────────────────────────────────────────────
+  // ── Limit Sanitization ────────────────────────────────────────────
+  //
+  // No upper clamp on client-provided limits since commit ba22391 —
+  // the scope is the security boundary. Client `.limit(N)` passes
+  // through verbatim, coerced to a positive integer, falling back to
+  // DEFAULT_LIMIT (25) on parse failure.
 
-  describe("limit clamping", () => {
-    it("should clamp limit to 100", () => {
+  describe("limit sanitization", () => {
+    it("should pass large client limits through verbatim (no upper clamp)", () => {
       const steps: QueryStep[] = [{ method: "limit", args: [500] }];
 
       adapter.queryFromClient(ProjectModel, { userId: "u1" }, steps);
 
       const limitCall = calls.find((c) => c.method === "limit");
-      expect(limitCall!.args[0]).toBe(100);
+      expect(limitCall!.args[0]).toBe(500);
     });
 
     it("should treat limit(0) as default (0 is not a valid limit)", () => {
@@ -184,7 +189,7 @@ describe("BackendAdapter.queryFromClient", () => {
       adapter.queryFromClient(ProjectModel, { userId: "u1" }, steps);
 
       const limitCall = calls.find((c) => c.method === "limit");
-      // parseInt(0) || 25 → 25, then Math.max(25, 1) → 25, Math.min(25, 100) → 25
+      // parseInt(0) || 25 → 25, then Math.max(25, 1) → 25
       expect(limitCall!.args[0]).toBe(25);
     });
 
@@ -194,7 +199,7 @@ describe("BackendAdapter.queryFromClient", () => {
       adapter.queryFromClient(ProjectModel, { userId: "u1" }, steps);
 
       const limitCall = calls.find((c) => c.method === "limit");
-      // NaN → default 25, clamped to min 1 max 100
+      // NaN → default 25, then Math.max(25, 1) → 25
       expect(limitCall!.args[0]).toBe(25);
     });
 
@@ -950,7 +955,11 @@ describe("BackendAdapter.queryFromClient", () => {
   });
 
   describe("adversarial: DoS via limit/offset", () => {
-    it("should cap absurdly large limits", () => {
+    it("should pass absurdly large limits through (scope is the DoS boundary, not the limit)", () => {
+      // No upper clamp since ba22391 — the scope already restricts
+      // which rows the client can see. A naked `Number.MAX_SAFE_INTEGER`
+      // here just becomes whatever the SQL driver does with it, which
+      // is bounded by the actual scoped row count.
       const steps: QueryStep[] = [
         { method: "limit", args: [Number.MAX_SAFE_INTEGER] },
       ];
@@ -958,7 +967,7 @@ describe("BackendAdapter.queryFromClient", () => {
       adapter.queryFromClient(ProjectModel, { userId: "u1" }, steps);
 
       const limitCall = calls.find((c) => c.method === "limit");
-      expect(limitCall!.args[0]).toBe(100);
+      expect(limitCall!.args[0]).toBe(Number.MAX_SAFE_INTEGER);
     });
 
     it("should handle negative limit", () => {
@@ -977,7 +986,7 @@ describe("BackendAdapter.queryFromClient", () => {
       adapter.queryFromClient(ProjectModel, { userId: "u1" }, steps);
 
       const limitCall = calls.find((c) => c.method === "limit");
-      // parseInt(Infinity) → NaN, NaN || 25 → 25, clamped to [1,100]
+      // parseInt(Infinity) → NaN, NaN || 25 → 25, then Math.max(25, 1) → 25
       expect(limitCall!.args[0]).toBe(25);
     });
   });

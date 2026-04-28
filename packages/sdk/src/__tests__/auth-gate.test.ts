@@ -66,7 +66,11 @@ describe("AuthGate", () => {
     await gate.ready;
     expect(gate.state.status).toBe("authenticated");
     expect(gate.state.userId).toBe("u2");
-    expect(gate.state.version).toBe(2);
+    // `version` ticks on every state transition, not just resolves —
+    // `reset()` bumps it too so `useAuthStatus` re-renders on
+    // disconnect (see commit 035a48b). resolve(1) → reset(2) →
+    // resolve(3).
+    expect(gate.state.version).toBe(3);
   });
 
   it("fetch blocks until resolved", async () => {
@@ -82,16 +86,22 @@ describe("AuthGate", () => {
     expect(results).toEqual(["a", "b"]);
   });
 
-  it("version increments on each resolve", () => {
+  it("version increments on every state transition", () => {
+    // `version` is the change-detection counter `useAuthStatus`
+    // depends on — every transition (resolve / unauth / reset) must
+    // bump it, otherwise consumers would miss reset → re-resolve
+    // cycles and stay stuck on stale auth state.
     const gate = new AuthGate();
     expect(gate.state.version).toBe(0);
     gate.resolve("u1");
     expect(gate.state.version).toBe(1);
     gate.reset();
-    gate.resolveUnauthenticated();
     expect(gate.state.version).toBe(2);
-    gate.reset();
-    gate.resolve("u2");
+    gate.resolveUnauthenticated();
     expect(gate.state.version).toBe(3);
+    gate.reset();
+    expect(gate.state.version).toBe(4);
+    gate.resolve("u2");
+    expect(gate.state.version).toBe(5);
   });
 });
