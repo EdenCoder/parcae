@@ -44,7 +44,9 @@
  * outside the caller's error path, so compensation is meaningless there.
  */
 
+import type { Job } from "bullmq";
 import type { ModelConstructor } from "@parcae/model";
+import type { EnqueueOptions } from "../services/context";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -62,8 +64,16 @@ export interface HookContext {
   data?: Record<string, any>;
   /** Distributed lock function. */
   lock: (key: string, ttl?: number) => Promise<() => Promise<void>>;
-  /** Enqueue a background job. Returns true if enqueued, false if deduped/skipped. */
-  enqueue: (name: string, data: any, opts?: any) => Promise<boolean>;
+  /**
+   * Enqueue a background job.
+   * Returns the BullMQ Job if added, `null` if deduped by jobId, or `false`
+   * if no queue is configured (REDIS_URL not set).
+   */
+  enqueue: (
+    name: string,
+    data: any,
+    opts?: EnqueueOptions,
+  ) => Promise<Job | false | null>;
   /** The authenticated user (if any). */
   user?: { id: string; [key: string]: any } | null;
   /**
