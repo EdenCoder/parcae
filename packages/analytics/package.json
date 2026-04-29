@@ -1,0 +1,38 @@
+{
+  "name": "@parcae/analytics",
+  "version": "0.1.0",
+  "description": "Parcae Analytics — event-stream + snapshot rollups, contracts, detectors, story projection",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@parcae/backend": "workspace:*",
+    "@parcae/model": "workspace:*",
+    "knex": "^3.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsup": "^8.5.0",
+    "typescript": "^5.8.0",
+    "vitest": "^4.0.18"
+  },
+  "license": "MIT"
+}
