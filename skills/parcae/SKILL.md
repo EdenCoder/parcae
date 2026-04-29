@@ -22,7 +22,7 @@ No codegen, no dashboard, no vendor lock-in. Everything is TypeScript.
 
 ## Packages
 
-`@parcae/model`, `@parcae/backend`, `@parcae/sdk`, `@parcae/auth-betterauth`, `@parcae/auth-clerk`.
+`@parcae/model`, `@parcae/backend`, `@parcae/sdk`, `@parcae/auth-betterauth`, `@parcae/auth-clerk`, `@parcae/analytics`.
 
 ## Architecture
 
@@ -160,6 +160,7 @@ For detailed API reference, read these as needed:
 - **[references/sdk.md](references/sdk.md)** -- createClient(), SocketTransport, SSETransport, AuthGate, React hooks (useQuery, useApi, useSetting), ParcaeProvider, auth gate components
 - **[references/auth.md](references/auth.md)** -- AuthAdapter interface, Better Auth server/client setup, Clerk adapter, session resolution
 - **[references/realtime.md](references/realtime.md)** -- PubSub (Redis), QuerySubscriptionManager, subscription lifecycle, diff ops, Socket.IO connection handling
+- **[references/analytics.md](references/analytics.md)** -- @parcae/analytics: Period, ActivityEvent + metric.event() decorator, Metric base + analytics_snapshot, Detector / Finding / StoryComposer / projection runner, Contract base for page-shaped read endpoints, materialized view orchestration
 
 ## Directory Structure
 
