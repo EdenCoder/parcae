@@ -144,6 +144,16 @@ export function validateAgainstFinding(
   finding: Finding,
 ): ComposedStory {
   const allowedNumbers = collectNumbers(finding.data);
+  // Metric-key constants are deterministic from the metric definition,
+  // not LLM hallucinations — `journey.sustained_4w` legitimately reads
+  // as "4-week sustained" in prose. Without this, the validator
+  // dropped otherwise-correct stories whenever the composer used
+  // metric semantics in a sentence.
+  for (const ref of finding.relatedMetrics) {
+    for (const match of ref.matchAll(/\d+(?:\.\d+)?/g)) {
+      allowedNumbers.add(Number(match[0]));
+    }
+  }
   const bodyNumbers = extractNumbers(`${story.title} ${story.body}`);
   for (const n of bodyNumbers) {
     if (!nearlyOneOf(n, allowedNumbers) && !nearlyOneOf(n, story.quotedValues)) {

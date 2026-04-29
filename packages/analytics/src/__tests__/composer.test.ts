@@ -95,6 +95,26 @@ describe("validateAgainstFinding", () => {
     expect(() => validateAgainstFinding(story, baseFinding)).toThrow(/73/);
   });
 
+  it("accepts numbers extracted from metric keys", () => {
+    // `journey.sustained_4w` legitimately reads as "4 weeks" in prose;
+    // the finding doesn't need to put 4 in data or quotedValues for
+    // that to validate.
+    const finding: Finding = {
+      ...baseFinding,
+      data: { dropped: 3, welcomed: 7 },
+      relatedMetrics: ["journey.sustained_4w", "journey.time_to_first_log"],
+    };
+    const story: ComposedStory = {
+      key: finding.key,
+      severity: "watch",
+      title: "Three patients dropped before 4 weeks",
+      body: "3 of 7 welcomed patients did not sustain for 4 weeks.",
+      quotedValues: [3, 7],
+      metricRefs: ["journey.sustained_4w"],
+    };
+    expect(() => validateAgainstFinding(story, finding)).not.toThrow();
+  });
+
   it("rejects a hallucinated metric ref", () => {
     const story: ComposedStory = {
       key: baseFinding.key,
