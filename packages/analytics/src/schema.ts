@@ -11,6 +11,7 @@ import type { Knex } from "knex";
 import type { AnalyticsEvent, EventEmitter } from "./event.js";
 import { setEventEmitter } from "./event.js";
 import { generateId } from "./id.js";
+import { ensureStateChangeTable } from "./state-change.js";
 
 export const ANALYTICS_EVENT_TABLE = "analytics_event";
 export const ANALYTICS_SNAPSHOT_TABLE = "analytics_snapshot";
@@ -18,6 +19,7 @@ export const ANALYTICS_SNAPSHOT_TABLE = "analytics_snapshot";
 export async function ensureAnalyticsTables(db: Knex): Promise<void> {
   await ensureEventTable(db);
   await ensureSnapshotTable(db);
+  await ensureStateChangeTable(db);
 }
 
 async function ensureEventTable(db: Knex): Promise<void> {
