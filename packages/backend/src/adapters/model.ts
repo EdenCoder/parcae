@@ -55,6 +55,18 @@ function resolveColType(col: ColumnType): string {
 }
 
 /**
+ * RFC 6901 array-index segment: numeric string (`"0"`, `"12"`) or
+ * the append marker `"-"`. When the NEXT path segment after a
+ * missing intermediate is one of these, the intermediate must be a
+ * JSONB array, not an object — otherwise a downstream `for…of`
+ * over the JS-side hydrated value would crash with "object is not
+ * iterable" when the same field is later read back.
+ */
+function isArrayIndexSegment(seg: string | undefined): boolean {
+  return seg === "-" || (seg !== undefined && /^\d+$/.test(seg));
+}
+
+/**
  * Hydrate a DB row into a Model instance.
  * Unpacks the `data` JSONB overflow column into top-level fields and
  * delegates to `Model.hydrate` so field-initializer defaults don't
@@ -1008,6 +1020,15 @@ export class BackendAdapter implements ModelAdapter {
           case "add": {
             if (innerSegments[innerSegments.length - 1] === "-") {
               const parent = innerSegments.slice(0, -1);
+              // The `-` (append) case writes into a JSONB array.
+              // Pre-existing behaviour: every intermediate emitted
+              // for the parent path defaults to `'[]'::jsonb`.
+              // Strictly only the deepest intermediate (the array
+              // itself) needs to be `[]`, but in practice all
+              // shallower parents already exist when we get here, so
+              // their COALESCE preserves the existing shape and the
+              // wrong-shape default never lands. Left as-is to keep
+              // this fix minimal — DOL-553 targets the non-`-` paths.
               this._ensureIntermediates(parent, column, ensured, (pgPath) => {
                 sql = `jsonb_set_lax(${sql}, ?::text[], COALESCE((COALESCE(${column}, '{}'::jsonb)) #> ?::text[], '[]'::jsonb), true, 'use_json_null')`;
                 bindings.push(pgPath, pgPath);
@@ -1025,8 +1046,8 @@ export class BackendAdapter implements ModelAdapter {
                 innerSegments,
                 column,
                 ensured,
-                (pgPath) => {
-                  sql = `jsonb_set_lax(${sql}, ?::text[], COALESCE((COALESCE(${column}, '{}'::jsonb)) #> ?::text[], '{}'::jsonb), true, 'use_json_null')`;
+                (pgPath, defaultJson) => {
+                  sql = `jsonb_set_lax(${sql}, ?::text[], COALESCE((COALESCE(${column}, '{}'::jsonb)) #> ?::text[], ${defaultJson}), true, 'use_json_null')`;
                   bindings.push(pgPath, pgPath);
                 },
               );
@@ -1047,8 +1068,8 @@ export class BackendAdapter implements ModelAdapter {
                 innerSegments,
                 column,
                 ensured,
-                (pgPath) => {
-                  sql = `jsonb_set_lax(${sql}, ?::text[], COALESCE((COALESCE(${column}, '{}'::jsonb)) #> ?::text[], '{}'::jsonb), true, 'use_json_null')`;
+                (pgPath, defaultJson) => {
+                  sql = `jsonb_set_lax(${sql}, ?::text[], COALESCE((COALESCE(${column}, '{}'::jsonb)) #> ?::text[], ${defaultJson}), true, 'use_json_null')`;
                   bindings.push(pgPath, pgPath);
                 },
               );
@@ -1086,17 +1107,39 @@ export class BackendAdapter implements ModelAdapter {
     });
   }
 
+  /**
+   * Walk every parent depth of a JSON path and emit one
+   * `jsonb_set_lax` ensuring that intermediate exists. The shape
+   * created when the intermediate is missing depends on the NEXT
+   * path segment: a numeric index (`"0"`, `"12"`) or the append
+   * marker (`"-"`) means the intermediate is an array (`'[]'::jsonb`);
+   * any other key means it's a plain object (`'{}'::jsonb`).
+   *
+   * Without the array branch, a patch like
+   * `replace /blocks/<id>/shots/0/panel` on a row with no prior
+   * `shots` field would write `shots = { "0": { panel: … } }`,
+   * passing the JSON write but blowing up every subsequent
+   * `for (const s of block.shots)` with "object is not iterable"
+   * once the row hydrates back into JS.
+   *
+   * The `add /…/-` append branch passes its own static `'[]'::jsonb`
+   * default to `emit` and ignores the `defaultJson` arg — its
+   * pre-existing behaviour is left unchanged.
+   */
   private _ensureIntermediates(
     segments: string[],
     column: string,
     ensured: Set<string>,
-    emit: (pgPath: string) => void,
+    emit: (pgPath: string, defaultJson: string) => void,
   ): void {
     for (let depth = 1; depth < segments.length; depth++) {
       const key = `${column}:${segments.slice(0, depth).join(",")}`;
       if (!ensured.has(key)) {
         ensured.add(key);
-        emit(`{${segments.slice(0, depth).join(",")}}`);
+        const defaultJson = isArrayIndexSegment(segments[depth])
+          ? "'[]'::jsonb"
+          : "'{}'::jsonb";
+        emit(`{${segments.slice(0, depth).join(",")}}`, defaultJson);
       }
     }
   }

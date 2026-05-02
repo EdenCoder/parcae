@@ -171,9 +171,30 @@ function lazyQuery<T>(
 // ─── Patch helpers ──────────────────────────────────────────────────────────
 
 /**
+ * RFC 6901 array-index segment: numeric string (`"0"`, `"12"`) or
+ * the append-marker `"-"`. When the NEXT path segment after a
+ * missing intermediate is one of these, the intermediate must be an
+ * array, not an object — otherwise `applyPatch`'s array-add /
+ * array-replace branch can't do its splice / index assignment, and
+ * a downstream `for…of` would crash with "object is not iterable".
+ */
+function isArrayIndexSegment(seg: string | undefined): boolean {
+  return seg === "-" || (seg !== undefined && /^\d+$/.test(seg));
+}
+
+/**
  * `fast-json-patch` doesn't auto-vivify parent objects. Walk every op's
- * path and ensure intermediate segments exist as plain objects so
- * applyPatch doesn't blow up on a missing parent.
+ * path and ensure intermediate segments exist so applyPatch doesn't
+ * blow up on a missing parent.
+ *
+ * Vivification shape is decided by looking at the NEXT path segment:
+ * a numeric index (or `-`) means the intermediate is an array; any
+ * other key means it's a plain object. Without the array branch,
+ * patches like `replace /blocks/<id>/shots/0/panel` on a block with
+ * no prior `shots` field would create `block.shots = {}` and then
+ * set `block.shots["0"]…` — leaving a `{ "0": {…} }` shape that
+ * looks like an array but throws `object is not iterable` on the
+ * very next `for (const s of block.shots)`.
  */
 function ensureIntermediates(
   doc: Record<string, any>,
@@ -186,7 +207,7 @@ function ensureIntermediates(
       const seg = segments[i]!;
       const val = cursor[seg];
       if (val === null || val === undefined || typeof val !== "object") {
-        cursor[seg] = {};
+        cursor[seg] = isArrayIndexSegment(segments[i + 1]) ? [] : {};
       }
       cursor = cursor[seg];
     }
