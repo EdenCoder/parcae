@@ -55,12 +55,36 @@ export interface MetricSnapshot {
    * Metadata pushed onto the row. Intended for things consumers want
    * to read alongside the value but don't need indexed: per-cohort
    * patient ids for drill-down, mean alongside median, etc. Capped at
-   * 64KB to stop unbounded blob growth.
+   * `MAX_METADATA_BYTES` to stop unbounded blob growth from a runaway
+   * metric — real cohort-with-evidence payloads run hundreds of KB on
+   * mid-sized orgs and that's fine; the cap is a guard against a bug
+   * stuffing megabytes per row, not a budget.
    */
   metadata?: Record<string, unknown>;
 }
 
-const MAX_METADATA_BYTES = 64 * 1024;
+/**
+ * Hard upper bound on `MetricSnapshot.metadata` size. Originally 64KB
+ * — too tight: a single cohort with 50+ patients carrying biomarker
+ * trajectory + behaviour-summary evidence routinely lands over that,
+ * which then rolls back the metric's transaction silently and the
+ * snapshot never updates. Raised to 1MB so realistic cohort payloads
+ * fit; postgres's jsonb hard limit is 1GB so we're still 1000× under
+ * the platform ceiling. Override via `setMaxMetadataBytes()` for
+ * tests or specialised deployments.
+ */
+let maxMetadataBytes = 1024 * 1024;
+
+export function setMaxMetadataBytes(bytes: number): void {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    throw new Error(`setMaxMetadataBytes requires a positive number, got ${bytes}`);
+  }
+  maxMetadataBytes = bytes;
+}
+
+export function getMaxMetadataBytes(): number {
+  return maxMetadataBytes;
+}
 
 export abstract class Metric {
   /** Hierarchical key, e.g. `"engagement.wau"`. */
@@ -145,9 +169,11 @@ async function persistSnapshots(
 
   const rows = snapshots.map((s) => {
     const metadata = s.metadata ?? {};
-    if (byteLength(metadata) > MAX_METADATA_BYTES) {
+    const cap = maxMetadataBytes;
+    const size = byteLength(metadata);
+    if (size > cap) {
       throw new Error(
-        `analytics_snapshot metadata exceeded ${MAX_METADATA_BYTES} bytes for key=${metric.key}`,
+        `analytics_snapshot metadata exceeded ${cap} bytes (got ${size}) for key=${metric.key}`,
       );
     }
     const dimensions = s.dimensions ?? {};
