@@ -102,6 +102,17 @@ export {
   type StoryStatus,
 } from "./story.js";
 
+export {
+  ANALYTICS_STATE_CHANGE_TABLE,
+  diffCohorts,
+  ensureStateChangeTable,
+  persistStateChangeRows,
+  type DiffArgs,
+  type ReasonShape,
+  type StateChangeRow,
+  type Transition,
+} from "./state-change.js";
+
 export { WauMetric, AnomalyDetector } from "./examples.js";
 
 export { generateId } from "./id.js";
