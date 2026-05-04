@@ -36,6 +36,8 @@ export {
   runMetrics,
   readLatestSnapshot,
   readSnapshotSeries,
+  setMaxMetadataBytes,
+  getMaxMetadataBytes,
   type MetricContext,
   type MetricSnapshot,
   type PersistedSnapshot,

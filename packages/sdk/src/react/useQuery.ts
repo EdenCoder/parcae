@@ -140,11 +140,27 @@ function notify(e: CacheEntry): void {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
- * Ensure every intermediate segment of each patch path exists as a plain
- * object on `doc`.  `fast-json-patch` does NOT auto-vivify parents, so a
- * patch like `{ op:"add", path:"/a/b/c" }` will throw if `doc.a` is `null`
- * or missing.  We walk the path segments and replace any `null` / non-object
- * intermediates with `{}` so the subsequent `applyPatch` call can succeed.
+ * RFC 6901 array-index segment: numeric string (`"0"`, `"12"`) or
+ * the append-marker `"-"`. When the NEXT path segment after a missing
+ * intermediate is one of these, the intermediate must be an array.
+ */
+function isArrayIndexSegment(seg: string | undefined): boolean {
+  return seg === "-" || (seg !== undefined && /^\d+$/.test(seg));
+}
+
+/**
+ * Ensure every intermediate segment of each patch path exists on
+ * `doc`. `fast-json-patch` does NOT auto-vivify parents, so a patch
+ * like `{ op:"add", path:"/a/b/c" }` will throw if `doc.a` is `null`
+ * or missing. We walk the path segments and replace any `null` /
+ * non-object intermediates so the subsequent `applyPatch` call can
+ * succeed.
+ *
+ * Vivification shape is decided by looking at the NEXT path segment:
+ * a numeric index (or `-`) means the intermediate is an array; any
+ * other key means it's a plain object. Mirrors the same rule in
+ * `@parcae/model`'s ensureIntermediates so optimistic local apply
+ * matches the server-side write shape.
  */
 function ensureIntermediates(
   doc: Record<string, any>,
@@ -158,7 +174,7 @@ function ensureIntermediates(
       const seg = segments[i]!;
       const val = cursor[seg];
       if (val === null || val === undefined || typeof val !== "object") {
-        cursor[seg] = {};
+        cursor[seg] = isArrayIndexSegment(segments[i + 1]) ? [] : {};
       }
       cursor = cursor[seg];
     }

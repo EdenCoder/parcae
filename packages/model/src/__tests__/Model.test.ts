@@ -340,6 +340,141 @@ describe("Model", () => {
       await post.flush();
       expect(adapter.patched.length).toBe(0);
     });
+
+    // Regression — DOL-553. A patch like
+    // `replace /tags/0/text` on a model with no prior `tags` field
+    // used to auto-vivify `tags` as `{}`, leaving the field as
+    // `{ "0": { text: "…" } }` and crashing every subsequent
+    // `for (const t of tags)` with "object is not iterable".
+    // Vivification now picks `[]` when the next path segment is a
+    // numeric index.
+    it("vivifies missing intermediates as [] when the next segment is a numeric index", async () => {
+      const post = Post.create({ title: "x" });
+      await post.save();
+      await post.patch([
+        {
+          op: "add",
+          path: "/tags/0",
+          value: { text: "first" },
+        },
+      ]);
+      const tags = (post as any).tags;
+      expect(Array.isArray(tags)).toBe(true);
+      expect(tags).toEqual([{ text: "first" }]);
+      // Crucially, the value can be iterated without throwing.
+      const collected: any[] = [];
+      for (const t of tags) collected.push(t);
+      expect(collected).toEqual([{ text: "first" }]);
+    });
+
+    it("vivifies deep numeric-segment paths through nested missing parents", async () => {
+      const post = Post.create({ title: "x" });
+      await post.save();
+      // Mirrors the real shot-panel hook shape:
+      //   replace /blocks/<id>/shots/<idx>/panel
+      // on a row where neither `blocks.<id>` nor its `shots` field
+      // exists yet.
+      await post.patch([
+        {
+          op: "add",
+          path: "/blocks/abc/shots/0/panel",
+          value: { url: "https://example.test/p.png" },
+        },
+      ]);
+      const blocks = (post as any).blocks;
+      expect(blocks).toBeTypeOf("object");
+      expect(Array.isArray(blocks)).toBe(false); // /blocks/abc → object
+      expect(Array.isArray(blocks.abc.shots)).toBe(true); // /shots/0 → array
+      expect(blocks.abc.shots[0].panel.url).toBe(
+        "https://example.test/p.png",
+      );
+    });
+
+    it("still vivifies non-numeric next segments as plain objects", async () => {
+      const post = Post.create({ title: "x" });
+      await post.save();
+      await post.patch([
+        { op: "replace", path: "/meta/cover/url", value: "u" },
+      ]);
+      const meta = (post as any).meta;
+      expect(Array.isArray(meta)).toBe(false);
+      expect(meta.cover.url).toBe("u");
+    });
+
+    it("vivifies the parent of an `add /…/-` append-marker as []", async () => {
+      const post = Post.create({ title: "x" });
+      await post.save();
+      // RFC 6901 `-` segment means "after the last array element".
+      // The parent must be an array for `applyPatch`'s array-add
+      // branch to do its splice.
+      await post.patch([
+        { op: "add", path: "/tags/-", value: { text: "first" } },
+      ]);
+      const tags = (post as any).tags;
+      expect(Array.isArray(tags)).toBe(true);
+      expect(tags).toEqual([{ text: "first" }]);
+    });
+
+    it("vivifies multi-digit numeric segments as arrays (regression — the regex must accept '12', not just '1')", async () => {
+      const post = Post.create({ title: "x" });
+      await post.save();
+      // Direct sparse-index add — fast-json-patch's array path
+      // accepts numeric strings of any length.
+      await post.patch([
+        { op: "add", path: "/items/0", value: "first" },
+        { op: "add", path: "/items/1", value: "second" },
+      ]);
+      // After the two adds, `items` is a real array of length 2.
+      // The regression guard here is the regex that decides
+      // numeric-vs-string: a literal-`/^\d$/` would only match
+      // single-digit indices and fall through to `{}` for `"12"`.
+      const items = (post as any).items;
+      expect(Array.isArray(items)).toBe(true);
+      expect(items).toEqual(["first", "second"]);
+    });
+
+    it("does not coerce a string segment that merely contains digits to array (e.g. 'b1')", async () => {
+      const post = Post.create({ title: "x" });
+      await post.save();
+      // `b1` is a Scenecode-style block id, not a numeric index —
+      // must remain an object lookup. If the regex were `/\d/`
+      // (contains-digit) instead of `/^\d+$/` (all-digits),
+      // `blocks.b1` would wrongly vivify as `[]`.
+      await post.patch([
+        { op: "add", path: "/blocks/b1/text", value: "hi" },
+      ]);
+      const blocks = (post as any).blocks;
+      expect(Array.isArray(blocks)).toBe(false);
+      expect(blocks.b1.text).toBe("hi");
+    });
+
+    it("preserves an existing array when patching a sub-index (does not clobber to {})", async () => {
+      const post = Post.create({ title: "x" });
+      await post.save();
+      // Pre-seed an array so the intermediate already exists; the
+      // vivification heuristic must NOT replace a healthy array
+      // with `{}` (or even with a fresh `[]` — only missing /
+      // null intermediates are touched).
+      await post.patch([
+        { op: "add", path: "/tags/0", value: "a" },
+        { op: "add", path: "/tags/1", value: "b" },
+      ]);
+      // Now patch a deeper sub-path under the existing array.
+      // First make tags entries objects.
+      await post.patch([
+        { op: "replace", path: "/tags/0", value: { text: "a" } },
+        { op: "replace", path: "/tags/1", value: { text: "b" } },
+      ]);
+      await post.patch([
+        { op: "replace", path: "/tags/0/role", value: "primary" },
+      ]);
+      const tags = (post as any).tags;
+      expect(Array.isArray(tags)).toBe(true);
+      expect(tags).toEqual([
+        { text: "a", role: "primary" },
+        { text: "b" },
+      ]);
+    });
   });
 
   describe("get / set dot-path accessors", () => {
