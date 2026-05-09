@@ -301,14 +301,26 @@ function applyOps(
     return { items, changed: false };
   }
 
-  // For update-only ops, the items array reference stays the same
-  // (Model identity is stable) but we still return `changed: true`
-  // so the caller bumps `entry.version` → hash changes → consumers
-  // re-render. The array being the SAME reference is intentional —
-  // any `React.memo(Row)` wrapping the row components short-circuits
-  // for unchanged rows, so the re-render is cheap.
+  // For update-only ops, return a NEW array reference (shallow copy).
+  // Per-item Model identity is still stable — SYM_SERVER_MERGE mutated
+  // the existing instances in place, so `React.memo(Row, item)` rows
+  // are still ref-equal and short-circuit cleanly. Only the wrapping
+  // array is fresh, which is what downstream `useMemo([items])` and
+  // derived-state computations need to invalidate.
+  //
+  // Without the new reference, consumers like
+  //   const rows = useMemo(() => items.map(toRow), [items])
+  // see the same items reference and return the cached `rows`, even
+  // though individual model fields just mutated. The `useSyncExternalStore`
+  // re-render fires (because cache.hash bumps via version++), but the
+  // memoized derived state is stale, so the rendered UI doesn't reflect
+  // the mutation. This was reproducible on Freia's chat screen: an
+  // `assistant-log-confirm` chip transitioned to `-done` server-side,
+  // the update op was received and applied (changed=true), but the chip
+  // visually stayed in pre-save state because `useMemo([rawMessages])`
+  // returned the cached rows. Slicing on update breaks that cycle.
   if (!hasRemoves && !hasAdds) {
-    return { items, changed: true };
+    return { items: items.slice(), changed: true };
   }
 
   const result: any[] = [];
