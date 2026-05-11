@@ -8,7 +8,7 @@
 export { Model, generateId, SYM_SERVER_MERGE, SYM_VERSION } from "./Model";
 export type { WithRefs } from "./Model";
 
-export { ops } from "./patch";
+export { ops, dedupOps } from "./patch";
 export type { OpBuilder } from "./patch";
 
 /**

@@ -37,6 +37,7 @@
 import { EventEmitter } from "eventemitter3";
 import ShortId from "short-unique-id";
 import { applyPatch, compare } from "fast-json-patch";
+import { dedupOps } from "./patch";
 import {
   CHAINABLE_METHODS,
   type ModelAdapter,
@@ -677,7 +678,14 @@ export class Model extends EventEmitter {
    * subscription layer can skip echoes of its own writes for the
    * specific sub-paths still in flight.
    */
-  async patch(ops: PatchOp[]): Promise<void> {
+  async patch(rawOps: PatchOp[]): Promise<void> {
+    if (rawOps.length === 0) return;
+    // Normalize: drop ops whose path lives UNDER another `remove`
+    // op in the same batch. Without this, fast-json-patch crashes
+    // on the sub-path op when its parent has just been removed.
+    // Callers can freely compose helpers — the framework keeps the
+    // batch consistent. See `patch.ts:dedupOps` for the contract.
+    const ops = dedupOps(rawOps);
     if (ops.length === 0) return;
 
     const paths = new Set<string>();

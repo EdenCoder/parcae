@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { ops } from "../patch";
+import { dedupOps, ops } from "../patch";
+import type { PatchOp } from "../adapters/types";
 
 describe("ops (unscoped builders)", () => {
   it("builds a remove op", () => {
@@ -77,5 +78,81 @@ describe("ops.scope", () => {
     // empty-string path yields just the base.
     const s = ops.scope("/root");
     expect(s.remove("").path).toBe("/root");
+  });
+});
+
+describe("dedupOps", () => {
+  it("drops sub-field removes under a parent remove", () => {
+    const input: PatchOp[] = [
+      { op: "remove", path: "/blocks/X/shots/Y/render" },
+      { op: "remove", path: "/blocks/X/shots/Y/render/url" },
+      { op: "remove", path: "/blocks/X/shots/Y/render/duration" },
+    ];
+    const out = dedupOps(input);
+    expect(out).toEqual([
+      { op: "remove", path: "/blocks/X/shots/Y/render" },
+    ]);
+  });
+
+  it("preserves siblings under the same parent", () => {
+    const input: PatchOp[] = [
+      { op: "remove", path: "/blocks/X/shots/Y/render" },
+      { op: "remove", path: "/blocks/X/shots/Y/sketch" },
+      { op: "remove", path: "/blocks/X/shots/Y/panel" },
+    ];
+    const out = dedupOps(input);
+    expect(out).toHaveLength(3);
+    expect(out.map((o) => o.path)).toEqual([
+      "/blocks/X/shots/Y/render",
+      "/blocks/X/shots/Y/sketch",
+      "/blocks/X/shots/Y/panel",
+    ]);
+  });
+
+  it("drops non-remove ops under a parent-remove (would crash applyPatch)", () => {
+    // The whole point: fast-json-patch throws when an op targets a
+    // path whose parent was just removed in the same batch. Dedup
+    // collapses these so callers can freely compose helpers without
+    // having to know the cleanup order.
+    const input: PatchOp[] = [
+      { op: "remove", path: "/blocks/X/image" },
+      { op: "replace", path: "/blocks/X/image/url", value: "foo" },
+      { op: "add", path: "/blocks/X/image/hash", value: "deadbeef" },
+    ];
+    const out = dedupOps(input);
+    expect(out).toEqual([{ op: "remove", path: "/blocks/X/image" }]);
+  });
+
+  it("collapses duplicate identical removes to one", () => {
+    const input: PatchOp[] = [
+      { op: "remove", path: "/a" },
+      { op: "remove", path: "/a" },
+      { op: "remove", path: "/a" },
+    ];
+    const out = dedupOps(input);
+    expect(out).toEqual([{ op: "remove", path: "/a" }]);
+  });
+
+  it("preserves non-overlapping ops in order", () => {
+    const input: PatchOp[] = [
+      { op: "replace", path: "/a", value: 1 },
+      { op: "remove", path: "/b/x" },
+      { op: "add", path: "/c", value: 2 },
+    ];
+    const out = dedupOps(input);
+    expect(out).toEqual(input);
+  });
+
+  it("returns empty for empty input", () => {
+    expect(dedupOps([])).toEqual([]);
+  });
+
+  it("is a no-op when no removes are present", () => {
+    const input: PatchOp[] = [
+      { op: "replace", path: "/a", value: 1 },
+      { op: "add", path: "/b", value: 2 },
+    ];
+    const out = dedupOps(input);
+    expect(out).toEqual(input);
   });
 });
