@@ -152,11 +152,16 @@ const ProjectModel: any = {
   },
 };
 
-function makeModel(id = "p1"): any {
+function makeModel(id = "p1", initialBlocks: any = {}): any {
   return {
     constructor: ProjectModel,
     id,
-    __data: { id, blocks: {}, tags: [], meta: {} },
+    __data: { id, blocks: initialBlocks, tags: [], meta: {} },
+    // DOL-675: `_patchPostgres` reads `__serverSnapshot[column]` to
+    // decide which intermediate `jsonb_set_lax` ensures can be
+    // skipped. Mirror the in-memory blocks so tests that exercise
+    // the skip path see the same shape.
+    __serverSnapshot: { id, blocks: initialBlocks, tags: [], meta: {} },
   };
 }
 
@@ -284,6 +289,94 @@ describe("BackendAdapter._patchPostgres — vivification shape (DOL-553)", () =>
     // ops walk the same chain.
     const arrayCount = (sql!.match(/'\[\]'::jsonb/g) ?? []).length;
     expect(arrayCount).toBe(1);
+  });
+
+  // ── DOL-675: ensure pass must NOT undo prior remove ops ──────────
+
+  it("does not undo a remove sibling when a replace ensures the same parent", async () => {
+    // Pre-state: block b119 with three shots. We remove two of the
+    // three and update the third's `order` field. The replace's
+    // `_ensureIntermediates` walk MUST NOT re-read
+    // `column #> '{b119}'` (and thereby resurrect the removed shots
+    // by setting `b119` back to its original value). Pre-fix: the
+    // ensure read from `column` and silently undid the removes.
+    const model = makeModel("p1", {
+      b119: {
+        shots: {
+          b120: { id: "b120", setup: "MED", order: "a0" },
+          b443: { id: "b443", setup: "OTS", order: "a1" },
+          b550: { id: "b550", setup: "WIDE", order: "a2" },
+        },
+      },
+    });
+    await adapter.patch(model, [
+      { op: "remove", path: "/blocks/b119/shots/b120" } as any,
+      { op: "remove", path: "/blocks/b119/shots/b443" } as any,
+      {
+        op: "replace",
+        path: "/blocks/b119/shots/b550/order",
+        value: "a3",
+      } as any,
+    ]);
+    const sql = capture.lastSqlFor("blocks");
+    expect(sql).toBeDefined();
+    // The bug signature: ensure SQL that reads from the original
+    // column, e.g. `COALESCE(blocks #> ?::text[], '{}'::jsonb)`.
+    // Post-fix the ensure for `{b119}` is skipped entirely because
+    // the path exists in the pre-state snapshot and no ancestor
+    // was removed in this batch.
+    expect(sql).not.toMatch(/COALESCE\([^)]*blocks\s*#>/);
+    // The `#-` removes for both shots must survive into the SQL.
+    expect(sql).toContain("#-");
+    const removeBindings = capture.lastBindingsFor("blocks") ?? [];
+    expect(removeBindings).toContain("{b119,shots,b120}");
+    expect(removeBindings).toContain("{b119,shots,b443}");
+    // The `replace` for `b550/order` lands as a `jsonb_set_lax`.
+    expect(sql).toMatch(/jsonb_set_lax\(/);
+  });
+
+  it("emits ensure when the path doesn't exist in the pre-batch snapshot", async () => {
+    // Pre-state: blocks is empty. A deep replace forces every
+    // intermediate to be ensured (none exist on the row). The
+    // emits must use the segment-derived default ('{}' or '[]')
+    // — pre-fix they used `COALESCE(column #> path, default)` and
+    // post-fix they use the static default directly.
+    const model = makeModel("p1", {});
+    await adapter.patch(model, [
+      {
+        op: "replace",
+        path: "/blocks/abc/portrait/url",
+        value: "https://example.test/p.png",
+      } as any,
+    ]);
+    const sql = capture.lastSqlFor("blocks");
+    expect(sql).toBeDefined();
+    expect(sql).toContain("'{}'::jsonb");
+    // No `column #>` reads — every ensure uses the static default.
+    expect(sql).not.toMatch(/COALESCE\([^)]*blocks\s*#>/);
+  });
+
+  it("re-emits ensure for a path whose ancestor was removed earlier in the batch", async () => {
+    // Pre-state has /a/b/c. Op 1 removes /a/b. Op 2 adds /a/b/d.
+    // The ensure for {a,b} must fire (it was removed) so the leaf
+    // set has a parent to land on, but the ensure must use the
+    // STATIC '{}'::jsonb default rather than reading from the
+    // original column (which would resurrect the removed subtree).
+    const model = makeModel("p1", { a: { b: { c: 1 } } });
+    await adapter.patch(model, [
+      { op: "remove", path: "/blocks/a/b" } as any,
+      {
+        op: "add",
+        path: "/blocks/a/b/d",
+        value: 2,
+      } as any,
+    ]);
+    const sql = capture.lastSqlFor("blocks");
+    expect(sql).toBeDefined();
+    // Static default — no column-read for the resurrected path.
+    expect(sql).not.toMatch(/COALESCE\([^)]*blocks\s*#>/);
+    // The remove fires.
+    expect(sql).toContain("#-");
   });
 
   // ── Pure top-level ops (regression: no array vivification) ────────

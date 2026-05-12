@@ -1015,24 +1015,59 @@ export class BackendAdapter implements ModelAdapter {
       const bindings: any[] = [];
       const ensured = new Set<string>();
 
+      // Pre-batch in-memory state for the column. The optimistic
+      // local apply in `Model.patch` already ran before this adapter
+      // call, so `__data[column]` reflects POST-batch state.
+      // `__serverSnapshot[column]` is the last server-authoritative
+      // value, which corresponds to the row's state BEFORE this
+      // batch's ops applied — exactly what we need to decide whether
+      // an intermediate path needs to be ensured.
+      //
+      // When the snapshot isn't available (rare — only on a freshly
+      // constructed model that hasn't been hydrated), fall back to
+      // empty so every depth gets an ensure (safe but adds a tiny
+      // overhead).
+      const preState: any =
+        (model as any).__serverSnapshot?.[column] ?? null;
+      // Tracks paths whose subtree was removed earlier in THIS batch.
+      // Subsequent ensures targeting these paths must still emit so
+      // the leaf set has a parent to land on. The "" sentinel marks
+      // a root-wipe (`remove /` or root replace) — every subsequent
+      // path needs an ensure regardless of pre-state.
+      const removedPaths = new Set<string>();
+
+      const ancestorOrSelfRemoved = (segments: string[]): boolean => {
+        if (removedPaths.has("")) return true;
+        for (let d = 1; d <= segments.length; d++) {
+          if (removedPaths.has(segments.slice(0, d).join(","))) return true;
+        }
+        return false;
+      };
+
       for (const { op: o, innerSegments } of columnOps) {
         switch (o.op) {
           case "add": {
             if (innerSegments[innerSegments.length - 1] === "-") {
               const parent = innerSegments.slice(0, -1);
-              // The `-` (append) case writes into a JSONB array.
-              // Pre-existing behaviour: every intermediate emitted
-              // for the parent path defaults to `'[]'::jsonb`.
-              // Strictly only the deepest intermediate (the array
-              // itself) needs to be `[]`, but in practice all
-              // shallower parents already exist when we get here, so
-              // their COALESCE preserves the existing shape and the
-              // wrong-shape default never lands. Left as-is to keep
-              // this fix minimal — DOL-553 targets the non-`-` paths.
-              this._ensureIntermediates(parent, column, ensured, (pgPath) => {
-                sql = `jsonb_set_lax(${sql}, ?::text[], COALESCE((COALESCE(${column}, '{}'::jsonb)) #> ?::text[], '[]'::jsonb), true, 'use_json_null')`;
-                bindings.push(pgPath, pgPath);
-              });
+              // Array-append (`/-`) — ensure the parent path exists
+              // as `[]` if missing. The append target is an array,
+              // so we override the segment-derived default with the
+              // hardcoded `'[]'::jsonb` (matching the pre-DOL-675
+              // behaviour). The pre-state-aware ensure skips
+              // intermediates that already exist on the row and
+              // weren't removed earlier in this batch, preserving
+              // any prior mutations (DOL-675).
+              this._ensureIntermediates(
+                parent,
+                column,
+                ensured,
+                preState,
+                ancestorOrSelfRemoved,
+                (pgPath /* defaultJson ignored — append target is an array */) => {
+                  sql = `jsonb_set_lax(${sql}, ?::text[], '[]'::jsonb, true, 'use_json_null')`;
+                  bindings.push(pgPath);
+                },
+              );
               sql = `jsonb_insert(${sql}, ?::text[], ?::jsonb, true)`;
               bindings.push(
                 `{${[...parent, "-1"].join(",")}}`,
@@ -1041,14 +1076,21 @@ export class BackendAdapter implements ModelAdapter {
             } else if (innerSegments.length === 0) {
               sql = "?::jsonb";
               bindings.push(JSON.stringify((o as any).value));
+              // Root replace — every future path starts from this
+              // new value. Treat it like a root-wipe for ensure
+              // tracking; pre-state is irrelevant.
+              removedPaths.clear();
+              removedPaths.add("");
             } else {
               this._ensureIntermediates(
                 innerSegments,
                 column,
                 ensured,
+                preState,
+                ancestorOrSelfRemoved,
                 (pgPath, defaultJson) => {
-                  sql = `jsonb_set_lax(${sql}, ?::text[], COALESCE((COALESCE(${column}, '{}'::jsonb)) #> ?::text[], ${defaultJson}), true, 'use_json_null')`;
-                  bindings.push(pgPath, pgPath);
+                  sql = `jsonb_set_lax(${sql}, ?::text[], ${defaultJson}, true, 'use_json_null')`;
+                  bindings.push(pgPath);
                 },
               );
               sql = `jsonb_set_lax(${sql}, ?::text[], ?::jsonb, true, 'use_json_null')`;
@@ -1063,14 +1105,18 @@ export class BackendAdapter implements ModelAdapter {
             if (innerSegments.length === 0) {
               sql = "?::jsonb";
               bindings.push(JSON.stringify((o as any).value));
+              removedPaths.clear();
+              removedPaths.add("");
             } else {
               this._ensureIntermediates(
                 innerSegments,
                 column,
                 ensured,
+                preState,
+                ancestorOrSelfRemoved,
                 (pgPath, defaultJson) => {
-                  sql = `jsonb_set_lax(${sql}, ?::text[], COALESCE((COALESCE(${column}, '{}'::jsonb)) #> ?::text[], ${defaultJson}), true, 'use_json_null')`;
-                  bindings.push(pgPath, pgPath);
+                  sql = `jsonb_set_lax(${sql}, ?::text[], ${defaultJson}, true, 'use_json_null')`;
+                  bindings.push(pgPath);
                 },
               );
               sql = `jsonb_set_lax(${sql}, ?::text[], ?::jsonb, true, 'use_json_null')`;
@@ -1084,9 +1130,12 @@ export class BackendAdapter implements ModelAdapter {
           case "remove": {
             if (innerSegments.length === 0) {
               sql = `'{}'::jsonb`;
+              removedPaths.clear();
+              removedPaths.add("");
             } else {
               sql = `(${sql} #- ?::text[])`;
               bindings.push(`{${innerSegments.join(",")}}`);
+              removedPaths.add(innerSegments.join(","));
             }
             break;
           }
@@ -1108,12 +1157,31 @@ export class BackendAdapter implements ModelAdapter {
   }
 
   /**
-   * Walk every parent depth of a JSON path and emit one
-   * `jsonb_set_lax` ensuring that intermediate exists. The shape
-   * created when the intermediate is missing depends on the NEXT
-   * path segment: a numeric index (`"0"`, `"12"`) or the append
-   * marker (`"-"`) means the intermediate is an array (`'[]'::jsonb`);
-   * any other key means it's a plain object (`'{}'::jsonb`).
+   * Walk every parent depth of a JSON path and emit a `jsonb_set_lax`
+   * call to ensure that intermediate exists ONLY when needed:
+   *
+   *   1. If the path already exists in the row's pre-batch snapshot
+   *      (`preState`) AND no earlier op in the same batch removed
+   *      that path or one of its ancestors (`ancestorOrSelfRemoved`),
+   *      skip the ensure entirely. The intermediate is intact in the
+   *      live SQL expression, and emitting an ensure would silently
+   *      undo prior `remove` ops by re-reading from the original
+   *      column value (DOL-675).
+   *
+   *   2. Otherwise the ensure emits a `jsonb_set_lax` with a STATIC
+   *      `'{}'::jsonb` (or `'[]'::jsonb`) default. Reading from the
+   *      original column inside the ensure would also undo prior
+   *      mutations whenever the read path overlaps with an earlier
+   *      remove — so even when an ensure IS needed, the static
+   *      default is the safe choice. Any data that was at the path
+   *      pre-batch was either preserved upstream (case 1) or wiped
+   *      by an earlier remove in this batch (case 2, expected).
+   *
+   * The shape created when the intermediate is missing depends on
+   * the NEXT path segment: a numeric index (`"0"`, `"12"`) or the
+   * append marker (`"-"`) means the intermediate is an array
+   * (`'[]'::jsonb`); any other key means it's a plain object
+   * (`'{}'::jsonb`).
    *
    * Without the array branch, a patch like
    * `replace /blocks/<id>/shots/0/panel` on a row with no prior
@@ -1121,27 +1189,54 @@ export class BackendAdapter implements ModelAdapter {
    * passing the JSON write but blowing up every subsequent
    * `for (const s of block.shots)` with "object is not iterable"
    * once the row hydrates back into JS.
-   *
-   * The `add /…/-` append branch passes its own static `'[]'::jsonb`
-   * default to `emit` and ignores the `defaultJson` arg — its
-   * pre-existing behaviour is left unchanged.
    */
   private _ensureIntermediates(
     segments: string[],
     column: string,
     ensured: Set<string>,
+    preState: any,
+    ancestorOrSelfRemoved: (segments: string[]) => boolean,
     emit: (pgPath: string, defaultJson: string) => void,
   ): void {
     for (let depth = 1; depth < segments.length; depth++) {
-      const key = `${column}:${segments.slice(0, depth).join(",")}`;
+      const path = segments.slice(0, depth);
+      const pathKey = path.join(",");
+      if (
+        BackendAdapter._pathExistsInData(preState, path) &&
+        !ancestorOrSelfRemoved(path)
+      ) {
+        // Path already lives on the row and isn't under a
+        // previously-removed ancestor — the live SQL expression
+        // still has it intact. Emitting an ensure would re-read the
+        // original column at this path and overwrite any earlier
+        // remove ops in this batch (DOL-675).
+        continue;
+      }
+      const key = `${column}:${pathKey}`;
       if (!ensured.has(key)) {
         ensured.add(key);
         const defaultJson = isArrayIndexSegment(segments[depth])
           ? "'[]'::jsonb"
           : "'{}'::jsonb";
-        emit(`{${segments.slice(0, depth).join(",")}}`, defaultJson);
+        emit(`{${pathKey}}`, defaultJson);
       }
     }
+  }
+
+  /**
+   * Walk a record-shaped JSONB value to determine whether `segments`
+   * names a present (non-null) path. Used by `_ensureIntermediates`
+   * to skip emits for paths that already exist in the pre-batch row
+   * state.
+   */
+  private static _pathExistsInData(data: any, segments: string[]): boolean {
+    if (data == null) return false;
+    let cursor = data;
+    for (const seg of segments) {
+      if (cursor == null || typeof cursor !== "object") return false;
+      cursor = cursor[seg];
+    }
+    return cursor != null;
   }
 
   /**
