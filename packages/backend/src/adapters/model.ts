@@ -1,5 +1,6 @@
 import { log } from "../logger";
 import { detectEngine } from "./engine";
+import { loadCachedSchemas } from "../schema/generate";
 
 /**
  * BackendAdapter — Knex + Postgres persistence for Parcae Model.
@@ -71,6 +72,19 @@ function isArrayIndexSegment(seg: string | undefined): boolean {
  * Unpacks the `data` JSONB overflow column into top-level fields and
  * delegates to `Model.hydrate` so field-initializer defaults don't
  * clobber the data coming from the DB.
+ *
+ * Overflow-merge ordering
+ * ───────────────────────
+ * Declared schema columns are the source of truth. The `data` JSONB
+ * overflow is only allowed to fill keys that don't have a column. This
+ * matters whenever a column is promoted from overflow to first-class
+ * after rows already exist in production: the migration adds the
+ * column with whatever value `serialize()` writes to it, but the old
+ * value lingers in the `data` blob too. Without this filter, the next
+ * `PATCH` would update the column → readback would `Object.assign` the
+ * stale JSON copy back over the new column value → the change appears
+ * to revert. `save()` rewrites the blob and resolves the drift, but
+ * `patch()` is incremental and never touches `data`.
  */
 function hydrate<T>(
   modelClass: ModelConstructor<T>,
@@ -78,23 +92,44 @@ function hydrate<T>(
   row: Record<string, any>,
 ): T {
   const data = { ...row };
+  const schema = modelClass.__schema as SchemaDefinition | undefined;
 
-  // Unpack JSONB overflow column
+  // Unpack JSONB overflow column. Schema-known keys are skipped so a
+  // stale snapshot in the blob can't override a column we just wrote.
+  let overflow: Record<string, any> | null = null;
   if (typeof data.data === "string") {
     try {
-      Object.assign(data, JSON.parse(data.data) || {});
-    } catch {}
+      overflow = JSON.parse(data.data) ?? null;
+    } catch {
+      overflow = null;
+    }
   } else if (typeof data.data === "object" && data.data !== null) {
-    Object.assign(data, data.data);
+    overflow = data.data as Record<string, any>;
+  }
+  if (overflow && typeof overflow === "object") {
+    for (const [key, value] of Object.entries(overflow)) {
+      if (schema && key in schema) continue;
+      data[key] = value;
+    }
   }
   delete data.data;
 
-  // Parse datetime strings
-  const schema = (modelClass as any).__schema as SchemaDefinition | undefined;
+  // Coerce per-column types from the row shape we get back from Knex.
+  // - datetime: ISO strings → Date instances
+  // - json:     SQLite stores these as TEXT, so they come back as strings
+  //             (Postgres jsonb arrives pre-parsed, so we no-op there).
   if (schema) {
     for (const [key, colDef] of Object.entries(schema)) {
-      if (resolveColType(colDef) === "datetime" && data[key]) {
-        data[key] = new Date(data[key]);
+      const t = resolveColType(colDef);
+      const val = data[key];
+      if (t === "datetime" && val) {
+        data[key] = new Date(val);
+      } else if (t === "json" && typeof val === "string" && val.length > 0) {
+        try {
+          data[key] = JSON.parse(val);
+        } catch {
+          // Leave as-is if it's not valid JSON — better than crashing.
+        }
       }
     }
   }
@@ -103,6 +138,10 @@ function hydrate<T>(
   data.createdAt = data.createdAt ? new Date(data.createdAt) : new Date();
   data.updatedAt = data.updatedAt ? new Date(data.updatedAt) : new Date();
 
+  // Static `hydrate` is declared on Model itself but not on the
+  // ModelConstructor interface (it's the constructor's job from the
+  // adapter's POV). Cast to `any` for this single invocation — every
+  // Model subclass inherits the static so the call is sound.
   return (modelClass as any).hydrate(adapter, data) as T;
 }
 
@@ -113,7 +152,7 @@ function hydrate<T>(
 function serialize(model: any): Record<string, any> {
   const ModelClass = model.constructor as typeof Model;
   const schema =
-    ((ModelClass as any).__schema as SchemaDefinition | undefined) ?? {};
+    (ModelClass.__schema as SchemaDefinition | undefined) ?? {};
   const raw = model.__data;
 
   if (!model.id) {
@@ -182,10 +221,80 @@ export class BackendAdapter implements ModelAdapter {
     this.services = services;
   }
 
-  /** Register model constructors so the adapter can resolve refs by type. */
-  registerModels(models: ModelConstructor[]): void {
+  /**
+   * Register model constructors so the adapter can resolve refs by type
+   * AND attach `__schema` onto each model class from the on-disk
+   * `.parcae/schema.json` cache when available.
+   *
+   * Why we read the cache here, unconditionally: the schema is a
+   * read-only artifact — it tells us how each column is typed (string,
+   * number, json, …) — and several adapter code paths *require* it to
+   * make correct decisions (json-array `whereIn` dispatch, ref-field
+   * dot-notation rewriting, …). Without it, server-side query builds
+   * silently fall through to broken SQL even though the cache is
+   * sitting on disk.
+   *
+   * Schema *generation* (running ts-morph against source files,
+   * writing the cache) and *DDL* (CREATE TABLE / migrations) stay
+   * opt-in via `generateSchemas()` and `ensureAllTables()` — they're
+   * write-side operations and live downstream of registration.
+   *
+   * If `__schema` was already set on a model (e.g. an explicit prior
+   * call to `generateSchemas()` or a manual override in a test), we
+   * leave it alone.
+   */
+  registerModels(
+    models: ModelConstructor[],
+    options: { projectRoot?: string } = {},
+  ): void {
     for (const m of models) {
       this._models.set(m.type, m);
+    }
+    this._attachCachedSchemas(models, options.projectRoot ?? process.cwd());
+  }
+
+  private _attachCachedSchemas(
+    models: ModelConstructor[],
+    projectRoot: string,
+  ): void {
+    const cached = loadCachedSchemas(projectRoot);
+    if (!cached) return;
+    const modelsByType = new Map(models.map((m) => [m.type, m] as const));
+    const modelsByName = new Map(models.map((m) => [m.name, m] as const));
+    for (const [type, schema] of Object.entries(cached)) {
+      const ModelClass = modelsByType.get(type);
+      if (!ModelClass) continue;
+      // Don't clobber a schema that's already attached.
+      if (ModelClass.__schema) continue;
+      ModelClass.__schema = schema;
+    }
+    // Wire ref targets — the cache stores them as `{ type: "Name" }`
+    // stubs (constructor references aren't JSON-serializable); resolve
+    // them to the actual constructors registered in this adapter.
+    for (const [, ModelClass] of modelsByType) {
+      const schema = ModelClass.__schema as
+        | SchemaDefinition
+        | undefined;
+      if (!schema) continue;
+      for (const [key, colDef] of Object.entries(schema)) {
+        if (
+          typeof colDef === "object" &&
+          colDef !== null &&
+          "kind" in colDef &&
+          colDef.kind === "ref"
+        ) {
+          const targetName = colDef.target?.type;
+          const target =
+            modelsByName.get(targetName) ?? modelsByType.get(targetName);
+          // The schema is a Record<string, ColumnType>; the assignment
+          // satisfies the type but writing a fresh ref entry needs an
+          // index signature widening. Cast once at the write site —
+          // the read shape stays typed.
+          const typed = schema as Record<string, ColumnType>;
+          if (target) typed[key] = { kind: "ref", target };
+          else typed[key] = "string";
+        }
+      }
     }
   }
 
@@ -260,7 +369,7 @@ export class BackendAdapter implements ModelAdapter {
     term: string,
     modelClass: ModelConstructor,
   ): any {
-    const searchFields = (modelClass as any).searchFields as string[];
+    const searchFields = modelClass.searchFields as string[];
     if (!searchFields?.length || !term.trim()) return knexQuery;
 
     const table = tableName(modelClass);
@@ -480,6 +589,8 @@ export class BackendAdapter implements ModelAdapter {
     ">=",
     "like",
     "ilike",
+    "not like",
+    "not ilike",
     "in",
     "not in",
     "is",
@@ -495,6 +606,96 @@ export class BackendAdapter implements ModelAdapter {
    * `.clearLimit()` to disable the injection.
    */
   private static DEFAULT_LIMIT = 25;
+
+  /**
+   * Per-modelClass cache of "which `json` columns are actually arrays?".
+   *
+   * The schema resolver collapses both `string[]` and arbitrary objects
+   * into the same `"json"` ColumnType, so we can't tell at the schema
+   * layer whether a column was declared as `tags: string[] = []` or
+   * `metadata: any = null`. We discover this by probing a fresh model
+   * instance once and remembering the answer. WeakMap keys the cache by
+   * constructor so it never holds a class alive past unloading.
+   */
+  /**
+   * Decide whether `whereIn(col, vals)` should dispatch to JSONB
+   * containment SQL.
+   *
+   * Schema-only check: if the resolved column type is `"json"`, we
+   * assume the column stores an array (the only `whereIn` shape that
+   * makes any sense — `whereIn("metadata", [{...}])` on a json-object
+   * column is meaningless either way). The decision is purely
+   * declarative — no `new modelClass()` probe, no per-class cache, no
+   * WeakMap. Anything that isn't `"json"` falls through to the
+   * standard scalar-column whereIn path.
+   *
+   * If a caller really does whereIn-against-a-json-object column, the
+   * `@>` query still runs — it just won't match anything useful.
+   * Loud-failure-at-the-DB is preferred over the previous mode where
+   * the runtime probe could silently downgrade to broken `IN ($1)`
+   * SQL when `new modelClass()` couldn't construct an instance.
+   */
+  private _isJsonArrayColumn(
+    _modelClass: any,
+    colName: any,
+    schema?: SchemaDefinition,
+  ): boolean {
+    if (typeof colName !== "string") return false;
+    if (!schema) return false;
+    return schema[colName] === "json";
+  }
+
+  /**
+   * Translate `whereIn(jsonArrayCol, vals)` into "the array contains
+   * any of these values" SQL.
+   *
+   *   - Postgres jsonb: `(col @> ?::jsonb OR col @> ?::jsonb …)`
+   *     where each binding is a single-element JSON array stringified.
+   *     `@>` is the jsonb-contains operator and matches when every
+   *     element on the right exists in the left (so wrapping each value
+   *     in `[v]` gives us proper "any of" semantics across an OR fan-out).
+   *
+   *   - SQLite TEXT: `(CAST(col AS TEXT) LIKE ? OR …)` where each
+   *     binding is `%"<value>"%`. The surrounding quotes are essential —
+   *     they pin the match to a literal JSON-array element and stop
+   *     prefix/suffix collisions between ids that happen to share a
+   *     common substring.
+   *
+   * An empty values array yields a hard-false predicate so the result
+   * matches the conventional `WHERE col IN ()` semantics ("nothing").
+   *
+   * Both branches go through `whereRaw` rather than `where(col, op, val)`
+   * because (a) we want to OR multiple containment checks under a
+   * single grouped clause, and (b) the `?::jsonb` cast in the Postgres
+   * branch is awkward to express through `where(col, "@>", val)` without
+   * Knex re-binding the placeholder.
+   */
+  private _applyJsonArrayWhereIn<T>(
+    chain: QueryChain<T>,
+    colName: string,
+    values: any[],
+  ): QueryChain<T> {
+    const c: any = chain;
+    if (!Array.isArray(values) || values.length === 0) {
+      return c.whereRaw("1 = 0");
+    }
+    if (this.isSqlite) {
+      const parts = values.map(() => `CAST(?? AS TEXT) LIKE ?`).join(" OR ");
+      const bindings: any[] = [];
+      for (const v of values) {
+        bindings.push(colName, `%"${String(v)}"%`);
+      }
+      return c.whereRaw(`(${parts})`, bindings);
+    }
+    // Postgres jsonb. Wrap each value in a one-element JSON array so
+    // `@>` is true iff the column's array contains that value.
+    const parts = values.map(() => `?? @> ?::jsonb`).join(" OR ");
+    const bindings: any[] = [];
+    for (const v of values) {
+      bindings.push(colName, JSON.stringify([v]));
+    }
+    return c.whereRaw(`(${parts})`, bindings);
+  }
 
   queryFromClient<T>(
     modelClass: ModelConstructor<T>,
@@ -514,7 +715,7 @@ export class BackendAdapter implements ModelAdapter {
     }
     if (!Array.isArray(steps)) steps = [];
 
-    const schema = ((modelClass as any).__schema as SchemaDefinition) ?? {};
+    const schema = (modelClass.__schema as SchemaDefinition) ?? {};
     const validColumns = new Set([
       "id",
       "createdAt",
@@ -594,6 +795,24 @@ export class BackendAdapter implements ModelAdapter {
             1,
           );
         }
+      }
+
+      // ── whereIn on a JSON-array column → "array contains any of" ─────
+      // Stock `WHERE col IN (?, ?)` compares the whole jsonb value to
+      // each binding as a string, which never matches when the column
+      // stores an array. Detect that case and emit dialect-appropriate
+      // containment SQL instead so callers can write the natural
+      // `Scene.whereIn("tags", [tagId])` and have it Just Work.
+      if (
+        (step.method === "whereIn" || step.method === "orWhereIn") &&
+        this._isJsonArrayColumn(modelClass, args[0], schema)
+      ) {
+        chain = this._applyJsonArrayWhereIn(
+          chain,
+          args[0] as string,
+          args[1] as any[],
+        );
+        continue;
       }
 
       chain = (chain as any)[step.method](...args);
@@ -740,8 +959,7 @@ export class BackendAdapter implements ModelAdapter {
     const targetType = colDef.target?.type;
     if (!targetType) return null;
     const resolvedTarget = this._models.get(targetType) ?? colDef.target;
-    const targetSchema =
-      ((resolvedTarget as any).__schema as SchemaDefinition) ?? null;
+    const targetSchema = (resolvedTarget?.__schema as SchemaDefinition) ?? null;
     const targetTable = pluralize(targetType);
 
     // Validate the nested column exists on the target model
@@ -832,7 +1050,7 @@ export class BackendAdapter implements ModelAdapter {
           BackendAdapter.COLUMN_ARG_METHODS.has(method)
         ) {
           const schema =
-            ((modelClass as any).__schema as SchemaDefinition) ?? {};
+            (modelClass.__schema as SchemaDefinition) ?? {};
           const rewritten = this._rewriteRefDotNotation(
             { method, args },
             args,
@@ -848,13 +1066,37 @@ export class BackendAdapter implements ModelAdapter {
             );
           }
         }
+        // ── whereIn on a JSON-array column → containment SQL ───────────
+        // Same dispatch `queryFromClient` does for client-sent queries.
+        // Without this, a server-side
+        //   `Post.whereIn("performers", [id]).find()`
+        // falls through to bare `WHERE "performers" IN (?)` and Postgres
+        // errors with `invalid input syntax for type json` on the JSONB
+        // column.
+        if (
+          (method === "whereIn" || method === "orWhereIn") &&
+          typeof args[0] === "string"
+        ) {
+          const schema =
+            (modelClass.__schema as SchemaDefinition) ?? {};
+          if (this._isJsonArrayColumn(modelClass, args[0], schema)) {
+            return this._buildQuery(
+              modelClass,
+              this._applyJsonArrayWhereIn(
+                knexQuery,
+                args[0] as string,
+                args[1] as any[],
+              ),
+            );
+          }
+        }
         return this._buildQuery(modelClass, knexQuery[method](...args));
       };
     }
 
     // search() — applies hybrid full-text + fuzzy search SQL
     chain.search = (term: string) => {
-      const searchFields = (modelClass as any).searchFields as
+      const searchFields = modelClass.searchFields as
         | string[]
         | undefined;
       if (!searchFields?.length || !term.trim()) {
@@ -903,7 +1145,7 @@ export class BackendAdapter implements ModelAdapter {
 
     const ModelClass = model.constructor as typeof Model;
     const table = tableName(ModelClass as unknown as ModelConstructor);
-    const schema = ((ModelClass as any).__schema as SchemaDefinition) ?? {};
+    const schema = (ModelClass.__schema as SchemaDefinition) ?? {};
 
     // ── SQLite: read-modify-write (no native JSONB operators) ──────
     if (this.isSqlite) {
@@ -976,7 +1218,9 @@ export class BackendAdapter implements ModelAdapter {
         const actual = innerSegments.length
           ? current?.[innerSegments[0]!]
           : current;
-        if (!equal(actual, (o as any).value)) {
+        // TypeScript narrows `o` to TestOperation<any> via the
+        // discriminant check above; `.value` is typed.
+        if (!equal(actual, o.value)) {
           throw new ClientError(`patch test failed at ${o.path}`);
         }
       }
@@ -996,11 +1240,18 @@ export class BackendAdapter implements ModelAdapter {
     for (const [column, columnOps] of byColumn) {
       const colType = columnOps[0]!.colType;
 
-      // Scalar columns: direct value SET
+      // Scalar columns: direct value SET. Only `add` / `replace` /
+      // `remove` are meaningful at the root of a scalar column; the
+      // other discriminants either need a json path (`move`, `copy`)
+      // or were short-circuited above (`test`).
       if (colType !== "json") {
         const lastOp = columnOps[columnOps.length - 1]!;
-        if (lastOp.op.op === "test") continue;
-        const value = (lastOp.op as any).value;
+        const op = lastOp.op;
+        if (op.op === "test") continue;
+        // `value` is present on AddOperation / ReplaceOperation; a
+        // bare `remove` leaves the field undefined → coerce to null.
+        const value =
+          op.op === "add" || op.op === "replace" ? op.value : undefined;
         updateFields[column] =
           colType === "datetime"
             ? value
@@ -1071,11 +1322,11 @@ export class BackendAdapter implements ModelAdapter {
               sql = `jsonb_insert(${sql}, ?::text[], ?::jsonb, true)`;
               bindings.push(
                 `{${[...parent, "-1"].join(",")}}`,
-                JSON.stringify((o as any).value),
+                JSON.stringify(o.value),
               );
             } else if (innerSegments.length === 0) {
               sql = "?::jsonb";
-              bindings.push(JSON.stringify((o as any).value));
+              bindings.push(JSON.stringify(o.value));
               // Root replace — every future path starts from this
               // new value. Treat it like a root-wipe for ensure
               // tracking; pre-state is irrelevant.
@@ -1096,15 +1347,19 @@ export class BackendAdapter implements ModelAdapter {
               sql = `jsonb_set_lax(${sql}, ?::text[], ?::jsonb, true, 'use_json_null')`;
               bindings.push(
                 `{${innerSegments.join(",")}}`,
-                JSON.stringify((o as any).value),
+                JSON.stringify(o.value),
               );
             }
             break;
           }
           case "replace": {
+            // `case "replace"` narrows `o` to ReplaceOperation<any>.
             if (innerSegments.length === 0) {
               sql = "?::jsonb";
-              bindings.push(JSON.stringify((o as any).value));
+              bindings.push(JSON.stringify(o.value));
+              // Root replace — every future path starts from this
+              // new value. Treat it like a root-wipe for ensure
+              // tracking; pre-state is irrelevant.
               removedPaths.clear();
               removedPaths.add("");
             } else {
@@ -1122,7 +1377,7 @@ export class BackendAdapter implements ModelAdapter {
               sql = `jsonb_set_lax(${sql}, ?::text[], ?::jsonb, true, 'use_json_null')`;
               bindings.push(
                 `{${innerSegments.join(",")}}`,
-                JSON.stringify((o as any).value),
+                JSON.stringify(o.value),
               );
             }
             break;
@@ -1147,6 +1402,27 @@ export class BackendAdapter implements ModelAdapter {
       }
 
       updateFields[column] = this.write.raw(sql, bindings);
+    }
+
+    // Heal legacy `data` overflow: strip any schema-known keys we just
+    // wrote so a future read can't resurrect a stale snapshot from the
+    // JSON blob. Pre-fix this was the silent "save reverts" failure
+    // mode for rows imported when the schema had fewer columns —
+    // `serialize()` writes the column AND a `data` overflow copy until
+    // every key is promoted, but `patch()` only updates the column,
+    // leaving the JSON copy to win on the next read (see the
+    // `hydrate()` overflow filter for the symmetric guard).
+    const staleKeys = [...byColumn.keys()].filter(
+      (k) => k !== "data" && k in schema,
+    );
+    if (staleKeys.length > 0) {
+      // `data` jsonb column always exists; COALESCE handles the rare
+      // row where it's null. `- text[]` removes the listed top-level
+      // keys (PostgreSQL ≥ 10).
+      updateFields.data = this.write.raw(
+        `COALESCE(data, '{}'::jsonb) - ?::text[]`,
+        [`{${staleKeys.join(",")}}`],
+      );
     }
 
     await this.write(table).where("id", model.id).update(updateFields);
@@ -1304,7 +1580,10 @@ export class BackendAdapter implements ModelAdapter {
       if (colType !== "json") {
         const lastOp = columnOps[columnOps.length - 1]!;
         if (lastOp.op === "test") continue;
-        const value = (lastOp as any).value;
+        const value =
+          lastOp.op === "add" || lastOp.op === "replace"
+            ? lastOp.value
+            : undefined;
         updateFields[column] =
           colType === "datetime"
             ? value
@@ -1335,6 +1614,38 @@ export class BackendAdapter implements ModelAdapter {
       updateFields[column] = JSON.stringify(result.newDocument);
     }
 
+    // Heal legacy `data` overflow — mirror of the Postgres branch.
+    // See `_patchPostgres` for the full rationale; in short, rows
+    // imported when a column was still part of the JSON overflow blob
+    // can resurrect stale snapshots on the next read, so we strip the
+    // touched schema keys from the blob whenever we patch them.
+    const staleKeys = [...byColumn.keys()].filter(
+      (k) => k !== "data" && k in schema,
+    );
+    if (staleKeys.length > 0) {
+      let dataBlob: Record<string, any> = {};
+      const existing = row.data;
+      if (typeof existing === "string") {
+        try {
+          dataBlob = JSON.parse(existing) ?? {};
+        } catch {
+          dataBlob = {};
+        }
+      } else if (existing && typeof existing === "object") {
+        dataBlob = { ...(existing as Record<string, any>) };
+      }
+      let touched = false;
+      for (const key of staleKeys) {
+        if (key in dataBlob) {
+          delete dataBlob[key];
+          touched = true;
+        }
+      }
+      if (touched) {
+        updateFields.data = JSON.stringify(dataBlob);
+      }
+    }
+
     await this.write(table).where("id", model.id).update(updateFields);
   }
 
@@ -1360,6 +1671,63 @@ export class BackendAdapter implements ModelAdapter {
       .select(field)
       .first();
     if (row) (model as any)[field] = row[field];
+  }
+
+  /**
+   * Atomic bulk-increment over a set of row ids in one SQL statement.
+   *
+   *   UPDATE <table> SET <field> = <field> + <amount> WHERE id IN (...)
+   *
+   * The single-row `increment()` path above is read-modify-write at the
+   * Knex layer too (Knex's `.increment()` builds a `SET col = col + ?`
+   * UPDATE — atomic per-row), but issuing one SQL per id is slow for the
+   * hot counter paths in `hooks/scene-performers.ts` and
+   * `hooks/tag-counts.ts` (which fan out to N performers / M tags per
+   * Scene save). This method ships a single UPDATE.
+   *
+   * Use when the calling code doesn't care about post-update field
+   * values being reflected on the model instances — the standard case
+   * for hooks, which fire-and-forget.
+   *
+   * `amount` can be negative for atomic bulk decrement.
+   */
+  async incrementMany(
+    modelClass: ModelConstructor,
+    ids: readonly string[],
+    field: string,
+    amount: number,
+  ): Promise<void> {
+    if (amount === 0 || ids.length === 0) return;
+    const table = tableName(modelClass);
+    await this.write(table).whereIn("id", ids).increment(field, amount);
+  }
+
+  /**
+   * Run `fn` inside a Knex transaction. Returns whatever `fn` returns,
+   * or rolls back on any thrown error.
+   *
+   * Caveat: parcae model operations issued inside `fn` do NOT
+   * automatically participate in the transaction — they go through the
+   * adapter's default knex handle, which is the outer connection.
+   * Callers that need a fully-transactional model operation should
+   * still drop down to raw SQL via the `trx` argument until parcae
+   * grows transaction-threading at the model layer.
+   *
+   * The primary use case today is grouping a few raw `UPDATE`/`DELETE`
+   * statements (e.g. delete-scene's joint-table cleanup) so a crash
+   * mid-way doesn't leave half the rows scrubbed.
+   */
+  async runInTransaction<T>(
+    fn: (trx: any) => Promise<T>,
+  ): Promise<T> {
+    return this.write.transaction(async (trx: any) => fn(trx));
+  }
+
+  /** Raw access to the write Knex handle. Use sparingly — prefer model
+   *  query chains. Provided for the few places that need a raw UPDATE
+   *  (counter bumps, bulk deletes) and for transaction integration. */
+  knex(): any {
+    return this.write;
   }
 
   // ── Hooks ────────────────────────────────────────────────────────────
@@ -1450,7 +1818,7 @@ export class BackendAdapter implements ModelAdapter {
     modelClass: ModelConstructor,
     opts: { knex?: any } = {},
   ): Promise<void> {
-    if ((modelClass as any).managed === false) {
+    if (modelClass.managed === false) {
       log.info(
         `skipping schema — model=${modelClass.type} (externally managed)`,
       );
@@ -1464,8 +1832,8 @@ export class BackendAdapter implements ModelAdapter {
     const kx = opts.knex ?? this.write;
 
     const table = tableName(modelClass);
-    const schema = ((modelClass as any).__schema as SchemaDefinition) ?? {};
-    const indexes = (modelClass as any).indexes || [];
+    const schema = (modelClass.__schema as SchemaDefinition) ?? {};
+    const indexes = modelClass.indexes ?? [];
 
     log.info(`ensuring schema — model=${modelClass.type}`);
 
@@ -1572,7 +1940,7 @@ export class BackendAdapter implements ModelAdapter {
     log.info(`ensured schema — model=${modelClass.type}`);
 
     // ── Search schema (tsvector + trigram + optional vector) ──────────
-    const searchFields = (modelClass as any).searchFields as
+    const searchFields = modelClass.searchFields as
       | string[]
       | undefined;
     if (searchFields?.length) {
@@ -1700,11 +2068,11 @@ export class BackendAdapter implements ModelAdapter {
    */
   private _registerEmbeddingHooks(models: ModelConstructor[]): void {
     for (const modelClass of models) {
-      const searchFields = (modelClass as any).searchFields as
+      const searchFields = modelClass.searchFields as
         | string[]
         | undefined;
       if (!searchFields?.length) continue;
-      if ((modelClass as any).managed === false) continue;
+      if (modelClass.managed === false) continue;
 
       const table = tableName(modelClass);
 

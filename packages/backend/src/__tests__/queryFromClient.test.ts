@@ -293,7 +293,24 @@ describe("BackendAdapter.queryFromClient", () => {
 
   describe("operator validation", () => {
     it("should allow safe operators", () => {
-      const safeOps = ["=", "!=", "<>", "<", ">", "<=", ">=", "like", "ilike"];
+      // `not like` / `not ilike` are the negative complements of
+      // `like` / `ilike` — same pattern surface, no extra attack
+      // surface. Necessary for predicates like
+      // `WHERE path NOT LIKE 'http%'` (aura: local-vs-streamed
+      // filter on the Scenes page).
+      const safeOps = [
+        "=",
+        "!=",
+        "<>",
+        "<",
+        ">",
+        "<=",
+        ">=",
+        "like",
+        "ilike",
+        "not like",
+        "not ilike",
+      ];
 
       for (const op of safeOps) {
         const t = createTestAdapter();
@@ -1070,6 +1087,157 @@ describe("BackendAdapter.queryFromClient", () => {
       expect(() =>
         adapter.queryFromClient(ProjectModel, { userId: "u1" }, steps),
       ).toThrow("Invalid column");
+    });
+  });
+
+  // ── whereIn on JSON-array columns ─────────────────────────────────
+  //
+  // The schema resolver collapses both `string[]` and arbitrary objects
+  // into the same `"json"` ColumnType. queryFromClient additionally
+  // probes a fresh model instance and remembers which `json` columns
+  // are runtime arrays so it can dispatch `whereIn` correctly:
+  //
+  //   - scalar / `{}` json columns → native `WHERE col IN (?, ?)`
+  //   - `string[]` json columns    → "array contains any of these"
+  //                                  via `@>` (Postgres) or LIKE
+  //                                  (SQLite). Without this, callers
+  //                                  who write the natural
+  //                                  `Scene.whereIn("tags", [tagId])`
+  //                                  silently match nothing.
+  describe("whereIn on JSON-array columns", () => {
+    // Real class so `new ModelClass()` works (the helper probes the
+    // runtime default value of each json column to learn array-ness).
+    class ProjectArrayModel {
+      static type = "project_array";
+      static __schema: SchemaDefinition = {
+        name: "string",
+        userId: "string",
+        // Both declared as `json` in the schema — the difference is
+        // only visible by inspecting the instance default below.
+        tags: "json",
+        metadata: "json",
+      };
+      name = "";
+      userId = "";
+      tags: string[] = []; // ← Array.isArray default → array column
+      metadata: any = null; // ← null default → object/any column
+    }
+
+    it("emits @> containment SQL on Postgres for json-array columns", () => {
+      const steps: QueryStep[] = [
+        { method: "whereIn", args: ["tags", ["a", "b"]] },
+      ];
+
+      adapter.queryFromClient(
+        ProjectArrayModel as any,
+        { userId: "u1" },
+        steps,
+      );
+
+      const whereRaw = calls.find((c) => c.method === "whereRaw");
+      expect(whereRaw).toBeDefined();
+      expect(whereRaw!.args[0]).toContain("@>");
+      // One @> clause per value, OR'd together.
+      expect((whereRaw!.args[0].match(/@>/g) ?? []).length).toBe(2);
+      expect(whereRaw!.args[1]).toEqual([
+        "tags",
+        '["a"]',
+        "tags",
+        '["b"]',
+      ]);
+      // Native whereIn must NOT be called for this column.
+      const nativeWhereIn = calls.find(
+        (c) =>
+          c.method === "whereIn" &&
+          Array.isArray(c.args[0])
+            ? false
+            : c.args[0] === "tags",
+      );
+      expect(nativeWhereIn).toBeUndefined();
+    });
+
+    it("emits LIKE containment SQL on SQLite for json-array columns", () => {
+      (adapter as any).engine = "sqlite";
+
+      const steps: QueryStep[] = [
+        { method: "whereIn", args: ["tags", ["a"]] },
+      ];
+
+      adapter.queryFromClient(
+        ProjectArrayModel as any,
+        { userId: "u1" },
+        steps,
+      );
+
+      const whereRaw = calls.find((c) => c.method === "whereRaw");
+      expect(whereRaw).toBeDefined();
+      expect(whereRaw!.args[0]).toContain("LIKE");
+      expect(whereRaw!.args[0]).not.toContain("@>");
+      // Surrounding quotes pin the LIKE to a literal JSON-array
+      // element — without them prefix/suffix collisions across ids
+      // would false-positive.
+      expect(whereRaw!.args[1]).toEqual(["tags", '%"a"%']);
+    });
+
+    it("falls through to native whereIn for scalar columns", () => {
+      const steps: QueryStep[] = [
+        { method: "whereIn", args: ["userId", ["u1", "u2"]] },
+      ];
+
+      adapter.queryFromClient(
+        ProjectArrayModel as any,
+        { userId: "u1" },
+        steps,
+      );
+
+      // Should see a native whereIn call (the second one — the first
+      // is the scope where).
+      const whereInCall = calls.find(
+        (c) => c.method === "whereIn" && c.args[0] === "userId",
+      );
+      expect(whereInCall).toBeDefined();
+      expect(whereInCall!.args).toEqual(["userId", ["u1", "u2"]]);
+    });
+
+    it("dispatches to @> for any json column — the schema doesn't track array-ness", () => {
+      // `metadata` is `metadata: any = null` on the model, but the
+      // schema resolver records its type as `"json"` either way.
+      // Schema-only dispatch treats any json column as a containment
+      // candidate; whereIn-against-an-object is a meaningless shape
+      // the caller is responsible for not building.
+      const steps: QueryStep[] = [
+        { method: "whereIn", args: ["metadata", ["x"]] },
+      ];
+
+      adapter.queryFromClient(
+        ProjectArrayModel as any,
+        { userId: "u1" },
+        steps,
+      );
+
+      const whereRaw = calls.find((c) => c.method === "whereRaw");
+      expect(whereRaw).toBeDefined();
+      expect(whereRaw!.args[0]).toContain("@>");
+      const nativeWhereIn = calls.find(
+        (c) => c.method === "whereIn" && c.args[0] === "metadata",
+      );
+      expect(nativeWhereIn).toBeUndefined();
+    });
+
+    it("emits a hard-false predicate for an empty values array", () => {
+      const steps: QueryStep[] = [
+        { method: "whereIn", args: ["tags", []] },
+      ];
+
+      adapter.queryFromClient(
+        ProjectArrayModel as any,
+        { userId: "u1" },
+        steps,
+      );
+
+      const whereRaw = calls.find((c) => c.method === "whereRaw");
+      expect(whereRaw).toBeDefined();
+      expect(whereRaw!.args[0]).toBe("1 = 0");
     });
   });
 });

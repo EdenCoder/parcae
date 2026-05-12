@@ -43,15 +43,22 @@ export function useModelAtomic<V = unknown>(
   path: string,
   compareFn?: (a: V, b: V) => boolean,
 ): V | undefined {
+  // Mirrors `useModel`'s tolerance for plain-JSON projections. Parcae
+  // adapter rows have an EventEmitter surface; HTTP-envelope rows
+  // shaped like a model don't. Probing for `.on` lets the hook
+  // short-circuit to a noop subscription instead of throwing
+  // `model.on is not a function` deep inside an unrelated component.
+  const isReactive = isLiveModel(model);
+
   const subscribe = useCallback(
     (cb: () => void) => {
-      if (!model) return () => {};
+      if (!isReactive || !model) return () => {};
       model.on("change", cb);
       return () => {
         model.off("change", cb);
       };
     },
-    [model],
+    [model, isReactive],
   );
 
   // Cache the last returned value so getSnapshot can return the
@@ -72,6 +79,12 @@ export function useModelAtomic<V = unknown>(
   }, [model, path, compareFn]);
 
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
+function isLiveModel(model: unknown): model is Model {
+  if (!model || typeof model !== "object") return false;
+  const m = model as { on?: unknown; off?: unknown };
+  return typeof m.on === "function" && typeof m.off === "function";
 }
 
 /**

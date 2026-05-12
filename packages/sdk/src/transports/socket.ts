@@ -14,7 +14,7 @@ import type { Transport, RequestOptions } from "@parcae/model";
 import { AuthGate } from "../auth-gate";
 import { log } from "../log";
 
-const DEFAULT_TIMEOUT = 30_000;
+const DEFAULT_TIMEOUT = 120_000;
 
 const uid = new ShortId({ length: 10 });
 const SOCKETS = new Map<string, any>();
@@ -183,7 +183,16 @@ export class SocketTransport extends EventEmitter implements Transport {
       if (existing) return existing;
       const req = this._call(method, path, data, options);
       this.inflight.set(dedupeKey, req);
-      req.finally(() => this.inflight.delete(dedupeKey));
+      // Clear the dedup slot on resolve / reject without creating an
+      // unhandled-rejection side chain — `.finally(...)` returns a new
+      // promise that re-rejects with the original error; without an
+      // attached `.catch` on THAT chain, the rejection leaks even when
+      // the caller awaits and handles `req` directly. `.then(_, _)`
+      // closes the loop with a no-op rejection handler.
+      req.then(
+        () => this.inflight.delete(dedupeKey),
+        () => this.inflight.delete(dedupeKey),
+      );
       return req;
     }
 

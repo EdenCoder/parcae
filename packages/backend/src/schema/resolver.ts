@@ -28,6 +28,42 @@ const SKIP_PREFIXES = ["__", "___"];
 
 // ─── Type Resolution ─────────────────────────────────────────────────────────
 
+/**
+ * Treat `string & T` (and other intersections that contain `string`)
+ * as a plain string for column-type purposes. The autocomplete-with-
+ * fallback pattern `"x" | "y" | (string & {})` is the canonical TS
+ * trick for "known values + open extension"; without this check, the
+ * `& {}` member doesn't match `isString()` and the whole union falls
+ * through to "json" — which then makes Postgres treat the column as
+ * JSONB and choke on bare string values.
+ */
+function isStringLike(t: Type): boolean {
+  if (t.isStringLiteral() || t.isString()) return true;
+  if (t.isIntersection()) {
+    const parts = t.getIntersectionTypes();
+    if (parts.some((p) => p.isString() || p.isStringLiteral())) return true;
+  }
+  return false;
+}
+
+function isNumberLike(t: Type): boolean {
+  if (t.isNumberLiteral() || t.isNumber()) return true;
+  if (t.isIntersection()) {
+    const parts = t.getIntersectionTypes();
+    if (parts.some((p) => p.isNumber() || p.isNumberLiteral())) return true;
+  }
+  return false;
+}
+
+function isBooleanLike(t: Type): boolean {
+  if (t.isBooleanLiteral() || t.isBoolean()) return true;
+  if (t.isIntersection()) {
+    const parts = t.getIntersectionTypes();
+    if (parts.some((p) => p.isBoolean() || p.isBooleanLiteral())) return true;
+  }
+  return false;
+}
+
 function resolveType(type: Type): ColumnType {
   const text = type.getText();
 
@@ -41,22 +77,14 @@ function resolveType(type: Type): ColumnType {
     }
     // Check if all members are the same primitive type
     // e.g. "active" | "pending" | "completed" → string
-    if (
-      nonNullTypes.length > 1 &&
-      nonNullTypes.every((t) => t.isStringLiteral() || t.isString())
-    ) {
+    // e.g. "x" | "y" | (string & {})           → string  (autocomplete-with-fallback)
+    if (nonNullTypes.length > 1 && nonNullTypes.every(isStringLike)) {
       return "string";
     }
-    if (
-      nonNullTypes.length > 1 &&
-      nonNullTypes.every((t) => t.isNumberLiteral() || t.isNumber())
-    ) {
+    if (nonNullTypes.length > 1 && nonNullTypes.every(isNumberLike)) {
       return "number";
     }
-    if (
-      nonNullTypes.length > 1 &&
-      nonNullTypes.every((t) => t.isBooleanLiteral() || t.isBoolean())
-    ) {
+    if (nonNullTypes.length > 1 && nonNullTypes.every(isBooleanLike)) {
       return "boolean";
     }
     // Mixed-type union → json
@@ -172,8 +200,10 @@ export class SchemaResolver {
         const schema = this.resolveClass(classDecl);
         schemas.set(modelClass.type, schema);
 
-        // Inject onto the model constructor
-        (modelClass as any).__schema = schema;
+        // Inject onto the model constructor — `__schema` is on the
+        // `ModelConstructor` interface as an optional field, no cast
+        // needed.
+        modelClass.__schema = schema;
       }
     }
 
@@ -223,8 +253,10 @@ export class SchemaResolver {
           "kind" in colDef &&
           colDef.kind === "ref"
         ) {
-          const targetName = (colDef.target as any)?.type;
-          const targetModel = modelsByName.get(targetName);
+          const targetName = colDef.target?.type;
+          const targetModel = targetName
+            ? modelsByName.get(targetName)
+            : undefined;
           if (targetModel) {
             schema[key] = { kind: "ref", target: targetModel };
           } else {

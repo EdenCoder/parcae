@@ -62,9 +62,10 @@ export async function searchAll(
   const limit = options.limit ?? 10;
   const scopeCtx = options.scope ?? {};
 
-  // Filter to models that have searchFields defined
+  // Filter to models that have searchFields defined. `searchFields`
+  // is on the `ModelConstructor` interface, no cast required.
   const searchableModels = options.models.filter(
-    (m) => (m as any).searchFields?.length > 0,
+    (m) => (m.searchFields?.length ?? 0) > 0,
   );
 
   // Run searches in parallel
@@ -86,18 +87,24 @@ export async function searchAll(
         chain = chain.where(scopeResult);
       }
 
-      chain = (chain as any).search(term).limit(limit);
+      // `search` is part of the QueryChain surface; no cast needed.
+      chain = chain.search(term).limit(limit);
 
       const items = await chain.find();
 
       return Promise.all(
-        items.map(async (item: any, index: number) => {
-          const sanitized = await item.sanitize();
+        items.map(async (item, index) => {
+          // Items are query results — typed as `any` already through
+          // the adapter's `query<T>` generic. Project through sanitize
+          // for the wire shape and pull `_rank` (added by the search
+          // SQL's SELECT) for the relevance score.
+          const row = item as any;
+          const sanitized = await row.sanitize();
           return {
             type: modelClass.type,
             item: sanitized,
             // _rank from SQL if available, otherwise use position
-            rank: (item as any)._rank ?? items.length - index,
+            rank: row._rank ?? items.length - index,
           } as SearchResult;
         }),
       );

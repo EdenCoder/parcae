@@ -122,7 +122,10 @@ describe("Model", () => {
       expect(data.body).toBe("");
       expect(data.published).toBe(false);
       expect(data.id).toBeDefined();
-      expect(data.type).toBe("post");
+      // `type` is NOT in __data — it lives on the constructor as a
+      // static (`Post.type`), not on the instance. Projections that
+      // need it (`sanitize()`, `toJSON()`) read from the static.
+      expect(data.type).toBeUndefined();
       expect(data.createdAt).toBeDefined();
       expect(data.updatedAt).toBeDefined();
     });
@@ -132,6 +135,17 @@ describe("Model", () => {
       const data = post.__data;
       const keys = Object.keys(data);
       expect(keys.every((k) => !k.startsWith("Symbol"))).toBe(true);
+    });
+
+    it("sanitize() and toJSON() still include `type` from the static", async () => {
+      const post = Post.create({ title: "T" });
+      // The projection shape that goes over the wire keeps `type` as
+      // the discriminator clients use to route polymorphic responses
+      // — sourced from `Post.type` static rather than an instance
+      // field.
+      const sanitized = await post.sanitize();
+      expect(sanitized.type).toBe("post");
+      expect(post.toJSON().type).toBe("post");
     });
   });
 
@@ -528,6 +542,51 @@ describe("Model", () => {
       const sanitized = await post.sanitize();
       expect(sanitized.title).toBe("Sanitize");
       expect(sanitized.type).toBe("post");
+    });
+
+    it("sanitize strips fields listed in static privateFields", async () => {
+      // Subclass with two sensitive fields. The default
+      // implementation projects every column EXCEPT those — so a
+      // developer who forgets to override `sanitize()` still gets a
+      // safe shape over the wire.
+      class Account extends Model {
+        static type = "account" as const;
+        static readonly privateFields = [
+          "passwordHash",
+          "resetToken",
+        ] as const;
+        email: string = "";
+        passwordHash: string = "";
+        resetToken: string = "";
+      }
+
+      const acc = Account.create({
+        email: "a@b.com",
+        passwordHash: "supersecret",
+        resetToken: "tok-123",
+      });
+
+      const sanitized = await acc.sanitize();
+      expect(sanitized.email).toBe("a@b.com");
+      expect(sanitized.type).toBe("account");
+      // Sensitive fields are gone from the projection.
+      expect(sanitized.passwordHash).toBeUndefined();
+      expect(sanitized.resetToken).toBeUndefined();
+
+      // toJSON() ignores the list — it's the internal projection used
+      // by hooks / subscriptions where the full row is needed.
+      const internal = acc.toJSON();
+      expect(internal.passwordHash).toBe("supersecret");
+      expect(internal.resetToken).toBe("tok-123");
+    });
+
+    it("sanitize falls through to all fields when privateFields is empty", async () => {
+      // Default behaviour for a class without an explicit
+      // `privateFields` list — backward-compatible projection.
+      const post = Post.create({ title: "Visible", views: 5 });
+      const sanitized = await post.sanitize();
+      expect(sanitized.title).toBe("Visible");
+      expect(sanitized.views).toBe(5);
     });
   });
 

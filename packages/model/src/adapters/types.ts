@@ -44,7 +44,15 @@ export type IndexDefinition = string | string[];
 // ─── Model Constructor ───────────────────────────────────────────────────────
 
 /**
- * The static side of a Model subclass.
+ * The static side of a Model subclass — metadata + the `new` signature
+ * adapters and schema generators need to introspect the class.
+ *
+ * Static query/builder methods (`where`, `whereIn`, `find`, …) live on
+ * the `Model` class itself (see `../Model.ts`) and ARE typed properly
+ * when called against a concrete subclass like `Scene.where(...)`.
+ * Generic helpers that take a model-class parameter should use the
+ * `ModelClass<T>` alias below, which captures both the metadata
+ * surface AND the typed static query methods.
  */
 export interface ModelConstructor<T = any> {
   type: string;
@@ -70,8 +78,60 @@ export interface ModelConstructor<T = any> {
    * ```
    */
   searchFields?: string[];
+  /**
+   * Field-level write protection. Listed columns are stripped from
+   * client request bodies before being applied to the model in the
+   * auto-CRUD `POST` / `PUT` / `PATCH` routes. Server-side code can
+   * still write these fields directly.
+   *
+   * Default (empty) means only the framework's hardcoded system
+   * fields (`id`, `createdAt`, `updatedAt`, `type`) are protected.
+   */
+  readonlyFields?: readonly string[];
+  /**
+   * Field-level read protection. Listed columns are stripped from
+   * the default `sanitize()` projection so a column like
+   * `passwordHash` / `apiKey` / `inviteToken` doesn't leak through
+   * auto-CRUD GET endpoints.
+   *
+   * Subclasses that override `sanitize()` directly bypass this list.
+   * Default (empty) means every column is included.
+   */
+  privateFields?: readonly string[];
   __schema?: SchemaDefinition;
   new (adapter: ModelAdapter, data?: Record<string, any>): T;
+}
+
+/**
+ * Typed "model class" surface for generic helper functions.
+ *
+ *   async function hydrateTop<R extends Model & { id: string }>(
+ *     ModelClass: ModelClass<R>,
+ *     ids: string[],
+ *   ) {
+ *     const rows = await ModelClass.whereIn("id", ids).find()
+ *     // ↑ Typed as Promise<R[]> — no `as any` needed.
+ *     return rows
+ *   }
+ *
+ * Combines `ModelConstructor<T>` (for adapter / schema use) with the
+ * static query methods every Model subclass inherits. Return types
+ * mirror the class statics so concrete calls (`Scene.where(...)`) and
+ * generic calls (`ModelClass.where(...)`) produce the same chain.
+ */
+export interface ModelClass<T> extends ModelConstructor<T> {
+  create(data?: Record<string, any>): T;
+  findById(id: string): Promise<T | null>;
+  where(...args: any[]): QueryChain<T>;
+  whereRaw(query: string, ...bindings: any[]): QueryChain<T>;
+  whereIn(column: string, values: any[]): QueryChain<T>;
+  whereNot(...args: any[]): QueryChain<T>;
+  whereNotIn(column: string, values: any[]): QueryChain<T>;
+  whereNull(column: string): QueryChain<T>;
+  whereNotNull(column: string): QueryChain<T>;
+  select(...columns: string[]): QueryChain<T>;
+  count(): Promise<number>;
+  search(term: string): QueryChain<T>;
 }
 
 // ─── Scope System ────────────────────────────────────────────────────────────

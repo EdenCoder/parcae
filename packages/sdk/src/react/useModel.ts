@@ -22,8 +22,16 @@
  *     return <div>{msg.content}</div>;
  *   }
  *
- * Accepts `null` / `undefined` — the hook is inert in that case,
- * so conditional consumers stay ergonomic.
+ * Accepts `null` / `undefined` — the hook is inert in that case.
+ *
+ * Also accepts plain objects that *look* like model rows but aren't
+ * full instances (typically projections from a custom REST endpoint
+ * passed into a card wrapper that normally hydrates parcae rows).
+ * Those don't emit any change events, so the hook short-circuits to
+ * a no-op subscription — the component still re-renders normally
+ * when its parent passes new props. This keeps wrappers like
+ * `<PerformerCard performer={…}>` reusable for both live parcae
+ * rows and HTTP snapshots without forcing two variants.
  */
 
 import { Model, SYM_VERSION } from "@parcae/model";
@@ -32,22 +40,33 @@ import { useCallback, useSyncExternalStore } from "react";
 export function useModel<T extends Model>(
   model: T | null | undefined,
 ): T | null | undefined {
+  // Detect "real" Model instances by their EventEmitter surface. Plain
+  // objects from an HTTP envelope are valid input but inert.
+  const isReactive = isLiveModel(model);
+
   const subscribe = useCallback(
     (cb: () => void) => {
-      if (!model) return () => {};
+      if (!isReactive || !model) return () => {};
       model.on("change", cb);
       return () => {
         model.off("change", cb);
       };
     },
-    [model],
+    [model, isReactive],
   );
 
   const getSnapshot = useCallback(
-    () => (model ? ((model as any)[SYM_VERSION] as number) || 0 : 0),
-    [model],
+    () =>
+      isReactive && model ? ((model as any)[SYM_VERSION] as number) || 0 : 0,
+    [model, isReactive],
   );
 
   useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   return model;
+}
+
+function isLiveModel(model: unknown): model is Model {
+  if (!model || typeof model !== "object") return false;
+  const m = model as { on?: unknown; off?: unknown };
+  return typeof m.on === "function" && typeof m.off === "function";
 }

@@ -87,7 +87,7 @@ describe("ctx.onError — compensating actions", () => {
 
     const model = makeModel({ id: "m1", name: "alpha" });
     await expect(
-      adapter.save(model, { creating: true, ops: [], updates: [] } as any),
+      adapter.save(model),
     ).rejects.toThrow("second before failed");
 
     expect(cleanup).toHaveBeenCalledTimes(1);
@@ -103,7 +103,6 @@ describe("ctx.onError — compensating actions", () => {
     // Insert a row first so the second attempt collides on id
     await adapter.save(
       makeModel({ id: "dup", name: "first" }),
-      { creating: true, ops: [], updates: [] } as any,
     );
 
     // Force a PK collision: insert a different model with the same id and a
@@ -120,7 +119,6 @@ describe("ctx.onError — compensating actions", () => {
     await expect(
       adapter.save(
         makeModel({ id: "second", name: "first" }),
-        { creating: true, ops: [], updates: [] } as any,
       ),
     ).rejects.toThrow();
 
@@ -151,7 +149,6 @@ describe("ctx.onError — compensating actions", () => {
     await expect(
       adapter.save(
         makeModel({ id: "rb", name: "x" }),
-        { creating: true, ops: [], updates: [] } as any,
       ),
     ).rejects.toThrow("after failed");
 
@@ -187,7 +184,6 @@ describe("ctx.onError — compensating actions", () => {
     await expect(
       adapter.save(
         makeModel({ id: "lifo", name: "y" }),
-        { creating: true, ops: [], updates: [] } as any,
       ),
     ).rejects.toThrow("boom");
 
@@ -219,7 +215,6 @@ describe("ctx.onError — compensating actions", () => {
     await expect(
       adapter.save(
         makeModel({ id: "x1", name: "z" }),
-        { creating: true, ops: [], updates: [] } as any,
       ),
     ).rejects.toThrow("ORIGINAL");
 
@@ -237,7 +232,6 @@ describe("ctx.onError — compensating actions", () => {
 
     await adapter.save(
       makeModel({ id: "ok1", name: "ok" }),
-      { creating: true, ops: [], updates: [] } as any,
     );
 
     expect(cleanup).not.toHaveBeenCalled();
@@ -259,7 +253,6 @@ describe("ctx.onError — compensating actions", () => {
 
     await adapter.save(
       makeModel({ id: "async1", name: "a" }),
-      { creating: true, ops: [], updates: [] } as any,
     );
 
     // Give the fire-and-forget hook a moment
@@ -272,7 +265,6 @@ describe("ctx.onError — compensating actions", () => {
   it("fires cleanups for remove() when a before-hook throws", async () => {
     await adapter.save(
       makeModel({ id: "rm1", name: "to-remove" }),
-      { creating: true, ops: [], updates: [] } as any,
     );
 
     const cleanup = vi.fn();
@@ -311,7 +303,6 @@ describe("ctx.onError — compensating actions", () => {
     await expect(
       adapter.save(
         makeModel({ id: "mixed", name: "mm" }),
-        { creating: true, ops: [], updates: [] } as any,
       ),
     ).rejects.toThrow("after work failed");
 

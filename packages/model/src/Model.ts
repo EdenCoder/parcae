@@ -135,6 +135,20 @@ const SYSTEM_DATA_KEYS = new Set([
 // This allows building queries before Model.use() is called (e.g. in React
 // component bodies before ParcaeProvider mounts).
 
+/**
+ * Run `_apply()` on a freshly-constructed instance. Centralised so the
+ * `instance as any` cast lives in exactly one place rather than every
+ * static factory.
+ */
+function applyInstance(instance: any): void {
+  instance._apply();
+}
+
+/** Stamp the `__isNew` flag. Same centralisation rationale. */
+function markNew(instance: any, value: boolean): void {
+  instance.__isNew = value;
+}
+
 function lazyQuery<T>(
   modelClass: ModelConstructor<T>,
   steps: any[] = [],
@@ -248,6 +262,20 @@ export class Model extends EventEmitter {
 
   // ── Static ─────────────────────────────────────────────────────────
 
+  /**
+   * Discriminator for this model class. Singular, lowercase, used for:
+   *   - the table name (`pluralize(type)` → `pluralize("post")` → `"posts"`)
+   *   - the auto-CRUD path (`/v1/{type}s`)
+   *   - the response shape key (`{ posts: [...] }`)
+   *   - the `type` field included in `sanitize()` / `toJSON()`
+   *     projections so polymorphic client code can route on it
+   *
+   * Lives ONLY on the constructor — there's no instance field by the
+   * same name. Read it from the static (`Post.type`) or, given an
+   * instance, via `(post.constructor as typeof Model).type`. The
+   * framework's projections do the static read internally, so client
+   * payloads still carry a `type` key as before.
+   */
   static type: string = "";
   static path?: string;
   static scope?: {
@@ -260,6 +288,45 @@ export class Model extends EventEmitter {
   static indexes?: (string | string[])[];
   static searchFields?: string[];
   static managed: boolean = true;
+  /**
+   * Field-level write protection. Listed columns are stripped from
+   * client request bodies before they're applied to the model in the
+   * auto-CRUD `POST` / `PUT` / `PATCH` routes. The framework hardcodes
+   * `id` / `createdAt` / `updatedAt` / `type` as always-protected on top
+   * of this list.
+   *
+   * Use for:
+   *   - Counter columns the framework or hooks own (`sceneCount`,
+   *     `viewCount`, `oCount`, …).
+   *   - Ownership refs that scope-update can't re-enforce — without
+   *     this, a client with update access can reassign the owning
+   *     `user` to a different account.
+   *   - State-machine fields that should only mutate through explicit
+   *     server-side flows (`organized`, `corrupt`, `generatingAt`).
+   *
+   * Server-side code can still write these fields directly via
+   * `model.x = …; await model.save()` — `readonly` only restricts the
+   * HTTP-driven entry points.
+   *
+   * Default is empty (no extra restrictions) so existing models stay
+   * backward-compatible.
+   */
+  static readonly readonlyFields: readonly string[] = [];
+  /**
+   * Field-level read protection for the default `sanitize()`. Listed
+   * columns are stripped from the response shape so a column like
+   * `passwordHash` / `apiKey` / `inviteToken` doesn't leak through
+   * the auto-CRUD GET endpoints.
+   *
+   * Subclasses that override `sanitize()` directly bypass this list —
+   * they get full control over the shape. This is the safety net for
+   * the default path.
+   *
+   * Default is empty (no extra restrictions) so existing models stay
+   * backward-compatible. Encourage opting-in for any model with
+   * sensitive columns.
+   */
+  static readonly privateFields: readonly string[] = [];
   /** @internal */
   static __schema?: SchemaDefinition;
 
@@ -321,12 +388,15 @@ export class Model extends EventEmitter {
   }
 
   // ── Static Query Methods ───────────────────────────────────────────
-
-  private static _query<T extends Model>(
-    this: ModelConstructor<T>,
-  ): QueryChain<T> {
-    return lazyQuery(this);
-  }
+  //
+  // Every method below uses `this: ModelConstructor<T>` so the typing
+  // closes via the call shape: `Scene.where(...)` binds T = Scene from
+  // `typeof Scene satisfies ModelConstructor<Scene>`. The returned
+  // chain wraps T in `WithRefs<T>` to surface the `$`-prefixed ref
+  // accessors that `_apply()` installs at runtime. The single cast at
+  // the end of each body bridges the `QueryChain<T>` lazyQuery returns
+  // with the wider `QueryChain<WithRefs<T>>` the contract advertises;
+  // safe because `WithRefs<T>` is `T` plus extra fields.
 
   /**
    * Create a new, unsaved Model instance. Data provided here wins over
@@ -338,8 +408,8 @@ export class Model extends EventEmitter {
     data?: Record<string, any>,
   ): WithRefs<T> {
     const instance = new this(Model.getAdapter(), data);
-    (instance as any)._apply();
-    (instance as any).__isNew = true;
+    applyInstance(instance);
+    markNew(instance, true);
     return instance as WithRefs<T>;
   }
 
@@ -357,8 +427,8 @@ export class Model extends EventEmitter {
     data: Record<string, any>,
   ): T {
     const instance = new this(adapter, data);
-    (instance as any)._apply();
-    (instance as any).__isNew = false;
+    applyInstance(instance);
+    markNew(instance, false);
     return instance;
   }
 
@@ -373,7 +443,7 @@ export class Model extends EventEmitter {
     this: ModelConstructor<T>,
     ...args: any[]
   ): QueryChain<WithRefs<T>> {
-    return (this as any)._query().where(...args);
+    return lazyQuery(this).where(...args) as QueryChain<WithRefs<T>>;
   }
 
   static whereRaw<T extends Model>(
@@ -381,7 +451,9 @@ export class Model extends EventEmitter {
     query: string,
     ...bindings: any[]
   ): QueryChain<WithRefs<T>> {
-    return (this as any)._query().whereRaw(query, ...bindings);
+    return lazyQuery(this).whereRaw(query, ...bindings) as QueryChain<
+      WithRefs<T>
+    >;
   }
 
   static whereIn<T extends Model>(
@@ -389,14 +461,14 @@ export class Model extends EventEmitter {
     column: string,
     values: any[],
   ): QueryChain<WithRefs<T>> {
-    return (this as any)._query().whereIn(column, values);
+    return lazyQuery(this).whereIn(column, values) as QueryChain<WithRefs<T>>;
   }
 
   static whereNot<T extends Model>(
     this: ModelConstructor<T>,
     ...args: any[]
   ): QueryChain<WithRefs<T>> {
-    return (this as any)._query().whereNot(...args);
+    return lazyQuery(this).whereNot(...args) as QueryChain<WithRefs<T>>;
   }
 
   static whereNotIn<T extends Model>(
@@ -404,25 +476,41 @@ export class Model extends EventEmitter {
     column: string,
     values: any[],
   ): QueryChain<WithRefs<T>> {
-    return (this as any)._query().whereNotIn(column, values);
+    return lazyQuery(this).whereNotIn(column, values) as QueryChain<
+      WithRefs<T>
+    >;
+  }
+
+  static whereNull<T extends Model>(
+    this: ModelConstructor<T>,
+    column: string,
+  ): QueryChain<WithRefs<T>> {
+    return lazyQuery(this).whereNull(column) as QueryChain<WithRefs<T>>;
+  }
+
+  static whereNotNull<T extends Model>(
+    this: ModelConstructor<T>,
+    column: string,
+  ): QueryChain<WithRefs<T>> {
+    return lazyQuery(this).whereNotNull(column) as QueryChain<WithRefs<T>>;
   }
 
   static select<T extends Model>(
     this: ModelConstructor<T>,
     ...columns: string[]
   ): QueryChain<WithRefs<T>> {
-    return (this as any)._query().select(...columns);
+    return lazyQuery(this).select(...columns) as QueryChain<WithRefs<T>>;
   }
 
   static count<T extends Model>(this: ModelConstructor<T>): Promise<number> {
-    return (this as any)._query().count();
+    return lazyQuery(this).count();
   }
 
   static search<T extends Model>(
     this: ModelConstructor<T>,
     term: string,
   ): QueryChain<WithRefs<T>> {
-    return (this as any)._query().search(term);
+    return lazyQuery(this).search(term) as QueryChain<WithRefs<T>>;
   }
 
   // ── Constructor ────────────────────────────────────────────────────
@@ -456,17 +544,23 @@ export class Model extends EventEmitter {
     delete this[SYM_PENDING_DATA];
 
     // System fields — always set, even when `data` is empty, so a new
-    // instance always has a stable id / timestamps.
+    // instance always has a stable id / timestamps. `type` is NOT set
+    // on the instance: it's already on the constructor as a `static
+    // type`, so every read just goes through `this.constructor.type`.
+    // Storing it twice burns one field per instance (and one key per
+    // serialised payload) for no benefit.
     const nowIso = new Date().toISOString();
     (this as any).id = data.id ?? generateId();
-    (this as any).type = (this.constructor as typeof Model).type;
     (this as any).createdAt = data.createdAt ?? nowIso;
     (this as any).updatedAt = data.updatedAt ?? nowIso;
     if (data.tmp !== undefined) (this as any).tmp = data.tmp;
 
     // Apply provided non-system data. These OVERWRITE subclass field
     // defaults because we're running after the subclass's field
-    // initializers finished.
+    // initializers finished. `type` is in SYSTEM_DATA_KEYS so old
+    // payloads (e.g. a JSON snapshot from before the field was
+    // dropped) don't accidentally write a stale type onto the
+    // instance.
     for (const [key, value] of Object.entries(data)) {
       if (SYSTEM_DATA_KEYS.has(key)) continue;
       (this as any)[key] = value;
@@ -908,12 +1002,57 @@ export class Model extends EventEmitter {
     }
   }
 
+  /**
+   * Project this instance into the shape that's safe to send to a
+   * client. Subclasses can override for full control; the default
+   * implementation projects every column EXCEPT those listed in
+   * `static privateFields` on the subclass.
+   *
+   * The auto-CRUD routes (`GET /v1/<type>` / `GET /v1/<type>/:id`)
+   * call this on every row. A subclass with a column like
+   * `passwordHash` should add it to `privateFields`:
+   *
+   *   class User extends Model {
+   *     static privateFields = ["passwordHash", "resetToken"]
+   *     passwordHash: string = ""
+   *     ...
+   *   }
+   *
+   * `user` is supplied so subclasses can implement self-vs-other
+   * projections (e.g. show your own private notes but not someone
+   * else's). Default implementation ignores it — it's a uniform
+   * shape for everyone.
+   */
   async sanitize(_user?: { id: string }): Promise<Record<string, any>> {
-    return { type: (this as any).type, ...this.__data };
+    const ModelClass = this.constructor as typeof Model;
+    const privateFields = ModelClass.privateFields;
+    // `type` comes from the static — it's never been an instance
+    // field. Output shape stays identical to pre-cleanup callers.
+    const out: Record<string, any> = {
+      type: ModelClass.type,
+      ...this.__data,
+    };
+    if (privateFields && privateFields.length > 0) {
+      for (const field of privateFields) {
+        delete out[field];
+      }
+    }
+    return out;
   }
 
+  /**
+   * Plain-object projection of this instance. UNLIKE `sanitize()` this
+   * does NOT honour `privateFields` — `toJSON` is used internally by
+   * the framework (subscription deltas, hook payloads, the
+   * `__serverSnapshot` source-of-truth) where all columns are needed.
+   * Don't expose `toJSON()` to clients directly; use `sanitize()` from
+   * route handlers.
+   */
   toJSON(): Record<string, any> {
-    return { type: (this as any).type, ...this.__data };
+    return {
+      type: (this.constructor as typeof Model).type,
+      ...this.__data,
+    };
   }
 
   // ── Reference Proxy ──────────────────────────────────────────────────

@@ -790,3 +790,55 @@ export function useQuery<T>(
     onOps,
   };
 }
+
+// ─── @internal — test-only access to the cache ───────────────────────────────
+//
+// Exposed so unit tests can exercise the disconnect/reconnect path,
+// retry scheduling, and applyOps without going through React render.
+// Not part of the public surface — the names are deliberately prefixed
+// with `__` so consumers know they're framework-internal.
+
+/** @internal */
+export const __test = {
+  /** Clear the module-level cache between tests. */
+  resetCache(): void {
+    for (const entry of cache.values()) {
+      entry.dispose?.();
+      if (entry.gcTimer) clearTimeout(entry.gcTimer);
+      if (entry.retryTimer) clearTimeout(entry.retryTimer);
+    }
+    cache.clear();
+  },
+
+  /** Read the current entry (or undefined). */
+  getEntry(key: string): CacheEntry | undefined {
+    return cache.get(key);
+  },
+
+  /** Construct a cache key the same way `useQuery` does. */
+  buildKey(modelType: string, userId: string | null, steps: unknown[]): string {
+    return `${modelType}:${userId ?? "anon"}:${JSON.stringify(steps)}`;
+  },
+
+  /** Trigger the same fetch the hook would on first mount. */
+  fetch(
+    key: string,
+    chain: QueryChain<any>,
+    client: ParcaeClient,
+  ): CacheEntry {
+    const entry = getOrCreate(key);
+    doFetch(key, entry, chain, client);
+    return entry;
+  },
+
+  /** Hand-add a subscriber to keep the entry alive (refs counter). */
+  retain(key: string, onChange: () => void): () => void {
+    const entry = getOrCreate(key);
+    entry.refs++;
+    entry.listeners.add(onChange);
+    return () => {
+      entry.listeners.delete(onChange);
+      entry.refs--;
+    };
+  },
+}

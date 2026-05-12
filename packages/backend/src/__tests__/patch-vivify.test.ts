@@ -393,6 +393,15 @@ describe("BackendAdapter._patchPostgres — vivification shape (DOL-553)", () =>
     } finally {
       delete (ProjectModel.__schema as any).title;
     }
-    expect(capture.raws.length).toBe(0);
+    // Exactly one `raw()` call is expected: the stale-overflow scrub
+    // that strips the freshly-patched key from the `data` jsonb blob
+    // (`COALESCE(data, '{}'::jsonb) - ?::text[]`). This is the
+    // counterpart to the `hydrate()` overflow filter — without it, a
+    // patched column's stale snapshot in `data` could win on the next
+    // read. Anything beyond this single raw() would indicate an
+    // unwanted jsonb vivification side-effect on a scalar-only patch.
+    expect(capture.raws.length).toBe(1);
+    expect(capture.raws[0]!.sql).toContain("?::text[]");
+    expect(capture.raws[0]!.bindings).toEqual(["{title}"]);
   });
 });

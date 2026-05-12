@@ -15,8 +15,8 @@ describe("route registration", () => {
     });
     const routes = getRoutes();
     expect(routes.length).toBe(1);
-    expect(routes[0].method).toBe("GET");
-    expect(routes[0].path).toBe("/v1/test");
+    expect(routes[0]!.method).toBe("GET");
+    expect(routes[0]!.path).toBe("/v1/test");
   });
 
   it("should register POST routes with middleware", () => {
@@ -62,8 +62,8 @@ describe("hook registration", () => {
     hook.after(MockModel, "save", async () => {});
     const hooks = getHooks();
     expect(hooks.length).toBe(1);
-    expect(hooks[0].timing).toBe("after");
-    expect(hooks[0].actions).toEqual(["save"]);
+    expect(hooks[0]!.timing).toBe("after");
+    expect(hooks[0]!.actions).toEqual(["save"]);
   });
 
   it("should register before hooks with options", () => {
@@ -74,8 +74,8 @@ describe("hook registration", () => {
     });
     const hooks = getHooksFor("test2", "before", "remove");
     expect(hooks.length).toBe(1);
-    expect(hooks[0].async).toBe(true);
-    expect(hooks[0].priority).toBe(50);
+    expect(hooks[0]!.async).toBe(true);
+    expect(hooks[0]!.priority).toBe(50);
   });
 
   it("should filter by model type and timing", () => {

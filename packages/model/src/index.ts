@@ -24,6 +24,7 @@ export type { Transport, RequestOptions } from "./adapters/client";
 export { CHAINABLE_METHODS } from "./adapters/types";
 export type {
   ModelAdapter,
+  ModelClass,
   ModelConstructor,
   QueryChain,
   QueryStep,

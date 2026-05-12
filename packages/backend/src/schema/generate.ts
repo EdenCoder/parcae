@@ -17,6 +17,21 @@ import { readdirSync, statSync } from "node:fs";
 import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
 import { SchemaResolver } from "./resolver";
 
+/**
+ * Resolver-version stamp folded into every cache key. Bump this when
+ * the schema-resolver logic changes in a way that affects what column
+ * type a given TS type maps to. Without it, a build that ships a
+ * resolver fix will still load stale cached schemas keyed only on the
+ * model source-file hashes — which are *unchanged* across resolver
+ * upgrades, so the fix doesn't take effect on existing checkouts.
+ *
+ * Versioning policy:
+ *   1: initial
+ *   2: handle `string & T` / `(string & {})` autocomplete-fallback
+ *      pattern in unions (was incorrectly resolving to "json")
+ */
+const RESOLVER_VERSION = 2;
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 interface GenerateOptions {
@@ -154,7 +169,10 @@ export async function generateSchemas(
     return { schemas: new Map(), cached: false };
   }
 
-  const currentHash = hashFiles(sourceFiles);
+  // Hash includes the resolver-version stamp so a parcae upgrade that
+  // changes type→column mapping invalidates downstream caches without
+  // requiring every consumer to manually `rm .parcae/schema.json`.
+  const currentHash = `v${RESOLVER_VERSION}:${hashFiles(sourceFiles)}`;
 
   // Check cache
   if (!force) {
@@ -168,10 +186,14 @@ export async function generateSchemas(
       for (const [type, schema] of Object.entries(cache.schemas)) {
         schemas.set(type, schema);
         const ModelClass = modelsByType.get(type);
-        if (ModelClass) (ModelClass as any).__schema = schema;
+        if (ModelClass) ModelClass.__schema = schema;
       }
 
-      // Wire ref targets to actual constructors (cache stores them as plain { type } stubs)
+      // Wire ref targets to actual constructors. The cache stores
+      // ref targets as plain `{ type }` stubs (constructors aren't
+      // JSON-serialisable); resolve them here against the live
+      // registry so subsequent code can call e.g.
+      // `colDef.target.__schema` without re-walking the registry.
       for (const [, schema] of schemas) {
         for (const [key, colDef] of Object.entries(schema)) {
           if (
@@ -180,8 +202,10 @@ export async function generateSchemas(
             "kind" in colDef &&
             colDef.kind === "ref"
           ) {
-            const targetName = (colDef.target as any)?.type;
-            const target = modelsByName.get(targetName) ?? modelsByType.get(targetName);
+            const targetName = colDef.target?.type;
+            const target = targetName
+              ? modelsByName.get(targetName) ?? modelsByType.get(targetName)
+              : undefined;
             if (target) {
               schema[key] = { kind: "ref", target };
             } else {

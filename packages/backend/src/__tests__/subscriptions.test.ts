@@ -154,6 +154,53 @@ describe("QuerySubscriptionManager", () => {
 
       expect(manager.stats.queries).toBe(2);
     });
+
+    it("caps subscriptions per socket and returns empty items on overflow", async () => {
+      source.setResults([row("p1")]);
+      // Fill up to the cap with 100 distinct queries on one socket.
+      // Each `query("project", filter)` produces a different hash.
+      for (let i = 0; i < 100; i++) {
+        await manager.subscribe({
+          socketId: "attacker",
+          query: source.query("project", `bucket_${i}`),
+        });
+      }
+      expect(manager.stats.queries).toBe(100);
+
+      // The 101st subscription is rejected — returns the hash so the
+      // client can correlate but with an empty items list.
+      const overflow = await manager.subscribe({
+        socketId: "attacker",
+        query: source.query("project", `bucket_overflow`),
+      });
+      expect(overflow.items).toEqual([]);
+      // The rejected subscription was NOT cached server-side.
+      expect(manager.stats.queries).toBe(100);
+
+      // A DIFFERENT socket isn't affected by attacker's quota.
+      const otherSocket = await manager.subscribe({
+        socketId: "honest",
+        query: source.query("project", `bucket_overflow`),
+      });
+      expect(otherSocket.items).toHaveLength(1);
+    });
+
+    it("re-subscribing to a cached hash on the same socket doesn't count against the cap", async () => {
+      source.setResults([row("p1")]);
+      // 100 distinct → cap reached.
+      for (let i = 0; i < 100; i++) {
+        await manager.subscribe({
+          socketId: "s1",
+          query: source.query("project", `b_${i}`),
+        });
+      }
+      // Re-subscribing to one we already have → success.
+      const dup = await manager.subscribe({
+        socketId: "s1",
+        query: source.query("project", `b_5`),
+      });
+      expect(dup.items).toHaveLength(1);
+    });
   });
 
   // ── Unsubscribe ────────────────────────────────────────────────────

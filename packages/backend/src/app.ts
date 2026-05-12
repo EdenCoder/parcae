@@ -136,13 +136,14 @@ async function discoverModels(dir: string): Promise<ModelConstructor[]> {
 
     try {
       const mod = await import(filePath);
-      // Check all exports for Model constructors
+      // Check all exports for Model constructors — anything with a
+      // `static type` string is treated as a parcae model. We
+      // narrow via a property check instead of a generic type guard
+      // because the imported module is `unknown` at this point.
       for (const exported of Object.values(mod)) {
-        if (
-          typeof exported === "function" &&
-          (exported as any).type &&
-          typeof (exported as any).type === "string"
-        ) {
+        if (typeof exported !== "function") continue;
+        const candidate = exported as { type?: unknown };
+        if (typeof candidate.type === "string" && candidate.type.length > 0) {
           models.push(exported as ModelConstructor);
         }
       }

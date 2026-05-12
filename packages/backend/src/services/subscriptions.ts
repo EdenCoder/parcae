@@ -46,6 +46,21 @@ function jsonClone<T>(obj: T): T {
 
 // ─── Manager ─────────────────────────────────────────────────────────────────
 
+/**
+ * Per-socket subscription cap. Without it, a misbehaving client can
+ * subscribe to N distinct queries — each cached server-side with its
+ * own row set + per-model-change re-eval cost — and exhaust the
+ * server. 100 is well above typical UI usage (each page mounts a
+ * handful of `useQuery`s) and well below the threshold where a
+ * single socket starts to materially impact server memory.
+ *
+ * Hitting the cap is a development-time mistake or an attack, not a
+ * legitimate runtime case — log loudly and silently drop the new
+ * subscription's items (the client gets an empty result for that
+ * query, consistent with how an unsubscribed query reads).
+ */
+const MAX_SUBSCRIPTIONS_PER_SOCKET = 100;
+
 export class QuerySubscriptionManager {
   private queries = new Map<string, CachedQuery>();
   private socketQueries = new Map<string, Set<string>>();
@@ -65,8 +80,28 @@ export class QuerySubscriptionManager {
     opts: SubscriptionOptions,
   ): Promise<{ hash: string; items: Record<string, any>[] }> {
     const { socketId, query } = opts;
-    const modelType = (query as any).__modelType;
+    // `__modelType` lives on the QueryChain interface as @internal —
+    // populated by every chain factory (`Model._query` → `lazyQuery`
+    // server-side, the adapter's `query()` factory client-side).
+    const modelType = query.__modelType;
     const hash = hashFrom(query.exec().toSQL());
+
+    // Per-socket cap enforced BEFORE the cache lookup so a socket
+    // can't unlock new subscriptions by re-requesting an already-
+    // cached hash. The cap is on the socket's distinct-hash set
+    // size, not on the cached query's total subscribers — sharing a
+    // query across many sockets is fine and intentional.
+    const existing = this.socketQueries.get(socketId);
+    const alreadySubscribed = existing?.has(hash) ?? false;
+    if (
+      !alreadySubscribed &&
+      (existing?.size ?? 0) >= MAX_SUBSCRIPTIONS_PER_SOCKET
+    ) {
+      log.warn(
+        `subscriptions: socket ${socketId} hit the ${MAX_SUBSCRIPTIONS_PER_SOCKET} subscription cap — refusing new query for ${modelType}`,
+      );
+      return { hash, items: [] };
+    }
 
     let cached = this.queries.get(hash);
 
@@ -199,8 +234,14 @@ export class QuerySubscriptionManager {
     query: QueryChain<any>,
   ): Promise<Record<string, any>[]> {
     const models = await query.clone().find();
+    // `query.find()` returns `Promise<any[]>` (the chain's generic is
+    // `any`); the projection runs `sanitize()` for every Model row
+    // and falls back to `__data` for any non-Model row that snuck
+    // through (defensive — the default `sanitize` is now on Model
+    // itself, so the fallback is effectively unreachable for real
+    // model classes).
     return Promise.all(
-      (models as any[]).map((m: any) => m.sanitize?.() ?? m.__data ?? m),
+      models.map((m: any) => m.sanitize?.() ?? m.__data ?? m),
     );
   }
 
