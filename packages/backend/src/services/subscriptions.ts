@@ -135,6 +135,9 @@ export class QuerySubscriptionManager {
     }
     this.socketQueries.get(socketId)!.add(hash);
 
+    log.info(
+      `[subscriptions] subscribe ${modelType} hash=${hash.slice(0, 8)} socket=${socketId}: ${cached.subscribers.size} total subscriber(s), ${cached.result.size} initial item(s)`,
+    );
     return { hash, items: [...cached.result.values()] };
   }
 
@@ -155,8 +158,16 @@ export class QuerySubscriptionManager {
 
   unsubscribeAll(socketId: string): void {
     const hashes = this.socketQueries.get(socketId);
-    if (!hashes) return;
+    if (!hashes) {
+      log.info(
+        `[subscriptions] unsubscribeAll socket=${socketId}: nothing to clean`,
+      );
+      return;
+    }
 
+    log.info(
+      `[subscriptions] unsubscribeAll socket=${socketId}: dropping ${hashes.size} subscription(s)`,
+    );
     for (const hash of hashes) {
       const cached = this.queries.get(hash);
       if (!cached) continue;
@@ -174,8 +185,16 @@ export class QuerySubscriptionManager {
 
   onModelChange(modelType: string): void {
     const hashes = this.typeIndex.get(modelType);
-    if (!hashes || hashes.size === 0) return;
+    if (!hashes || hashes.size === 0) {
+      log.info(
+        `[subscriptions] onModelChange ${modelType}: no subscribers (typeIndex empty)`,
+      );
+      return;
+    }
 
+    log.info(
+      `[subscriptions] onModelChange ${modelType}: re-evaluating ${hashes.size} query(s)`,
+    );
     for (const hash of hashes) {
       const cached = this.queries.get(hash);
       if (!cached) continue;
@@ -222,6 +241,9 @@ export class QuerySubscriptionManager {
     cached.result = newResult;
 
     if (ops.length > 0) {
+      log.info(
+        `[subscriptions] _reeval ${cached.modelType} hash=${cached.hash.slice(0, 8)}: ${ops.length} op(s) -> ${cached.subscribers.size} subscriber(s) [${Array.from(cached.subscribers).join(", ")}]`,
+      );
       for (const socketId of cached.subscribers) {
         this.emitToSocket(socketId, `query:${cached.hash}`, ops);
       }

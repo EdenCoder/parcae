@@ -58,20 +58,23 @@ export class SocketTransport extends EventEmitter implements Transport {
 
     this.socket.on("connect", () => {
       this.isConnected = true;
-      log.debug("socket connected");
+      log.info(`[socket] connected id=${this.socket.id}`);
       this._doAuth();
       this.emit("connected");
     });
 
-    this.socket.on("disconnect", () => {
+    this.socket.on("disconnect", (reason: string) => {
       this.isConnected = false;
       this.token = undefined;
-      log.debug("socket disconnected");
+      log.info(`[socket] disconnected reason=${reason}`);
       this.auth.reset();
       this.emit("disconnected");
     });
 
-    this.socket.on("error", (err: Error) => this.emit("error", err));
+    this.socket.on("error", (err: Error) => {
+      log.warn(`[socket] error: ${err.message}`);
+      this.emit("error", err);
+    });
 
     if (this.socket.connected) {
       this.isConnected = true;

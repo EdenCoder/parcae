@@ -354,6 +354,9 @@ export class BackendAdapter implements ModelAdapter {
 
   private _notifyChange(model: any): void {
     const ModelClass = model.constructor as typeof Model;
+    log.info(
+      `[adapter] _notifyChange ${ModelClass.type} id=${model.id} subscriptions=${this.subscriptions ? "wired" : "null"}`,
+    );
     this.subscriptions?.onModelChange(ModelClass.type);
   }
 

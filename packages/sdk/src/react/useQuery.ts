@@ -516,6 +516,11 @@ function doFetch(
         const adapter = resolveAdapter(chain);
 
         const unsub = client.subscribe(`query:${hash}`, (ops: QueryOp[]) => {
+          log.info(
+            `[useQuery] query:${hash.slice(0, 8)} received`,
+            Array.isArray(ops) ? ops.length : "non-array",
+            "op(s)",
+          );
           if (!Array.isArray(ops) || ops.length === 0) return;
           const result = applyOps(
             entry.items,
@@ -524,7 +529,12 @@ function doFetch(
             adapter,
             entry,
           );
-          if (!result.changed) return;
+          if (!result.changed) {
+            log.info(
+              `[useQuery] query:${hash.slice(0, 8)} applyOps returned no change`,
+            );
+            return;
+          }
           entry.items = result.items;
           entry.version++;
           notify(entry);
