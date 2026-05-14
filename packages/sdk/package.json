@@ -29,6 +29,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@observ33r/object-equals": "^1.1.6",
     "@parcae/model": "workspace:*",
     "compress-json": "^3.1.0",
     "eventemitter3": "^5.0.1",
