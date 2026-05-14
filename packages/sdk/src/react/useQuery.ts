@@ -560,7 +560,15 @@ export function useQuery<T>(
   const client = useParcae();
   const waitForAuth = options.waitForAuth ?? true;
   const { status: authStatus, userId } = useAuthStatus();
-  const authReady = !waitForAuth || authStatus !== "pending";
+  // Strictly require "authenticated" rather than "anything but pending".
+  // Treating "unauthenticated" as ready races the socket session: the
+  // initial fetch goes over HTTP without a socket id, the server's
+  // QuerySubscriptionManager has no socket to register against, and
+  // subsequent model-change pushes have no subscriber to emit to. The
+  // realtime-on-reconnect path covers reconnect but not "never
+  // subscribed in the first place"; gating on "authenticated" forces
+  // the fetch to wait for the socket session to land.
+  const authReady = !waitForAuth || authStatus === "authenticated";
 
   // Compute the "live" key when auth is ready.
   const liveKey =
