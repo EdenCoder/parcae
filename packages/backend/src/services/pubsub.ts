@@ -111,39 +111,41 @@ export class PubSub {
   ): Promise<() => Promise<void>> {
     const MAX_RETRIES = 10;
 
+    // In-process fallback — local lock only.
+    //
+    // AsyncLock.acquire(key, executor, { timeout }) returns a Promise
+    // that *rejects* if the queue-wait timer fires before the executor
+    // runs. If we discard that promise (as the original code did), the
+    // rejection becomes an unhandled rejection and — under Node's
+    // default `--unhandled-rejections=throw` — kills the process. We
+    // pipe the rejection into the outer Promise's `reject` so the
+    // caller's `await lock(...)` throws cleanly and can be caught.
     if (!this.redlock) {
-      // In-process fallback — local lock only
-      return new Promise<() => Promise<void>>((resolve) => {
-        this.__lock.acquire(
-          key,
-          () =>
-            new Promise<void>((sub) => {
-              resolve(async () => sub());
-            }),
-          { timeout },
-        );
+      return new Promise<() => Promise<void>>((resolve, reject) => {
+        this.__lock
+          .acquire(
+            key,
+            () =>
+              new Promise<void>((sub) => {
+                resolve(async () => sub());
+              }),
+            { timeout },
+          )
+          .catch(reject);
       });
     }
 
+    // Redlock path: acquire the distributed lock first, *then* enter
+    // the in-process queue. Splitting these out (rather than nesting
+    // them inside a single try/catch) keeps the existing retry loop
+    // scoped to Redis-level contention. An in-process queue-wait
+    // timeout means the same Node process is genuinely holding the
+    // lock — retrying immediately would just time out again, so we
+    // surface that as a clean rejection and let the caller decide.
+    let redLock: Awaited<ReturnType<NonNullable<typeof this.redlock>["acquire"]>>;
     try {
-      const lock = await this.redlock.acquire([key], timeout);
-
-      return await new Promise<() => Promise<void>>((resolve) => {
-        this.__lock.acquire(
-          key,
-          () =>
-            new Promise<void>((sub) => {
-              resolve(async () => {
-                try {
-                  await lock.release();
-                } catch {}
-                sub();
-              });
-            }),
-          { timeout },
-        );
-      });
-    } catch (e) {
+      redLock = await this.redlock.acquire([key], timeout);
+    } catch {
       if (retry >= MAX_RETRIES) {
         throw new Error(
           `Failed to acquire lock for "${key}" after ${MAX_RETRIES} retries`,
@@ -152,6 +154,33 @@ export class PubSub {
       await new Promise<void>((r) => setTimeout(r, 50));
       return this.lock(key, timeout, retry + 1);
     }
+
+    return new Promise<() => Promise<void>>((resolve, reject) => {
+      this.__lock
+        .acquire(
+          key,
+          () =>
+            new Promise<void>((sub) => {
+              resolve(async () => {
+                try {
+                  await redLock.release();
+                } catch {}
+                sub();
+              });
+            }),
+          { timeout },
+        )
+        .catch(async (err) => {
+          // In-process queue-wait timed out while we already held the
+          // Redis lock. Release it eagerly so we don't leak the
+          // distributed lock for its full TTL and block every other
+          // instance from acquiring it.
+          try {
+            await redLock.release();
+          } catch {}
+          reject(err);
+        });
+    });
   }
 
   // ── Cleanup ──────────────────────────────────────────────────────────
