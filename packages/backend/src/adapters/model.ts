@@ -33,6 +33,7 @@ import {
   lock as globalLock,
   getRequestUser,
 } from "../services/context";
+import type { ModelChangeBus } from "../services/model-change-bus";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -194,6 +195,7 @@ function serialize(model: any): Record<string, any> {
 export class BackendAdapter implements ModelAdapter {
   private services: BackendServices;
   public subscriptions: any | null = null;
+  public modelChangeBus: ModelChangeBus | null = null;
 
   /** Registered model constructors, keyed by type. Set via registerModels(). */
   private _models = new Map<string, ModelConstructor>();
@@ -354,7 +356,15 @@ export class BackendAdapter implements ModelAdapter {
 
   private _notifyChange(model: any): void {
     const ModelClass = model.constructor as typeof Model;
-    this.subscriptions?.onModelChange(ModelClass.type);
+    // ModelChangeBus runs the local fast-path AND broadcasts to other
+    // replicas. When the bus is not wired (e.g. test setups that mount
+    // the adapter without app.ts), fall back to direct local dispatch
+    // so existing per-adapter tests keep working.
+    if (this.modelChangeBus) {
+      this.modelChangeBus.notify(ModelClass.type);
+    } else {
+      this.subscriptions?.onModelChange(ModelClass.type);
+    }
   }
 
   // ── Search Query ────────────────────────────────────────────────────
@@ -500,7 +510,6 @@ export class BackendAdapter implements ModelAdapter {
       throw err;
     }
 
-    this.pubsub?.emit?.(`delete+${ModelClass.type}:${model.id}`, model.__data);
     this._notifyChange(model);
   }
 
