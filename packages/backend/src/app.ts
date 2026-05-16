@@ -29,6 +29,7 @@ import {
 } from "./routing/route";
 import { BackendAdapter } from "./adapters/model";
 import { registerModelRoutes } from "./adapters/routes";
+import { ModelChangeBus } from "./services/model-change-bus";
 import { PubSub } from "./services/pubsub";
 import { QueueService } from "./services/queue";
 import { QuerySubscriptionManager } from "./services/subscriptions";
@@ -385,6 +386,7 @@ export function createApp(config: AppConfig): ParcaeApp {
         },
       );
       adapter.subscriptions = subscriptions;
+      adapter.modelChangeBus = new ModelChangeBus(pubsub, subscriptions);
 
       // ── Step 10: Mount auth routes + middleware ─────────────────────
       if (authAdapter) {
