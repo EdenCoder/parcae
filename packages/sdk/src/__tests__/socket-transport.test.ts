@@ -202,7 +202,7 @@ describe("SocketTransport — lifecycle & listener flow", () => {
     expect(t.isConnected).toBe(false);
   });
 
-  it("resets auth and clears the token on disconnect", async () => {
+  it("resets auth on disconnect but keeps the token for reconnect", async () => {
     const t = makeTransport("tok-abc");
     currentSocket.connect();
     // Simulate the server callback for `authenticate` so auth
@@ -251,12 +251,10 @@ describe("SocketTransport — lifecycle & listener flow", () => {
   });
 
   it("re-attempts auth on every reconnect (assuming a token is still set on construct)", () => {
-    // Note: on disconnect the transport sets `token = undefined`
-    // (so a re-connect doesn't replay a stale token). After the
-    // first disconnect, _doAuth becomes a no-op until
-    // `authenticate(token)` is called again. This test documents
-    // that contract — only the FIRST connect after construct
-    // triggers an authenticate emit.
+    // The token belongs to the user's session, not a particular
+    // websocket connection. Keep it across disconnect so backend
+    // restarts can reconnect and re-authenticate without waiting for
+    // a higher-level Provider to fetch a token via HTTP.
     const t = makeTransport("tok-abc");
     currentSocket.connect();
     expect(
@@ -264,10 +262,9 @@ describe("SocketTransport — lifecycle & listener flow", () => {
     ).toBe(1);
     currentSocket.disconnect();
     currentSocket.connect();
-    // No new authenticate — token was cleared on disconnect.
     expect(
       currentSocket.emits.filter((e) => e.event === "authenticate").length,
-    ).toBe(1);
+    ).toBe(2);
     void t;
   });
 

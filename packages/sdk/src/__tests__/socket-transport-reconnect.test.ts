@@ -382,6 +382,52 @@ describe("SocketTransport — in-flight requests across reconnect", () => {
     void t;
   });
 
+  it("re-authenticates with the existing token after a socket reconnect", async () => {
+    const t = makeTransport("tok-abc");
+    currentSocket.connect();
+    await flushAwaits();
+    expect(allEmits("authenticate")).toHaveLength(1);
+
+    completeAuth("u1");
+    expect(t.auth.state.status).toBe("authenticated");
+
+    currentSocket.disconnect();
+    expect(t.auth.state.status).toBe("pending");
+
+    currentSocket.connect();
+    await flushAwaits();
+
+    // Regression for DOL-898: disconnect used to clear `token` to
+    // undefined, so reconnect called _doAuth(), immediately bailed,
+    // and never re-established auth/subscriptions unless Provider's
+    // async getToken() happened to recover. The transport itself must
+    // own reconnect re-auth using the still-valid session token.
+    expect(allEmits("authenticate")).toHaveLength(2);
+    completeAuth("u1");
+    expect(t.auth.state.status).toBe("authenticated");
+  });
+
+  it("authenticate(same token) is a no-op once already authenticated", async () => {
+    const t = makeTransport("tok-abc");
+    currentSocket.connect();
+    await flushAwaits();
+    expect(allEmits("authenticate")).toHaveLength(1);
+
+    completeAuth("u1");
+    expect(t.auth.state.status).toBe("authenticated");
+
+    const result = await t.authenticate("tok-abc");
+
+    // Provider.onReconnect calls client.authenticate(token) after the
+    // socket connect handler already kicked off _doAuth(). If the
+    // token is unchanged and the transport is already authenticated,
+    // authenticate() must not reset AuthGate back to pending or emit a
+    // duplicate authenticate call.
+    expect(result).toEqual({ userId: "u1" });
+    expect(t.auth.state.status).toBe("authenticated");
+    expect(allEmits("authenticate")).toHaveLength(1);
+  });
+
   // ── isConnected getter / disconnect symmetry ────────────────────────
 
   it("isConnected flips back to false on disconnect even when token was set", () => {

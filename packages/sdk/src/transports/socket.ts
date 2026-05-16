@@ -65,7 +65,14 @@ export class SocketTransport extends EventEmitter implements Transport {
 
     this.socket.on("disconnect", () => {
       this.isConnected = false;
-      this.token = undefined;
+      // Keep the auth token across socket reconnects. The token
+      // belongs to the user's session, not this particular websocket
+      // connection. Clearing it here makes the next `connect` call
+      // into `_doAuth()` bail with token=undefined, leaving AuthGate
+      // pending until a higher-level Provider happens to fetch a
+      // token again. Backend restarts then silently kill existing
+      // `useQuery` subscriptions because nothing re-authenticates
+      // and re-subscribes them.
       log.debug("socket disconnected");
       this.auth.reset();
       this.emit("disconnected");
@@ -107,6 +114,10 @@ export class SocketTransport extends EventEmitter implements Transport {
   }
 
   async authenticate(token: string | null): Promise<{ userId: string | null }> {
+    if (token === this.token && this.auth.state.status === "authenticated") {
+      return { userId: this.auth.state.userId };
+    }
+
     this.token = token;
     this.auth.reset();
 
