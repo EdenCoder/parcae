@@ -29,6 +29,8 @@ export { registerModelRoutes } from "./adapters/routes";
 // Services
 export { PubSub } from "./services/pubsub";
 export type { PubSubConfig } from "./services/pubsub";
+export { ModelChangeBus } from "./services/model-change-bus";
+export type { ModelChangePayload } from "./services/model-change-bus";
 export { QueueService, addJobIfNotExists } from "./services/queue";
 export type { QueueConfig } from "./services/queue";
 export { QuerySubscriptionManager } from "./services/subscriptions";
