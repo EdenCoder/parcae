@@ -11,6 +11,7 @@ import { resolve, join } from "node:path";
 import { readdirSync, existsSync, statSync } from "node:fs";
 import pako from "pako";
 import { compress } from "compress-json";
+import pluralize from "pluralize";
 import { createSocketFakeRes } from "./socket-fake-res";
 import { Model } from "@parcae/model";
 import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
@@ -402,7 +403,13 @@ export function createApp(config: AppConfig): ParcaeApp {
       // that table. The bus is per-process; PubSub fans across
       // processes underneath it. Tracked so we can dispose on close.
       const offChange = changeBus.on((change) => {
-        subscriptions.onModelChange(change.table);
+        // ChangeBus carries DB table names because LISTEN/NOTIFY
+        // payloads originate from Postgres triggers (`projectAssets`).
+        // QuerySubscriptionManager indexes subscriptions by Model.type
+        // (`projectAsset`). Convert at the boundary so hook-path and
+        // trigger-path events hit the same index.
+        const modelType = pluralize.singular(change.table);
+        subscriptions.onModelChange(modelType);
       });
 
       // ── Step 9.5: LISTEN/NOTIFY poller (Postgres only) ─────────────

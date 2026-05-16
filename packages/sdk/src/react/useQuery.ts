@@ -851,34 +851,55 @@ export function useQuery<T>(
     }
   }, [key]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Re-fetch on reconnect
+  // Re-fetch when auth transitions INTO "authenticated".
+  //
+  // The socket-level `"connected"` event used to drive this, but it
+  // fires before the AuthGate's `authenticate` handshake completes —
+  // so gating on `authReady` at that moment always bailed, and
+  // nothing else triggered the refetch once auth eventually
+  // resolved. After a reconnect the server's subscription manager
+  // has no record of this socket (it disposed everything on the
+  // previous socket-id's `disconnect`), so a missed refetch =
+  // permanently silent realtime updates.
+  //
+  // Driving from authStatus directly fixes both:
+  //   - On initial mount, `authReady` flips false → true and the
+  //     `useEffect([key])` above handles first fetch. We skip here
+  //     when `entry.queryHash` is unset so we don't double-fire.
+  //   - On reconnect, authStatus cycles `authenticated` →
+  //     `pending` → `authenticated`. The transition into the final
+  //     `authenticated` state is exactly when we want to refire,
+  //     re-establishing the server-side subscription (it was
+  //     wiped when the prior socket-id disconnected).
+  //   - For users who never authenticate (anonymous), this never
+  //     fires — no 403 storm.
+  const prevAuthStatusRef = useRef<typeof authStatus | null>(null);
   useEffect(() => {
-    const onReconnect = () => {
-      const k = keyRef.current;
-      const currentChain = chainRef.current;
-      if (!k || !currentChain) return;
-      // `"connected"` fires on socket-level reconnect, which lands
-      // BEFORE the AuthGate completes its `authenticate` handshake.
-      // Issuing the refetch here would race ahead of auth and the
-      // server would respond 403. Wait for `authReady` (i.e.
-      // `authenticated`) before re-firing.
-      if (!authReadyRef.current) return;
-      const entry = cache.get(k);
-      if (!entry) return;
-      // Reset retry state and refetch
-      entry.retryCount = 0;
-      if (entry.retryTimer) {
-        clearTimeout(entry.retryTimer);
-        entry.retryTimer = null;
-      }
-      doFetch(k, entry, currentChain, clientRef.current);
-    };
+    const prev = prevAuthStatusRef.current;
+    prevAuthStatusRef.current = authStatus;
 
-    client.on("connected", onReconnect);
-    return () => {
-      client.off("connected", onReconnect);
-    };
-  }, [client]);
+    if (prev === null) return;
+    if (authStatus !== "authenticated") return;
+    if (prev === "authenticated") return;
+
+    const k = keyRef.current;
+    const currentChain = chainRef.current;
+    if (!k || !currentChain) return;
+    const entry = cache.get(k);
+    if (!entry) return;
+    // First-time fetches are handled by the `[key]` effect. Only
+    // re-fire when a prior subscription existed — that's the
+    // server-side state we need to re-establish after the socket
+    // disconnect wiped it.
+    if (!entry.queryHash) return;
+
+    entry.retryCount = 0;
+    if (entry.retryTimer) {
+      clearTimeout(entry.retryTimer);
+      entry.retryTimer = null;
+    }
+    doFetch(k, entry, currentChain, clientRef.current);
+  }, [authStatus]);
 
   // ── Drift poll ─────────────────────────────────────────────────────
   //
