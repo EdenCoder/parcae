@@ -747,7 +747,14 @@ export function useQuery<T>(
   const client = useParcae();
   const waitForAuth = options.waitForAuth ?? true;
   const { status: authStatus, userId } = useAuthStatus();
-  const authReady = !waitForAuth || authStatus !== "pending";
+  // Strict gate (DOL-894): with `waitForAuth: true` (default), only
+  // fire requests once the user is *actually* authenticated. The
+  // previous check `authStatus !== "pending"` let the
+  // "unauthenticated" state through, which produced 403s on every
+  // mounted query before a sign-in finished. Queries that
+  // legitimately want to read anonymously must opt out via
+  // `waitForAuth: false`.
+  const authReady = !waitForAuth || authStatus === "authenticated";
 
   // Compute the "live" key when auth is ready.
   const liveKey =
@@ -756,9 +763,13 @@ export function useQuery<T>(
       : null;
 
   // Hold on to the last valid key so we keep showing stale data during
-  // disconnects (when auth temporarily resets to "pending").  Only null
-  // the key out if we've *never* had a valid key (initial auth pending).
+  // disconnects (when auth temporarily resets to "pending"). When auth
+  // is *explicitly* `unauthenticated`, drop the fallback — handing
+  // back rows from a previous session would leak data across the
+  // sign-out boundary AND drive the fetch effects to re-issue
+  // forbidden requests against `userId: "anon"`.
   const lastKeyRef = useRef<string | null>(null);
+  if (authStatus === "unauthenticated") lastKeyRef.current = null;
   if (liveKey !== null) lastKeyRef.current = liveKey;
   const key = liveKey ?? lastKeyRef.current;
 
@@ -769,6 +780,12 @@ export function useQuery<T>(
   clientRef.current = client;
   const keyRef = useRef(key);
   keyRef.current = key;
+  // Ref so async fetch callbacks (reconnect, poll) can re-check the
+  // current auth state at the moment they'd otherwise hit the wire,
+  // not the state at effect-mount time. Without this, a transient
+  // reconnect during a sign-out window fires a forbidden request.
+  const authReadyRef = useRef(authReady);
+  authReadyRef.current = authReady;
 
   // subscribe and getSnapshot must depend on `key` so useSyncExternalStore
   // re-subscribes when the cache key changes (e.g. null -> real key after auth).
@@ -840,6 +857,12 @@ export function useQuery<T>(
       const k = keyRef.current;
       const currentChain = chainRef.current;
       if (!k || !currentChain) return;
+      // `"connected"` fires on socket-level reconnect, which lands
+      // BEFORE the AuthGate completes its `authenticate` handshake.
+      // Issuing the refetch here would race ahead of auth and the
+      // server would respond 403. Wait for `authReady` (i.e.
+      // `authenticated`) before re-firing.
+      if (!authReadyRef.current) return;
       const entry = cache.get(k);
       if (!entry) return;
       // Reset retry state and refetch
@@ -880,6 +903,11 @@ export function useQuery<T>(
       const k = keyRef.current;
       const currentChain = chainRef.current;
       if (!k || !currentChain) return;
+      // Mirror the reconnect gate: a poll firing during a sign-out
+      // or token-refresh window would race ahead of auth and 403.
+      // `authReadyRef` reflects the latest auth state regardless of
+      // when this effect was last mounted.
+      if (!authReadyRef.current) return;
       if (
         typeof document !== "undefined" &&
         document.visibilityState &&
