@@ -32,9 +32,12 @@ import { registerModelRoutes } from "./adapters/routes";
 import { PubSub } from "./services/pubsub";
 import { QueueService } from "./services/queue";
 import { QuerySubscriptionManager } from "./services/subscriptions";
+import { ChangeBus } from "./services/changeBus";
+import { ListenNotifyPoller } from "./services/listenNotifyPoller";
 import {
   _setServices,
   _setIo,
+  _setChangeBus,
   runWithRequestContext,
 } from "./services/context";
 import { getJobs } from "./routing/job";
@@ -312,11 +315,19 @@ export function createApp(config: AppConfig): ParcaeApp {
         log.info("Redis not configured — using in-process fallbacks");
       }
 
+      // ── Step 4.5: ChangeBus (model-change fan-out) ─────────────────
+      // Single structured event bus over PubSub. _notifyChange in the
+      // adapter publishes here; QuerySubscriptionManager listens
+      // (wired below). One bus per app; close()'d at shutdown.
+      const changeBus = new ChangeBus({ pubsub });
+      _setChangeBus(changeBus);
+
       // ── Step 5: Set up BackendAdapter + Model.use() ────────────────
       const adapter = new BackendAdapter({
         read: readDb,
         write: writeDb,
         pubsub,
+        changeBus,
       });
       adapter.registerModels(models);
       Model.use(adapter);
@@ -385,6 +396,47 @@ export function createApp(config: AppConfig): ParcaeApp {
         },
       );
       adapter.subscriptions = subscriptions;
+
+      // ChangeBus → manager: every Change (hook-path or LISTEN-path)
+      // triggers a debounced re-eval for every cached query watching
+      // that table. The bus is per-process; PubSub fans across
+      // processes underneath it. Tracked so we can dispose on close.
+      const offChange = changeBus.on((change) => {
+        subscriptions.onModelChange(change.table);
+      });
+
+      // ── Step 9.5: LISTEN/NOTIFY poller (Postgres only) ─────────────
+      // Captures external writes that bypass Parcae's adapter (raw
+      // SQL, migrations, ops console). Installs trigger DDL during
+      // ensureAllTables above; the poller subscribes via a dedicated
+      // pg client and emits Changes onto the bus with `source: "listen"`.
+      // Echoes of our own hook-path emits are deduped by request-id.
+      const listenNotifyEnabled =
+        adapter.engine !== "sqlite" &&
+        process.env.PARCAE_LISTEN_NOTIFY !== "false";
+      let listenNotify: ListenNotifyPoller | null = null;
+      if (listenNotifyEnabled && envConfig.DATABASE_URL) {
+        listenNotify = new ListenNotifyPoller({
+          url: envConfig.DATABASE_URL,
+          changeBus,
+        });
+        try {
+          await listenNotify.start();
+          log.info("LISTEN/NOTIFY poller started");
+        } catch (err) {
+          log.warn(
+            `LISTEN/NOTIFY poller failed to start (continuing without external-write capture): ${
+              (err as Error).message
+            }`,
+          );
+          listenNotify = null;
+        }
+      }
+
+      // Stash teardown handles so `app.stop()` can clean up.
+      (server as any)._parcaeChangeBus = changeBus;
+      (server as any)._parcaeOffChange = offChange;
+      (server as any)._parcaeListenNotify = listenNotify;
 
       // ── Step 10: Mount auth routes + middleware ─────────────────────
       if (authAdapter) {
@@ -685,6 +737,25 @@ export function createApp(config: AppConfig): ParcaeApp {
     async stop() {
       log.info("Shutting down...");
       if (server) {
+        const offChange = (server as any)._parcaeOffChange as
+          | (() => void)
+          | undefined;
+        offChange?.();
+        const listenNotify = (server as any)._parcaeListenNotify as
+          | ListenNotifyPoller
+          | null
+          | undefined;
+        if (listenNotify) {
+          try {
+            await listenNotify.stop();
+          } catch (err) {
+            log.warn(`listenNotify.stop threw: ${String(err)}`);
+          }
+        }
+        const changeBus = (server as any)._parcaeChangeBus as
+          | ChangeBus
+          | undefined;
+        changeBus?.close();
         server.io.close();
         await new Promise<void>((resolveClose) => {
           server!.httpServer.close(() => resolveClose());

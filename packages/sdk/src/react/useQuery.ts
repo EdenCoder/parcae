@@ -14,10 +14,30 @@ interface QueryChain<T> {
   __modelType?: string;
   __modelClass?: any;
   __adapter?: any;
+  /**
+   * Returns a sibling chain whose `.find()` sends
+   * `__forceRefresh: true`. Used by the drift poll to bypass the
+   * server-side subscription cache.
+   */
+  withForceRefresh?: () => QueryChain<T>;
 }
 
 interface UseQueryOptions {
   waitForAuth?: boolean;
+  /**
+   * Periodic drift-detection refetch interval, in milliseconds.
+   * The poll fetches the LIST endpoint with `__forceRefresh: true`,
+   * which makes the server re-execute the underlying query against
+   * the database, rebuild its subscription cache, and emit any
+   * drift ops to every subscriber. Drift detected on the client is
+   * logged with the prefix `[useQuery DOL-894]` for diagnostics.
+   *
+   * Set to `0` to disable. Polling automatically pauses while the
+   * tab is hidden and while the transport is disconnected.
+   *
+   * Default `60_000`.
+   */
+  poll?: number;
 }
 
 interface UseQueryResult<T> {
@@ -188,11 +208,80 @@ type QueryOp =
   | { op: "remove"; id: string }
   | { op: "update"; id: string; patch: Operation[] };
 
+/**
+ * Wire envelope emitted by `QuerySubscriptionManager`. Older servers
+ * may emit a bare `QueryOp[]`; we accept both shapes in
+ * `normalizeOpsPayload` below.
+ */
+interface QueryEnvelope {
+  ops: QueryOp[];
+  /** New ordered id list — present whenever membership/order changed. */
+  order?: string[];
+}
+
 /** Result from applyOps indicating what changed */
 interface ApplyResult {
   items: any[];
   /** Whether any items were mutated in-place or membership changed */
   changed: boolean;
+}
+
+function normalizeOpsPayload(
+  raw: unknown,
+): { ops: QueryOp[]; order?: string[] } | null {
+  if (Array.isArray(raw)) return { ops: raw as QueryOp[] };
+  if (
+    raw &&
+    typeof raw === "object" &&
+    Array.isArray((raw as any).ops)
+  ) {
+    const envelope = raw as QueryEnvelope;
+    return envelope.order
+      ? { ops: envelope.ops, order: envelope.order }
+      : { ops: envelope.ops };
+  }
+  return null;
+}
+
+/**
+ * Reorder an items array to match the new ordered id list. Returns
+ * `null` when no reordering was needed (items already in the same
+ * order as `order`) so callers can skip a redundant array rebuild.
+ */
+function reorderByIds<T extends { id: string }>(
+  items: T[],
+  order: string[],
+): T[] | null {
+  if (items.length === 0) return null;
+  // Fast-path: if items already match the desired order one-to-one,
+  // skip the rebuild. Callers can short-circuit re-render.
+  if (items.length === order.length) {
+    let same = true;
+    for (let i = 0; i < items.length; i++) {
+      if (items[i]?.id !== order[i]) {
+        same = false;
+        break;
+      }
+    }
+    if (same) return null;
+  }
+  const byId = new Map<string, T>();
+  for (const item of items) byId.set(item.id, item);
+  const next: T[] = [];
+  for (const id of order) {
+    const found = byId.get(id);
+    if (found) next.push(found);
+  }
+  // If the order array doesn't reference every item (e.g. older server,
+  // partial order spec), append the unmatched items in their original
+  // order to avoid silently dropping them.
+  if (next.length !== items.length) {
+    const placed = new Set(order);
+    for (const item of items) {
+      if (!placed.has(item.id)) next.push(item);
+    }
+  }
+  return next;
 }
 
 function applyOps(
@@ -450,6 +539,69 @@ function resolveAdapter(chain: QueryChain<any>): any {
   return chain.__adapter ?? (Model.hasAdapter() ? Model.getAdapter() : null);
 }
 
+// ── Drift detection helpers ──────────────────────────────────────────────────
+
+interface DriftSnapshot {
+  ids: string[];
+  updatedAtById: Map<string, string | undefined>;
+}
+
+function snapshotItems(items: any[]): DriftSnapshot {
+  const ids: string[] = new Array(items.length);
+  const updatedAtById = new Map<string, string | undefined>();
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const id = item?.id as string | undefined;
+    if (!id) continue;
+    ids[i] = id;
+    const ua = item?.updatedAt;
+    updatedAtById.set(
+      id,
+      ua instanceof Date ? ua.toISOString() : ua ? String(ua) : undefined,
+    );
+  }
+  return { ids, updatedAtById };
+}
+
+function reportDriftIfAny(
+  prev: DriftSnapshot,
+  next: any[],
+  modelType: string | undefined,
+): void {
+  const nextIds = new Set<string>();
+  let updatedAtDrift = 0;
+  let modifiedIds = 0;
+  for (const item of next) {
+    const id = item?.id as string | undefined;
+    if (!id) continue;
+    nextIds.add(id);
+    if (!prev.updatedAtById.has(id)) {
+      modifiedIds++;
+      continue;
+    }
+    const prevUa = prev.updatedAtById.get(id);
+    const nextUaRaw = item?.updatedAt;
+    const nextUa =
+      nextUaRaw instanceof Date
+        ? nextUaRaw.toISOString()
+        : nextUaRaw
+          ? String(nextUaRaw)
+          : undefined;
+    if (prevUa !== nextUa) updatedAtDrift++;
+  }
+  let removedIds = 0;
+  for (const id of prev.ids) {
+    if (!id) continue;
+    if (!nextIds.has(id)) removedIds++;
+  }
+  const drifted = updatedAtDrift + modifiedIds + removedIds;
+  if (drifted > 0) {
+    log.warn(
+      `[useQuery DOL-894] drift detected modelType=${modelType ?? "unknown"} added=${modifiedIds} removed=${removedIds} updated=${updatedAtDrift}`,
+    );
+  }
+}
+
 // ── Fetch + subscribe ────────────────────────────────────────────────────────
 
 function scheduleRetry(key: string, entry: CacheEntry): void {
@@ -478,6 +630,7 @@ function doFetch(
   entry: CacheEntry,
   chain: QueryChain<any>,
   client: ParcaeClient,
+  opts: { force?: boolean } = {},
 ): void {
   log.debug("useQuery: fetching", chain.__modelType);
 
@@ -491,10 +644,29 @@ function doFetch(
   entry.error = null;
   notify(entry);
 
-  chain
+  // For the drift-poll path: redirect through a sibling chain that
+  // sends `__forceRefresh: true`. The server re-executes the cached
+  // subscription query against the DB, rebuilds its result map, and
+  // emits drift ops via the normal `query:{hash}` channel — so even
+  // sockets that aren't polling converge once we land. Snapshot the
+  // current items first so we can detect drift on this client too.
+  const prevSnapshot = opts.force ? snapshotItems(entry.items) : null;
+  const fetchChain =
+    opts.force && typeof chain.withForceRefresh === "function"
+      ? chain.withForceRefresh()
+      : chain;
+
+  fetchChain
     .find()
     .then((result: any[]) => {
       log.debug("useQuery: got", result.length, "items for", chain.__modelType);
+      if (prevSnapshot) {
+        // Drift detection — log only. The new data will overwrite
+        // the cache below; this is purely diagnostic so we can
+        // quantify cross-process event-loss in the wild before
+        // tightening defaults.
+        reportDriftIfAny(prevSnapshot, result, chain.__modelType);
+      }
       entry.items = reconcile(entry.items, result, entry);
       entry.loading = false;
       entry.retryCount = 0; // Reset retries on success
@@ -515,8 +687,14 @@ function doFetch(
 
         const adapter = resolveAdapter(chain);
 
-        const unsub = client.subscribe(`query:${hash}`, (ops: QueryOp[]) => {
-          if (!Array.isArray(ops) || ops.length === 0) return;
+        const unsub = client.subscribe(`query:${hash}`, (payload: unknown) => {
+          const parsed = normalizeOpsPayload(payload);
+          if (!parsed) return;
+          const { ops, order } = parsed;
+          // No ops and no order → bail. (An empty envelope can occur
+          // when the order envelope alone arrived for a server that
+          // never reaches this branch in practice, but we guard.)
+          if (ops.length === 0 && !order) return;
           const result = applyOps(
             entry.items,
             ops,
@@ -524,8 +702,17 @@ function doFetch(
             adapter,
             entry,
           );
-          if (!result.changed) return;
-          entry.items = result.items;
+          let items = result.items;
+          let changed = result.changed;
+          if (order) {
+            const reordered = reorderByIds(items, order);
+            if (reordered) {
+              items = reordered;
+              changed = true;
+            }
+          }
+          if (!changed) return;
+          entry.items = items;
           entry.version++;
           notify(entry);
           // Fire ops listeners after cache is updated
@@ -669,6 +856,82 @@ export function useQuery<T>(
       client.off("connected", onReconnect);
     };
   }, [client]);
+
+  // ── Drift poll ─────────────────────────────────────────────────────
+  //
+  // Periodic refetch with `__forceRefresh: true` so the server
+  // re-executes the cached subscription query and emits any drift
+  // ops to every subscriber on the hash. Pauses while the tab is
+  // hidden or the transport is disconnected — both states are
+  // covered by other code paths (visibilitychange → no UI to update;
+  // reconnect → forced refetch via `onReconnect`). Gated on
+  // `options.poll`; default `60_000`, `0` disables.
+  const pollMs = options.poll ?? 60_000;
+  useEffect(() => {
+    if (!key) return;
+    if (pollMs <= 0) return;
+    if (typeof setInterval !== "function") return;
+
+    let timer: ReturnType<typeof setInterval> | null = null;
+    let stopped = false;
+
+    const tick = () => {
+      if (stopped) return;
+      const k = keyRef.current;
+      const currentChain = chainRef.current;
+      if (!k || !currentChain) return;
+      if (
+        typeof document !== "undefined" &&
+        document.visibilityState &&
+        document.visibilityState !== "visible"
+      ) {
+        return;
+      }
+      if (clientRef.current.isConnected === false) return;
+      const entry = cache.get(k);
+      if (!entry) return;
+      if (entry.refs <= 0) return;
+      doFetch(k, entry, currentChain, clientRef.current, { force: true });
+    };
+
+    const start = () => {
+      if (timer) return;
+      timer = setInterval(tick, pollMs);
+    };
+    const stop = () => {
+      if (!timer) return;
+      clearInterval(timer);
+      timer = null;
+    };
+
+    start();
+
+    const onVisibility = () => {
+      if (stopped) return;
+      if (typeof document === "undefined") return;
+      if (document.visibilityState === "visible") {
+        // Resume — fire one fresh tick immediately so the user sees a
+        // converged view as soon as they return to the tab, instead
+        // of waiting up to `pollMs` for the next interval.
+        tick();
+        start();
+      } else {
+        stop();
+      }
+    };
+
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibility);
+    }
+
+    return () => {
+      stopped = true;
+      stop();
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibility);
+      }
+    };
+  }, [key, pollMs]);
 
   const refetch = useCallback(() => {
     const k = keyRef.current;

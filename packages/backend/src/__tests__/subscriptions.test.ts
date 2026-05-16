@@ -81,9 +81,19 @@ describe("QuerySubscriptionManager", () => {
   beforeEach(() => {
     source = createQuerySource([]);
     emitted = [];
-    manager = new QuerySubscriptionManager((socketId, event, data) => {
-      emitted.push({ socketId, event, data });
-    });
+    // The bulk of the existing tests rely on `await tick()` (a 10ms
+    // setTimeout) flushing the re-eval cycle synchronously after
+    // `onModelChange`. The 25/100ms default debounce windows would
+    // break that. Drop both to 0 for the shared test fixture so we
+    // keep the existing assertions intact — the dedicated
+    // `coalescing` describe block constructs its own managers with
+    // realistic windows.
+    manager = new QuerySubscriptionManager(
+      (socketId, event, data) => {
+        emitted.push({ socketId, event, data });
+      },
+      { debounceMs: 0, maxWaitMs: 0 },
+    );
   });
 
   // ── Subscribe ──────────────────────────────────────────────────────
@@ -288,13 +298,15 @@ describe("QuerySubscriptionManager", () => {
       await tick();
 
       expect(emitted).toHaveLength(1);
-      const ops = emitted[0]!.data;
+      const ops = emitted[0]!.data.ops;
       expect(ops).toHaveLength(1);
       expect(ops[0]).toEqual({
         op: "add",
         id: "p2",
         data: { id: "p2", name: "B" },
       });
+      // Membership changed → order envelope present.
+      expect(emitted[0]!.data.order).toEqual(["p1", "p2"]);
     });
 
     it("should emit 'remove' op when an item disappears from results", async () => {
@@ -310,9 +322,11 @@ describe("QuerySubscriptionManager", () => {
       await tick();
 
       expect(emitted).toHaveLength(1);
-      const ops = emitted[0]!.data;
+      const ops = emitted[0]!.data.ops;
       expect(ops).toHaveLength(1);
       expect(ops[0]).toEqual({ op: "remove", id: "p2" });
+      // Membership changed → order envelope present.
+      expect(emitted[0]!.data.order).toEqual(["p1"]);
     });
 
     it("should emit 'update' op with JSON Patch when an item's data changes", async () => {
@@ -328,7 +342,7 @@ describe("QuerySubscriptionManager", () => {
       await tick();
 
       expect(emitted).toHaveLength(1);
-      const ops = emitted[0]!.data;
+      const ops = emitted[0]!.data.ops;
       expect(ops).toHaveLength(1);
       expect(ops[0].op).toBe("update");
       expect(ops[0].id).toBe("p1");
@@ -337,6 +351,71 @@ describe("QuerySubscriptionManager", () => {
       expect(ops[0].data).toBeUndefined();
       expect(ops[0].patch).toEqual([
         { op: "replace", path: "/views", value: 42 },
+      ]);
+      // Stable membership + stable order → no `order` envelope.
+      expect(emitted[0]!.data.order).toBeUndefined();
+    });
+
+    it("should not emit update ops for updatedAt-only changes", async () => {
+      source.setResults([
+        row("p1", {
+          name: "A",
+          updatedAt: "2026-05-15T07:57:00.000Z",
+          references: {
+            nodes: [{ id: "r1", updatedAt: "2026-05-15T07:57:01.000Z" }],
+          },
+        }),
+      ]);
+      await manager.subscribe({
+        socketId: "s1",
+        query: source.query("project"),
+      });
+
+      source.setResults([
+        row("p1", {
+          name: "A",
+          updatedAt: "2026-05-15T07:58:00.000Z",
+          references: {
+            nodes: [{ id: "r1", updatedAt: "2026-05-15T07:58:01.000Z" }],
+          },
+        }),
+      ]);
+      manager.onModelChange("project");
+      await tick();
+
+      expect(emitted).toHaveLength(0);
+    });
+
+    it("should strip updatedAt paths from mixed update patches", async () => {
+      source.setResults([
+        row("p1", {
+          name: "A",
+          updatedAt: "2026-05-15T07:57:00.000Z",
+          references: {
+            nodes: [{ id: "r1", updatedAt: "2026-05-15T07:57:01.000Z" }],
+          },
+        }),
+      ]);
+      await manager.subscribe({
+        socketId: "s1",
+        query: source.query("project"),
+      });
+
+      source.setResults([
+        row("p1", {
+          name: "A-updated",
+          updatedAt: "2026-05-15T07:58:00.000Z",
+          references: {
+            nodes: [{ id: "r1", updatedAt: "2026-05-15T07:58:01.000Z" }],
+          },
+        }),
+      ]);
+      manager.onModelChange("project");
+      await tick();
+
+      expect(emitted).toHaveLength(1);
+      expect(emitted[0]!.data.ops[0].patch).toEqual([
+        { op: "replace", path: "/name", value: "A-updated" },
       ]);
     });
 
@@ -361,7 +440,7 @@ describe("QuerySubscriptionManager", () => {
       await tick();
 
       expect(emitted).toHaveLength(1);
-      const ops = emitted[0]!.data;
+      const ops = emitted[0]!.data.ops;
       expect(ops).toHaveLength(3);
 
       const byOp = new Map(ops.map((o: any) => [o.id, o]));
@@ -470,7 +549,7 @@ describe("QuerySubscriptionManager", () => {
       manager.onModelChange("project");
       await tick();
 
-      const ops = emitted[0]!.data;
+      const ops = emitted[0]!.data.ops;
       const removeOp = ops.find((o: any) => o.op === "remove");
       const updateOp = ops.find((o: any) => o.op === "update");
 
@@ -505,7 +584,7 @@ describe("QuerySubscriptionManager", () => {
       manager.onModelChange("project");
       await tick();
 
-      const ops = emitted[0]!.data;
+      const ops = emitted[0]!.data.ops;
       // Only ONE op for p2 — not 3 ops for all items
       expect(ops).toHaveLength(1);
       expect(ops[0].id).toBe("p2");
@@ -552,7 +631,7 @@ describe("QuerySubscriptionManager", () => {
       await tick();
 
       expect(emitted).toHaveLength(1);
-      const op = emitted[0]!.data[0];
+      const op = emitted[0]!.data.ops[0];
       expect(op.op).toBe("update");
       expect(op.id).toBe("p1");
       expect(op.patch).toEqual([{ op: "replace", path: "/name", value: "C" }]);
@@ -576,6 +655,273 @@ describe("QuerySubscriptionManager", () => {
       manager.onModelChange("project");
       await tick();
 
+      expect(emitted).toHaveLength(0);
+    });
+  });
+
+  // ── Ordered-id emission ────────────────────────────────────────────
+
+  describe("order envelope", () => {
+    it("emits order array on add when membership changes", async () => {
+      source.setResults([row("p1", { name: "A" }), row("p3", { name: "C" })]);
+      await manager.subscribe({
+        socketId: "s1",
+        query: source.query("project"),
+      });
+
+      // p2 inserted between p1 and p3 — client needs the new order to
+      // place it correctly rather than appending to the end.
+      source.setResults([
+        row("p1", { name: "A" }),
+        row("p2", { name: "B" }),
+        row("p3", { name: "C" }),
+      ]);
+      manager.onModelChange("project");
+      await tick();
+
+      expect(emitted).toHaveLength(1);
+      const envelope = emitted[0]!.data;
+      expect(envelope.ops).toHaveLength(1);
+      expect(envelope.ops[0].op).toBe("add");
+      expect(envelope.ops[0].id).toBe("p2");
+      expect(envelope.order).toEqual(["p1", "p2", "p3"]);
+    });
+
+    it("emits order array when only ordering changes (no membership change)", async () => {
+      source.setResults([
+        row("p1", { name: "A" }),
+        row("p2", { name: "B" }),
+      ]);
+      await manager.subscribe({
+        socketId: "s1",
+        query: source.query("project"),
+      });
+
+      // Same membership, swapped order (e.g. orderBy on a mutable field).
+      source.setResults([
+        row("p2", { name: "B" }),
+        row("p1", { name: "A" }),
+      ]);
+      manager.onModelChange("project");
+      await tick();
+
+      expect(emitted).toHaveLength(1);
+      const envelope = emitted[0]!.data;
+      // No data changed, but the ORDER changed — no ops, just order.
+      expect(envelope.ops).toEqual([]);
+      expect(envelope.order).toEqual(["p2", "p1"]);
+    });
+
+    it("omits order when membership and order are both stable", async () => {
+      source.setResults([
+        row("p1", { name: "A" }),
+        row("p2", { name: "B" }),
+      ]);
+      await manager.subscribe({
+        socketId: "s1",
+        query: source.query("project"),
+      });
+
+      // Only p1 contents change. Order is identical.
+      source.setResults([
+        row("p1", { name: "A2" }),
+        row("p2", { name: "B" }),
+      ]);
+      manager.onModelChange("project");
+      await tick();
+
+      expect(emitted).toHaveLength(1);
+      expect(emitted[0]!.data.order).toBeUndefined();
+    });
+  });
+
+  // ── Coalescing (debounce + max-wait) ──────────────────────────────
+
+  describe("coalescing", () => {
+    it("collapses a burst of onModelChange into a single re-eval", async () => {
+      // Use realistic windows so we observe coalescing in practice.
+      const fast = new QuerySubscriptionManager(
+        (socketId, event, data) => {
+          emitted.push({ socketId, event, data });
+        },
+        { debounceMs: 30, maxWaitMs: 120 },
+      );
+
+      source.setResults([row("p1", { name: "A" })]);
+      await fast.subscribe({
+        socketId: "s1",
+        query: source.query("project"),
+      });
+
+      // Eight rapid signals in a row — only ONE re-eval should fire,
+      // and it should reflect the FINAL state of the source.
+      source.setResults([row("p1", { name: "A8" })]);
+      for (let i = 0; i < 8; i++) fast.onModelChange("project");
+
+      // Well after debounce window (30ms) but inside max-wait (120ms).
+      await new Promise((r) => setTimeout(r, 70));
+
+      expect(emitted).toHaveLength(1);
+      expect(emitted[0]!.data.ops[0].patch).toEqual([
+        { op: "replace", path: "/name", value: "A8" },
+      ]);
+    });
+
+    it("max-wait forces a re-eval during a sustained write storm", async () => {
+      const fast = new QuerySubscriptionManager(
+        (socketId, event, data) => {
+          emitted.push({ socketId, event, data });
+        },
+        { debounceMs: 30, maxWaitMs: 80 },
+      );
+
+      source.setResults([row("p1", { name: "A" })]);
+      await fast.subscribe({
+        socketId: "s1",
+        query: source.query("project"),
+      });
+
+      // Push a new signal every 20ms so the debounce timer never gets
+      // to fire. The max-wait ceiling has to break the deadlock.
+      source.setResults([row("p1", { name: "A!" })]);
+      const t0 = Date.now();
+      const interval = setInterval(() => {
+        fast.onModelChange("project");
+      }, 20);
+
+      // Wait long enough that the max-wait (80ms) must have fired but
+      // less than enough for debounce alone to ever land.
+      await new Promise((r) => setTimeout(r, 140));
+      clearInterval(interval);
+      const elapsed = Date.now() - t0;
+
+      expect(emitted.length).toBeGreaterThanOrEqual(1);
+      expect(emitted[0]!.data.ops[0].patch).toEqual([
+        { op: "replace", path: "/name", value: "A!" },
+      ]);
+      // Sanity — the first emission landed before we cleared.
+      expect(elapsed).toBeLessThanOrEqual(160);
+    });
+
+    it("respects per-Model `realtime` override", async () => {
+      // The default mock-query Proxy intercepts every prop including
+      // `__modelClass`, so we can't just patch one in. Build a small
+      // plain-object query that exposes the minimum surface the
+      // manager needs PLUS a real `__modelClass.realtime`.
+      let resultsFor = [row("p1", { name: "A" })];
+      const buildQuery = (modelClass: { realtime?: any }) => {
+        const q: any = {
+          __modelType: "project",
+          __modelClass: modelClass,
+          find: async () =>
+            resultsFor.map((r) => ({
+              __data: r,
+              sanitize: () => r,
+            })),
+          exec: () => ({
+            sql: "SELECT * FROM projects WHERE realtime_override",
+            bindings: [],
+            toSQL: () => ({
+              sql: "SELECT * FROM projects WHERE realtime_override",
+              bindings: [],
+            }),
+          }),
+          clone: () => q,
+        };
+        return q;
+      };
+
+      const ownEmitted: any[] = [];
+      const m = new QuerySubscriptionManager(
+        (socketId, event, data) => {
+          ownEmitted.push({ socketId, event, data });
+        },
+        // Default windows are 25/100ms — Model.realtime overrides.
+      );
+
+      await m.subscribe({
+        socketId: "s1",
+        query: buildQuery({ realtime: { debounceMs: 200, maxWaitMs: 400 } }),
+      });
+
+      resultsFor = [row("p1", { name: "B" })];
+      m.onModelChange("project");
+
+      // Under the default 100ms max-wait the re-eval would have fired
+      // already. Under the override (400ms) it has NOT.
+      await new Promise((r) => setTimeout(r, 120));
+      expect(ownEmitted).toHaveLength(0);
+
+      // Wait through the override's debounce.
+      await new Promise((r) => setTimeout(r, 200));
+      expect(ownEmitted).toHaveLength(1);
+    });
+  });
+
+  // ── Force-refresh (drift poll) ────────────────────────────────────
+
+  describe("force-refresh", () => {
+    it("rebuilds the cached result and emits drift to all subscribers", async () => {
+      // Set up two subscribers on the same query.
+      source.setResults([row("p1", { name: "A" })]);
+      const sub1 = await manager.subscribe({
+        socketId: "s1",
+        query: source.query("project"),
+      });
+      await manager.subscribe({
+        socketId: "s2",
+        query: source.query("project"),
+      });
+      // Both sockets share one cache entry.
+      expect(manager.stats.queries).toBe(1);
+
+      // Simulate drift: an external write changes the row but the
+      // hook-path notification never arrived (e.g. cross-process
+      // event lost). The cache still thinks p1 is "A".
+      source.setResults([row("p1", { name: "A-drifted" })]);
+
+      // s1 polls with force: true. The drift is detected, every
+      // subscriber receives the update, and the response carries
+      // the freshly-rebuilt items.
+      const force = await manager.subscribe(
+        { socketId: "s1", query: source.query("project") },
+        { force: true },
+      );
+
+      expect(force.hash).toBe(sub1.hash);
+      expect(force.items).toEqual([{ id: "p1", name: "A-drifted" }]);
+
+      // Both sockets received a `query:{hash}` emission with the
+      // drift op.
+      const s1Emits = emitted.filter((e) => e.socketId === "s1");
+      const s2Emits = emitted.filter((e) => e.socketId === "s2");
+      expect(s1Emits).toHaveLength(1);
+      expect(s2Emits).toHaveLength(1);
+      expect(s1Emits[0]!.data.ops).toEqual([
+        {
+          op: "update",
+          id: "p1",
+          patch: [{ op: "replace", path: "/name", value: "A-drifted" }],
+        },
+      ]);
+    });
+
+    it("does nothing when force is false", async () => {
+      source.setResults([row("p1", { name: "A" })]);
+      await manager.subscribe({
+        socketId: "s1",
+        query: source.query("project"),
+      });
+
+      // Drift simulated but no force.
+      source.setResults([row("p1", { name: "A-drifted" })]);
+      const refetch = await manager.subscribe({
+        socketId: "s1",
+        query: source.query("project"),
+      });
+
+      // Stale cached items — no DB re-execution happened.
+      expect(refetch.items).toEqual([{ id: "p1", name: "A" }]);
       expect(emitted).toHaveLength(0);
     });
   });

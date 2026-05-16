@@ -32,11 +32,38 @@ export type { PubSubConfig } from "./services/pubsub";
 export { QueueService, addJobIfNotExists } from "./services/queue";
 export type { QueueConfig } from "./services/queue";
 export { QuerySubscriptionManager } from "./services/subscriptions";
+export type { QueryEmitEnvelope } from "./services/subscriptions";
+export { ChangeBus } from "./services/changeBus";
+export type {
+  Change,
+  ChangeOp,
+  ChangeSource,
+  ChangeListener,
+} from "./services/changeBus";
+export {
+  ListenNotifyPoller,
+  PARCAE_CHANNEL,
+} from "./services/listenNotifyPoller";
+export {
+  ensureChangeTriggers,
+  triggerFunctionSql,
+  createTriggerSql,
+  TRIGGER_FUNCTION_NAME,
+} from "./services/changeTriggers";
+export {
+  withTransaction,
+  getActiveTransactionFrame,
+} from "./services/transactionContext";
+export type {
+  TransactionFrame,
+  WithTransactionDeps,
+} from "./services/transactionContext";
 export {
   enqueue,
   lock,
   getQueue,
   getPubSub,
+  getChangeBus,
   getIo,
   runWithRequestContext,
   getRequestUser,

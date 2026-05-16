@@ -173,21 +173,32 @@ export class FrontendAdapter implements ModelAdapter {
   private _buildQuery<T>(
     modelClass: ModelConstructor<T>,
     steps: QueryStep[],
+    options: { forceRefresh?: boolean } = {},
   ): QueryChain<T> {
     const chain: any = {};
 
     for (const method of CHAINABLE_METHODS) {
       chain[method] = (...args: any[]) => {
-        return this._buildQuery(modelClass, [
-          ...steps,
-          { method, args: this._serializeArgs(args) },
-        ]);
+        return this._buildQuery(
+          modelClass,
+          [
+            ...steps,
+            { method, args: this._serializeArgs(args) },
+          ],
+          options,
+        );
       };
     }
 
     chain.find = async (): Promise<T[]> => {
       const path = this.resolvePath(modelClass);
-      const result = await this.transport.get(path, { __query: steps });
+      const requestData: Record<string, any> = { __query: steps };
+      // `__forceRefresh: true` tells the backend's LIST handler to
+      // re-execute the cached subscription query against the DB and
+      // emit any drift to every subscriber. Used by `useQuery`'s
+      // periodic drift poll to recover from missed events.
+      if (options.forceRefresh) requestData.__forceRefresh = true;
+      const result = await this.transport.get(path, requestData);
       const items = result?.[modelClass.type + "s"] ?? result?.items ?? [];
       const models = items.map((row: any) =>
         (modelClass as any).hydrate(this, row),
@@ -223,10 +234,27 @@ export class FrontendAdapter implements ModelAdapter {
       return result?.total ?? 0;
     };
 
+    /**
+     * Returns a sibling chain that, on `.find()`, sets the
+     * `__forceRefresh: true` request flag. The backend's LIST handler
+     * re-executes the cached subscription query against the DB and
+     * emits any drift to every subscriber on the same hash. Used by
+     * `useQuery`'s periodic drift poll — not part of the public
+     * fluent API, kept on the chain so consumers can probe it via
+     * `useQuery`'s `poll` option.
+     */
+    chain.withForceRefresh = (): QueryChain<T> => {
+      return this._buildQuery(modelClass, steps, {
+        ...options,
+        forceRefresh: true,
+      });
+    };
+
     chain.__steps = steps;
     chain.__modelType = modelClass.type;
     chain.__modelClass = modelClass;
     chain.__adapter = this;
+    chain.__forceRefresh = options.forceRefresh === true;
 
     return chain as QueryChain<T>;
   }

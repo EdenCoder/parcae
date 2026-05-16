@@ -33,6 +33,12 @@ import {
   lock as globalLock,
   getRequestUser,
 } from "../services/context";
+import type { ChangeBus, ChangeOp } from "../services/changeBus";
+import {
+  bufferChangeIfActive,
+  getActiveTransactionFrame,
+} from "../services/transactionContext";
+import { ensureChangeTriggers } from "../services/changeTriggers";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -40,6 +46,7 @@ export interface BackendServices {
   read: any; // Knex read replica
   write: any; // Knex primary
   pubsub?: any; // Redis pub/sub + lock (optional)
+  changeBus?: ChangeBus; // Cross-process model-change fan-out (optional)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -216,6 +223,15 @@ export class BackendAdapter implements ModelAdapter {
   get pubsub() {
     return this.services.pubsub;
   }
+  /**
+   * Cross-process model-change fan-out. Set by `createApp()` after
+   * the bus + manager are wired together. If `null`, `_notifyChange`
+   * falls through to the local manager only (legacy single-process
+   * mode).
+   */
+  get changeBus(): ChangeBus | null {
+    return this.services.changeBus ?? null;
+  }
 
   constructor(services: BackendServices) {
     this.services = services;
@@ -352,9 +368,58 @@ export class BackendAdapter implements ModelAdapter {
     this._searchExtensionsReady = true;
   }
 
-  private _notifyChange(model: any): void {
+  /**
+   * Notify the subscription layer that a model was written.
+   *
+   * Routing rules, in order:
+   *   1. Inside a `withTransaction(...)` frame → buffer the Change;
+   *      the wrapper flushes on commit and drops on rollback.
+   *   2. ChangeBus wired → publish on the bus. The bus delivers to
+   *      every instance's local `QuerySubscriptionManager` plus
+   *      back to this instance via Redis loopback (or in-process
+   *      EventEmitter when no Redis is configured).
+   *   3. No bus → fall through to the local manager directly. This
+   *      preserves legacy single-process behaviour for tests and
+   *      consumers that haven't migrated.
+   *
+   * `op` is one of `"insert" | "update" | "delete"`. We derive it
+   * from the call site (save with `__isNew`, save without, patch,
+   * remove) rather than asking the model — that way a model with
+   * a custom `__isNew` getter can't corrupt the bus contract.
+   */
+  private _notifyChange(model: any, op: ChangeOp): void {
     const ModelClass = model.constructor as typeof Model;
-    this.subscriptions?.onModelChange(ModelClass.type);
+    const table = tableName(ModelClass as unknown as ModelConstructor);
+    const id: string | undefined = (model as any).id;
+
+    if (!this.changeBus) {
+      // Legacy single-process path. No bus, no dedup, no transaction
+      // buffer — just fire the local manager.
+      this.subscriptions?.onModelChange(ModelClass.type);
+      return;
+    }
+
+    if (!id) {
+      // A write without an id shouldn't be possible (serialize()
+      // generates one), but guard so the bus contract holds.
+      log.warn(
+        `subscriptions: _notifyChange called without id model=${ModelClass.type}`,
+      );
+      return;
+    }
+
+    const frame = getActiveTransactionFrame();
+    const requestId = frame?.requestId ?? this.changeBus.newRequestId();
+    const change = {
+      table,
+      op,
+      id,
+      requestId,
+      source: "hook" as const,
+    };
+
+    if (bufferChangeIfActive(change)) return;
+    this.changeBus.emit(change);
   }
 
   // ── Search Query ────────────────────────────────────────────────────
@@ -481,7 +546,7 @@ export class BackendAdapter implements ModelAdapter {
     }
 
     log.info(`model saved model=${ModelClass.type}, id=${model.id}`);
-    this._notifyChange(model);
+    this._notifyChange(model, creating ? "insert" : "update");
   }
 
   // ── remove ───────────────────────────────────────────────────────────
@@ -501,7 +566,7 @@ export class BackendAdapter implements ModelAdapter {
     }
 
     this.pubsub?.emit?.(`delete+${ModelClass.type}:${model.id}`, model.__data);
-    this._notifyChange(model);
+    this._notifyChange(model, "delete");
   }
 
   // ── findById ─────────────────────────────────────────────────────────
@@ -1162,7 +1227,7 @@ export class BackendAdapter implements ModelAdapter {
       throw err;
     }
 
-    this._notifyChange(model);
+    this._notifyChange(model, "update");
   }
 
   private async _patchPostgres(
@@ -1544,7 +1609,7 @@ export class BackendAdapter implements ModelAdapter {
       throw err;
     }
 
-    this._notifyChange(model);
+    this._notifyChange(model, "update");
   }
 
   private async _patchSqliteBody(
@@ -2058,6 +2123,26 @@ export class BackendAdapter implements ModelAdapter {
     // Register embedding hooks for AlloyDB models with searchFields
     if (this.engine === "alloydb") {
       this._registerEmbeddingHooks(models);
+    }
+
+    // Install LISTEN/NOTIFY trigger function + per-table triggers so
+    // external writes (raw SQL, migrations, ops console) reach the
+    // ChangeBus via pg_notify. SQLite is a no-op. Gated by env so
+    // operators can turn it off if it conflicts with custom triggers.
+    if (
+      this.engine !== "sqlite" &&
+      process.env.PARCAE_LISTEN_NOTIFY !== "false"
+    ) {
+      const managedTables: string[] = [];
+      for (const modelClass of models) {
+        if (modelClass.managed === false) continue;
+        managedTables.push(tableName(modelClass));
+      }
+      await ensureChangeTriggers({
+        knex: this.write,
+        engine: this.engine,
+        tables: managedTables,
+      });
     }
   }
 

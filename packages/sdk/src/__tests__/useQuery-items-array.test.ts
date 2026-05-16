@@ -71,6 +71,21 @@ class FakeClient extends EventEmitter {
       if (sub.event === `query:${hash}`) sub.handler(ops);
     }
   }
+
+  /**
+   * Mirror the new server envelope shape `{ ops, order? }` that
+   * `QuerySubscriptionManager` emits when membership/order changes.
+   * The bare-array `emitQueryOps` above is preserved for backward-
+   * compat tests against the legacy wire shape.
+   */
+  emitQueryEnvelope(
+    hash: string,
+    envelope: { ops: unknown[]; order?: string[] },
+  ): void {
+    for (const sub of this.subscriptions) {
+      if (sub.event === `query:${hash}`) sub.handler(envelope);
+    }
+  }
 }
 
 // ─── chain factory ──────────────────────────────────────────────────────────
@@ -306,7 +321,85 @@ describe("useQuery — items-array reference contract", () => {
     release();
   });
 
-  // ── 4. Regression — the bug the slice() fix prevents ──────────────
+  // ── 4. Order envelope (DOL-894) ───────────────────────────────────
+
+  it("envelope with `order` places an `add` in the right slot (insertion middle)", async () => {
+    // Server sees the new ordered set `[p1, p2, p3]` after p2 was
+    // inserted between p1 and p3. The legacy bare-array path would
+    // append p2 to the end. With the envelope's `order` field the
+    // client reorders correctly.
+    const client = new FakeClient();
+    const { entry, release } = await primeCache(client, "h-order-add", [
+      { id: "p1", title: "A" },
+      { id: "p3", title: "C" },
+    ]);
+
+    const beforeP1 = entry.items[0];
+    const beforeP3 = entry.items[1];
+
+    client.emitQueryEnvelope("h-order-add", {
+      ops: [{ op: "add", id: "p2", data: { id: "p2", title: "B" } }],
+      order: ["p1", "p2", "p3"],
+    });
+
+    expect(entry.items).toHaveLength(3);
+    expect(entry.items.map((i: any) => i.id)).toEqual(["p1", "p2", "p3"]);
+    // Identity of existing rows preserved across reorder.
+    expect(entry.items[0]).toBe(beforeP1);
+    expect(entry.items[2]).toBe(beforeP3);
+
+    release();
+  });
+
+  it("envelope with `order` and NO ops still reorders (pure-order change)", async () => {
+    const client = new FakeClient();
+    const { entry, release } = await primeCache(client, "h-order-only", [
+      { id: "p1", title: "A" },
+      { id: "p2", title: "B" },
+    ]);
+
+    const beforeP1 = entry.items[0];
+    const beforeP2 = entry.items[1];
+
+    client.emitQueryEnvelope("h-order-only", {
+      ops: [],
+      order: ["p2", "p1"],
+    });
+
+    expect(entry.items.map((i: any) => i.id)).toEqual(["p2", "p1"]);
+    expect(entry.items[0]).toBe(beforeP2);
+    expect(entry.items[1]).toBe(beforeP1);
+
+    release();
+  });
+
+  it("envelope-shape update without `order` behaves like the legacy array path", async () => {
+    // Membership stable + order stable → the server omits `order`.
+    // Result must still be the new-array-reference update.
+    const client = new FakeClient();
+    const { entry, release } = await primeCache(client, "h-env-update", [
+      { id: "p1", title: "first" },
+      { id: "p2", title: "second" },
+    ]);
+
+    const beforeArray = entry.items;
+
+    client.emitQueryEnvelope("h-env-update", {
+      ops: [
+        {
+          op: "update",
+          id: "p1",
+          patch: [{ op: "replace", path: "/title", value: "updated" }],
+        },
+      ],
+    });
+
+    expect(entry.items).not.toBe(beforeArray);
+    expect(entry.items[0].title).toBe("updated");
+    release();
+  });
+
+  // ── 5. Regression — the bug the slice() fix prevents ──────────────
 
   it("downstream useMemo-style dep arrays see a NEW items reference on update (regression: items.slice fix)", async () => {
     // Models the canonical bug: a consumer wrapping items in a

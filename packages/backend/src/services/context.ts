@@ -23,6 +23,7 @@ import { log } from "../logger";
 import type { QueueService } from "./queue";
 import { addJobIfNotExists } from "./queue";
 import type { PubSub } from "./pubsub";
+import type { ChangeBus } from "./changeBus";
 
 // ─── Request context (per-request user via AsyncLocalStorage) ────────────────
 
@@ -52,12 +53,18 @@ export function getRequestUser(): {
 
 let _queue: QueueService | null = null;
 let _pubsub: PubSub | null = null;
+let _changeBus: ChangeBus | null = null;
 let _io: any = null;
 
 /** @internal — called by createApp() */
 export function _setServices(queue: QueueService, pubsub: PubSub): void {
   _queue = queue;
   _pubsub = pubsub;
+}
+
+/** @internal — called by createApp() after the bus is constructed. */
+export function _setChangeBus(bus: ChangeBus): void {
+  _changeBus = bus;
 }
 
 /** @internal — called by createApp() after server creation */
@@ -157,6 +164,11 @@ export function getQueue(): QueueService | null {
 /** Get the raw PubSub instance. */
 export function getPubSub(): PubSub | null {
   return _pubsub;
+}
+
+/** Get the cross-process model-change bus. */
+export function getChangeBus(): ChangeBus | null {
+  return _changeBus;
 }
 
 /** Get the Socket.IO server instance. */

@@ -266,11 +266,30 @@ export interface QueryChain<T> {
   /** @internal Create an independent copy of this chain. */
   clone(): QueryChain<T>;
 
+  /**
+   * Return a sibling chain whose `.find()` injects
+   * `__forceRefresh: true` into the request. The backend's auto-CRUD
+   * LIST handler re-executes the cached subscription query against
+   * the DB, rebuilds its result map, and emits any drift ops to
+   * every subscriber. Used by `useQuery({ poll })` to recover from
+   * missed cross-process events. Not part of the public fluent API —
+   * call sites should reach for the `poll` option instead.
+   *
+   * Optional — backends that don't implement realtime can leave it
+   * unimplemented; `useQuery` falls back to the plain refetch path
+   * via `__forceRefresh` being a no-op server-side.
+   *
+   * @internal
+   */
+  withForceRefresh?(): QueryChain<T>;
+
   // Internal — used by hooks and subscription manager
   /** @internal */ __steps: QueryStep[];
   /** @internal */ __modelType: string;
   /** @internal */ __modelClass: ModelConstructor<T>;
   /** @internal */ __adapter: ModelAdapter;
+  /** @internal — true when `.withForceRefresh()` was applied. */
+  __forceRefresh?: boolean;
 }
 
 // ─── Model Adapter ───────────────────────────────────────────────────────────

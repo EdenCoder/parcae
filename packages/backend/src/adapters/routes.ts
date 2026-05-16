@@ -248,10 +248,18 @@ export function registerModelRoutes(
           // For socket RPC, subscribe to query-level change notifications.
           // The subscription manager will re-eval this query on model changes
           // and emit surgical add/remove/update ops to this socket.
+          //
+          // `__forceRefresh: true` is the drift-poll hook — the client's
+          // periodic refetch sets it so we re-execute the cached query
+          // against the DB and emit any drift ops to every subscriber
+          // on the same hash. Without it, repeated LIST calls just
+          // hand back whatever's in the cache.
           const socketId = req._socketId;
           if (socketId && adapter.subscriptions) {
+            const force = data.__forceRefresh === true ||
+              data.__forceRefresh === "true";
             const [sub, totalCount] = await Promise.all([
-              adapter.subscriptions.subscribe({ socketId, query }),
+              adapter.subscriptions.subscribe({ socketId, query }, { force }),
               countQuery.count(),
             ]);
 
