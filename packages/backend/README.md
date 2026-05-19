@@ -412,8 +412,31 @@ Environment variables validated at startup via Zod. `.env` files are auto-loaded
 | `AUTH_SECRET`       | No       | --            | Session signing secret (required if auth enabled) |
 | `TRUSTED_ORIGINS`   | No       | --            | Comma-separated CORS origins                      |
 | `NODE_ENV`          | No       | `development` | `development` / `production` / `test`             |
-| `SERVER`            | No       | `true`        | Run HTTP + WebSocket server                       |
-| `DAEMON`            | No       | `false`       | Run background workers                            |
+| `RUN_SERVER`        | No       | `true`        | Register CRUD / custom routes / Socket.IO         |
+| `RUN_HOOKS`         | No       | `true`        | Run model lifecycle hooks                         |
+| `RUN_JOBS`          | No       | `false`       | `true` / `false` / `"name1,name2"` (workers)      |
+| `SERVER`            | No       | --            | _Deprecated alias for_ `RUN_SERVER`               |
+| `DAEMON`            | No       | --            | _Deprecated: equivalent to_ `RUN_HOOKS=true RUN_JOBS=true` |
+
+### Process roles
+
+The three `RUN_*` flags compose to give you four useful process shapes:
+
+| Role            | `RUN_SERVER` | `RUN_HOOKS` | `RUN_JOBS` | Use case                                     |
+| --------------- | ------------ | ----------- | ---------- | -------------------------------------------- |
+| All-in-one      | `true`       | `true`      | `true`     | Dev, single-process deploys                  |
+| API only        | `true`       | `true`      | `false`    | Stateless HTTP/Socket.IO front-end           |
+| Worker only     | `false`      | `true`      | `true`     | Dedicated BullMQ consumer                    |
+| Named workers   | `false`      | `true`      | `panel,…`  | (reserved — per-name routing TBD)            |
+
+`/<version>/health` is always served regardless of `RUN_SERVER`, so the
+worker process can still satisfy Cloud Run / k8s probes.
+
+> ⚠️ **Booleans are strict.** `RUN_SERVER=false` actually means false. The
+> earlier `z.coerce.boolean()` coercion treated _any non-empty string as
+> true_, which silently broke `SERVER=false` and `DAEMON=false`. We now
+> accept `{true,false,1,0,yes,no,on,off}` (case-insensitive) and reject
+> the rest with a clear error at startup.
 
 ## Exports
 

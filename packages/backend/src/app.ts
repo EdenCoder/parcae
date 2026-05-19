@@ -18,8 +18,13 @@ import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
 import { log } from "./logger";
 import { ClientError } from "./helpers";
 import { generateSchemas } from "./schema/generate";
-import { parseConfig, isSqliteUrl, sqliteFilename } from "./config";
-import type { Config } from "./config";
+import {
+  parseConfig,
+  isSqliteUrl,
+  sqliteFilename,
+  resolveRuntimeFlags,
+} from "./config";
+import type { Config, RuntimeFlags } from "./config";
 import { createServer_ } from "./server";
 import type { ServerContext } from "./server";
 import {
@@ -39,6 +44,7 @@ import {
   _setServices,
   _setIo,
   _setChangeBus,
+  _setRuntimeFlags,
   runWithRequestContext,
 } from "./services/context";
 import { getJobs } from "./routing/job";
@@ -211,6 +217,7 @@ export function createApp(config: AppConfig): ParcaeApp {
   let models: ModelConstructor[] = [];
   let server: ServerContext | null = null;
   let envConfig: Config | null = null;
+  let flags: RuntimeFlags | null = null;
 
   return {
     get schemas() {
@@ -226,7 +233,23 @@ export function createApp(config: AppConfig): ParcaeApp {
       const port = options.port ?? envConfig.PORT;
       const dev = options.dev ?? envConfig.NODE_ENV === "development";
 
-      log.info(`Starting${dev ? " (dev mode)" : ""}...`);
+      // Resolve per-process runtime flags. Legacy SERVER/DAEMON are mapped
+      // into RUN_SERVER/RUN_HOOKS/RUN_JOBS here; the rest of startup only
+      // consults `flags`. We also publish them into the service context
+      // so downstream code (e.g. BackendAdapter.runHooks) can branch on them.
+      flags = resolveRuntimeFlags(envConfig, (m) => log.warn(m));
+      _setRuntimeFlags(flags);
+
+      const jobsLabel =
+        flags.jobs === true
+          ? "all"
+          : flags.jobs === false
+            ? "none"
+            : `[${[...flags.jobs].join(", ")}]`;
+      log.info(
+        `Starting${dev ? " (dev mode)" : ""} — ` +
+          `server=${flags.server} hooks=${flags.hooks} jobs=${jobsLabel}`,
+      );
 
       // ── Step 1: Discover models ────────────────────────────────────
       if (Array.isArray(config.models)) {
@@ -521,13 +544,28 @@ export function createApp(config: AppConfig): ParcaeApp {
       });
 
       // ── Step 12: Register auto-CRUD routes ─────────────────────────
-      const crudCount = registerModelRoutes(models, adapter, version);
-      log.info(`Registered ${crudCount} auto-CRUD route(s)`);
+      // CRUD routes only make sense when this process serves HTTP. Worker-only
+      // processes skip them so the `/health` endpoint is the lone exposed route.
+      const crudCount = flags.server
+        ? registerModelRoutes(models, adapter, version)
+        : 0;
+      log.info(
+        flags.server
+          ? `Registered ${crudCount} auto-CRUD route(s)`
+          : `Skipped auto-CRUD route registration (RUN_SERVER=false)`,
+      );
 
       // ── Step 13: Auto-discover ──────────────────────────────────────
       // Scan all configured directories. Files self-register by calling
       // route.*, hook.*, job() at import time. Doesn't matter which dir
       // a hook or job lives in — just that the file exists.
+      //
+      // We always import the files (so module-level side effects like
+      // singleton construction fire identically across processes), but
+      // we apply per-flag gates further down:
+      //   - custom routes from `controllers/` only attach to polka when RUN_SERVER=true
+      //   - hooks fire only when RUN_HOOKS=true (gated in BackendAdapter.runHooks)
+      //   - BullMQ workers start only when RUN_JOBS != false (gated below)
       const routesBefore = getRoutes().length;
       const hooksBefore = getHooks().length;
       const jobsBefore = getJobs().length;
@@ -552,18 +590,53 @@ export function createApp(config: AppConfig): ParcaeApp {
       );
 
       // ── Step 14: Apply discovered routes to Polka ──────────────────
+      // Custom routes registered via `route.get/post/...` only attach when
+      // RUN_SERVER=true. Worker-only processes intentionally leave them
+      // unbound so they're unreachable on the worker URL.
       const routes = getRoutes();
-      for (const entry of routes) {
-        const method = entry.method.toLowerCase() as keyof typeof server.polka;
-        if (typeof server.polka[method] === "function") {
-          const handlers = [...entry.middlewares, entry.handler];
-          (server.polka[method] as any)(entry.path, ...handlers);
+      if (flags.server) {
+        for (const entry of routes) {
+          const method = entry.method.toLowerCase() as keyof typeof server.polka;
+          if (typeof server.polka[method] === "function") {
+            const handlers = [...entry.middlewares, entry.handler];
+            (server.polka[method] as any)(entry.path, ...handlers);
+          }
         }
+      } else if (routes.length > 0) {
+        log.info(
+          `Skipped attaching ${routes.length} custom route(s) (RUN_SERVER=false)`,
+        );
       }
 
       // ── Step 15: Start job workers ─────────────────────────────────
+      // Only register a BullMQ worker when RUN_JOBS allows it. When `jobs` is
+      // a `Set<string>` we accept the comma-list API surface but currently
+      // process every name (warning once) — true per-name routing requires
+      // moving each job to its own BullMQ queue and is tracked separately.
       const registeredJobs = getJobs();
-      if (registeredJobs.length > 0 && queue.get()) {
+      const wantsAnyJobs = flags.jobs !== false;
+      if (
+        wantsAnyJobs &&
+        registeredJobs.length > 0 &&
+        queue.get()
+      ) {
+        if (flags.jobs instanceof Set) {
+          const unknown = [...flags.jobs].filter(
+            (name) => !registeredJobs.some((j) => j.name === name),
+          );
+          if (unknown.length > 0) {
+            log.warn(
+              `[jobs] RUN_JOBS references unknown job name(s): ${unknown.join(", ")} — ` +
+                `they will not be processed.`,
+            );
+          }
+          log.warn(
+            "[jobs] RUN_JOBS=<comma-list> per-name routing is not yet implemented — " +
+              "this worker will accept all registered job names. " +
+              "See @parcae/backend env docs.",
+          );
+        }
+
         const defaultQueue = queue.get()!;
         const maxConcurrency = Math.max(
           1,
@@ -587,12 +660,25 @@ export function createApp(config: AppConfig): ParcaeApp {
           },
           maxConcurrency,
         );
+        log.info(
+          `Started BullMQ worker on queue "${defaultQueue.name}" — ` +
+            `max concurrency ${maxConcurrency}, ${registeredJobs.length} handler(s)`,
+        );
+      } else if (!wantsAnyJobs && registeredJobs.length > 0) {
+        log.info(
+          `Skipped starting BullMQ worker (RUN_JOBS=false) — ` +
+            `${registeredJobs.length} job(s) discovered but unhandled by this process`,
+        );
       }
 
       // ── Step 16: Socket.IO connection handling ─────────────────────
+      // Only attach socket handlers when RUN_SERVER=true. The Socket.IO
+      // server itself is always constructed (the createServer_ contract
+      // expects it), but on worker-only processes it sits idle — no
+      // clients should be hitting the worker URL anyway.
       const modelsByType = new Map(models.map((m) => [m.type, m]));
 
-      server.io.on("connection", (socket) => {
+      if (flags.server) server.io.on("connection", (socket) => {
         let socketSession: any = null;
 
         // ── RPC: pipe socket calls through Polka's HTTP handler ─────
@@ -728,15 +814,21 @@ export function createApp(config: AppConfig): ParcaeApp {
       });
 
       // ── Step 17: Start listening ───────────────────────────────────
+      // ALWAYS bind to PORT, even on worker-only processes (RUN_SERVER=false).
+      // Cloud Run / k8s health probes need *something* to talk to, and the
+      // `/{version}/health` endpoint registered in Step 11 is the cheapest
+      // signal of liveness we have.
       await new Promise<void>((resolveStart) => {
         server!.httpServer.listen(port, () => resolveStart());
       });
 
+      const exposedRoutes = flags.server ? routes.length + crudCount : 0;
       log.success(
         `Ready on port ${port} — ` +
           `${models.length} models, ` +
-          `${routes.length + crudCount} routes, ` +
-          `${getHooks().length} hooks, ` +
+          `${exposedRoutes} routes` +
+          (flags.server ? "" : " (health only — RUN_SERVER=false)") +
+          `, ${getHooks().length} hooks, ` +
           `${getJobs().length} jobs`,
       );
     },

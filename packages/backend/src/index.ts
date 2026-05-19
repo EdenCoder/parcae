@@ -15,8 +15,9 @@ export {
   configSchema,
   isSqliteUrl,
   sqliteFilename,
+  resolveRuntimeFlags,
 } from "./config";
-export type { Config } from "./config";
+export type { Config, RuntimeFlags } from "./config";
 
 // Server
 export { createServer_ } from "./server";
@@ -65,6 +66,7 @@ export {
   getPubSub,
   getChangeBus,
   getIo,
+  getRuntimeFlags,
   runWithRequestContext,
   getRequestUser,
 } from "./services/context";

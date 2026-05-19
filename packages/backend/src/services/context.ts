@@ -24,6 +24,7 @@ import type { QueueService } from "./queue";
 import { addJobIfNotExists } from "./queue";
 import type { PubSub } from "./pubsub";
 import type { ChangeBus } from "./changeBus";
+import type { RuntimeFlags } from "../config";
 
 // ─── Request context (per-request user via AsyncLocalStorage) ────────────────
 
@@ -55,6 +56,10 @@ let _queue: QueueService | null = null;
 let _pubsub: PubSub | null = null;
 let _changeBus: ChangeBus | null = null;
 let _io: any = null;
+// Default: hooks run, server runs, jobs do not. Mirrors `resolveRuntimeFlags`
+// defaults so adapter callers see sensible behaviour if startup never ran
+// (mainly: unit tests that instantiate BackendAdapter directly).
+let _flags: RuntimeFlags = { server: true, hooks: true, jobs: false };
 
 /** @internal — called by createApp() */
 export function _setServices(queue: QueueService, pubsub: PubSub): void {
@@ -70,6 +75,25 @@ export function _setChangeBus(bus: ChangeBus): void {
 /** @internal — called by createApp() after server creation */
 export function _setIo(io: any): void {
   _io = io;
+}
+
+/** @internal — called by createApp() once flags are resolved. */
+export function _setRuntimeFlags(flags: RuntimeFlags): void {
+  _flags = flags;
+}
+
+/**
+ * Read the resolved per-process runtime flags.
+ *
+ * Returns the same object the framework consulted during startup. Useful
+ * for code that needs to branch on `RUN_SERVER` / `RUN_HOOKS` / `RUN_JOBS`
+ * outside of `app.ts` (e.g. the model adapter's hook dispatch).
+ *
+ * Defaults to `{ server: true, hooks: true, jobs: false }` if `createApp()`
+ * hasn't run yet — keeps direct `BackendAdapter` instantiation in tests sane.
+ */
+export function getRuntimeFlags(): RuntimeFlags {
+  return _flags;
 }
 
 // ─── enqueue() ───────────────────────────────────────────────────────────────

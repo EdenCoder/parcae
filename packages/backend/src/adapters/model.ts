@@ -32,6 +32,7 @@ import {
   enqueue as globalEnqueue,
   lock as globalLock,
   getRequestUser,
+  getRuntimeFlags,
 } from "../services/context";
 import type { ChangeBus, ChangeOp } from "../services/changeBus";
 import {
@@ -1807,6 +1808,13 @@ export class BackendAdapter implements ModelAdapter {
       cleanups?: Array<() => Promise<void> | void>;
     },
   ): Promise<void> {
+    // RUN_HOOKS=false: skip dispatch entirely. The hook registry is still
+    // populated (so `getHooksFor` would return entries), but worker-only
+    // processes that want pure job consumption can opt out of hook side
+    // effects. Note: this also means before-hooks that mutate `model`
+    // (e.g. `model.title = model.title.trim()`) won't fire.
+    if (!getRuntimeFlags().hooks) return;
+
     const ModelClass = model.constructor as typeof Model;
     const hooks = getHooksFor(
       ModelClass.type,
