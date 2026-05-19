@@ -73,8 +73,13 @@ $$ LANGUAGE plpgsql;
   `.trim();
 }
 
+// Hyphens are legal in quoted table names but not in unquoted
+// trigger identifiers, so kebab-case tables (`chat-messages`)
+// would emit `parcae_change_chat-messages` and Postgres would
+// reject the DROP/CREATE with `syntax error at or near "-"`.
+// Sanitize once at the boundary so callers can use bare names.
 export function triggerName(table: string): string {
-  return `${TRIGGER_PREFIX}${table}`;
+  return `${TRIGGER_PREFIX}${table.replaceAll("-", "_")}`;
 }
 
 /**
@@ -109,6 +114,22 @@ export async function ensureChangeTriggers(opts: {
 }): Promise<void> {
   if (opts.engine === "sqlite") return;
   if (opts.tables.length === 0) return;
+
+  // Sanitization is silent (kebab → snake), so two tables that
+  // differ only in `-` vs `_` would collide on the trigger name
+  // and the second install would clobber the first. Detect at
+  // boot rather than silently overwriting.
+  const byTriggerName = new Map<string, string>();
+  for (const table of opts.tables) {
+    const name = triggerName(table);
+    const prior = byTriggerName.get(name);
+    if (prior && prior !== table) {
+      throw new Error(
+        `changeTriggers: trigger name collision: tables ${prior} and ${table} both sanitize to ${name}`,
+      );
+    }
+    byTriggerName.set(name, table);
+  }
 
   try {
     await opts.knex.raw(triggerFunctionSql());

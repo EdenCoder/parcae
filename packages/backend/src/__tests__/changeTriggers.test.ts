@@ -42,12 +42,30 @@ describe("createTriggerSql", () => {
     expect(triggerName("posts")).toBe("parcae_change_posts");
   });
 
+  it("sanitizes hyphens in kebab-case table names", () => {
+    expect(triggerName("chat-messages")).toBe("parcae_change_chat_messages");
+    expect(triggerName("priority-walkthroughs")).toBe(
+      "parcae_change_priority_walkthroughs",
+    );
+  });
+
   it("emits a DROP-then-CREATE pair so the install is idempotent", () => {
     const sql = createTriggerSql("posts");
     expect(sql).toContain('DROP TRIGGER IF EXISTS parcae_change_posts ON "posts"');
     expect(sql).toContain('CREATE TRIGGER parcae_change_posts');
     expect(sql).toContain('AFTER INSERT OR UPDATE OR DELETE ON "posts"');
     expect(sql).toContain('FOR EACH ROW EXECUTE FUNCTION parcae_change_notify()');
+  });
+
+  it("quotes only the table name in DDL, not the sanitized trigger name", () => {
+    const sql = createTriggerSql("chat-messages");
+    expect(sql).toContain(
+      'DROP TRIGGER IF EXISTS parcae_change_chat_messages ON "chat-messages"',
+    );
+    expect(sql).toContain("CREATE TRIGGER parcae_change_chat_messages");
+    expect(sql).toContain(
+      'AFTER INSERT OR UPDATE OR DELETE ON "chat-messages"',
+    );
   });
 });
 
@@ -121,6 +139,18 @@ describe("ensureChangeTriggers", () => {
     // the per-table triggers (they reference a missing function).
     const calls = (knex.raw as any).mock.calls as any[];
     expect(calls).toHaveLength(1);
+  });
+
+  it("throws on trigger-name collision rather than silently clobbering", async () => {
+    const knex = makeKnex();
+    await expect(
+      ensureChangeTriggers({
+        knex,
+        engine: "postgres",
+        tables: ["chat-messages", "chat_messages"],
+      }),
+    ).rejects.toThrow(/trigger name collision/);
+    expect(knex.raw).not.toHaveBeenCalled();
   });
 
   it("continues to the next table when one trigger install fails", async () => {
