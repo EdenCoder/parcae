@@ -49,6 +49,9 @@ import {
 } from "./services/context";
 import { getJobs } from "./routing/job";
 import { getHooks } from "./routing/hook";
+import { getCrons } from "./routing/cron";
+import type { CronEntry } from "./routing/cron";
+import { Cron } from "croner";
 import { getMigrations } from "./routing/migration";
 import { runMigrations } from "./adapters/migrations";
 import { discoverMigrations } from "./adapters/migration-discovery";
@@ -66,6 +69,13 @@ export interface AppConfig {
   hooks?: string;
   /** Jobs directory for auto-discovery. */
   jobs?: string;
+  /**
+   * Crons directory for auto-discovery. Files self-register via `cron()`
+   * at import time. Crons are local (in-process) scheduled tasks — not
+   * BullMQ jobs — so they fire wherever `RUN_CRONS` is enabled, with
+   * cross-process deduplication via distributed try-lock at fire time.
+   */
+  crons?: string;
   /**
    * Migrations directory for auto-discovery. Files are loaded at startup and
    * self-register via `migration()`. Runs in lexicographic order, before
@@ -205,6 +215,69 @@ async function discoverAndImport(dir: string, label: string): Promise<number> {
   }
 
   return count;
+}
+
+// ─── Cron scheduling ─────────────────────────────────────────────────────────
+
+/**
+ * Start a single registered cron with cross-process deduplication.
+ *
+ * croner fires the trigger on every process that has `RUN_CRONS=true`. To
+ * avoid running the same handler N times per tick when there's an N-wide
+ * worker fleet, every contender attempts a non-blocking `tryLock` keyed
+ * on the cron name + the planned fire timestamp (millisecond-rounded).
+ * Exactly one process wins per tick via Redis SET NX EX; the others
+ * silently bail before invoking the handler.
+ *
+ * `entry.options.overlap` (default `false`) propagates to croner's
+ * `protect` so a slow handler doesn't stack ticks even if the lock dance
+ * lets two processes race past the SETNX boundary (shouldn't happen, but
+ * belt-and-suspenders).
+ */
+function startCron(entry: CronEntry, pubsub: PubSub): Cron {
+  const protectPrev = entry.options.overlap !== true;
+  return new Cron(
+    entry.pattern,
+    {
+      protect: protectPrev,
+      timezone: entry.options.timezone,
+    },
+    async () => {
+      // Round to the nearest second so contending processes hash the same
+      // tick window even with mild clock skew. The lock key includes the
+      // pattern so multiple crons that happen to share names across
+      // versions don't collide.
+      const tickMs = Math.floor(Date.now() / 1000) * 1000;
+      const lockKey = `cron:tick:${entry.name}:${tickMs}`;
+      // Hold the dedup key longer than any reasonable tick to absorb
+      // clock drift, capped at 5 minutes so a stuck process doesn't
+      // wedge the schedule forever.
+      const ttlMs = 5 * 60 * 1000;
+      let acquired = true;
+      try {
+        acquired = await pubsub.tryLock(lockKey, ttlMs);
+      } catch (err) {
+        log.warn(
+          `[cron:${entry.name}] tryLock failed (${(err as Error).message}); ` +
+            `firing anyway — duplicate execution possible`,
+        );
+      }
+      if (!acquired) return;
+
+      const fireDate = new Date();
+      try {
+        await entry.handler({
+          data: { name: entry.name, pattern: entry.pattern, fireDate },
+        });
+      } catch (err) {
+        log.error(
+          `[cron:${entry.name}] handler threw: ${(err as Error).message}`,
+        );
+        // Don't rethrow — croner would silently swallow it anyway, and
+        // we want the schedule to keep firing on the next tick.
+      }
+    },
+  );
 }
 
 // ─── createApp ───────────────────────────────────────────────────────────────
@@ -557,8 +630,9 @@ export function createApp(config: AppConfig): ParcaeApp {
 
       // ── Step 13: Auto-discover ──────────────────────────────────────
       // Scan all configured directories. Files self-register by calling
-      // route.*, hook.*, job() at import time. Doesn't matter which dir
-      // a hook or job lives in — just that the file exists.
+      // route.*, hook.*, job(), cron() at import time. Doesn't matter
+      // which dir a hook / job / cron lives in — just that the file
+      // exists.
       //
       // We always import the files (so module-level side effects like
       // singleton construction fire identically across processes), but
@@ -566,13 +640,18 @@ export function createApp(config: AppConfig): ParcaeApp {
       //   - custom routes from `controllers/` only attach to polka when RUN_SERVER=true
       //   - hooks fire only when RUN_HOOKS=true (gated in BackendAdapter.runHooks)
       //   - BullMQ workers start only when RUN_JOBS != false (gated below)
+      //   - cron schedulers start only when RUN_CRONS=true (gated below)
       const routesBefore = getRoutes().length;
       const hooksBefore = getHooks().length;
       const jobsBefore = getJobs().length;
+      const cronsBefore = getCrons().length;
 
-      const dirs = [config.controllers, config.hooks, config.jobs].filter(
-        (d): d is string => typeof d === "string",
-      );
+      const dirs = [
+        config.controllers,
+        config.hooks,
+        config.jobs,
+        config.crons,
+      ].filter((d): d is string => typeof d === "string");
       let totalFiles = 0;
       for (const dir of dirs) {
         totalFiles += await discoverAndImport(dir, "module");
@@ -581,12 +660,14 @@ export function createApp(config: AppConfig): ParcaeApp {
       const routesAfter = getRoutes().length;
       const hooksAfter = getHooks().length;
       const jobsAfter = getJobs().length;
+      const cronsAfter = getCrons().length;
 
       log.info(
         `Discovered ${totalFiles} file(s) → ` +
           `${routesAfter - routesBefore} route(s), ` +
           `${hooksAfter - hooksBefore} hook(s), ` +
-          `${jobsAfter - jobsBefore} job(s)`,
+          `${jobsAfter - jobsBefore} job(s), ` +
+          `${cronsAfter - cronsBefore} cron(s)`,
       );
 
       // ── Step 14: Apply discovered routes to Polka ──────────────────
@@ -633,6 +714,21 @@ export function createApp(config: AppConfig): ParcaeApp {
       // before deploying.
       const registeredJobs = getJobs();
       const wantsAnyJobs = flags.jobs !== false;
+
+      // Eagerly create the BullMQ queue for every registered job, even on
+      // processes that won't run a worker. This guarantees:
+      //   - the queue meta key exists in Redis with our standard defaults
+      //     (3 attempts, exponential backoff, retention windows)
+      //   - third-party consumers can subscribe immediately without
+      //     waiting for the first enqueue to spawn the queue lazily
+      //   - monitoring tools (Bull Board, Arena) see every known queue
+      // The bare `defaultName` queue stays uncreated by design — nothing
+      // routes there after the per-name cutover.
+      if (queue.get() && registeredJobs.length > 0) {
+        for (const jobEntry of registeredJobs) {
+          queue.get(queue.queueNameFor(jobEntry.name));
+        }
+      }
 
       if (wantsAnyJobs && registeredJobs.length > 0 && queue.get()) {
         // Capture into a local so TS can narrow inside the closure below.
@@ -698,6 +794,70 @@ export function createApp(config: AppConfig): ParcaeApp {
         log.info(
           `Skipped starting BullMQ workers (RUN_JOBS=false) — ` +
             `${registeredJobs.length} job(s) discovered but unhandled by this process`,
+        );
+      }
+
+      // ── Step 15.5: Schedule local crons ────────────────────────────
+      // Crons are NOT BullMQ jobs — they're in-process scheduled tasks
+      // backed by croner. They fire wherever RUN_CRONS is enabled;
+      // cross-process dedup happens inside the handler via a Redis
+      // try-lock keyed on the cron name + fire timestamp.
+      //
+      //   - RUN_CRONS=true       → schedule every registered cron
+      //   - RUN_CRONS=false      → don't schedule anything
+      //   - RUN_CRONS=a,b,c      → schedule only those names (pins
+      //                            specific schedules to specific fleets)
+      //
+      // Multi-process safety is automatic: every contender attempts
+      // `tryLock("cron:tick:<name>:<fireMs>", ttl)`. Exactly one wins via
+      // Redis SET NX EX semantics, the rest skip silently.
+      const registeredCrons = getCrons();
+      const wantsAnyCrons = flags.crons !== false;
+
+      if (wantsAnyCrons && registeredCrons.length > 0) {
+        const cronsFlag = flags.crons;
+        const shouldSchedule = (cronName: string): boolean => {
+          if (cronsFlag === true) return true;
+          if (cronsFlag instanceof Set) return cronsFlag.has(cronName);
+          return false;
+        };
+
+        if (cronsFlag instanceof Set) {
+          const unknown = [...cronsFlag].filter(
+            (name) => !registeredCrons.some((c) => c.name === name),
+          );
+          if (unknown.length > 0) {
+            log.warn(
+              `[crons] RUN_CRONS references unknown cron name(s): ` +
+                `${unknown.join(", ")} — nothing will fire them from this process.`,
+            );
+          }
+        }
+
+        const startedCrons: Cron[] = [];
+        const scheduled: string[] = [];
+        const skipped: string[] = [];
+        for (const entry of registeredCrons) {
+          if (!shouldSchedule(entry.name)) {
+            skipped.push(entry.name);
+            continue;
+          }
+          startedCrons.push(startCron(entry, pubsub));
+          scheduled.push(`${entry.name}@"${entry.pattern}"`);
+        }
+        // Stash teardown handles so `app.stop()` cleans up.
+        (server as any)._parcaeCrons = startedCrons;
+        if (scheduled.length > 0) {
+          log.info(`Scheduled ${scheduled.length} cron(s): ${scheduled.join(", ")}`);
+        }
+        if (skipped.length > 0) {
+          log.info(
+            `Skipped ${skipped.length} cron(s) not selected by RUN_CRONS: ${skipped.join(", ")}`,
+          );
+        }
+      } else if (!wantsAnyCrons && registeredCrons.length > 0) {
+        log.info(
+          `Skipped scheduling ${registeredCrons.length} cron(s) (RUN_CRONS=false)`,
         );
       }
 
@@ -859,7 +1019,8 @@ export function createApp(config: AppConfig): ParcaeApp {
           `${exposedRoutes} routes` +
           (flags.server ? "" : " (health only — RUN_SERVER=false)") +
           `, ${getHooks().length} hooks, ` +
-          `${getJobs().length} jobs`,
+          `${getJobs().length} jobs, ` +
+          `${getCrons().length} crons`,
       );
     },
 
@@ -879,6 +1040,20 @@ export function createApp(config: AppConfig): ParcaeApp {
             await listenNotify.stop();
           } catch (err) {
             log.warn(`listenNotify.stop threw: ${String(err)}`);
+          }
+        }
+        // Stop any active cron schedulers before we tear down the
+        // server. `Cron.stop()` cancels the next tick and prevents new
+        // handler invocations; any in-flight handler keeps running but
+        // can't queue another tick onto a dead instance.
+        const crons = (server as any)._parcaeCrons as Cron[] | undefined;
+        if (crons?.length) {
+          for (const c of crons) {
+            try {
+              c.stop();
+            } catch (err) {
+              log.warn(`cron.stop threw: ${String(err)}`);
+            }
           }
         }
         const changeBus = (server as any)._parcaeChangeBus as

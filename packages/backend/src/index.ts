@@ -119,6 +119,14 @@ export type {
   JobEntry,
 } from "./routing/job";
 
+export { cron, getCrons, getCron, clearCrons } from "./routing/cron";
+export type {
+  CronHandler,
+  CronContext,
+  CronOptions,
+  CronEntry,
+} from "./routing/cron";
+
 export {
   migration,
   getMigrations,

@@ -183,6 +183,58 @@ export class PubSub {
     });
   }
 
+  // ── Try-lock (non-blocking) ──────────────────────────────────────────
+
+  /**
+   * Attempt to acquire a single-shot lock without waiting. Returns `true`
+   * if this caller won the key, `false` if someone else already holds it.
+   *
+   * Uses `SET NX EX` semantics — the key is auto-released when the TTL
+   * elapses, so callers don't need to remember to unlock. Suitable for
+   * cheap "only one of us runs this tick" patterns like cron deduplication
+   * where every contender computes the same key for the same scheduled
+   * moment and only the first SET succeeds.
+   *
+   * Falls back to in-process state when no Redis is configured (single-
+   * process dev mode): the in-memory Map plays the same role.
+   *
+   * @param key  Identifier for the lock window. Include the tick timestamp
+   *             when used for periodic dedup so each tick has its own key.
+   * @param ttlMs  Time-to-live in milliseconds. Set to the cron interval
+   *             (or a bit longer) so a missed expiry doesn't block the
+   *             next tick.
+   */
+  async tryLock(key: string, ttlMs: number): Promise<boolean> {
+    if (this.redisWrite) {
+      // ioredis: `SET key value EX seconds NX` — atomic, returns "OK" on
+      // success or null if the key already exists.
+      const ttlSeconds = Math.max(1, Math.ceil(ttlMs / 1000));
+      const result = await this.redisWrite.set(
+        key,
+        "1",
+        "EX",
+        ttlSeconds,
+        "NX",
+      );
+      return result === "OK";
+    }
+
+    // In-process fallback. Track a per-key expiry; reject if still live.
+    const now = Date.now();
+    const existing = this.__tryLocks.get(key);
+    if (existing && existing > now) return false;
+    this.__tryLocks.set(key, now + ttlMs);
+    // Lazy GC so the map doesn't grow unbounded in long-lived processes.
+    if (this.__tryLocks.size > 1024) {
+      for (const [k, exp] of this.__tryLocks) {
+        if (exp <= now) this.__tryLocks.delete(k);
+      }
+    }
+    return true;
+  }
+
+  private __tryLocks = new Map<string, number>();
+
   // ── Cleanup ──────────────────────────────────────────────────────────
 
   async close(): Promise<void> {

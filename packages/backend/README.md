@@ -415,27 +415,34 @@ Environment variables validated at startup via Zod. `.env` files are auto-loaded
 | `RUN_SERVER`        | No       | `true`        | Register CRUD / custom routes / Socket.IO         |
 | `RUN_HOOKS`         | No       | `true`        | Run model lifecycle hooks                         |
 | `RUN_JOBS`          | No       | `false`       | `true` / `false` / `"name1,name2"` (workers)      |
+| `RUN_CRONS`         | No       | follows JOBS  | `true` / `false` / `"name1,name2"` (schedulers)   |
 | `SERVER`            | No       | --            | _Deprecated alias for_ `RUN_SERVER`               |
 | `DAEMON`            | No       | --            | _Deprecated: equivalent to_ `RUN_HOOKS=true RUN_JOBS=true` |
 
 ### Process roles
 
-The three `RUN_*` flags compose to give you four useful process shapes:
+The four `RUN_*` flags compose to give you useful process shapes:
 
-| Role            | `RUN_SERVER` | `RUN_HOOKS` | `RUN_JOBS` | Use case                                     |
-| --------------- | ------------ | ----------- | ---------- | -------------------------------------------- |
-| All-in-one      | `true`       | `true`      | `true`     | Dev, single-process deploys                  |
-| API only        | `true`       | `true`      | `false`    | Stateless HTTP/Socket.IO front-end           |
-| Worker only     | `false`      | `true`      | `true`     | Dedicated BullMQ consumer (all job names)    |
-| Named workers   | `false`      | `true`      | `panel,…`  | Per-job-fleet routing (GPU, mailer, etc.)    |
+| Role            | `RUN_SERVER` | `RUN_HOOKS` | `RUN_JOBS` | `RUN_CRONS` | Use case                                     |
+| --------------- | ------------ | ----------- | ---------- | ----------- | -------------------------------------------- |
+| All-in-one      | `true`       | `true`      | `true`     | `true`      | Dev, single-process deploys                  |
+| API only        | `true`       | `true`      | `false`    | `false`     | Stateless HTTP/Socket.IO front-end           |
+| Worker only     | `false`      | `true`      | `true`     | `true`      | Dedicated BullMQ consumer + cron host        |
+| Named workers   | `false`      | `true`      | `panel,…`  | `false`     | Per-job-fleet routing (GPU, mailer, etc.)    |
+| Cron host       | `false`      | `true`      | `false`    | `true`      | Tiny process that only fires scheduled tasks |
 
-`/<version>/health` is always served regardless of `RUN_SERVER`, so the
-worker process can still satisfy Cloud Run / k8s probes.
+`RUN_CRONS` defaults to follow `RUN_JOBS` (any process running jobs also
+schedules every cron). `/<version>/health` is always served regardless
+of `RUN_SERVER`, so the worker process can still satisfy Cloud Run / k8s
+probes.
 
 ### Per-job-name queues
 
 Each registered job is enqueued into its own BullMQ queue, named
-`${defaultName}:${jobName}` (e.g. `parcae:panel`, `parcae:post.index`).
+`${defaultName}-${jobName}` (e.g. `parcae-panel`, `parcae-post.index`).
+Colons in either component are collapsed to dashes because BullMQ v5
+rejects colons in queue names — the job-side identifier (`post:index`)
+keeps its original shape; only the derived queue name is sanitised.
 Workers subscribe to specific queues, so an operator can split workloads
 across machines without each worker pulling jobs it can't handle:
 
@@ -469,7 +476,7 @@ queue) can use BullMQ directly:
 import { Worker } from "bullmq";
 import { connection } from "./redis";
 
-new Worker("parcae:depth", processor, { connection, concurrency: 4 });
+new Worker("parcae-depth", processor, { connection, concurrency: 4 });
 ```
 
 > ⚠️ **Booleans are strict.** `RUN_SERVER=false` actually means false. The
@@ -498,7 +505,8 @@ drains the old queue.
 
 2. **External Workers/Queues** in your codebase that referenced the
    legacy queue name directly (e.g. `new Queue("parcae")`) need to
-   move to `new Queue("parcae:<jobname>")` or use `enqueue()` /
+   move to `new Queue("parcae-<jobname>")` (dash-separated — BullMQ
+   v5 rejects colons in queue names) or use `enqueue()` /
    `queue.queueNameFor("<jobname>")` instead.
 
 ## Exports

@@ -92,12 +92,18 @@ export class QueueService {
    * and let third-party consumers pick up specific jobs without colliding
    * with each other.
    *
+   * BullMQ v5 rejects colons in queue names, so any colons (from the
+   * namespace separator OR from a colon-style job name like `post:index`)
+   * are collapsed to dashes. Job names themselves keep their original
+   * shape — only the derived queue name is sanitised.
+   *
    * @example
-   * queueNameFor("panel")                    → "parcae:panel"
-   * queueNameFor("project-asset.image")      → "parcae:project-asset.image"
+   * queueNameFor("panel")                    → "parcae-panel"
+   * queueNameFor("project-asset.image")      → "parcae-project-asset.image"
+   * queueNameFor("post:index")               → "parcae-post-index"
    */
   queueNameFor(jobName: string): string {
-    return `${this.defaultName}:${jobName}`;
+    return `${this.defaultName}:${jobName}`.split(":").join("-");
   }
 
   private async build(url: string): Promise<void> {

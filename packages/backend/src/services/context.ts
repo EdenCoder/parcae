@@ -56,10 +56,16 @@ let _queue: QueueService | null = null;
 let _pubsub: PubSub | null = null;
 let _changeBus: ChangeBus | null = null;
 let _io: any = null;
-// Default: hooks run, server runs, jobs do not. Mirrors `resolveRuntimeFlags`
-// defaults so adapter callers see sensible behaviour if startup never ran
-// (mainly: unit tests that instantiate BackendAdapter directly).
-let _flags: RuntimeFlags = { server: true, hooks: true, jobs: false };
+// Default: hooks run, server runs, jobs and crons do not. Mirrors
+// `resolveRuntimeFlags` defaults so adapter callers see sensible behaviour
+// if startup never ran (mainly: unit tests that instantiate BackendAdapter
+// directly).
+let _flags: RuntimeFlags = {
+  server: true,
+  hooks: true,
+  jobs: false,
+  crons: false,
+};
 
 /** @internal — called by createApp() */
 export function _setServices(queue: QueueService, pubsub: PubSub): void {

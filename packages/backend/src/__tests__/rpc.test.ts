@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { route, getRoutes, clearRoutes } from "../routing/route";
 import { hook, getHooks, getHooksFor, clearHooks } from "../routing/hook";
 import { job, getJob, getJobs, clearJobs } from "../routing/job";
+import { cron, getCron, getCrons, clearCrons } from "../routing/cron";
 import { json, ok, error } from "../helpers";
 import { log } from "../logger";
 import { parseConfig, resolveRuntimeFlags } from "../config";
@@ -300,34 +301,132 @@ describe("resolveRuntimeFlags", () => {
   });
 });
 
+describe("cron registration", () => {
+  beforeEach(() => clearCrons());
+
+  it("registers a cron and returns the entry", () => {
+    const entry = cron("daily-digest", "0 7 * * *", () => {});
+    expect(entry.name).toBe("daily-digest");
+    expect(entry.pattern).toBe("0 7 * * *");
+    expect(getCrons().length).toBe(1);
+    expect(getCron("daily-digest")).toBe(entry);
+  });
+
+  it("supports per-cron options (overlap, timezone)", () => {
+    const entry = cron("metrics", "*/10 * * * *", () => {}, {
+      overlap: true,
+      timezone: "America/New_York",
+    });
+    expect(entry.options.overlap).toBe(true);
+    expect(entry.options.timezone).toBe("America/New_York");
+  });
+
+  it("rejects duplicate names", () => {
+    cron("only-once", "* * * * *", () => {});
+    expect(() => cron("only-once", "* * * * *", () => {})).toThrow(/duplicate/);
+  });
+
+  it("rejects empty name / pattern", () => {
+    expect(() => cron("", "* * * * *", () => {})).toThrow(/name is required/);
+    expect(() => cron("foo", "", () => {})).toThrow(/pattern is required/);
+  });
+
+  it("clearCrons() resets the registry between tests", () => {
+    cron("a", "* * * * *", () => {});
+    cron("b", "* * * * *", () => {});
+    expect(getCrons().length).toBe(2);
+    clearCrons();
+    expect(getCrons().length).toBe(0);
+  });
+});
+
+describe("resolveRuntimeFlags — RUN_CRONS", () => {
+  it("defaults to true when jobs are enabled", () => {
+    const cfg = parseConfig({
+      DATABASE_URL: "postgres://localhost/test",
+      RUN_JOBS: "true",
+    });
+    expect(resolveRuntimeFlags(cfg).crons).toBe(true);
+  });
+
+  it("defaults to false when jobs are disabled (server-only process)", () => {
+    const cfg = parseConfig({
+      DATABASE_URL: "postgres://localhost/test",
+      RUN_JOBS: "false",
+    });
+    expect(resolveRuntimeFlags(cfg).crons).toBe(false);
+  });
+
+  it("honours explicit RUN_CRONS=true / false / name-list", () => {
+    const t = parseConfig({
+      DATABASE_URL: "postgres://localhost/test",
+      RUN_CRONS: "true",
+    });
+    expect(resolveRuntimeFlags(t).crons).toBe(true);
+
+    const f = parseConfig({
+      DATABASE_URL: "postgres://localhost/test",
+      RUN_CRONS: "false",
+    });
+    expect(resolveRuntimeFlags(f).crons).toBe(false);
+
+    const named = parseConfig({
+      DATABASE_URL: "postgres://localhost/test",
+      RUN_CRONS: "daily-digest, cleanup",
+    });
+    const flags = resolveRuntimeFlags(named).crons;
+    expect(flags).toBeInstanceOf(Set);
+    expect([...(flags as ReadonlySet<string>)]).toEqual([
+      "daily-digest",
+      "cleanup",
+    ]);
+  });
+
+  it("RUN_CRONS overrides the jobs-derived default", () => {
+    const cfg = parseConfig({
+      DATABASE_URL: "postgres://localhost/test",
+      RUN_JOBS: "true",
+      RUN_CRONS: "false",
+    });
+    expect(resolveRuntimeFlags(cfg).jobs).toBe(true);
+    expect(resolveRuntimeFlags(cfg).crons).toBe(false);
+  });
+});
+
 describe("QueueService — per-job-name queue routing", () => {
   // No Redis URL → no connection; we're only exercising the naming helpers
   // and the configured defaultName, which work without a backing Redis.
   it("derives per-job queue names with the default namespace", () => {
     const q = new QueueService();
     expect(q.defaultName).toBe("parcae");
-    expect(q.queueNameFor("panel")).toBe("parcae:panel");
-    expect(q.queueNameFor("post.index")).toBe("parcae:post.index");
-    // Job names with colons (legacy/dollhouse convention) are preserved
-    // — BullMQ allows colons in queue names, only jobIds reject them.
+    expect(q.queueNameFor("panel")).toBe("parcae-panel");
+    expect(q.queueNameFor("post.index")).toBe("parcae-post.index");
+    // Dot-notation job names (the dollhouse convention) survive intact.
     expect(q.queueNameFor("project-asset.panel.process")).toBe(
-      "parcae:project-asset.panel.process",
+      "parcae-project-asset.panel.process",
     );
+  });
+
+  it("collapses colons in job names — BullMQ v5 rejects them in queues", () => {
+    const q = new QueueService();
+    // The `post:index` convention from older parcae docs/examples still
+    // works at the `enqueue("post:index", …)` layer; only the derived
+    // BullMQ queue name is sanitised.
+    expect(q.queueNameFor("post:index")).toBe("parcae-post-index");
+    expect(q.queueNameFor("a:b:c")).toBe("parcae-a-b-c");
   });
 
   it("honours a custom defaultName", () => {
     const q = new QueueService({ name: "myapp" });
     expect(q.defaultName).toBe("myapp");
-    expect(q.queueNameFor("panel")).toBe("myapp:panel");
+    expect(q.queueNameFor("panel")).toBe("myapp-panel");
   });
 
-  it("get() with no name still returns the legacy default queue", () => {
-    // Without REDIS_URL we can't actually instantiate Queues — that's the
-    // expected fallback. The important behaviour: `get()` defaults to the
-    // bare `defaultName`, which is the queue the transitional fallback
-    // worker subscribes to (see app.ts Step 15).
+  it("get() returns null without a Redis connection", () => {
+    // Without REDIS_URL we can't instantiate Queues — confirms the safe
+    // fallback so unit tests don't accidentally open Redis sockets.
     const q = new QueueService();
     expect(q.get()).toBeNull();
-    expect(q.get("parcae:panel")).toBeNull();
+    expect(q.get("parcae-panel")).toBeNull();
   });
 });

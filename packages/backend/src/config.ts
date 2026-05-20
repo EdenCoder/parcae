@@ -115,15 +115,33 @@ export const configSchema = z.object({
   /**
    * Whether to start BullMQ workers for background jobs.
    *
-   *   - `"true"` (or `true`): start a single worker that handles all registered job names.
+   *   - `"true"` (or `true`): subscribe to every registered job's per-name queue.
    *   - `"false"` (or unset): do not start any worker. Jobs can still be enqueued
    *     from this process; they sit in the queue until a worker process consumes them.
-   *   - `"name1,name2,..."`: reserved syntax for per-name worker routing. Parsed but
-   *     not yet implemented — currently behaves the same as `"true"` with a warning.
+   *   - `"name1,name2,..."`: subscribe only to the listed job names. Useful for
+   *     splitting workloads across worker fleets, or routing GPU-heavy jobs to a
+   *     dedicated cluster.
    *
    * Default: `"false"`.
    */
   RUN_JOBS: z.string().optional(),
+
+  /**
+   * Whether to schedule in-process cron tasks registered via `cron()`.
+   * Multi-instance safety is built in: each tick acquires a distributed
+   * try-lock keyed on the cron name + fire timestamp so only one process
+   * runs the handler per tick.
+   *
+   *   - `"true"` (or `true`): schedule every registered cron.
+   *   - `"false"` (or unset): don't schedule any cron on this process.
+   *   - `"name1,name2,..."`: schedule only the listed crons. Useful for
+   *     pinning specific schedules to specific worker fleets (e.g. a
+   *     "heavy nightly report" cron lives on a beefier instance).
+   *
+   * Default: follows `RUN_JOBS`. If `RUN_JOBS != false` the default is
+   * `true` (run all crons), otherwise `false`.
+   */
+  RUN_CRONS: z.string().optional(),
 
   /**
    * @deprecated Use `RUN_SERVER` instead. Kept for backward compatibility.
@@ -159,7 +177,10 @@ export type Config = z.infer<typeof configSchema>;
  *   - `server`: register CRUD / custom routes / Socket.IO RPC?
  *   - `hooks`: invoke model lifecycle hooks?
  *   - `jobs`: start BullMQ workers? `true` = handle all, `false` = none,
- *     `Set<string>` = handle only the named jobs (reserved; today behaves as `true`).
+ *     `Set<string>` = handle only the named jobs.
+ *   - `crons`: schedule in-process cron tasks? Same shape as `jobs`.
+ *     Defaults to following `jobs` (any process running jobs also runs
+ *     all crons; pure server processes don't).
  *
  * @see resolveRuntimeFlags
  */
@@ -167,18 +188,25 @@ export interface RuntimeFlags {
   server: boolean;
   hooks: boolean;
   jobs: true | false | ReadonlySet<string>;
+  crons: true | false | ReadonlySet<string>;
 }
 
 /**
- * Parse the `RUN_JOBS` env value into `true | false | Set<name>`.
- * Comma-list is reserved for future per-name routing; today the worker
- * still accepts all job names and logs a warning.
+ * Parse a `RUN_JOBS` / `RUN_CRONS`-style env value into
+ * `true | false | Set<name>`. Both flags share the syntax:
+ *
+ *   "true" / "1" / "yes" / "on"   → true
+ *   "false" / "0" / "no" / "off"  → false
+ *   "" / undefined                → false
+ *   "name1,name2"                  → Set { "name1", "name2" }
  */
-function parseRunJobs(value: string | undefined): true | false | Set<string> {
+function parseNameList(value: string | undefined): true | false | Set<string> {
   if (value === undefined || value === "") return false;
   const trimmed = value.trim().toLowerCase();
-  if (trimmed === "true" || trimmed === "1") return true;
-  if (trimmed === "false" || trimmed === "0") return false;
+  if (trimmed === "true" || trimmed === "1" || trimmed === "yes" || trimmed === "on")
+    return true;
+  if (trimmed === "false" || trimmed === "0" || trimmed === "no" || trimmed === "off")
+    return false;
   const names = value
     .split(",")
     .map((s) => s.trim())
@@ -236,7 +264,7 @@ export function resolveRuntimeFlags(
   // ── jobs ───────────────────────────────────────────────────────────
   let jobs: true | false | ReadonlySet<string>;
   if (config.RUN_JOBS !== undefined) {
-    jobs = parseRunJobs(config.RUN_JOBS);
+    jobs = parseNameList(config.RUN_JOBS);
   } else if (config.DAEMON !== undefined) {
     // We may have already warned above; don't warn twice. DAEMON=true → jobs on.
     jobs = config.DAEMON;
@@ -244,7 +272,19 @@ export function resolveRuntimeFlags(
     jobs = false;
   }
 
-  return { server, hooks, jobs };
+  // ── crons ──────────────────────────────────────────────────────────
+  // Default: any process opted in to jobs also runs every cron. Pure
+  // server processes (RUN_JOBS=false) leave crons off so we don't fire
+  // scheduled work from the HTTP-only fleet. Operators can override with
+  // explicit RUN_CRONS=true / false / name-list.
+  let crons: true | false | ReadonlySet<string>;
+  if (config.RUN_CRONS !== undefined) {
+    crons = parseNameList(config.RUN_CRONS);
+  } else {
+    crons = jobs !== false;
+  }
+
+  return { server, hooks, jobs, crons };
 }
 
 /**
