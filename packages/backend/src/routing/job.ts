@@ -70,6 +70,14 @@ export function clearJobs(): void {
 /**
  * Register a background job processor.
  *
+ * Registration is idempotent on `name`: if the same name is registered
+ * more than once (which happens in real codebases when a `jobs/foo.ts`
+ * file is imported as a side effect by something in `hooks/` or
+ * `controllers/` _and then_ discovered directly by the auto-discovery
+ * scan), the latest registration wins. Without this guard you'd end up
+ * with N BullMQ Worker instances per job after the per-queue routing
+ * change, each duplicating the Redis traffic.
+ *
  * ```typescript
  * job("post:index", async ({ data }) => {
  *   const post = await Post.findById(data.postId);
@@ -87,6 +95,11 @@ export function job(
   options: JobOptions = {},
 ): JobEntry {
   const entry: JobEntry = { name, handler, options };
-  registeredJobs.push(entry);
+  const existingIdx = registeredJobs.findIndex((j) => j.name === name);
+  if (existingIdx >= 0) {
+    registeredJobs[existingIdx] = entry;
+  } else {
+    registeredJobs.push(entry);
+  }
   return entry;
 }

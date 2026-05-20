@@ -182,10 +182,22 @@ async function discoverModels(dir: string): Promise<ModelConstructor[]> {
 
 /**
  * Auto-discover and import all .ts/.js files from a directory (recursively).
- * Files self-register by calling route.*, hook.*, job() at import time.
- * Like Next.js — just put files in the directory, they're auto-loaded.
+ * Files self-register by calling route.*, hook.*, job(), cron() at import
+ * time. Like Next.js — just put files in the directory, they're auto-loaded.
+ *
+ * The cache (second arg) survives across multiple discoverAndImport calls
+ * so we don't import the same canonical file twice when the same physical
+ * file shows up via different scans — e.g. when `hooks/foo.ts` does a
+ * side-effect import of `jobs/asset/bar.ts` and we then scan `jobs/`
+ * directly. tsx's path normalisation is just inconsistent enough that
+ * Node's own module cache can't catch this; carrying our own canonical-
+ * path Set is the cheap defensive fix.
  */
-async function discoverAndImport(dir: string, label: string): Promise<number> {
+async function discoverAndImport(
+  dir: string,
+  label: string,
+  importedFiles: Set<string>,
+): Promise<number> {
   const absDir = resolve(dir);
   if (!existsSync(absDir)) return 0;
 
@@ -202,6 +214,17 @@ async function discoverAndImport(dir: string, label: string): Promise<number> {
     const filePath = join(absDir, entryStr);
     const stat = statSync(filePath);
     if (!stat.isFile()) continue;
+
+    if (importedFiles.has(filePath)) {
+      // Already imported (probably via a side-effect chain from an
+      // earlier scan). Skip the redundant import — re-importing isn't
+      // a no-op for files whose side effects include registry pushes
+      // (`job()`, `hook()`, `cron()`), and tsx's module cache doesn't
+      // always dedupe imports keyed by different absolute paths that
+      // resolve to the same canonical file.
+      continue;
+    }
+    importedFiles.add(filePath);
 
     try {
       await import(filePath);
@@ -652,9 +675,15 @@ export function createApp(config: AppConfig): ParcaeApp {
         config.jobs,
         config.crons,
       ].filter((d): d is string => typeof d === "string");
+      // Shared across every scan in this app so a file pulled in via
+      // a side-effect chain (e.g. `hooks/x.ts` imports `jobs/y.ts`)
+      // isn't imported again when its own dir is scanned. Critical for
+      // registry pushes (`job()`, `hook()`, `cron()`) since re-running
+      // them creates duplicate entries.
+      const importedFiles = new Set<string>();
       let totalFiles = 0;
       for (const dir of dirs) {
-        totalFiles += await discoverAndImport(dir, "module");
+        totalFiles += await discoverAndImport(dir, "module", importedFiles);
       }
 
       const routesAfter = getRoutes().length;
