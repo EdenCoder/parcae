@@ -426,17 +426,80 @@ The three `RUN_*` flags compose to give you four useful process shapes:
 | --------------- | ------------ | ----------- | ---------- | -------------------------------------------- |
 | All-in-one      | `true`       | `true`      | `true`     | Dev, single-process deploys                  |
 | API only        | `true`       | `true`      | `false`    | Stateless HTTP/Socket.IO front-end           |
-| Worker only     | `false`      | `true`      | `true`     | Dedicated BullMQ consumer                    |
-| Named workers   | `false`      | `true`      | `panel,…`  | (reserved — per-name routing TBD)            |
+| Worker only     | `false`      | `true`      | `true`     | Dedicated BullMQ consumer (all job names)    |
+| Named workers   | `false`      | `true`      | `panel,…`  | Per-job-fleet routing (GPU, mailer, etc.)    |
 
 `/<version>/health` is always served regardless of `RUN_SERVER`, so the
 worker process can still satisfy Cloud Run / k8s probes.
+
+### Per-job-name queues
+
+Each registered job is enqueued into its own BullMQ queue, named
+`${defaultName}:${jobName}` (e.g. `parcae:panel`, `parcae:post.index`).
+Workers subscribe to specific queues, so an operator can split workloads
+across machines without each worker pulling jobs it can't handle:
+
+```
+RUN_JOBS=true              # subscribe to every registered job's queue
+RUN_JOBS=panel,image       # only handle panel + image jobs on this fleet
+RUN_JOBS=false             # don't process any jobs (enqueue still works)
+```
+
+Each worker uses its own per-job `concurrency` from
+`job(name, handler, { concurrency })`. **Total in-flight work is the
+sum of opted-in concurrencies**, not the max — that was the
+pre-routing footgun. So a worker with `panel=16 image=32 voice=32` is
+running up to **80** concurrent BullMQ jobs, not 32.
+
+Unknown names in `RUN_JOBS` (typos) log a warning at startup but don't
+hard-fail — useful when staged rollouts mean a job hasn't been
+registered yet in this version.
+
+> ⚠️ **Hard cutover from pre-routing versions.** No worker subscribes to
+> the bare `${defaultName}` queue any more. If you're upgrading across
+> this boundary, drain any in-flight legacy jobs **before** deploying
+> (the BullMQ CLI, `redis-cli DEL bull:<name>:*`, or a one-off script).
+> After the upgrade, any jobs still sitting in `${defaultName}` will
+> stay there until you clean them up manually.
+
+Third-party consumers (e.g. a GPU pod processing only the `depth`
+queue) can use BullMQ directly:
+
+```typescript
+import { Worker } from "bullmq";
+import { connection } from "./redis";
+
+new Worker("parcae:depth", processor, { connection, concurrency: 4 });
+```
 
 > ⚠️ **Booleans are strict.** `RUN_SERVER=false` actually means false. The
 > earlier `z.coerce.boolean()` coercion treated _any non-empty string as
 > true_, which silently broke `SERVER=false` and `DAEMON=false`. We now
 > accept `{true,false,1,0,yes,no,on,off}` (case-insensitive) and reject
 > the rest with a clear error at startup.
+
+### Migrating from pre-0.8.2
+
+Pre-0.8.2 versions enqueued every job into a single shared queue
+(named `${JOB_QUEUE_NAME}`, default `parcae`). The new version routes
+each job to its own queue. **Hard cutover** — no transitional worker
+drains the old queue.
+
+1. **Before deploying**, drain any in-flight jobs from the legacy
+   queue. The cheapest way is to let it idle until empty:
+
+       redis-cli LLEN bull:parcae:wait        # count waiting jobs
+       redis-cli LLEN bull:parcae:active      # in-flight
+       redis-cli ZCARD bull:parcae:delayed    # scheduled / retry-backoff
+
+   Or, if you don't care about the in-flight work, nuke it:
+
+       redis-cli --scan --pattern 'bull:parcae:*' | xargs redis-cli DEL
+
+2. **External Workers/Queues** in your codebase that referenced the
+   legacy queue name directly (e.g. `new Queue("parcae")`) need to
+   move to `new Queue("parcae:<jobname>")` or use `enqueue()` /
+   `queue.queueNameFor("<jobname>")` instead.
 
 ## Exports
 

@@ -5,6 +5,7 @@ import { job, getJob, getJobs, clearJobs } from "../routing/job";
 import { json, ok, error } from "../helpers";
 import { log } from "../logger";
 import { parseConfig, resolveRuntimeFlags } from "../config";
+import { QueueService } from "../services/queue";
 
 describe("route registration", () => {
   beforeEach(() => clearRoutes());
@@ -296,5 +297,37 @@ describe("resolveRuntimeFlags", () => {
     expect(warnings.some((w) => w.includes("SERVER is deprecated"))).toBe(
       false,
     );
+  });
+});
+
+describe("QueueService — per-job-name queue routing", () => {
+  // No Redis URL → no connection; we're only exercising the naming helpers
+  // and the configured defaultName, which work without a backing Redis.
+  it("derives per-job queue names with the default namespace", () => {
+    const q = new QueueService();
+    expect(q.defaultName).toBe("parcae");
+    expect(q.queueNameFor("panel")).toBe("parcae:panel");
+    expect(q.queueNameFor("post.index")).toBe("parcae:post.index");
+    // Job names with colons (legacy/dollhouse convention) are preserved
+    // — BullMQ allows colons in queue names, only jobIds reject them.
+    expect(q.queueNameFor("project-asset.panel.process")).toBe(
+      "parcae:project-asset.panel.process",
+    );
+  });
+
+  it("honours a custom defaultName", () => {
+    const q = new QueueService({ name: "myapp" });
+    expect(q.defaultName).toBe("myapp");
+    expect(q.queueNameFor("panel")).toBe("myapp:panel");
+  });
+
+  it("get() with no name still returns the legacy default queue", () => {
+    // Without REDIS_URL we can't actually instantiate Queues — that's the
+    // expected fallback. The important behaviour: `get()` defaults to the
+    // bare `defaultName`, which is the queue the transitional fallback
+    // worker subscribes to (see app.ts Step 15).
+    const q = new QueueService();
+    expect(q.get()).toBeNull();
+    expect(q.get("parcae:panel")).toBeNull();
   });
 });

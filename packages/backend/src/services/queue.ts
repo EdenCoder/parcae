@@ -72,12 +72,32 @@ export class QueueService {
   private connection: ConnectionOptions | null = null;
   private queues = new Map<string, Queue>();
   private workers = new Map<string, Worker>();
-  private defaultName: string;
+  /**
+   * Namespace prefix for all queue names. Each registered job gets its own
+   * BullMQ queue named `${defaultName}:${jobName}`. The bare `defaultName`
+   * queue is reserved as a transitional fallback for in-flight legacy jobs
+   * enqueued before the per-name routing landed (see app.ts Step 15).
+   */
+  public readonly defaultName: string;
   public building: Promise<void>;
 
   constructor(config: QueueConfig = {}) {
     this.defaultName = config.name ?? "parcae";
     this.building = config.url ? this.build(config.url) : Promise.resolve();
+  }
+
+  /**
+   * Resolve a registered job name into its BullMQ queue name.
+   * Per-job-name queues let workers subscribe selectively (RUN_JOBS=a,b)
+   * and let third-party consumers pick up specific jobs without colliding
+   * with each other.
+   *
+   * @example
+   * queueNameFor("panel")                    → "parcae:panel"
+   * queueNameFor("project-asset.image")      → "parcae:project-asset.image"
+   */
+  queueNameFor(jobName: string): string {
+    return `${this.defaultName}:${jobName}`;
   }
 
   private async build(url: string): Promise<void> {

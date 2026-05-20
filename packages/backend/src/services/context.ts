@@ -110,6 +110,10 @@ export interface EnqueueOptions {
 /**
  * Enqueue a background job. Deduplicates by jobId if provided.
  *
+ * Each job name maps to its own BullMQ queue (`${defaultName}:${name}`), so
+ * workers can subscribe selectively (`RUN_JOBS=panel,image`) and external
+ * consumers can pick up specific jobs without seeing unrelated work.
+ *
  * ```typescript
  * import { enqueue } from "@parcae/backend";
  *
@@ -129,7 +133,10 @@ export async function enqueue(
     return false;
   }
 
-  const queue = _queue.get();
+  // Route by job name into a dedicated queue. The bare `defaultName` queue
+  // is reserved for transitional legacy traffic — never enqueue there.
+  const queueName = _queue.queueNameFor(name);
+  const queue = _queue.get(queueName);
   if (!queue) {
     log.warn(`enqueue("${name}"): queue not available`);
     return false;

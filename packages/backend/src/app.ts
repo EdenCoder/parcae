@@ -608,65 +608,95 @@ export function createApp(config: AppConfig): ParcaeApp {
         );
       }
 
-      // ── Step 15: Start job workers ─────────────────────────────────
-      // Only register a BullMQ worker when RUN_JOBS allows it. When `jobs` is
-      // a `Set<string>` we accept the comma-list API surface but currently
-      // process every name (warning once) — true per-name routing requires
-      // moving each job to its own BullMQ queue and is tracked separately.
+      // ── Step 15: Start per-job-name BullMQ workers ─────────────────
+      //
+      // Each registered job gets its own BullMQ queue named
+      // `${defaultName}:${jobName}`. Workers subscribe to specific queues:
+      //
+      //   - RUN_JOBS=true    → subscribe to every registered job's queue
+      //   - RUN_JOBS=false   → don't subscribe to anything (enqueue still
+      //                        works; the queues just sit waiting)
+      //   - RUN_JOBS=a,b,c   → subscribe only to those job names. Useful
+      //                        for splitting workloads across worker
+      //                        fleets, or routing GPU-heavy jobs to a
+      //                        dedicated cluster.
+      //
+      // Per-job concurrency comes from `job(name, handler, { concurrency })`
+      // — each worker uses its own value, so total in-flight work is the
+      // SUM of opted-in concurrencies (not the max, which was the
+      // pre-change footgun).
+      //
+      // Hard cutover: no worker subscribes to the bare `defaultName` queue,
+      // so any jobs left there by pre-routing versions of @parcae/backend
+      // will be stranded. Operators upgrading across this boundary should
+      // drain the legacy queue (`bullmq` CLI / `redis-cli DEL bull:<name>`)
+      // before deploying.
       const registeredJobs = getJobs();
       const wantsAnyJobs = flags.jobs !== false;
-      if (
-        wantsAnyJobs &&
-        registeredJobs.length > 0 &&
-        queue.get()
-      ) {
-        if (flags.jobs instanceof Set) {
-          const unknown = [...flags.jobs].filter(
+
+      if (wantsAnyJobs && registeredJobs.length > 0 && queue.get()) {
+        // Capture into a local so TS can narrow inside the closure below.
+        const jobsFlag = flags.jobs;
+
+        const shouldHandle = (jobName: string): boolean => {
+          if (jobsFlag === true) return true;
+          if (jobsFlag instanceof Set) return jobsFlag.has(jobName);
+          return false;
+        };
+
+        // Validate the name list against the registered jobs so operators
+        // catch typos at startup instead of wondering why a job never runs.
+        if (jobsFlag instanceof Set) {
+          const unknown = [...jobsFlag].filter(
             (name) => !registeredJobs.some((j) => j.name === name),
           );
           if (unknown.length > 0) {
             log.warn(
               `[jobs] RUN_JOBS references unknown job name(s): ${unknown.join(", ")} — ` +
-                `they will not be processed.`,
+                `nothing will pick them up from this process.`,
             );
           }
-          log.warn(
-            "[jobs] RUN_JOBS=<comma-list> per-name routing is not yet implemented — " +
-              "this worker will accept all registered job names. " +
-              "See @parcae/backend env docs.",
-          );
         }
 
-        const defaultQueue = queue.get()!;
-        const maxConcurrency = Math.max(
-          1,
-          ...registeredJobs.map((j) => j.options?.concurrency ?? 1),
-        );
-        queue.createWorker(
-          defaultQueue.name,
-          async (bullJob) => {
-            const jobEntry = registeredJobs.find(
-              (j) => j.name === bullJob.name,
-            );
-            if (!jobEntry) {
-              log.warn(`No handler for job "${bullJob.name}"`);
-              return;
-            }
-            return jobEntry.handler({
-              data: bullJob.data,
-              bullJob,
-              attempt: bullJob.attemptsMade,
-            });
-          },
-          maxConcurrency,
-        );
-        log.info(
-          `Started BullMQ worker on queue "${defaultQueue.name}" — ` +
-            `max concurrency ${maxConcurrency}, ${registeredJobs.length} handler(s)`,
-        );
+        const started: Array<{ name: string; concurrency: number }> = [];
+        const skipped: string[] = [];
+
+        for (const jobEntry of registeredJobs) {
+          if (!shouldHandle(jobEntry.name)) {
+            skipped.push(jobEntry.name);
+            continue;
+          }
+          const concurrency = jobEntry.options?.concurrency ?? 1;
+          const queueName = queue.queueNameFor(jobEntry.name);
+          queue.createWorker(
+            queueName,
+            async (bullJob) => {
+              return jobEntry.handler({
+                data: bullJob.data,
+                bullJob,
+                attempt: bullJob.attemptsMade,
+              });
+            },
+            concurrency,
+          );
+          started.push({ name: jobEntry.name, concurrency });
+        }
+
+        if (started.length > 0) {
+          const total = started.reduce((s, j) => s + j.concurrency, 0);
+          log.info(
+            `Started ${started.length} BullMQ worker(s) — total concurrency ${total} ` +
+              `(${started.map((j) => `${j.name}=${j.concurrency}`).join(", ")})`,
+          );
+        }
+        if (skipped.length > 0) {
+          log.info(
+            `Skipped ${skipped.length} job(s) not selected by RUN_JOBS: ${skipped.join(", ")}`,
+          );
+        }
       } else if (!wantsAnyJobs && registeredJobs.length > 0) {
         log.info(
-          `Skipped starting BullMQ worker (RUN_JOBS=false) — ` +
+          `Skipped starting BullMQ workers (RUN_JOBS=false) — ` +
             `${registeredJobs.length} job(s) discovered but unhandled by this process`,
         );
       }
