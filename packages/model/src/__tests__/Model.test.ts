@@ -355,6 +355,31 @@ describe("Model", () => {
       expect(adapter.patched.length).toBe(0);
     });
 
+    // DOL-1040: the patch ack path used to `structuredClone` the
+    // whole snapshot before applying ops, then reassign the cloned
+    // copy back to the symbol slot. The snapshot is private and the
+    // public `__serverSnapshot` getter is documented `Readonly`, so
+    // there's no consumer that needs the immutability — the defensive
+    // clone was pure waste. After the fix we mutate in place; this
+    // test pins that behaviour so we don't silently regress it.
+    it("mutates __serverSnapshot in place across patches — identity stable, no allocation", async () => {
+      const post = Post.create({ title: "x", views: 0 });
+      await post.save();
+      const before = (post as any).__serverSnapshot;
+      await post.patch([{ op: "replace", path: "/title", value: "y" }]);
+      await post.patch([{ op: "replace", path: "/views", value: 7 }]);
+      const after = (post as any).__serverSnapshot;
+      // Same object reference — no defensive structuredClone allocation
+      // happened during the ack.
+      expect(after).toBe(before);
+      // Values still tracked correctly so a subsequent flush is a no-op.
+      expect(after.title).toBe("y");
+      expect(after.views).toBe(7);
+      adapter.patched.length = 0;
+      await post.flush();
+      expect(adapter.patched.length).toBe(0);
+    });
+
     // Regression — DOL-553. A patch like
     // `replace /tags/0/text` on a model with no prior `tags` field
     // used to auto-vivify `tags` as `{}`, leaving the field as

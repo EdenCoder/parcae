@@ -229,6 +229,42 @@ function ensureIntermediates(
   }
 }
 
+/**
+ * Produce a JSON-safe deep copy of `value` where `Date` instances are
+ * serialised to ISO strings and arrays/objects are recursively cloned.
+ *
+ * Used by `_doFlush()` to feed `fast-json-patch.compare()` a Date-free
+ * structure. Without this coercion, `compare()` walks each `Date` as a
+ * string-iterable and emits ~24 char-level `add` ops per Date field
+ * instead of detecting equality — DOL-412 fixed that bug by JSON-
+ * round-tripping both sides; DOL-1040 swaps the round-trip for this
+ * single-pass walker, dropping two string-allocation passes per
+ * flush.
+ *
+ * Semantics match `JSON.parse(JSON.stringify(value))`'s own-enumerable
+ * traversal (we use `Object.keys` not `for...in` so prototype-chain
+ * properties stay absent from the clone, same as the JSON round-trip).
+ */
+function dateSafeClone(value: any): any {
+  if (value === null || value === undefined) return value;
+  if (value instanceof Date) return value.toISOString();
+  if (Array.isArray(value)) {
+    const out = new Array(value.length);
+    for (let i = 0; i < value.length; i++) {
+      out[i] = dateSafeClone(value[i]);
+    }
+    return out;
+  }
+  if (typeof value === "object") {
+    const out: Record<string, any> = {};
+    for (const key of Object.keys(value)) {
+      out[key] = dateSafeClone((value as any)[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
 /** Return the set of top-level keys touched by a batch of ops. */
 function topLevelKeys(ops: readonly PatchOp[]): Set<string> {
   const keys = new Set<string>();
@@ -809,10 +845,17 @@ export class Model extends EventEmitter {
       await this[SYM_ADAPTER].patch(this, ops);
 
       // Replay ops onto the snapshot so flush() won't re-emit them.
-      const serverSnap = structuredClone(this[SYM_SNAPSHOT]);
-      ensureIntermediates(serverSnap, ops);
-      applyPatch(serverSnap, ops, false, true);
-      this[SYM_SNAPSHOT] = serverSnap;
+      //
+      // We mutate the existing snapshot in place rather than cloning
+      // (DOL-1040). `SYM_SNAPSHOT` is Symbol-keyed and only exposed
+      // via the `__serverSnapshot` getter that's typed `Readonly` —
+      // no external consumer can hold a reference that needs the
+      // pre-patch view. On a 500KB Scenecode project the old
+      // structuredClone was 3–5 ms of main-thread CPU per patch;
+      // mutating in place reclaims that.
+      const snapshot = this[SYM_SNAPSHOT];
+      ensureIntermediates(snapshot, ops);
+      applyPatch(snapshot, ops, false, true);
 
       this.emit("patched", this);
     } finally {
@@ -911,16 +954,25 @@ export class Model extends EventEmitter {
    * delegates to `patch()`. Callers must ensure serialization via
    * `flush()`'s `SYM_FLUSH_INFLIGHT` guard. */
   private async _doFlush(): Promise<void> {
-    const strip = (data: Record<string, any>): Record<string, any> => {
+    // Strip framework-managed columns AND coerce Date instances to
+    // ISO strings in one pass — see the file-level `dateSafeClone`
+    // for the why. Previously this was a separate `strip()` (one
+    // walk) followed by `JSON.parse(JSON.stringify(...))` (one
+    // walk + two string allocations) per side. The combined helper
+    // collapses to one recursive walk per side and skips the
+    // string allocations entirely (DOL-1040).
+    const stripAndDateClone = (
+      data: Record<string, any>,
+    ): Record<string, any> => {
       const out: Record<string, any> = {};
-      for (const [k, v] of Object.entries(data)) {
-        if (SYSTEM_DATA_KEYS.has(k)) continue;
-        out[k] = v;
+      for (const key of Object.keys(data)) {
+        if (SYSTEM_DATA_KEYS.has(key)) continue;
+        out[key] = dateSafeClone((data as any)[key]);
       }
       return out;
     };
-    const snap = JSON.parse(JSON.stringify(strip(this[SYM_SNAPSHOT] ?? {})));
-    const current = JSON.parse(JSON.stringify(strip(this.__data)));
+    const snap = stripAndDateClone(this[SYM_SNAPSHOT] ?? {});
+    const current = stripAndDateClone(this.__data);
     const ops = compare(snap, current) as unknown as PatchOp[];
     if (ops.length === 0) return;
     return this.patch(ops);
