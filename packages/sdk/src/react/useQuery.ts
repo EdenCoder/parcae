@@ -127,6 +127,30 @@ const GC_DELAY = 60_000;
 const EMPTY: any[] = [];
 const INITIAL_HASH = "L"; // loading=true, no items
 
+/**
+ * Drop every cache entry whose key was generated for a different
+ * user than `currentUserId`. Used on auth transitions
+ * (sign-out → `null`; user switch → new userId) to evict stale
+ * entries that belonged to the previous session BEFORE the 60s GC
+ * timer would otherwise reach them.
+ *
+ * Cache keys are `${modelType}:${userId ?? "anon"}:${JSON.stringify(steps)}`,
+ * so the prior-user segment is exactly `:${prevUserId}:`. We don't
+ * touch entries for the current user or for explicitly-anonymous
+ * (`:anon:`) chains, since those belong to ongoing consumers.
+ */
+function purgeCacheForUser(prevUserId: string | null): void {
+  if (prevUserId === null) return;
+  const needle = `:${prevUserId}:`;
+  for (const [key, entry] of cache) {
+    if (!key.includes(needle)) continue;
+    entry.dispose?.();
+    if (entry.gcTimer) clearTimeout(entry.gcTimer);
+    if (entry.retryTimer) clearTimeout(entry.retryTimer);
+    cache.delete(key);
+  }
+}
+
 const MAX_RETRIES = 3;
 const RETRY_DELAYS = [1_000, 3_000, 10_000];
 
@@ -1331,6 +1355,11 @@ export async function prefetch<T>(
       doFetch(key, entry, chain as any, client);
     }
   });
+}
+
+/** @internal — exposed so the auth gate can drive evictions. */
+export function _purgeCacheForUser(prevUserId: string | null): void {
+  purgeCacheForUser(prevUserId);
 }
 
 /** @internal */

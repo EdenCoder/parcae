@@ -5,6 +5,7 @@ import { createClient } from "../client";
 import type { ParcaeClient, ClientConfig } from "../client";
 import type { AuthClientAdapter } from "../auth-adapter";
 import { ParcaeContext } from "./context";
+import { _purgeCacheForUser } from "./useQuery";
 import { log } from "../log";
 
 export interface ParcaeProviderProps {
@@ -57,6 +58,27 @@ export const ParcaeProvider: React.FC<ParcaeProviderProps> = ({
     // Init adapter with the backend URL
     auth.init(url || "");
 
+    // Belt-and-suspenders cache eviction on user transitions
+    // (DOL-1037 prefetch safety). When userId changes — sign-out to
+    // null, or sign-in as a new user — drop every `useQuery` cache
+    // entry that was keyed under the prior userId. Without this,
+    // entries linger for the 60s GC window after the session ends.
+    // Not a security issue (the keys differ across users so the
+    // stale data isn't reachable from the new session) but cleans
+    // up memory promptly and shortens the privacy window.
+    const transport: any = client.transport;
+    let lastUserId: string | null =
+      transport?.auth?.state?.userId ?? null;
+    const unsubGate: undefined | (() => void) =
+      transport?.auth?.subscribe?.(() => {
+        const nowUserId: string | null =
+          transport?.auth?.state?.userId ?? null;
+        if (lastUserId !== null && nowUserId !== lastUserId) {
+          _purgeCacheForUser(lastUserId);
+        }
+        lastUserId = nowUserId;
+      });
+
     // Resolve session and authenticate
     const doAuth = async () => {
       try {
@@ -77,7 +99,10 @@ export const ParcaeProvider: React.FC<ParcaeProviderProps> = ({
       client.authenticate(token).catch(() => {});
     });
 
-    return unsub;
+    return () => {
+      unsub();
+      unsubGate?.();
+    };
   }, [auth, client, url]);
 
   // On socket reconnect, re-resolve session via auth adapter

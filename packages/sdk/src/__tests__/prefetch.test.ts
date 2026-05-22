@@ -279,3 +279,56 @@ describe("prefetch", () => {
     ).rejects.toThrow(/__modelType/);
   });
 });
+
+describe("_purgeCacheForUser (auth-transition cache eviction)", () => {
+  beforeEach(() => useQueryTest.resetCache());
+  afterEach(() => useQueryTest.resetCache());
+
+  it("drops only entries whose key includes the prior userId", async () => {
+    // Prefetch one chain under userA and one under userB.
+    const chainA = makeChain({
+      results: [{ id: "p-a" }],
+      queryHash: "h-a",
+    });
+    const chainB = makeChain({
+      results: [{ id: "p-b" }],
+      queryHash: "h-b",
+    });
+
+    const gateA = makeGate("userA");
+    gateA.resolve();
+    await prefetch(makeFakeClient(gateA) as unknown as ParcaeClient, chainA);
+
+    const gateB = makeGate("userB");
+    gateB.resolve();
+    await prefetch(makeFakeClient(gateB) as unknown as ParcaeClient, chainB);
+
+    const keyA = useQueryTest.buildKey("post", "userA", chainA.__steps);
+    const keyB = useQueryTest.buildKey("post", "userB", chainB.__steps);
+    expect(useQueryTest.getEntry(keyA)).toBeDefined();
+    expect(useQueryTest.getEntry(keyB)).toBeDefined();
+
+    // Sign-out-of-userA event → purge userA's entries.
+    const { _purgeCacheForUser } = await import("../react/useQuery");
+    _purgeCacheForUser("userA");
+
+    expect(useQueryTest.getEntry(keyA)).toBeUndefined();
+    expect(useQueryTest.getEntry(keyB)).toBeDefined();
+  });
+
+  it("is a no-op when passed null (no prior session)", async () => {
+    const gate = makeGate("u1");
+    gate.resolve();
+    const chain = makeChain({
+      results: [{ id: "p1" }],
+      queryHash: "h-1",
+    });
+    await prefetch(makeFakeClient(gate) as unknown as ParcaeClient, chain);
+    const key = useQueryTest.buildKey("post", "u1", chain.__steps);
+
+    const { _purgeCacheForUser } = await import("../react/useQuery");
+    _purgeCacheForUser(null);
+
+    expect(useQueryTest.getEntry(key)).toBeDefined();
+  });
+});
