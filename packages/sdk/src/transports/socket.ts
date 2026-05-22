@@ -137,7 +137,19 @@ export class SocketTransport extends EventEmitter implements Transport {
   }
 
   async authenticate(token: string | null): Promise<{ userId: string | null }> {
+    const tCall = performance.now();
+    console.log("[socket DOL-1037] authenticate() called", {
+      gateId: (this.auth as any).__id,
+      gateStatus: this.auth.state.status,
+      tokenChanged: token !== this.token,
+      hasToken: token !== null && token !== undefined,
+      t: tCall,
+    });
     if (token === this.token && this.auth.state.status === "authenticated") {
+      console.log("[socket DOL-1037] authenticate() early-return (cached)", {
+        gateId: (this.auth as any).__id,
+        t: performance.now(),
+      });
       return { userId: this.auth.state.userId };
     }
 
@@ -186,6 +198,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     const waitStart = performance.now();
     if (this.auth.state.status === "pending") {
       console.log("[socket DOL-1037] fetch awaiting auth.ready", {
+        gateId: (this.auth as any).__id,
         method,
         path,
         t: waitStart,
@@ -195,6 +208,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     const waitMs = performance.now() - waitStart;
     if (waitMs > 1) {
       console.log("[socket DOL-1037] fetch auth.ready resolved", {
+        gateId: (this.auth as any).__id,
         method,
         path,
         waitedMs: Number(waitMs.toFixed(0)),
