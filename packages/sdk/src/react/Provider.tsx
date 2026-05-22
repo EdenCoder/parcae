@@ -8,6 +8,21 @@ import { ParcaeContext } from "./context";
 import { _purgeCacheForUser } from "./useQuery";
 import { log } from "../log";
 
+async function handleReconnectAuth(
+  auth: Pick<AuthClientAdapter, "getToken">,
+  client: Pick<ParcaeClient, "authenticate">,
+): Promise<void> {
+  try {
+    const token = await auth.getToken();
+    if (token) await client.authenticate(token);
+  } catch {
+    // A reconnect-time session read is best-effort. The socket transport
+    // already re-authenticates with its retained token on reconnect;
+    // treating a transient HTTP/session failure as sign-out can downgrade
+    // a successfully re-authenticated socket back to unauthenticated.
+  }
+}
+
 export interface ParcaeProviderProps {
   /** Pre-created client instance. */
   client?: ParcaeClient;
@@ -149,12 +164,7 @@ export const ParcaeProvider: React.FC<ParcaeProviderProps> = ({
 
     const onReconnect = async () => {
       log.debug("reconnected — re-resolving session");
-      try {
-        const token = await auth.getToken();
-        await client.authenticate(token);
-      } catch {
-        await client.authenticate(null);
-      }
+      await handleReconnectAuth(auth, client);
     };
 
     client.on("connected", onReconnect);
@@ -176,3 +186,5 @@ export const ParcaeProvider: React.FC<ParcaeProviderProps> = ({
     <ParcaeContext.Provider value={client}>{children}</ParcaeContext.Provider>
   );
 };
+
+export const __test = { handleReconnectAuth };
