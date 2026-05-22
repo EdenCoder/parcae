@@ -555,23 +555,16 @@ export class Model extends EventEmitter {
     (this as any).updatedAt = data.updatedAt ?? nowIso;
     if (data.tmp !== undefined) (this as any).tmp = data.tmp;
 
-    // Apply provided non-system data. These OVERWRITE subclass field
-    // defaults because we're running after the subclass's field
-    // initializers finished. `type` is in SYSTEM_DATA_KEYS so old
-    // payloads (e.g. a JSON snapshot from before the field was
-    // dropped) don't accidentally write a stale type onto the
-    // instance.
-    for (const [key, value] of Object.entries(data)) {
-      if (SYSTEM_DATA_KEYS.has(key)) continue;
-      (this as any)[key] = value;
-    }
-
-    // Install per-field accessors for ref fields. Replaces whatever
-    // the subclass's `declare` / data assignment put there with a
-    // getter that returns a lazy-loading Model proxy and a setter
-    // that accepts either a Model instance (stored as its id) or a
-    // raw id string.
+    // Identify ref fields up front. We install their getter/setter
+    // accessors BEFORE writing non-ref user data so the ref slots
+    // never go through a data-property phase that would have to be
+    // converted (with a hidden-class transition) on the way out.
+    // Subclass field initializers like `author: Author | null = null`
+    // may have already written a data property — `defineProperty`
+    // overrides cleanly, so we still avoid the deopt-inducing
+    // `delete + defineProperty` pattern of the previous design.
     const schema = (this.constructor as typeof Model).__schema;
+    const refTargets = new Map<string, ModelConstructor>();
     if (schema) {
       for (const [field, col] of Object.entries(schema)) {
         if (
@@ -580,9 +573,33 @@ export class Model extends EventEmitter {
           "kind" in col &&
           col.kind === "ref"
         ) {
-          this._installRefField(field, col.target);
+          refTargets.set(field, col.target);
         }
       }
+    }
+    for (const [field, target] of refTargets) {
+      // Seed the closure's raw-id slot from whatever the caller passed
+      // in (Model instance → its id; raw string id → as-is) or whatever
+      // the subclass's field initializer landed before this ran.
+      const incoming = data[field] ?? (this as any)[field];
+      const raw =
+        incoming instanceof Model
+          ? ((incoming as any).id ?? null)
+          : ((incoming as string | null | undefined) ?? null);
+      this._installRefField(field, target, raw);
+    }
+
+    // Apply provided non-system, non-ref data. These OVERWRITE subclass
+    // field defaults because we're running after the subclass's field
+    // initializers finished. `type` is in SYSTEM_DATA_KEYS so old
+    // payloads (e.g. a JSON snapshot from before the field was
+    // dropped) don't accidentally write a stale type onto the
+    // instance. Ref fields are skipped — their values were already
+    // consumed into the accessor closures above.
+    for (const [key, value] of Object.entries(data)) {
+      if (SYSTEM_DATA_KEYS.has(key)) continue;
+      if (refTargets.has(key)) continue;
+      (this as any)[key] = value;
     }
 
     // Seed the server snapshot from the fully-applied state. For a
@@ -598,34 +615,52 @@ export class Model extends EventEmitter {
    * Replace the plain `post.author` / `post.$author` pair with an
    * accessor pair driven by a closed-over `raw` id slot.
    *
-   *   post.author            → lazy-loading Model proxy
-   *   post.author = user     → stores user.id
-   *   post.author = "u_abc"  → stores "u_abc"
+   *   post.author            → lazy-loading Model proxy (memoized per raw id)
+   *   post.author = user     → stores user.id, invalidates cached proxy
+   *   post.author = "u_abc"  → stores "u_abc", invalidates cached proxy
    *   post.$author           → "u_abc" (raw id, no load)
-   *   post.$author = "u_xyz" → overwrites raw id
+   *   post.$author = "u_xyz" → overwrites raw id, invalidates cached proxy
+   *
+   * No `delete` of the pre-existing data property — `Object.defineProperty`
+   * overrides cleanly without forcing V8 into dictionary mode. The
+   * caller in `_apply()` also tries to install accessors BEFORE writing
+   * non-ref user data, so the most common path (no subclass field
+   * initializer with `= null` default) goes through one hidden-class
+   * transition per ref instead of three (DOL-1045).
    */
-  private _installRefField(field: string, targetClass: ModelConstructor): void {
-    const initial = (this as any)[field];
-    let raw: string | null =
-      initial instanceof Model
-        ? ((initial as any).id ?? null)
-        : ((initial as string | null | undefined) ?? null);
-
-    delete (this as any)[field];
-
+  private _installRefField(
+    field: string,
+    targetClass: ModelConstructor,
+    initialRaw: string | null,
+  ): void {
+    let raw: string | null = initialRaw;
+    // Per-instance proxy memoization. The same `raw` id returns the
+    // same Proxy reference across reads, so `<UserCard user={post.author}>`
+    // rendered at 60 fps doesn't allocate a fresh Proxy per frame.
+    let cachedProxy: any = null;
+    let cachedRaw: string | null = null;
     const self = this;
+
+    const invalidate = (): void => {
+      if (raw !== cachedRaw) cachedProxy = null;
+    };
+
     Object.defineProperty(this, field, {
       configurable: true,
       enumerable: true,
       get() {
         if (!raw) return null;
-        return self._createRefProxy(targetClass, raw);
+        if (cachedProxy && cachedRaw === raw) return cachedProxy;
+        cachedProxy = self._createRefProxy(targetClass, raw);
+        cachedRaw = raw;
+        return cachedProxy;
       },
       set(value: Model | string | null | undefined) {
         raw =
           value instanceof Model
             ? ((value as any).id ?? null)
             : (value ?? null);
+        invalidate();
       },
     });
 
@@ -640,6 +675,7 @@ export class Model extends EventEmitter {
       },
       set(v: string | null | undefined) {
         raw = v ?? null;
+        invalidate();
       },
     });
   }
@@ -1098,6 +1134,43 @@ export class Model extends EventEmitter {
 
         // React Suspense integration — throw the pending promise.
         throw loading;
+      },
+      // ── Iteration safety (DOL-1045) ──────────────────────────────
+      //
+      // Without these two traps, `Object.keys(proxy)` /
+      // `JSON.stringify(walk)` / `for..in` would surface the empty
+      // backing target (`{}`) and any framework-internal property
+      // lookup (DevTools console expansion, `lodash.isEqual`,
+      // `react-fast-compare`) would land on the `get` trap above
+      // and fire `findById` plus throw a Promise into a consumer
+      // that almost never wants either. We restrict the visible
+      // surface to the same whitelist the `get` trap returns
+      // synchronously — `{id, type}` — so iteration sees a tidy
+      // 2-key stub and stays clear of the lazy-load path.
+      ownKeys(): ArrayLike<string | symbol> {
+        return ["id", "type"];
+      },
+      getOwnPropertyDescriptor(_target, prop) {
+        if (prop === "id") {
+          return {
+            value: refId,
+            writable: false,
+            enumerable: true,
+            configurable: true,
+          };
+        }
+        if (prop === "type") {
+          return {
+            value: targetClass.type,
+            writable: false,
+            enumerable: true,
+            configurable: true,
+          };
+        }
+        return undefined;
+      },
+      has(_target, prop) {
+        return prop === "id" || prop === "type";
       },
     });
 

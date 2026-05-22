@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { Model, generateId } from "../Model";
 import type { ModelAdapter, QueryChain } from "../adapters/types";
 
@@ -619,6 +619,116 @@ describe("Model", () => {
 
       // Restore
       (Model as any).__adapter = saved;
+    });
+  });
+
+  // ── Reference field accessors (DOL-1045) ──────────────────────────
+  //
+  // Refs are installed as getter/setter pairs on the instance. Two
+  // perf invariants pinned here:
+  //
+  //   1. Per-instance proxy memoization — `post.author` read twice
+  //      with the same underlying raw id returns the SAME Proxy
+  //      reference. A <UserCard user={post.author}> rendered 60×/sec
+  //      should not allocate a fresh Proxy every render.
+  //
+  //   2. The lazy-load proxy's `ownKeys` / `getOwnPropertyDescriptor`
+  //      surface is restricted so iteration (`Object.keys`,
+  //      `JSON.stringify` shallow walk, `for..in`) doesn't trip the
+  //      "any non-whitelisted prop access throws `loading`" trap and
+  //      fire unintended `findById` requests from incidental code
+  //      (DevTools, isEqual, structured-logger walks).
+  describe("reference field accessors", () => {
+    class Author extends Model {
+      static type = "author" as const;
+      name: string = "";
+    }
+    class Article extends Model {
+      static type = "article" as const;
+      // Set __schema explicitly: the resolver normally builds this
+      // from ts-morph at startup; in tests we hand-roll it.
+      static __schema = {
+        title: "string",
+        author: { kind: "ref", target: Author },
+      } as any;
+      title: string = "";
+      // Declared but uninitialised — the accessor installer replaces
+      // the (absent) data property with a getter/setter pair.
+      declare author: Author;
+    }
+
+    // `expect(proxy).toBe(...)` walks the proxy via vitest's diff
+    // formatter and trips the lazy-load `get` trap, so we compare
+    // identity directly via `===` here and assert on the boolean.
+    it("post.author returns the SAME proxy reference across reads (memoized per raw id)", () => {
+      const article = Article.hydrate(adapter, { title: "x", author: "a1" });
+      const first = article.author;
+      const second = article.author;
+      expect(first === second).toBe(true);
+    });
+
+    it("changing the raw id via post.author = ... invalidates the proxy cache", () => {
+      const article = Article.hydrate(adapter, { title: "x", author: "a1" });
+      const first = article.author;
+      article.author = "a2" as any;
+      const after = article.author;
+      // Different raw id → different proxy reference.
+      expect(after === first).toBe(false);
+      // …but two reads after the change are still memoized.
+      const afterAgain = article.author;
+      expect(afterAgain === after).toBe(true);
+    });
+
+    it("changing the raw id via post.$author = ... also invalidates the proxy cache", () => {
+      const article = Article.hydrate(adapter, { title: "x", author: "a1" });
+      const first = article.author;
+      (article as any).$author = "a3";
+      const after = article.author;
+      expect(after === first).toBe(false);
+    });
+
+    it("Object.keys(post.author) lists only the safe whitelist — no findById trip", () => {
+      // Mark up the adapter so any accidental load attempt is loud
+      // and obvious in the assertion (we'd see it in the spy).
+      const findByIdSpy = vi.fn(async () => null);
+      const oldFindById = adapter.findById;
+      adapter.findById = findByIdSpy as any;
+      try {
+        const article = Article.hydrate(adapter, { title: "x", author: "a1" });
+        const keys = Object.keys(article.author);
+        // Only stable safe keys — anything that would force a load is absent.
+        expect(keys.sort()).toEqual(["id", "type"]);
+        expect(findByIdSpy).not.toHaveBeenCalled();
+      } finally {
+        adapter.findById = oldFindById;
+      }
+    });
+
+    it("JSON.stringify(post.author) serializes the {id,type} stub without firing findById", () => {
+      const findByIdSpy = vi.fn(async () => null);
+      const oldFindById = adapter.findById;
+      adapter.findById = findByIdSpy as any;
+      try {
+        const article = Article.hydrate(adapter, { title: "x", author: "a1" });
+        const serialized = JSON.stringify(article.author);
+        expect(JSON.parse(serialized)).toEqual({ id: "a1", type: "author" });
+        expect(findByIdSpy).not.toHaveBeenCalled();
+      } finally {
+        adapter.findById = oldFindById;
+      }
+    });
+
+    it("post.$author returns the raw id directly (no proxy allocation)", () => {
+      const article = Article.hydrate(adapter, { title: "x", author: "a1" });
+      expect((article as any).$author).toBe("a1");
+    });
+
+    it("post.author = null clears both the proxy and the raw id", () => {
+      const article = Article.hydrate(adapter, { title: "x", author: "a1" });
+      // Cast so the strict declared type doesn't fight us.
+      (article as any).author = null;
+      expect(article.author).toBeNull();
+      expect((article as any).$author).toBeNull();
     });
   });
 });
