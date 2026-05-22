@@ -196,7 +196,8 @@ export class SocketTransport extends EventEmitter implements Transport {
     options?: RequestOptions,
   ): Promise<any> {
     const waitStart = performance.now();
-    if (this.auth.state.status === "pending") {
+    const wasPending = this.auth.state.status === "pending";
+    if (wasPending) {
       console.log("[socket DOL-1037] fetch awaiting auth.ready", {
         gateId: (this.auth as any).__id,
         method,
@@ -207,12 +208,27 @@ export class SocketTransport extends EventEmitter implements Transport {
     await this.auth.ready;
     const waitMs = performance.now() - waitStart;
     if (waitMs > 1) {
-      console.log("[socket DOL-1037] fetch auth.ready resolved", {
+      // Distinguish two failure modes that the previous "auth.ready
+      // resolved" message conflated:
+      //
+      //   - REAL auth wait: status was "pending" when fetch entered
+      //     and resolved during the await. The gap is genuine
+      //     auth-handshake latency.
+      //
+      //   - MICROTASK DELAY: status was already "authenticated" when
+      //     fetch entered. The `await` of an already-resolved promise
+      //     should yield ~0ms, so a >1ms gap means the JS event loop
+      //     couldn't drain microtasks — i.e. the main thread was
+      //     blocked by sync work (e.g. heavy editor hydrate). The
+      //     fetch is fine, the *consumer* is starving the loop.
+      const kind = wasPending ? "auth-wait" : "main-thread-blocked";
+      console.log(`[socket DOL-1037] fetch unblocked (${kind})`, {
         gateId: (this.auth as any).__id,
         method,
         path,
         waitedMs: Number(waitMs.toFixed(0)),
-        status: this.auth.state.status,
+        wasPending,
+        statusNow: this.auth.state.status,
         t: performance.now(),
       });
     }
