@@ -57,6 +57,7 @@ import { runMigrations } from "./adapters/migrations";
 import { discoverMigrations } from "./adapters/migration-discovery";
 import type { AuthAdapter, AuthSession } from "./auth";
 import knex from "knex";
+import { shutdownResources } from "./shutdown";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -560,9 +561,19 @@ export function createApp(config: AppConfig): ParcaeApp {
       }
 
       // Stash teardown handles so `app.stop()` can clean up.
+      //
+      // `stop()` reads these off the server object and hands them to
+      // `shutdownResources()`. We stash the resources rather than
+      // closing over them so that the `stop` closure doesn't pin them
+      // to memory when the app object is held without ever being
+      // started (e.g. in test setup).
       (server as any)._parcaeChangeBus = changeBus;
       (server as any)._parcaeOffChange = offChange;
       (server as any)._parcaeListenNotify = listenNotify;
+      (server as any)._parcaePubSub = pubsub;
+      (server as any)._parcaeQueue = queue;
+      (server as any)._parcaeWriteDb = writeDb;
+      (server as any)._parcaeReadDb = readDb;
 
       // ── Step 10: Mount auth routes + middleware ─────────────────────
       if (authAdapter) {
@@ -1054,47 +1065,34 @@ export function createApp(config: AppConfig): ParcaeApp {
     },
 
     async stop() {
+      if (!server) return;
       log.info("Shutting down...");
-      if (server) {
-        const offChange = (server as any)._parcaeOffChange as
-          | (() => void)
-          | undefined;
-        offChange?.();
-        const listenNotify = (server as any)._parcaeListenNotify as
-          | ListenNotifyPoller
-          | null
-          | undefined;
-        if (listenNotify) {
-          try {
-            await listenNotify.stop();
-          } catch (err) {
-            log.warn(`listenNotify.stop threw: ${String(err)}`);
-          }
-        }
-        // Stop any active cron schedulers before we tear down the
-        // server. `Cron.stop()` cancels the next tick and prevents new
-        // handler invocations; any in-flight handler keeps running but
-        // can't queue another tick onto a dead instance.
-        const crons = (server as any)._parcaeCrons as Cron[] | undefined;
-        if (crons?.length) {
-          for (const c of crons) {
-            try {
-              c.stop();
-            } catch (err) {
-              log.warn(`cron.stop threw: ${String(err)}`);
-            }
-          }
-        }
-        const changeBus = (server as any)._parcaeChangeBus as
-          | ChangeBus
-          | undefined;
-        changeBus?.close();
-        server.io.close();
-        await new Promise<void>((resolveClose) => {
-          server!.httpServer.close(() => resolveClose());
-        });
-        server = null;
-      }
+
+      // Pull every stashed resource off the server object and hand it
+      // to the shared shutdown helper. The helper drives the ordering
+      // and swallows per-resource errors so a slow Redis can't stop
+      // the DB pool from closing. See `./shutdown.ts` for the contract.
+      const stash = server as any;
+      await shutdownResources({
+        io: server.io,
+        httpServer: server.httpServer,
+        crons: (stash._parcaeCrons as Cron[] | undefined) ?? null,
+        listenNotify:
+          (stash._parcaeListenNotify as ListenNotifyPoller | null | undefined) ??
+          null,
+        offChange:
+          (stash._parcaeOffChange as (() => void) | undefined) ?? null,
+        changeBus: (stash._parcaeChangeBus as ChangeBus | undefined) ?? null,
+        queue: (stash._parcaeQueue as QueueService | undefined) ?? null,
+        pubsub: (stash._parcaePubSub as PubSub | undefined) ?? null,
+        writeDb: (stash._parcaeWriteDb as ReturnType<typeof knex> | undefined) ?? null,
+        readDb: (stash._parcaeReadDb as ReturnType<typeof knex> | undefined) ?? null,
+      });
+
+      // Null out the closure so a follow-up stop() is a no-op rather
+      // than re-running the cleanup against half-closed handles.
+      server = null;
+      log.info("Shutdown complete");
     },
   };
 }
