@@ -93,6 +93,43 @@ interface ManagerOptions {
   debounceMs?: number;
   /** Default max-wait ceiling for re-eval, in ms. Default 100ms. */
   maxWaitMs?: number;
+  /**
+   * Maximum concurrent `_reeval` operations across all cached queries.
+   * Default 8. See `Semaphore` JSDoc for the rationale — a write-storm
+   * on a hot table can schedule N distinct cached-query re-evals at
+   * the same instant; without a cap, every one of them hits the DB
+   * pool in parallel.
+   *
+   * Overridable at boot via the `PARCAE_REEVAL_CONCURRENCY` env var
+   * (parsed by `createApp()` and passed in via this option).
+   */
+  reevalConcurrency?: number;
+}
+
+/**
+ * Socket.IO backend hooks. The legacy form passes just `emitToSocket`
+ * and the manager fans out re-eval envelopes via a per-subscriber
+ * loop (one `io.to(socketId).emit(...)` per subscriber, N for N
+ * subscribers).
+ *
+ * The room-aware form (DOL-1047) also supplies `emitToRoom`,
+ * `joinRoom`, and `leaveRoom`. Every subscriber for a given cached
+ * query joins the Socket.IO room `query:${hash}` at subscribe-time,
+ * so re-eval can broadcast ONCE via `io.to(room).emit(...)` regardless
+ * of how many sockets are listening. Substantial savings at scale
+ * (100 subscribers per query: 100 emits → 1).
+ */
+type EmitToSocket = (socketId: string, event: string, data: any) => void;
+type EmitToRoom = (room: string, event: string, data: any) => void;
+type JoinRoom = (socketId: string, room: string) => void;
+type LeaveRoom = (socketId: string, room: string) => void;
+
+interface IoBackend {
+  emitToSocket: EmitToSocket;
+  /** Optional room broadcast. When present, used in place of per-socket emits. */
+  emitToRoom?: EmitToRoom;
+  joinRoom?: JoinRoom;
+  leaveRoom?: LeaveRoom;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -102,9 +139,73 @@ function hashFrom(toSQL: { sql: string; bindings: any[] }): string {
   return createHash("sha256").update(payload).digest("hex").slice(0, 16);
 }
 
-/** JSON round-trip to normalize Dates to strings, strip undefined, etc. */
-function jsonClone<T>(obj: T): T {
-  return JSON.parse(JSON.stringify(obj));
+/**
+ * Single-pass recursive clone that coerces `Date` instances to ISO
+ * strings, drops `undefined`, and strips functions — matching the
+ * own-enumerable semantics of `JSON.parse(JSON.stringify(...))` but
+ * without the intermediate string materialisation. Used per-row in
+ * `_reeval` / `subscribe` so a 50-row × 5KB result set doesn't
+ * round-trip through ~250KB of serialised JSON per re-eval (DOL-1047).
+ */
+function dateSafeClone<T>(value: T): T {
+  if (value === null || value === undefined) return value;
+  if (value instanceof Date) return value.toISOString() as unknown as T;
+  if (Array.isArray(value)) {
+    const out: any[] = new Array(value.length);
+    for (let i = 0; i < value.length; i++) {
+      out[i] = dateSafeClone(value[i]);
+    }
+    return out as unknown as T;
+  }
+  if (typeof value === "object") {
+    const out: Record<string, any> = {};
+    for (const key of Object.keys(value as object)) {
+      const v = (value as any)[key];
+      if (v === undefined) continue; // match JSON.stringify own-property drop
+      if (typeof v === "function") continue;
+      out[key] = dateSafeClone(v);
+    }
+    return out as unknown as T;
+  }
+  return value;
+}
+
+/**
+ * Fixed-permit semaphore used to bound concurrent `_reeval` work
+ * across all cached queries. A burst write-storm on a hot table
+ * schedules every cached query for re-eval at roughly the same ms;
+ * without a cap, every re-eval hits the DB pool in parallel and
+ * either queues on `acquireTimeoutMillis` or starves concurrent
+ * request handlers. With the cap, work runs at most `permits` at a
+ * time and the queue drains naturally (DOL-1047).
+ */
+class Semaphore {
+  private free: number;
+  private waiters: Array<() => void> = [];
+  private readonly capacity: number;
+  constructor(permits: number) {
+    this.free = permits;
+    this.capacity = permits;
+  }
+  async acquire(): Promise<void> {
+    if (this.free > 0) {
+      this.free--;
+      return;
+    }
+    await new Promise<void>((resolve) => this.waiters.push(resolve));
+  }
+  release(): void {
+    const next = this.waiters.shift();
+    if (next) {
+      next();
+    } else {
+      this.free++;
+    }
+  }
+  /** Number of acquisitions currently held — exposed for tests. */
+  get inFlight(): number {
+    return this.capacity - this.free;
+  }
 }
 
 function isUpdatedAtPath(path: string): boolean {
@@ -167,23 +268,51 @@ const MAX_SUBSCRIPTIONS_PER_SOCKET = 100;
 
 const DEFAULT_DEBOUNCE_MS = 25;
 const DEFAULT_MAX_WAIT_MS = 100;
+const DEFAULT_REEVAL_CONCURRENCY = 8;
 
 export class QuerySubscriptionManager {
   private queries = new Map<string, CachedQuery>();
   private socketQueries = new Map<string, Set<string>>();
   private typeIndex = new Map<string, Set<string>>();
 
-  private emitToSocket: (socketId: string, event: string, data: any) => void;
+  private emitToSocket: EmitToSocket;
+  private emitToRoom: EmitToRoom | null;
+  private joinRoom: JoinRoom | null;
+  private leaveRoom: LeaveRoom | null;
   private defaultDebounceMs: number;
   private defaultMaxWaitMs: number;
+  private reevalSemaphore: Semaphore;
 
-  constructor(
-    emitToSocket: (socketId: string, event: string, data: any) => void,
-    opts: ManagerOptions = {},
-  ) {
-    this.emitToSocket = emitToSocket;
+  constructor(io: EmitToSocket | IoBackend, opts: ManagerOptions = {}) {
+    // Two shapes for backward compatibility. The legacy form (a bare
+    // function) is still used by every existing test fixture; the
+    // room-aware form is what `createApp()` wires in production.
+    if (typeof io === "function") {
+      this.emitToSocket = io;
+      this.emitToRoom = null;
+      this.joinRoom = null;
+      this.leaveRoom = null;
+    } else {
+      this.emitToSocket = io.emitToSocket;
+      this.emitToRoom = io.emitToRoom ?? null;
+      this.joinRoom = io.joinRoom ?? null;
+      this.leaveRoom = io.leaveRoom ?? null;
+    }
     this.defaultDebounceMs = opts.debounceMs ?? DEFAULT_DEBOUNCE_MS;
     this.defaultMaxWaitMs = opts.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
+    this.reevalSemaphore = new Semaphore(
+      Math.max(1, opts.reevalConcurrency ?? DEFAULT_REEVAL_CONCURRENCY),
+    );
+  }
+
+  /** @internal — exposed for diagnostics + tests. */
+  get reevalInFlight(): number {
+    return this.reevalSemaphore.inFlight;
+  }
+
+  /** Resolve the room name for a cached query. Stable across re-evals. */
+  private _roomFor(hash: string): string {
+    return `query:${hash}`;
   }
 
   // ── Subscribe ──────────────────────────────────────────────────────
@@ -233,7 +362,7 @@ export class QuerySubscriptionManager {
       const rows = await this._execQuery(query);
       const result = new Map<string, Record<string, any>>();
       for (const row of rows) {
-        const clean = jsonClone(row);
+        const clean = dateSafeClone(row);
         result.set(clean.id, clean);
       }
 
@@ -266,6 +395,14 @@ export class QuerySubscriptionManager {
     }
     this.socketQueries.get(socketId)!.add(hash);
 
+    // When the IO backend supports rooms, join the socket so the
+    // `_reeval` broadcast (`io.to(room).emit`) reaches it. Skipped on
+    // re-subscribe: Socket.IO's `join` is idempotent but the call
+    // round-trips through the adapter, so guard on alreadySubscribed.
+    if (this.joinRoom && !alreadySubscribed) {
+      this.joinRoom(socketId, this._roomFor(hash));
+    }
+
     return { hash, items: [...cached.result.values()] };
   }
 
@@ -275,8 +412,12 @@ export class QuerySubscriptionManager {
     const cached = this.queries.get(hash);
     if (!cached) return;
 
-    cached.subscribers.delete(socketId);
+    const wasSubscribed = cached.subscribers.delete(socketId);
     this.socketQueries.get(socketId)?.delete(hash);
+
+    if (wasSubscribed && this.leaveRoom) {
+      this.leaveRoom(socketId, this._roomFor(hash));
+    }
 
     if (cached.subscribers.size === 0) {
       this._teardownCoalesce(cached);
@@ -292,7 +433,10 @@ export class QuerySubscriptionManager {
     for (const hash of hashes) {
       const cached = this.queries.get(hash);
       if (!cached) continue;
-      cached.subscribers.delete(socketId);
+      const wasSubscribed = cached.subscribers.delete(socketId);
+      if (wasSubscribed && this.leaveRoom) {
+        this.leaveRoom(socketId, this._roomFor(hash));
+      }
       if (cached.subscribers.size === 0) {
         this._teardownCoalesce(cached);
         this.queries.delete(hash);
@@ -374,11 +518,17 @@ export class QuerySubscriptionManager {
 
     c.inFlight = true;
     c.needsFollowup = false;
+    // Bound the parallel DB hits across the whole manager. Without
+    // the semaphore, N distinct cached queries all hitting `onModelChange`
+    // in the same tick launch N concurrent SELECTs and either queue
+    // on the pool or starve unrelated handlers (DOL-1047).
+    await this.reevalSemaphore.acquire();
     try {
       await this._reeval(cached);
     } catch (err) {
       log.error(`subscriptions: re-eval failed for ${cached.hash}:`, err);
     } finally {
+      this.reevalSemaphore.release();
       c.inFlight = false;
     }
     if (c.needsFollowup) {
@@ -407,7 +557,7 @@ export class QuerySubscriptionManager {
     const rows = await this._execQuery(cached.query);
     const newResult = new Map<string, Record<string, any>>();
     for (const row of rows) {
-      const clean = jsonClone(row);
+      const clean = dateSafeClone(row);
       newResult.set(clean.id, clean);
     }
 
@@ -450,8 +600,16 @@ export class QuerySubscriptionManager {
       ? { ops, order: newOrder }
       : { ops };
 
-    for (const socketId of cached.subscribers) {
-      this.emitToSocket(socketId, `query:${cached.hash}`, envelope);
+    const event = `query:${cached.hash}`;
+    if (this.emitToRoom) {
+      // Single broadcast — Socket.IO walks the room's socket set and
+      // emits to each transport in one pass. For N subscribers this
+      // is O(1) emits at the manager layer instead of O(N).
+      this.emitToRoom(this._roomFor(cached.hash), event, envelope);
+    } else {
+      for (const socketId of cached.subscribers) {
+        this.emitToSocket(socketId, event, envelope);
+      }
     }
   }
 
