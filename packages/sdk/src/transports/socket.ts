@@ -87,9 +87,6 @@ export class SocketTransport extends EventEmitter implements Transport {
     // timing. Only when a resolver IS supplied do we wait on it
     // before authenticating.
     if (config.getToken) {
-      console.log("[socket DOL-1037] config.getToken provided — eager fetch", {
-        t: performance.now(),
-      });
       // Token starts as undefined so any external `authenticate()`
       // call landing first overrides this path cleanly.
       this.token = undefined;
@@ -99,18 +96,10 @@ export class SocketTransport extends EventEmitter implements Transport {
         .then((t) => {
           this.token = t ?? null;
           this.tokenAwaitNeeded = false;
-          console.log("[socket DOL-1037] eager getToken() resolved", {
-            hasToken: t !== null && t !== undefined,
-            t: performance.now(),
-          });
         })
-        .catch((err) => {
+        .catch(() => {
           this.token = null;
           this.tokenAwaitNeeded = false;
-          console.log("[socket DOL-1037] eager getToken() rejected", {
-            error: String(err),
-            t: performance.now(),
-          });
         });
     } else {
       this.tokenReady = Promise.resolve();
@@ -134,11 +123,6 @@ export class SocketTransport extends EventEmitter implements Transport {
     this.socket.on("connect", () => {
       this.isConnected = true;
       log.debug("socket connected");
-      console.log("[socket DOL-1037] connect", {
-        socketId: this.socket.id,
-        hasToken: this.token !== undefined && this.token !== null,
-        t: performance.now(),
-      });
       // Legacy path: no constructor `getToken`. Run `_doAuth` +
       // emit `connected` synchronously so existing consumers /
       // tests see identical timing.
@@ -165,10 +149,6 @@ export class SocketTransport extends EventEmitter implements Transport {
       // `useQuery` subscriptions because nothing re-authenticates
       // and re-subscribes them.
       log.debug("socket disconnected");
-      console.log("[socket DOL-1037] disconnect", {
-        socketId: this.socket.id,
-        t: performance.now(),
-      });
       this.auth.reset();
       this.emit("disconnected");
     });
@@ -190,12 +170,7 @@ export class SocketTransport extends EventEmitter implements Transport {
   }
 
   private _doAuth(): void {
-    if (this.token === undefined) {
-      console.log("[socket DOL-1037] _doAuth bailed — token undefined", {
-        t: performance.now(),
-      });
-      return;
-    }
+    if (this.token === undefined) return;
     if (this.token === null) {
       this.auth.resolveUnauthenticated();
       return;
@@ -203,18 +178,9 @@ export class SocketTransport extends EventEmitter implements Transport {
 
     const t0 = performance.now();
     log.debug("authenticating...");
-    console.log("[socket DOL-1037] _doAuth → emit('authenticate')", {
-      socketId: this.socket.id,
-      t: t0,
-    });
     this.socket.emit("authenticate", this.token, (response: any) => {
       const ms = (performance.now() - t0).toFixed(0);
       const userId = response?.userId ?? null;
-      console.log("[socket DOL-1037] _doAuth ← server reply", {
-        userId,
-        ms: Number(ms),
-        t: performance.now(),
-      });
       if (userId) {
         this.auth.resolve(userId);
         log.debug(`authenticated as ${userId} (${ms}ms)`);
@@ -226,19 +192,7 @@ export class SocketTransport extends EventEmitter implements Transport {
   }
 
   async authenticate(token: string | null): Promise<{ userId: string | null }> {
-    const tCall = performance.now();
-    console.log("[socket DOL-1037] authenticate() called", {
-      gateId: (this.auth as any).__id,
-      gateStatus: this.auth.state.status,
-      tokenChanged: token !== this.token,
-      hasToken: token !== null && token !== undefined,
-      t: tCall,
-    });
     if (token === this.token && this.auth.state.status === "authenticated") {
-      console.log("[socket DOL-1037] authenticate() early-return (cached)", {
-        gateId: (this.auth as any).__id,
-        t: performance.now(),
-      });
       return { userId: this.auth.state.userId };
     }
 
@@ -284,43 +238,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     data: any = {},
     options?: RequestOptions,
   ): Promise<any> {
-    const waitStart = performance.now();
-    const wasPending = this.auth.state.status === "pending";
-    if (wasPending) {
-      console.log("[socket DOL-1037] fetch awaiting auth.ready", {
-        gateId: (this.auth as any).__id,
-        method,
-        path,
-        t: waitStart,
-      });
-    }
     await this.auth.ready;
-    const waitMs = performance.now() - waitStart;
-    if (waitMs > 1) {
-      // Distinguish two failure modes that the previous "auth.ready
-      // resolved" message conflated:
-      //
-      //   - REAL auth wait: status was "pending" when fetch entered
-      //     and resolved during the await. The gap is genuine
-      //     auth-handshake latency.
-      //
-      //   - MICROTASK DELAY: status was already "authenticated" when
-      //     fetch entered. The `await` of an already-resolved promise
-      //     should yield ~0ms, so a >1ms gap means the JS event loop
-      //     couldn't drain microtasks — i.e. the main thread was
-      //     blocked by sync work (e.g. heavy editor hydrate). The
-      //     fetch is fine, the *consumer* is starving the loop.
-      const kind = wasPending ? "auth-wait" : "main-thread-blocked";
-      console.log(`[socket DOL-1037] fetch unblocked (${kind})`, {
-        gateId: (this.auth as any).__id,
-        method,
-        path,
-        waitedMs: Number(waitMs.toFixed(0)),
-        wasPending,
-        statusNow: this.auth.state.status,
-        t: performance.now(),
-      });
-    }
 
     if (!this.socket.connected) {
       await new Promise<void>((resolve, reject) => {

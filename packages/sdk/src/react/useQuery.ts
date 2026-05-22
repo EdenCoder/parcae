@@ -681,13 +681,6 @@ function doFetch(
   opts: { force?: boolean } = {},
 ): void {
   log.debug("useQuery: fetching", chain.__modelType);
-  const t0 = performance.now();
-  console.log("[usequery DOL-1037] doFetch →", {
-    key,
-    modelType: chain.__modelType,
-    force: opts.force ?? false,
-    t: t0,
-  });
 
   // Store chain/client on the entry so retry and refetch can access them
   // without needing the original closure.
@@ -715,17 +708,7 @@ function doFetch(
     .find()
     .then((result: any[]) => {
       log.debug("useQuery: got", result.length, "items for", chain.__modelType);
-      const ms = (performance.now() - t0).toFixed(0);
       const hash = (result as any).__queryHash;
-      console.log("[usequery DOL-1037] doFetch ← result", {
-        key,
-        modelType: chain.__modelType,
-        items: result.length,
-        queryHash: hash ?? null,
-        totalCount: (result as any).__totalCount ?? null,
-        ms: Number(ms),
-        t: performance.now(),
-      });
       if (prevSnapshot) {
         // Drift detection — log only. The new data will overwrite
         // the cache below; this is purely diagnostic so we can
@@ -752,11 +735,6 @@ function doFetch(
 
         const adapter = resolveAdapter(chain);
 
-        console.log("[usequery DOL-1037] subscribe → query:" + hash, {
-          key,
-          modelType: chain.__modelType,
-          t: performance.now(),
-        });
         const unsub = client.subscribe(`query:${hash}`, (payload: unknown) => {
           const parsed = normalizeOpsPayload(payload);
           if (!parsed) return;
@@ -765,13 +743,6 @@ function doFetch(
           // when the order envelope alone arrived for a server that
           // never reaches this branch in practice, but we guard.)
           if (ops.length === 0 && !order) return;
-          console.log("[usequery DOL-1037] sub-event", {
-            key,
-            modelType: chain.__modelType,
-            opsCount: ops.length,
-            hasOrder: order != null,
-            t: performance.now(),
-          });
           const result = applyOps(
             entry.items,
             ops,
@@ -903,13 +874,6 @@ export function useQuery<T>(
 
   // Fetch on key change. Uses the ref to get the latest chain.
   useEffect(() => {
-    console.log("[usequery DOL-1037] effect[key]", {
-      key,
-      authStatus,
-      authReady,
-      modelType: chainRef.current?.__modelType ?? null,
-      t: performance.now(),
-    });
     if (!key) return;
     const currentChain = chainRef.current;
     if (!currentChain) return;
@@ -925,14 +889,13 @@ export function useQuery<T>(
     // Single-source-of-truth for "should we kick a fetch off?":
     // `entry.chain` is set on the very first line of `doFetch` (before
     // any await), so its absence is the canonical "no fetch has ever
-    // started for this key" signal. Previously the gate used a
-    // combination of `entry.items === EMPTY` + `!entry.loading` +
-    // `!entry.dispose`, which let a SECOND hook landing on the same
-    // key fire `doFetch` again while the first fetch was still in
-    // flight — wasted state updates + notify cascades (the transport
-    // GET dedup saved the wire round trip, but the cache-level
-    // duplication still propagated). See DOL-1037 trace for the
-    // `useCreators` × multiple-sections case.
+    // started for this key" signal. A combined check like
+    // `items === EMPTY && !loading && !dispose` would let a SECOND
+    // hook landing on the same key fire `doFetch` while the first
+    // fetch is still in flight — `dispose` is only set AFTER the
+    // fetch resolves and the subscription opens, so the second hook
+    // would slip through and run a redundant cache update +
+    // notify cascade. Gating on `entry.chain` closes that.
     if (!entry.chain) {
       doFetch(key, entry, currentChain, clientRef.current);
     } else if (entry.items === EMPTY && !entry.loading && !entry.error) {
@@ -970,14 +933,6 @@ export function useQuery<T>(
     const prev = prevAuthStatusRef.current;
     prevAuthStatusRef.current = authStatus;
 
-    console.log("[usequery DOL-1037] effect[authStatus]", {
-      key: keyRef.current,
-      prev,
-      next: authStatus,
-      modelType: chainRef.current?.__modelType ?? null,
-      t: performance.now(),
-    });
-
     if (prev === null) return;
     if (authStatus !== "authenticated") return;
     if (prev === "authenticated") return;
@@ -993,12 +948,6 @@ export function useQuery<T>(
     // disconnect wiped it.
     if (!entry.queryHash) return;
 
-    console.log("[usequery DOL-1037] reconnect-refetch", {
-      key: k,
-      modelType: currentChain.__modelType ?? null,
-      queryHash: entry.queryHash,
-      t: performance.now(),
-    });
     entry.retryCount = 0;
     if (entry.retryTimer) {
       clearTimeout(entry.retryTimer);
