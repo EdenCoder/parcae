@@ -24,12 +24,23 @@ import type { QueueService } from "./queue";
 import { addJobIfNotExists } from "./queue";
 import type { PubSub } from "./pubsub";
 import type { ChangeBus } from "./changeBus";
+import type { RefLoader } from "./ref-loader";
 import type { RuntimeFlags } from "../config";
 
 // ─── Request context (per-request user via AsyncLocalStorage) ────────────────
 
 interface RequestContext {
   user: { id: string; [key: string]: any } | null;
+  /**
+   * Per-request batcher for `BackendAdapter.findById`. Created in
+   * `app.ts`'s per-request middleware so every `post.user` /
+   * `comment.author` ref access on the backend coalesces into a
+   * single `WHERE id IN (...)` lookup per type per microtask. Absent
+   * when no `app.start()`-installed middleware ran (background jobs,
+   * tests instantiating BackendAdapter directly) — `findById` then
+   * falls back to its direct per-id query. See `./ref-loader.ts`.
+   */
+  refLoader?: RefLoader | null;
 }
 
 const _requestContext = new AsyncLocalStorage<RequestContext>();
@@ -48,6 +59,16 @@ export function getRequestUser(): {
   [key: string]: any;
 } | null {
   return _requestContext.getStore()?.user ?? null;
+}
+
+/**
+ * Get the request-scoped `RefLoader`, if any. Returns `null` when the
+ * call is outside an `app.start()`-installed request scope (jobs,
+ * tests). Consumers should fall through to direct queries on null —
+ * the loader exists for batching, not correctness.
+ */
+export function getRefLoader(): RefLoader | null {
+  return _requestContext.getStore()?.refLoader ?? null;
 }
 
 // ─── Global context (set by createApp at startup) ────────────────────────────

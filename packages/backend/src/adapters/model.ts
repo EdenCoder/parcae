@@ -31,6 +31,7 @@ import { getHooksFor, hook } from "../routing/hook";
 import {
   enqueue as globalEnqueue,
   lock as globalLock,
+  getRefLoader,
   getRequestUser,
   getRuntimeFlags,
 } from "../services/context";
@@ -624,11 +625,55 @@ export class BackendAdapter implements ModelAdapter {
     id: string,
   ): Promise<T | null> {
     if (!id) return null;
+    // When called inside an `app.start()`-installed request scope, a
+    // RefLoader is attached to the AsyncLocalStorage frame. Defer to
+    // it so concurrent ref-proxy resolutions in the same microtask
+    // coalesce into one `WHERE id IN (...)` batch instead of N
+    // sequential `WHERE id = ?` lookups. Outside a request (jobs,
+    // hook handlers without a request frame, tests) we fall through
+    // to the direct path. See `services/ref-loader.ts`.
+    const loader = getRefLoader();
+    if (loader) {
+      const row = await loader.load(modelClass.type, id);
+      return (row as T | null) ?? null;
+    }
     const row = await this.read(tableName(modelClass))
       .select("*")
       .where("id", id)
       .first();
     return row ? hydrate(modelClass, this, row) : null;
+  }
+
+  /**
+   * Fetch many rows of one type by id in a single query and return a
+   * `Map<id, hydratedModel>`. Missing ids are simply absent from the
+   * map — callers can default to `null`. Empty id lists short-circuit
+   * without touching the database; unknown model types resolve to an
+   * empty map rather than throwing.
+   *
+   * This is the batch entry point the request-scoped `RefLoader`
+   * calls; it's also useful directly when you have a known list of
+   * ids and want to avoid the per-id round-trip dance manually.
+   */
+  async batchFindByType(
+    type: string,
+    ids: string[],
+  ): Promise<Map<string, any>> {
+    const result = new Map<string, any>();
+    if (ids.length === 0) return result;
+
+    const modelClass = this._models.get(type);
+    if (!modelClass) return result;
+
+    const uniqueIds = Array.from(new Set(ids));
+    const rows = await this.read(tableName(modelClass))
+      .select("*")
+      .whereIn("id", uniqueIds);
+    for (const row of rows ?? []) {
+      const hydrated = hydrate(modelClass, this, row);
+      result.set((hydrated as any).id, hydrated);
+    }
+    return result;
   }
 
   // ── query ────────────────────────────────────────────────────────────
