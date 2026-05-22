@@ -198,8 +198,31 @@ export class FrontendAdapter implements ModelAdapter {
       // emit any drift to every subscriber. Used by `useQuery`'s
       // periodic drift poll to recover from missed events.
       if (options.forceRefresh) requestData.__forceRefresh = true;
+      // Diagnostic trace — paired with the [usequery DOL-1037]
+      // doFetch logs in the SDK so we can see the gap between the
+      // SDK kicking off `chain.find()` and the wire request going
+      // out (typically: an `await auth.ready` in the transport).
+      const tStart = (typeof performance !== "undefined"
+        ? performance.now()
+        : Date.now());
+      console.log("[adapter DOL-1037] chain.find →", {
+        path,
+        steps: steps.length,
+        forceRefresh: options.forceRefresh ?? false,
+        t: tStart,
+      });
       const result = await this.transport.get(path, requestData);
+      const tEnd = (typeof performance !== "undefined"
+        ? performance.now()
+        : Date.now());
       const items = result?.[modelClass.type + "s"] ?? result?.items ?? [];
+      console.log("[adapter DOL-1037] chain.find ← result", {
+        path,
+        itemsCount: Array.isArray(items) ? items.length : null,
+        queryHash: result?.__queryHash ?? null,
+        ms: Number((tEnd - tStart).toFixed(0)),
+        t: tEnd,
+      });
       const models = items.map((row: any) =>
         (modelClass as any).hydrate(this, row),
       );

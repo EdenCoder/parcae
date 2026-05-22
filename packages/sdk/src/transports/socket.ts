@@ -183,7 +183,25 @@ export class SocketTransport extends EventEmitter implements Transport {
     data: any = {},
     options?: RequestOptions,
   ): Promise<any> {
+    const waitStart = performance.now();
+    if (this.auth.state.status === "pending") {
+      console.log("[socket DOL-1037] fetch awaiting auth.ready", {
+        method,
+        path,
+        t: waitStart,
+      });
+    }
     await this.auth.ready;
+    const waitMs = performance.now() - waitStart;
+    if (waitMs > 1) {
+      console.log("[socket DOL-1037] fetch auth.ready resolved", {
+        method,
+        path,
+        waitedMs: Number(waitMs.toFixed(0)),
+        status: this.auth.state.status,
+        t: performance.now(),
+      });
+    }
 
     if (!this.socket.connected) {
       await new Promise<void>((resolve, reject) => {
