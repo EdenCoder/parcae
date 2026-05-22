@@ -280,6 +280,53 @@ describe("prefetch", () => {
   });
 });
 
+describe("concurrent useQuery mounts on the same key (DOL-1037)", () => {
+  beforeEach(() => useQueryTest.resetCache());
+  afterEach(() => useQueryTest.resetCache());
+
+  it("a second mount on the same key while the first fetch is in flight does NOT re-fire doFetch", async () => {
+    // Simulate two `useQuery` hooks mounting in the same tick on the
+    // same cache key (e.g. `useCreators` called from multiple
+    // sibling sections with identical `User.whereIn(...)` chains).
+    // Pre-fix, both effects passed the `!entry.dispose` guard and
+    // fired `doFetch` twice; the transport's GET dedup saved the
+    // wire but the cache still got two `notify` cycles.
+    const gate = makeGate("u1");
+    gate.resolve();
+    const client = makeFakeClient(gate);
+    const findSpy = vi.fn();
+
+    // Each "mount" reuses the same chain (same key downstream).
+    const buildChain = () =>
+      makeChain({
+        results: [{ id: "p1", title: "first" }],
+        queryHash: "h-concurrent",
+        findSpy,
+      });
+
+    const key = useQueryTest.buildKey("post", "u1", buildChain().__steps);
+
+    // First mount kicks off the fetch via doFetch.
+    const release1 = useQueryTest.retain(key, () => {});
+    useQueryTest.fetch(key, buildChain(), client as unknown as ParcaeClient);
+
+    // Second mount lands on the same cache entry MIDFLIGHT (before
+    // the await ticks). `prefetch` is a convenient stand-in for the
+    // second hook's effect — it goes through the same `entry.chain`
+    // gate that the fixed effect uses.
+    const second = prefetch(client as unknown as ParcaeClient, buildChain());
+
+    // Let the in-flight fetch settle.
+    await new Promise((r) => setImmediate(r));
+    const items = await second;
+
+    expect(findSpy).toHaveBeenCalledTimes(1);
+    expect(items).toHaveLength(1);
+    expect((items[0] as any).id).toBe("p1");
+    release1();
+  });
+});
+
 describe("_purgeCacheForUser (auth-transition cache eviction)", () => {
   beforeEach(() => useQueryTest.resetCache());
   afterEach(() => useQueryTest.resetCache());

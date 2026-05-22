@@ -922,15 +922,23 @@ export function useQuery<T>(
       entry.retryTimer = null;
     }
 
-    if (entry.items === EMPTY && !entry.loading) {
-      // Entry was created but never fetched (or was reset)
+    // Single-source-of-truth for "should we kick a fetch off?":
+    // `entry.chain` is set on the very first line of `doFetch` (before
+    // any await), so its absence is the canonical "no fetch has ever
+    // started for this key" signal. Previously the gate used a
+    // combination of `entry.items === EMPTY` + `!entry.loading` +
+    // `!entry.dispose`, which let a SECOND hook landing on the same
+    // key fire `doFetch` again while the first fetch was still in
+    // flight — wasted state updates + notify cascades (the transport
+    // GET dedup saved the wire round trip, but the cache-level
+    // duplication still propagated). See DOL-1037 trace for the
+    // `useCreators` × multiple-sections case.
+    if (!entry.chain) {
       doFetch(key, entry, currentChain, clientRef.current);
-    } else if (
-      entry.items === EMPTY &&
-      entry.error === null &&
-      !entry.dispose
-    ) {
-      // Fresh entry — needs initial fetch
+    } else if (entry.items === EMPTY && !entry.loading && !entry.error) {
+      // Entry exists but was somehow reset (chain set, loading false,
+      // items still EMPTY sentinel, no error). Edge case — kick a
+      // fresh fetch.
       doFetch(key, entry, currentChain, clientRef.current);
     }
   }, [key]); // eslint-disable-line react-hooks/exhaustive-deps
