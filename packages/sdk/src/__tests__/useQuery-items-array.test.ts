@@ -155,6 +155,7 @@ describe("useQuery — items-array reference contract", () => {
     const beforeArray = entry.items;
     const beforeP1 = entry.items[0];
     const beforeP2 = entry.items[1];
+    const beforeVersion = entry.version;
 
     client.emitQueryOps("h-update", [
       {
@@ -182,7 +183,9 @@ describe("useQuery — items-array reference contract", () => {
     expect(entry.items[1].title).toBe("second");
 
     // Version bumps on changed=true so useSyncExternalStore fires.
-    expect(entry.version).toBe(1);
+    // Assert relative — the fetch path itself also bumps version
+    // (DOL-1041) so the absolute count isn't 1.
+    expect(entry.version).toBeGreaterThan(beforeVersion);
 
     release();
   });
