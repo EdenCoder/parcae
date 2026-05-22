@@ -110,7 +110,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     this.socket.on("connect", () => {
       this.connection.connected();
       this.emit("connected");
-      void this._handshake();
+      void this._handshake().catch(() => {});
     });
 
     this.socket.on("disconnect", () => {
@@ -127,7 +127,7 @@ export class SocketTransport extends EventEmitter implements Transport {
 
     if (this.socket.connected) {
       this.connection.connected();
-      void this._handshake();
+      void this._handshake().catch(() => {});
     }
   }
 
@@ -142,8 +142,16 @@ export class SocketTransport extends EventEmitter implements Transport {
     let token: string | null = null;
     try {
       token = await this.getToken();
-    } catch {
-      token = null;
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      log.warn(`hello: token resolution failed (${error.message})`);
+      this.emit("error", error);
+      // Keep SessionMachine pending / unchanged. A failed token read is
+      // not proof of an anonymous session; it usually means the auth
+      // endpoint is temporarily unavailable (502/CORS during backend
+      // restart). Treating it as null would fire protected queries as
+      // :anon: and turn transient infra failure into 403 storms.
+      throw error;
     }
 
     const t0 = performance.now();

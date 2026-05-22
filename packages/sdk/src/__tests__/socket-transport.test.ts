@@ -140,6 +140,26 @@ describe("SocketTransport — hello/resync protocol", () => {
     expect(t.session.state.userId).toBeNull();
   });
 
+  it("token resolver failure leaves the session pending and does not send anonymous hello", async () => {
+    const t = makeTransport(async () => {
+      throw new Error("auth endpoint unavailable");
+    });
+    const onError = vi.fn();
+    const onResync = vi.fn();
+    t.on("error", onError);
+    t.on("resync-required", onResync);
+
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(currentSocket.emits.filter((e) => e.event === "hello")).toHaveLength(0);
+    expect(t.session.state.status).toBe("pending");
+    expect(t.session.state.userId).toBeNull();
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onResync).not.toHaveBeenCalled();
+  });
+
   it("disconnect does NOT mutate the SessionMachine", async () => {
     const t = makeTransport(async () => "tok");
     currentSocket.connect();

@@ -41,12 +41,8 @@ export const ParcaeProvider: React.FC<ParcaeProviderProps> = ({
 
     const getToken: ClientConfig["getToken"] = auth
       ? async () => {
-          try {
-            auth.init(url);
-            return await auth.getToken();
-          } catch {
-            return null;
-          }
+          auth.init(url);
+          return await auth.getToken();
         }
       : noopToken;
 

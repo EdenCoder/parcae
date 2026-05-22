@@ -82,14 +82,10 @@ export function betterAuth(opts: BetterAuthOptions = {}): AuthClientAdapter {
 
     async getToken(): Promise<string | null> {
       if (!client) return null;
-      try {
-        const primed = primedSessionPromise;
-        primedSessionPromise = null; // one-shot
-        const session = await (primed ?? client.getSession());
-        return session?.data?.session?.token ?? null;
-      } catch {
-        return null;
-      }
+      const primed = primedSessionPromise;
+      primedSessionPromise = null; // one-shot
+      const session = await (primed ?? client.getSession());
+      return session?.data?.session?.token ?? null;
     },
 
     onChange(callback: (token: string | null) => void): () => void {
@@ -101,7 +97,9 @@ export function betterAuth(opts: BetterAuthOptions = {}): AuthClientAdapter {
             const token = session?.data?.session?.token ?? null;
             callback(token);
           } catch {
-            callback(null);
+            // Transient auth endpoint failures are not sign-outs.
+            // Keep the current session identity until a successful
+            // session read proves it changed.
           }
         }
       };
