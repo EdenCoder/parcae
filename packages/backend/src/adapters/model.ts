@@ -50,6 +50,53 @@ export interface BackendServices {
   changeBus?: ChangeBus; // Cross-process model-change fan-out (optional)
 }
 
+/**
+ * Cached snapshot of the live database schema, built once at the top
+ * of `ensureAllTables()` and consumed by every per-model `ensureTable()`
+ * call. This replaces the previous O(models × columns) sequential
+ * `hasColumn` / `hasIndex` round-trips with a small fixed number of
+ * bulk queries against `information_schema` (Postgres) or
+ * `sqlite_master` + `PRAGMA table_info` (SQLite).
+ *
+ * The snapshot is **read-only**. DDL emitted during `ensureTable()` is
+ * NOT reflected back into the cache — the cache exists to answer "does
+ * column X exist on table Y *as of the start of this boot*". Any
+ * follow-up code that needs to see newly-added columns (e.g.
+ * `_ensureSearchSchema`'s checks for `_search` / `_embedding`) still
+ * queries the database directly so it observes its own writes.
+ */
+interface BulkIntrospection {
+  tables: Set<string>;
+  /** Map from table name to the set of column names that table exposes. */
+  columns: Map<string, Set<string>>;
+  /** Map from table name to the set of index names that table exposes. */
+  indexes: Map<string, Set<string>>;
+}
+
+/**
+ * Columns parcae always considers its own — never droppable as
+ * "obsolete" even when the model no longer declares them, and even
+ * when `PARCAE_DROP_OBSOLETE_COLUMNS=true` is set. This covers:
+ *
+ *   - Primary key + bookkeeping: `id`, `createdAt`, `updatedAt`, `tmp`
+ *   - JSONB overflow column: `data`
+ *   - Search columns from `static searchFields`: `_search`, `_embedding`
+ *
+ * Note: `_search` / `_embedding` are kept on the protected list even
+ * if the model has dropped `static searchFields` since their last
+ * boot. Reverting search is an explicit migration operation; we don't
+ * destroy them as a side-effect of a code change.
+ */
+const PARCAE_OWNED_COLUMNS: ReadonlySet<string> = new Set([
+  "id",
+  "createdAt",
+  "updatedAt",
+  "tmp",
+  "data",
+  "_search",
+  "_embedding",
+]);
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function tableName(modelClass: ModelConstructor): string {
@@ -1887,9 +1934,143 @@ export class BackendAdapter implements ModelAdapter {
 
   // ── Schema Management ────────────────────────────────────────────────
 
+  /**
+   * Bulk-load existing table / column / index metadata for a set of
+   * tables in a small fixed number of round-trips. Replaces the
+   * previous per-(model × column) sequential `hasColumn` calls and the
+   * per-table `pg_indexes` / `pragma_index_list` queries — cuts cold
+   * start from O(N×C) RTTs to O(1) on Postgres and O(N) on SQLite.
+   *
+   * The returned snapshot is read-only and only reflects schema state
+   * at the moment of introspection. Any DDL emitted later in the
+   * `ensureTable()` pass is NOT reflected back.
+   *
+   * On Postgres we use a single `= ANY(?)` query against
+   * `information_schema` and `pg_indexes`. SQLite has no array-bind
+   * support and `PRAGMA` is per-table, so we issue one PRAGMA per
+   * table — still O(N) instead of O(N×C). For an empty `tables`
+   * argument the method returns an empty snapshot without touching
+   * the database.
+   */
+  private async _bulkIntrospectSchema(
+    tables: string[],
+  ): Promise<BulkIntrospection> {
+    const result: BulkIntrospection = {
+      tables: new Set(),
+      columns: new Map(),
+      indexes: new Map(),
+    };
+    if (tables.length === 0) return result;
+
+    const kx = this.write;
+    const wantedTables = new Set(tables);
+
+    if (this.isSqlite) {
+      // ── SQLite path ────────────────────────────────────────────
+      // 1) Which of the wanted tables exist.
+      const placeholders = tables.map(() => "?").join(", ");
+      const tableRows: Array<{ name: string }> = await kx.raw(
+        `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${placeholders})`,
+        tables,
+      );
+      const existingTables = (tableRows ?? []).map((r) => r.name);
+      for (const t of existingTables) result.tables.add(t);
+
+      // 2) Columns per existing table — one PRAGMA per table.
+      //    `PRAGMA table_info(X)` doesn't accept a bound parameter
+      //    for the table name, so we splice it into the SQL after
+      //    intersecting with the wanted set (above) — table names
+      //    are model-derived (pluralized type), not user input.
+      for (const t of existingTables) {
+        if (!wantedTables.has(t)) continue;
+        const colRows: Array<{ name: string }> = await kx.raw(
+          `PRAGMA table_info(\`${t.replace(/`/g, "")}\`)`,
+        );
+        result.columns.set(
+          t,
+          new Set((colRows ?? []).map((r) => r.name)),
+        );
+      }
+
+      // 3) Indexes — one shot across all wanted tables.
+      const idxRows: Array<{ name: string; tbl_name: string }> = await kx.raw(
+        `SELECT name, tbl_name FROM sqlite_master WHERE type = 'index' AND tbl_name IN (${placeholders})`,
+        tables,
+      );
+      for (const row of idxRows ?? []) {
+        if (!wantedTables.has(row.tbl_name)) continue;
+        let set = result.indexes.get(row.tbl_name);
+        if (!set) {
+          set = new Set();
+          result.indexes.set(row.tbl_name, set);
+        }
+        set.add(row.name);
+      }
+    } else {
+      // ── Postgres path ──────────────────────────────────────────
+      // One query each for tables / columns / indexes via `= ANY(?)`.
+      // Scoped to the current schema (typically `public`) so we don't
+      // pick up the same table name in another schema.
+      const tableRes = await kx.raw(
+        `SELECT table_name FROM information_schema.tables
+         WHERE table_schema = current_schema() AND table_name = ANY(?)`,
+        [tables],
+      );
+      for (const row of tableRes?.rows ?? []) {
+        if (wantedTables.has(row.table_name)) {
+          result.tables.add(row.table_name);
+        }
+      }
+
+      const colRes = await kx.raw(
+        `SELECT table_name, column_name FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = ANY(?)`,
+        [tables],
+      );
+      for (const row of colRes?.rows ?? []) {
+        if (!wantedTables.has(row.table_name)) continue;
+        let set = result.columns.get(row.table_name);
+        if (!set) {
+          set = new Set();
+          result.columns.set(row.table_name, set);
+        }
+        set.add(row.column_name);
+      }
+
+      const idxRes = await kx.raw(
+        `SELECT tablename, indexname FROM pg_indexes
+         WHERE schemaname = current_schema() AND tablename = ANY(?)`,
+        [tables],
+      );
+      for (const row of idxRes?.rows ?? []) {
+        if (!wantedTables.has(row.tablename)) continue;
+        let set = result.indexes.get(row.tablename);
+        if (!set) {
+          set = new Set();
+          result.indexes.set(row.tablename, set);
+        }
+        set.add(row.indexname);
+      }
+    }
+
+    return result;
+  }
+
   async ensureTable(
     modelClass: ModelConstructor,
-    opts: { knex?: any } = {},
+    opts: {
+      knex?: any;
+      /**
+       * Pre-fetched schema snapshot. When provided, `ensureTable()`
+       * answers `hasTable` / `hasColumn` / `hasIndex` from the cache
+       * instead of issuing per-call round-trips. Supplied by
+       * `ensureAllTables()`; migration-time `ensureModel()` callers
+       * leave it undefined and fall back to per-call queries (which
+       * is correct because they run inside a transaction whose row
+       * visibility differs from the boot-time cache).
+       */
+      introspection?: BulkIntrospection;
+    } = {},
   ): Promise<void> {
     if (modelClass.managed === false) {
       log.info(
@@ -1907,39 +2088,82 @@ export class BackendAdapter implements ModelAdapter {
     const table = tableName(modelClass);
     const schema = (modelClass.__schema as SchemaDefinition) ?? {};
     const indexes = modelClass.indexes ?? [];
+    const intro = opts.introspection;
 
     log.info(`ensuring schema — model=${modelClass.type}`);
 
-    const hasTable = await kx.schema.hasTable(table);
+    // `hasTable` and column/index existence: answered from the cache
+    // when ensureAllTables built one, otherwise per-call (preserves
+    // migration-time semantics for `ensureModel`).
+    const hasTable = intro
+      ? intro.tables.has(table)
+      : await kx.schema.hasTable(table);
 
     const existingColumns: string[] = [];
     if (hasTable) {
-      for (const key of Object.keys(schema)) {
-        if (await kx.schema.hasColumn(table, key))
-          existingColumns.push(key);
-      }
-      for (const sys of ["createdAt", "updatedAt", "tmp"]) {
-        if (await kx.schema.hasColumn(table, sys))
-          existingColumns.push(sys);
+      if (intro) {
+        const cols = intro.columns.get(table);
+        if (cols) existingColumns.push(...cols);
+      } else {
+        for (const key of Object.keys(schema)) {
+          if (await kx.schema.hasColumn(table, key))
+            existingColumns.push(key);
+        }
+        for (const sys of ["createdAt", "updatedAt", "tmp"]) {
+          if (await kx.schema.hasColumn(table, sys))
+            existingColumns.push(sys);
+        }
       }
     }
 
     let existingIndexes: string[] = [];
-    try {
-      if (this.isSqlite) {
-        const rows = await kx.raw(
-          "SELECT name FROM pragma_index_list(?)",
-          [table],
-        );
-        existingIndexes = (rows ?? []).map((r: any) => r.name);
-      } else {
-        const result = await kx.raw(
-          "SELECT * FROM pg_indexes WHERE tablename = ?",
-          [table],
-        );
-        existingIndexes = result.rows.map((r: any) => r.indexname);
+    if (intro) {
+      const idx = intro.indexes.get(table);
+      if (idx) existingIndexes = [...idx];
+    } else {
+      try {
+        if (this.isSqlite) {
+          const rows = await kx.raw(
+            "SELECT name FROM pragma_index_list(?)",
+            [table],
+          );
+          existingIndexes = (rows ?? []).map((r: any) => r.name);
+        } else {
+          const result = await kx.raw(
+            "SELECT * FROM pg_indexes WHERE tablename = ?",
+            [table],
+          );
+          existingIndexes = result.rows.map((r: any) => r.indexname);
+        }
+      } catch {}
+    }
+
+    // Detect columns that exist in the DB but are no longer declared
+    // on the model. Done only when we have a bulk introspection cache
+    // (i.e. during ensureAllTables(), not migration-time ensureModel)
+    // because the cache gives us the complete column set; migrations
+    // typically drop columns explicitly anyway.
+    let obsoleteColumns: string[] = [];
+    const shouldDropObsolete =
+      process.env.PARCAE_DROP_OBSOLETE_COLUMNS === "true";
+    if (intro && hasTable && existingColumns.length > 0) {
+      const owned = new Set<string>([
+        ...Object.keys(schema),
+        ...PARCAE_OWNED_COLUMNS,
+      ]);
+      obsoleteColumns = existingColumns.filter((c) => !owned.has(c));
+      if (obsoleteColumns.length > 0) {
+        if (shouldDropObsolete) {
+          log.info(
+            `dropping ${obsoleteColumns.length} obsolete column(s) — table=${table} columns=[${obsoleteColumns.join(", ")}]`,
+          );
+        } else {
+          log.info(
+            `obsolete column(s) detected — table=${table} columns=[${obsoleteColumns.join(", ")}] (set PARCAE_DROP_OBSOLETE_COLUMNS=true to remove)`,
+          );
+        }
       }
-    } catch {}
+    }
 
     await kx.schema[hasTable ? "alterTable" : "createTable"](
       table,
@@ -2006,6 +2230,15 @@ export class BackendAdapter implements ModelAdapter {
         for (const idx of indexes) {
           if (Array.isArray(idx)) t.index(idx, idx.join("_"));
           else t.index(idx, idx);
+        }
+
+        // Drop obsolete columns last, after every additive change has
+        // been queued. Gated behind PARCAE_DROP_OBSOLETE_COLUMNS so
+        // operators opt in to destructive behaviour.
+        if (shouldDropObsolete) {
+          for (const col of obsoleteColumns) {
+            t.dropColumn(col);
+          }
         }
       },
     );
@@ -2124,8 +2357,16 @@ export class BackendAdapter implements ModelAdapter {
   }
 
   async ensureAllTables(models: ModelConstructor[]): Promise<void> {
+    // Bulk-introspect once for every managed table so the per-model
+    // `ensureTable()` calls can answer existence questions from memory.
+    // Externally-managed models are excluded — we never inspect or
+    // alter their schema. See `BulkIntrospection` for the contract.
+    const managed = models.filter((m) => m.managed !== false);
+    const managedTables = managed.map((m) => tableName(m));
+    const introspection = await this._bulkIntrospectSchema(managedTables);
+
     for (const modelClass of models) {
-      await this.ensureTable(modelClass);
+      await this.ensureTable(modelClass, { introspection });
     }
 
     // Register embedding hooks for AlloyDB models with searchFields
