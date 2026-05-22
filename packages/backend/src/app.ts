@@ -37,6 +37,7 @@ import { BackendAdapter } from "./adapters/model";
 import { registerModelRoutes } from "./adapters/routes";
 import { PubSub } from "./services/pubsub";
 import { QueueService } from "./services/queue";
+import { RefLoader } from "./services/ref-loader";
 import { QuerySubscriptionManager } from "./services/subscriptions";
 import { ChangeBus } from "./services/changeBus";
 import { ListenNotifyPoller } from "./services/listenNotifyPoller";
@@ -589,9 +590,20 @@ export function createApp(config: AppConfig): ParcaeApp {
       // Middleware: propagate request user via AsyncLocalStorage so hooks
       // can access it regardless of whether the save originates from
       // auto-CRUD routes or custom controllers.
+      //
+      // We also create a per-request `RefLoader` here so every
+      // `BackendAdapter.findById` call inside the request scope
+      // coalesces concurrent ref-proxy resolutions into one
+      // `WHERE id IN (...)` batch per type per microtask. Outside
+      // this scope (background jobs, hooks fired from non-HTTP code
+      // paths, tests) `findById` falls through to the direct
+      // per-id query. See `services/ref-loader.ts` for the contract.
       server.polka.use((req: any, res: any, next: any) => {
         const user = req.session?.user ?? null;
-        runWithRequestContext({ user }, () => {
+        const refLoader = new RefLoader((type, ids) =>
+          adapter.batchFindByType(type, ids),
+        );
+        runWithRequestContext({ user, refLoader }, () => {
           next();
         });
       });
