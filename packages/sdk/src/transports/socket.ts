@@ -24,6 +24,25 @@ export interface SocketTransportConfig {
   version?: string;
   path?: string;
   token?: string | null;
+  /**
+   * Async token resolver. When provided, the transport starts
+   * resolving the token immediately at construction (so it runs in
+   * parallel with React mount and socket connect) and emits the
+   * `authenticate` handshake as soon as BOTH the socket is connected
+   * AND the token has resolved — without waiting for the consumer's
+   * useEffect lifecycle.
+   *
+   * This is the load-bearing fix for the "React-mount auth hole" we
+   * see in the DOL-1037 trace: previously, the Provider's
+   * `useEffect` had to fire (after every child effect, per React's
+   * effect ordering) before it could call `client.authenticate()`,
+   * adding 200–300 ms of dead time on cold starts. With `getToken`
+   * wired in, the handshake races React rendering and typically
+   * lands first.
+   *
+   * Mutually exclusive with `token` — pass one or the other.
+   */
+  getToken?: () => Promise<string | null>;
 }
 
 export class SocketTransport extends EventEmitter implements Transport {
@@ -35,12 +54,68 @@ export class SocketTransport extends EventEmitter implements Transport {
   private version: string;
   private token: string | null | undefined;
   private inflight = new Map<string, Promise<any>>();
+  /**
+   * Resolves once the constructor-supplied `getToken` Promise (if any)
+   * has settled. The `connect` handler awaits this before `_doAuth`
+   * runs so the token is in hand by the time we emit the
+   * `authenticate` event.
+   *
+   * For the legacy / no-getToken path this is `Promise.resolve()`
+   * immediately, so the connect-time `_doAuth` runs as before.
+   */
+  private tokenReady: Promise<void>;
+  /**
+   * `true` while `tokenReady` hasn't settled. Used by the `connect`
+   * handler to decide whether to fall through synchronously (legacy
+   * path, no getToken) or defer `_doAuth` until the token lands.
+   */
+  private tokenAwaitNeeded: boolean;
 
   constructor(config: SocketTransportConfig) {
     super();
     this.url = config.url;
     this.version = config.version ?? "v1";
     this.token = config.token;
+
+    // Eager token resolver — race with React mount + socket connect
+    // so the auth handshake doesn't get serialised behind useEffect.
+    // See `SocketTransportConfig.getToken` for the rationale.
+    //
+    // `tokenAwaitNeeded` is the load-bearing branch: when no
+    // resolver was supplied, we keep the legacy sync `connect` →
+    // `_doAuth` path so existing tests + consumers see identical
+    // timing. Only when a resolver IS supplied do we wait on it
+    // before authenticating.
+    if (config.getToken) {
+      console.log("[socket DOL-1037] config.getToken provided — eager fetch", {
+        t: performance.now(),
+      });
+      // Token starts as undefined so any external `authenticate()`
+      // call landing first overrides this path cleanly.
+      this.token = undefined;
+      this.tokenAwaitNeeded = true;
+      this.tokenReady = config
+        .getToken()
+        .then((t) => {
+          this.token = t ?? null;
+          this.tokenAwaitNeeded = false;
+          console.log("[socket DOL-1037] eager getToken() resolved", {
+            hasToken: t !== null && t !== undefined,
+            t: performance.now(),
+          });
+        })
+        .catch((err) => {
+          this.token = null;
+          this.tokenAwaitNeeded = false;
+          console.log("[socket DOL-1037] eager getToken() rejected", {
+            error: String(err),
+            t: performance.now(),
+          });
+        });
+    } else {
+      this.tokenReady = Promise.resolve();
+      this.tokenAwaitNeeded = false;
+    }
 
     const socketPath = config.path ?? "/ws";
     const socketKey = `${this.url}:${socketPath}`;
@@ -64,8 +139,19 @@ export class SocketTransport extends EventEmitter implements Transport {
         hasToken: this.token !== undefined && this.token !== null,
         t: performance.now(),
       });
-      this._doAuth();
+      // Legacy path: no constructor `getToken`. Run `_doAuth` +
+      // emit `connected` synchronously so existing consumers /
+      // tests see identical timing.
+      //
+      // Eager-token path: defer `_doAuth` until the in-flight
+      // resolver lands. `connected` still fires synchronously
+      // because it's a socket-state event, not an auth event.
       this.emit("connected");
+      if (this.tokenAwaitNeeded) {
+        this.tokenReady.then(() => this._doAuth());
+      } else {
+        this._doAuth();
+      }
     });
 
     this.socket.on("disconnect", () => {
@@ -92,7 +178,10 @@ export class SocketTransport extends EventEmitter implements Transport {
     if (this.socket.connected) {
       this.isConnected = true;
       log.debug("socket connected");
-      this._doAuth();
+      // Same await-then-_doAuth pattern as the on('connect') handler
+      // — kept in sync so the eager-getToken path works even when
+      // we attach to an already-connected cached socket.
+      this.tokenReady.then(() => this._doAuth());
     }
 
     if (this.token === null) {

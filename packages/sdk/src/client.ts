@@ -16,6 +16,19 @@ export interface ClientConfig {
   transport?: "socket" | "sse" | Transport;
   /** Initial auth token. null = no auth. undefined = call authenticate() later. */
   token?: string | null;
+  /**
+   * Async token resolver. When provided, the SocketTransport awaits
+   * this before emitting the `authenticate` handshake — so the auth
+   * round trip happens in parallel with React mount instead of being
+   * serialised behind the consumer's `useEffect` lifecycle.
+   *
+   * The Provider's session-resolution effect should NOT also call
+   * `client.authenticate(initialToken)` when this is set, or both
+   * handshakes will race (the AuthGate would resolve twice).
+   *
+   * Mutually exclusive with `token`.
+   */
+  getToken?: () => Promise<string | null>;
 }
 
 export interface ParcaeClient {
@@ -55,6 +68,7 @@ export function createClient(config: ClientConfig): ParcaeClient {
       url: config.url,
       version,
       token: config.token,
+      getToken: config.getToken,
     });
   }
 
