@@ -510,10 +510,39 @@ export function createApp(config: AppConfig): ParcaeApp {
       _setIo(server.io);
 
       // ── Step 9: Set up QuerySubscriptionManager ────────────────────
+      // The IO backend wires Socket.IO rooms (DOL-1047): every
+      // subscriber for a given cached query joins `query:${hash}` at
+      // subscribe time so re-eval can broadcast ONCE via `io.to(room)`
+      // instead of N times via `io.to(socketId)`. The legacy
+      // `emitToSocket` is still provided as a fallback for any path
+      // that doesn't have a room (e.g. force-refresh on a query the
+      // socket hasn't joined yet).
+      const reevalConcurrency = process.env.PARCAE_REEVAL_CONCURRENCY
+        ? Math.max(1, Number(process.env.PARCAE_REEVAL_CONCURRENCY))
+        : undefined;
       const subscriptions = new QuerySubscriptionManager(
-        (socketId, event, data) => {
-          server?.io.to(socketId).emit(event, data);
+        {
+          emitToSocket: (socketId, event, data) => {
+            server?.io.to(socketId).emit(event, data);
+          },
+          emitToRoom: (room, event, data) => {
+            server?.io.to(room).emit(event, data);
+          },
+          joinRoom: (socketId, room) => {
+            const socket = server?.io.sockets.sockets.get(socketId);
+            // The socket may have disconnected between the HTTP
+            // subscribe call landing and this hook firing. Skip
+            // silently — the room broadcast won't reach a missing
+            // socket either way, and `unsubscribe` will GC the
+            // cached query when its subscriber count hits zero.
+            socket?.join(room);
+          },
+          leaveRoom: (socketId, room) => {
+            const socket = server?.io.sockets.sockets.get(socketId);
+            socket?.leave(room);
+          },
         },
+        reevalConcurrency !== undefined ? { reevalConcurrency } : {},
       );
       adapter.subscriptions = subscriptions;
 

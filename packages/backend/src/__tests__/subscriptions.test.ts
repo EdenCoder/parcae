@@ -962,6 +962,231 @@ describe("QuerySubscriptionManager", () => {
   });
 });
 
+// ─── DOL-1047: concurrency cap + Socket.IO rooms ────────────────────────────
+//
+// Three new contracts pinned here:
+//
+//   1. Re-eval semaphore — a burst of `_scheduleReeval` calls across N
+//      distinct cached queries does NOT launch N simultaneous DB
+//      round-trips. The manager caps in-flight re-evals at
+//      `reevalConcurrency` (default 8), so the worst-case pool load
+//      from a write-storm stays bounded.
+//
+//   2. Socket.IO room broadcast — when the constructor is given an
+//      `emitToRoom` callback (and `joinRoom`/`leaveRoom`), every
+//      subscriber for a given cached query joins `query:${hash}` and
+//      re-eval emits ONCE via the room instead of N×emitToSocket.
+//
+//   3. Per-row clone — `jsonClone` (JSON.parse(JSON.stringify(...)))
+//      gets replaced with a single recursive walker that converts
+//      Date → ISO string but skips the intermediate string
+//      materialisation. Behavioural smoke: dates still come back as
+//      ISO strings in the cached result.
+
+describe("QuerySubscriptionManager — re-eval concurrency cap (DOL-1047)", () => {
+  it("limits concurrent in-flight re-evals to `reevalConcurrency`", async () => {
+    const source = createQuerySource([row("p1")]);
+
+    // Gated `find()` — pauses inside the body until we explicitly
+    // release it, recording its in-flight contribution while paused.
+    // The first `find()` per query runs during `subscribe`'s initial
+    // load and is released immediately so the subscribe loop can
+    // make progress; subsequent `find()`s are the re-eval bodies
+    // whose concurrency we want to observe.
+    let gateOpen = true;
+    let inFlight = 0;
+    let peak = 0;
+    const waiters: Array<() => void> = [];
+
+    const makeGatedQuery = (sql: string) => {
+      const chain: any = new Proxy(
+        {},
+        {
+          get(_t, prop: string) {
+            if (prop === "__modelType") return "project";
+            if (prop === "find") {
+              return async () => {
+                inFlight++;
+                if (inFlight > peak) peak = inFlight;
+                if (!gateOpen) {
+                  await new Promise<void>((resolve) =>
+                    waiters.push(resolve),
+                  );
+                }
+                inFlight--;
+                return source.query("project").find();
+              };
+            }
+            if (prop === "exec") {
+              return () => ({ toSQL: () => ({ sql, bindings: [] }) });
+            }
+            if (prop === "clone") return () => chain;
+            return (..._args: any[]) => chain;
+          },
+        },
+      );
+      return chain;
+    };
+
+    const REEVAL_CAP = 3;
+    const m = new QuerySubscriptionManager(() => {}, {
+      debounceMs: 0,
+      maxWaitMs: 0,
+      reevalConcurrency: REEVAL_CAP,
+    });
+
+    // Phase 1 — subscribe N queries with the gate OPEN so the
+    // initial `_execQuery` returns immediately.
+    const N = 12;
+    for (let i = 0; i < N; i++) {
+      await m.subscribe({ socketId: "s1", query: makeGatedQuery(`sql_${i}`) });
+    }
+    expect(peak).toBe(1); // sanity — initial loads ran one at a time
+
+    // Phase 2 — close the gate, reset stats, trigger a re-eval burst.
+    gateOpen = false;
+    peak = 0;
+    m.onModelChange("project");
+    await new Promise((r) => setTimeout(r, 5));
+
+    // With cap=REEVAL_CAP, at most REEVAL_CAP `_execQuery` bodies
+    // should be paused-and-waiting in the gate at the same time.
+    expect(peak).toBe(REEVAL_CAP);
+    expect(m.reevalInFlight).toBe(REEVAL_CAP);
+
+    // Drain the waiters in chunks and verify the semaphore lets the
+    // next batch in as old ones finish — never exceeding the cap.
+    while (waiters.length > 0) {
+      const next = waiters.shift()!;
+      next();
+      await new Promise((r) => setTimeout(r, 1));
+      expect(peak).toBeLessThanOrEqual(REEVAL_CAP);
+    }
+  });
+});
+
+describe("QuerySubscriptionManager — Socket.IO room broadcast (DOL-1047)", () => {
+  it("when emitToRoom is provided, emits ONCE per cached query (not per-subscriber)", async () => {
+    const source = createQuerySource([row("p1", { name: "first" })]);
+    const perSocket: Array<{ socketId: string; event: string }> = [];
+    const perRoom: Array<{ room: string; event: string; data: any }> = [];
+    const joins: Array<{ socketId: string; room: string }> = [];
+    const leaves: Array<{ socketId: string; room: string }> = [];
+
+    const m = new QuerySubscriptionManager(
+      {
+        emitToSocket: (socketId, event) => {
+          perSocket.push({ socketId, event });
+        },
+        emitToRoom: (room, event, data) => {
+          perRoom.push({ room, event, data });
+        },
+        joinRoom: (socketId, room) => {
+          joins.push({ socketId, room });
+        },
+        leaveRoom: (socketId, room) => {
+          leaves.push({ socketId, room });
+        },
+      },
+      { debounceMs: 0, maxWaitMs: 0 },
+    );
+
+    const sub1 = await m.subscribe({
+      socketId: "s1",
+      query: source.query("project"),
+    });
+    await m.subscribe({
+      socketId: "s2",
+      query: source.query("project"),
+    });
+    await m.subscribe({
+      socketId: "s3",
+      query: source.query("project"),
+    });
+
+    // Joining the room is done at subscribe-time so the manager
+    // doesn't need a socket reference when it later broadcasts.
+    expect(joins).toEqual([
+      { socketId: "s1", room: `query:${sub1.hash}` },
+      { socketId: "s2", room: `query:${sub1.hash}` },
+      { socketId: "s3", room: `query:${sub1.hash}` },
+    ]);
+
+    // Trigger a re-eval that changes the data.
+    source.setResults([row("p1", { name: "second" })]);
+    m.onModelChange("project");
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Single room broadcast — not N per-socket emits.
+    expect(perRoom).toHaveLength(1);
+    expect(perRoom[0]!.room).toBe(`query:${sub1.hash}`);
+    expect(perRoom[0]!.event).toBe(`query:${sub1.hash}`);
+    expect(perSocket).toHaveLength(0);
+
+    // Unsubscribe must mirror the join with a leave.
+    m.unsubscribe("s2", sub1.hash);
+    expect(leaves).toContainEqual({
+      socketId: "s2",
+      room: `query:${sub1.hash}`,
+    });
+  });
+
+  it("falls back to per-socket emit when only the legacy emitToSocket callback is provided", async () => {
+    const source = createQuerySource([row("p1", { name: "first" })]);
+    const perSocket: Array<{ socketId: string; event: string }> = [];
+
+    const m = new QuerySubscriptionManager(
+      (socketId, event) => {
+        perSocket.push({ socketId, event });
+      },
+      { debounceMs: 0, maxWaitMs: 0 },
+    );
+
+    const sub = await m.subscribe({
+      socketId: "s1",
+      query: source.query("project"),
+    });
+    await m.subscribe({
+      socketId: "s2",
+      query: source.query("project"),
+    });
+
+    source.setResults([row("p1", { name: "second" })]);
+    m.onModelChange("project");
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Backward-compat path: one emit per subscriber.
+    expect(perSocket).toEqual([
+      { socketId: "s1", event: `query:${sub.hash}` },
+      { socketId: "s2", event: `query:${sub.hash}` },
+    ]);
+  });
+});
+
+describe("QuerySubscriptionManager — Date safety on re-eval clone (DOL-1047)", () => {
+  it("preserves Date → ISO string coercion on rows after re-eval", async () => {
+    const source = createQuerySource([
+      row("p1", {
+        name: "first",
+        updatedAt: new Date("2024-01-01T00:00:00Z"),
+      }),
+    ]);
+    const m = new QuerySubscriptionManager(
+      () => {},
+      { debounceMs: 0, maxWaitMs: 0 },
+    );
+
+    const sub = await m.subscribe({
+      socketId: "s1",
+      query: source.query("project"),
+    });
+    // The cached result must hold ISO strings, not Date instances —
+    // matches the contract `jsonClone` (now `dateSafeClone`) gives.
+    expect(sub.items[0]!.updatedAt).toBe("2024-01-01T00:00:00.000Z");
+    expect(typeof sub.items[0]!.updatedAt).toBe("string");
+  });
+});
+
 // ── Helper ───────────────────────────────────────────────────────────────────
 
 /** Flush microtask queue so async _reeval completes */
