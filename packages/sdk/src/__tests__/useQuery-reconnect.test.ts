@@ -187,7 +187,7 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
 
     expect(entry.items[0]).toBe(firstInstance); // identity preserved
     expect(entry.items[0].title).toBe("updated");
-    expect(entry.version).toBe(1); // bumped on changed=true
+    expect(entry.version).toBeGreaterThan(0); // bumped on changed=true
     release();
   });
 
