@@ -42,7 +42,31 @@ interface UseQueryOptions {
 
 interface UseQueryResult<T> {
   items: T[];
+  /**
+   * `true` while no items have been delivered yet AND the consumer
+   * should display some kind of placeholder. This covers BOTH the
+   * "auth still resolving" and "wire request in flight" phases —
+   * which is the historical contract — but blurs them. Use
+   * `awaitingAuth` to distinguish if you want phase-specific UX.
+   */
   loading: boolean;
+  /**
+   * `true` while `useQuery` is parked because the auth gate hasn't
+   * resolved yet (and `waitForAuth` is on, which is the default).
+   * The hook hasn't even attempted a wire request — the cache key
+   * is `null` because `userId` isn't known.
+   *
+   * Recommended UX split:
+   *
+   *   - `awaitingAuth: true` → "Signing you in…"
+   *   - `loading: true && !awaitingAuth` → real fetch in flight,
+   *      show a data skeleton.
+   *   - `loading: false` → items are populated (possibly empty).
+   *
+   * Always `false` when `waitForAuth: false` was passed — anonymous
+   * queries fire immediately and skip the auth gate.
+   */
+  awaitingAuth: boolean;
   error: Error | null;
   refetch: () => void;
   /** Total matching records on the server (before limit/offset). */
@@ -1108,10 +1132,17 @@ export function useQuery<T>(
     [entryForOps],
   );
 
+  // `awaitingAuth` reflects "we're parked on the auth gate" — only
+  // true when the consumer asked us to wait (default) AND the gate
+  // is still in flight. Distinct from `loading` (which also covers
+  // wire-in-flight). See `UseQueryResult.awaitingAuth` JSDoc.
+  const awaitingAuth = waitForAuth && authStatus === "pending";
+
   if (!key)
     return {
       items: EMPTY as T[],
       loading: !authReady,
+      awaitingAuth,
       error: null,
       total: 0,
       refetch: noop,
@@ -1144,6 +1175,7 @@ export function useQuery<T>(
   return {
     items,
     loading: entry?.loading ?? true,
+    awaitingAuth,
     error: entry?.error ?? null,
     total: entry?.totalCount ?? 0,
     refetch,
@@ -1159,6 +1191,147 @@ export function useQuery<T>(
 // retry scheduling, and applyOps without going through React render.
 // Not part of the public surface — the names are deliberately prefixed
 // with `__` so consumers know they're framework-internal.
+
+// ─── prefetch ────────────────────────────────────────────────────────────────
+
+/**
+ * Options for `prefetch(client, chain, options?)`.
+ */
+export interface PrefetchOptions {
+  /**
+   * Wait for the auth gate to resolve before building the cache key
+   * and firing the request. Default `true`.
+   *
+   * Critical for auth safety: without this gate, a prefetch called
+   * during the "pending" window would build a key with `userId ??
+   * "anon"` (i.e. literally `:anon:`), then the wire request would
+   * pause on `auth.ready` and ultimately fire with the resolved
+   * user's cookie. The authenticated response would land in a cache
+   * entry KEYED AS ANONYMOUS — visible to any subsequent
+   * `useQuery({ waitForAuth: false })` looking up the same chain.
+   *
+   * With `waitForAuth: true` (default), we don't build the key until
+   * the gate resolves, so the entry is keyed under the actual user.
+   *
+   * Set to `false` only for legitimately-public queries.
+   */
+  waitForAuth?: boolean;
+}
+
+/**
+ * Prime the `useQuery` cache so a later component mount finds items
+ * already loaded — skipping the `mount → commit → useEffect → fetch`
+ * cascade.
+ *
+ * Typical usage: a route loader, a parent component effect, or the
+ * `ParcaeProvider`'s `onReady` callback warms the cache for known
+ * routes before the leaf components mount.
+ *
+ *   await client.prefetch(Project.where({ id: params.id }).limit(1));
+ *
+ * The returned Promise resolves with the loaded items (or rejects
+ * on error). Subscriptions open automatically — the cache entry
+ * stays live so the eventual `useQuery` consumer joins an existing
+ * subscription.
+ *
+ * Returns the existing cache entry's items if the same key was
+ * primed earlier (or is currently in flight) — no duplicate work.
+ *
+ * Auth-safe by default. See `PrefetchOptions.waitForAuth` for the
+ * `:anon:` key pollution threat model.
+ */
+export async function prefetch<T>(
+  client: ParcaeClient,
+  chain: QueryChain<T>,
+  options: PrefetchOptions = {},
+): Promise<T[]> {
+  const waitForAuth = options.waitForAuth ?? true;
+  const auth = (client.transport as any)?.auth as
+    | { ready: Promise<void>; state: { userId: string | null } }
+    | undefined;
+
+  // Critical for auth safety — see `PrefetchOptions.waitForAuth`.
+  // We build the key AFTER the gate resolves so the entry is keyed
+  // by the actual userId, not by `:anon:`.
+  if (waitForAuth && auth) {
+    await auth.ready;
+  }
+
+  const userId = auth?.state?.userId ?? null;
+  const modelType = (chain as any).__modelType;
+  if (!modelType) {
+    throw new Error(
+      "prefetch: chain has no __modelType — was it built from a real Model class?",
+    );
+  }
+  const steps = (chain as any).__steps ?? [];
+  const key = `${modelType}:${userId ?? "anon"}:${JSON.stringify(steps)}`;
+
+  const entry = getOrCreate(key);
+
+  // Retain the entry while we're waiting so the 60s GC doesn't fire
+  // mid-flight. Released when the Promise settles.
+  entry.refs++;
+  if (entry.gcTimer) {
+    clearTimeout(entry.gcTimer);
+    entry.gcTimer = null;
+  }
+
+  return new Promise<T[]>((resolve, reject) => {
+    let settled = false;
+
+    const release = () => {
+      entry.refs--;
+      if (entry.refs <= 0) {
+        // Same GC delay useQuery uses — gives a window for a
+        // consumer to mount and pick up the primed entry without
+        // re-fetching.
+        entry.gcTimer = setTimeout(() => {
+          entry.dispose?.();
+          cache.delete(key);
+        }, GC_DELAY);
+      }
+    };
+
+    const settle = (value: T[] | Error) => {
+      if (settled) return;
+      settled = true;
+      entry.listeners.delete(onChange);
+      release();
+      if (value instanceof Error) reject(value);
+      else resolve(value);
+    };
+
+    const onChange = () => {
+      if (entry.error) settle(entry.error);
+      else if (!entry.loading) settle(entry.items as T[]);
+    };
+
+    // Already errored? Surface synchronously.
+    if (entry.error) {
+      settle(entry.error);
+      return;
+    }
+    // Already loaded? Items may be `[]` (loaded-but-empty) — that
+    // still counts as "done". `entry.queryHash !== null` distinguishes
+    // "loaded into an empty result" from "fresh entry, never fetched".
+    if (!entry.loading && entry.queryHash !== null) {
+      settle(entry.items as T[]);
+      return;
+    }
+
+    // Either in flight (a parallel prefetch or a mounted useQuery is
+    // already fetching) or fresh. Subscribe for the completion notify.
+    entry.listeners.add(onChange);
+
+    // Kick off the fetch if nothing has yet — `entry.chain` is set
+    // by `doFetch` so its absence is the canonical "never fetched"
+    // signal. Avoids re-firing when a useQuery already started one.
+    if (!entry.chain) {
+      doFetch(key, entry, chain as any, client);
+    }
+  });
+}
 
 /** @internal */
 export const __test = {
