@@ -59,6 +59,11 @@ export class SocketTransport extends EventEmitter implements Transport {
     this.socket.on("connect", () => {
       this.isConnected = true;
       log.debug("socket connected");
+      console.log("[socket DOL-1037] connect", {
+        socketId: this.socket.id,
+        hasToken: this.token !== undefined && this.token !== null,
+        t: performance.now(),
+      });
       this._doAuth();
       this.emit("connected");
     });
@@ -74,6 +79,10 @@ export class SocketTransport extends EventEmitter implements Transport {
       // `useQuery` subscriptions because nothing re-authenticates
       // and re-subscribes them.
       log.debug("socket disconnected");
+      console.log("[socket DOL-1037] disconnect", {
+        socketId: this.socket.id,
+        t: performance.now(),
+      });
       this.auth.reset();
       this.emit("disconnected");
     });
@@ -92,7 +101,12 @@ export class SocketTransport extends EventEmitter implements Transport {
   }
 
   private _doAuth(): void {
-    if (this.token === undefined) return;
+    if (this.token === undefined) {
+      console.log("[socket DOL-1037] _doAuth bailed — token undefined", {
+        t: performance.now(),
+      });
+      return;
+    }
     if (this.token === null) {
       this.auth.resolveUnauthenticated();
       return;
@@ -100,9 +114,18 @@ export class SocketTransport extends EventEmitter implements Transport {
 
     const t0 = performance.now();
     log.debug("authenticating...");
+    console.log("[socket DOL-1037] _doAuth → emit('authenticate')", {
+      socketId: this.socket.id,
+      t: t0,
+    });
     this.socket.emit("authenticate", this.token, (response: any) => {
       const ms = (performance.now() - t0).toFixed(0);
       const userId = response?.userId ?? null;
+      console.log("[socket DOL-1037] _doAuth ← server reply", {
+        userId,
+        ms: Number(ms),
+        t: performance.now(),
+      });
       if (userId) {
         this.auth.resolve(userId);
         log.debug(`authenticated as ${userId} (${ms}ms)`);

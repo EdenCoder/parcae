@@ -49,6 +49,12 @@ export class AuthGate {
   resolve(userId: string): void {
     this.state.status = "authenticated";
     log.debug("auth: authenticated, userId:", userId);
+    console.log("[gate DOL-1037] resolve(authenticated)", {
+      userId,
+      version: this.state.version + 1,
+      listeners: this._listeners.size,
+      t: performance.now(),
+    });
     this.state.userId = userId;
     this.state.version++;
     this._resolve?.();
@@ -60,6 +66,11 @@ export class AuthGate {
   resolveUnauthenticated(): void {
     this.state.status = "unauthenticated";
     log.debug("auth: unauthenticated");
+    console.log("[gate DOL-1037] resolve(unauthenticated)", {
+      version: this.state.version + 1,
+      listeners: this._listeners.size,
+      t: performance.now(),
+    });
     this.state.userId = null;
     this.state.version++;
     this._resolve?.();
@@ -72,6 +83,13 @@ export class AuthGate {
     if (this.state.status !== "pending") {
       this.state.status = "pending";
       log.debug("auth: reset to pending");
+      console.log("[gate DOL-1037] reset(pending)", {
+        prevStatus: this.state.status,
+        prevUserId: this.state.userId,
+        version: this.state.version + 1,
+        listeners: this._listeners.size,
+        t: performance.now(),
+      });
       this.state.userId = null;
       this.state.version++;
       this.ready = this._makePending();
