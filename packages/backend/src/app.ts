@@ -949,6 +949,77 @@ export function createApp(config: AppConfig): ParcaeApp {
       // clients should be hitting the worker URL anyway.
       const modelsByType = new Map(models.map((m) => [m.type, m]));
 
+      // Resync RPC handler — see `transports/socket.ts` for the wire
+      // contract. Re-evaluates each client-supplied chain through the
+      // owning Model's `scope.read`, then rebinds a fresh subscription
+      // on the (post-reconnect) socket id. One round trip restores N
+      // queries.
+      async function resyncQueries(
+        socketId: string,
+        socketSession: AuthSession | null,
+        entries: Array<{
+          key: string;
+          modelType: string;
+          steps: unknown[];
+          queryHash?: string | null;
+        }>,
+        adapter: BackendAdapter,
+        registry: Map<string, ModelConstructor>,
+      ): Promise<
+        Array<{ key: string; hash: string; items: any[]; totalCount: number }>
+      > {
+        const results: Array<{
+          key: string;
+          hash: string;
+          items: any[];
+          totalCount: number;
+        }> = [];
+        for (const entry of entries) {
+          const ModelClass = registry.get(entry.modelType);
+          if (!ModelClass) continue;
+          const scope = (ModelClass as any).scope;
+          if (!scope?.read) continue;
+
+          const ctx = {
+            user: socketSession?.user ?? null,
+            params: {},
+            data: {},
+          } as any;
+          const scopeResult = scope.read(ctx);
+          if (!scopeResult) continue;
+
+          const steps = Array.isArray(entry.steps) ? entry.steps : [];
+          const query = adapter.queryFromClient(
+            ModelClass,
+            scopeResult,
+            steps as any,
+          );
+
+          const stepsWithoutPagination = steps.filter(
+            (s: any) => s?.method !== "limit" && s?.method !== "offset",
+          );
+          const countQuery = adapter.queryFromClient(
+            ModelClass,
+            scopeResult,
+            stepsWithoutPagination as any,
+          );
+
+          if (!adapter.subscriptions) continue;
+          const [sub, totalCount] = await Promise.all([
+            adapter.subscriptions.subscribe({ socketId, query }),
+            countQuery.count(),
+          ]);
+
+          results.push({
+            key: entry.key,
+            hash: sub.hash,
+            items: [...sub.items],
+            totalCount,
+          });
+        }
+        return results;
+      }
+
       if (flags.server) server.io.on("connection", (socket) => {
         let socketSession: any = null;
 
@@ -1032,19 +1103,73 @@ export function createApp(config: AppConfig): ParcaeApp {
           },
         );
 
-        // Authenticate via bearer token
-        socket.on("authenticate", async (token: string, callback: any) => {
-          if (authAdapter) {
-            try {
-              socketSession = await authAdapter.resolveToken(token);
-              callback({ userId: socketSession?.user?.id ?? null });
-            } catch {
-              callback({ userId: null });
+        // ── Hello / resync — session + reconnect protocol ─────────
+        //
+        // `hello` runs once per (re)connection: client sends its
+        // bearer token, server resolves the session, and binds it to
+        // this socket. The transport invokes this exactly once per
+        // socket; reconnects get a fresh `hello` automatically.
+        //
+        // `resync` is the batched reconnect refetch. The client hands
+        // us its live cache entries; we re-evaluate each query
+        // against the DB and re-bind subscriptions on the new socket
+        // id. One round trip restores N queries.
+        socket.on(
+          "hello",
+          async (payload: { token?: string | null }, callback: any) => {
+            const token = payload?.token ?? null;
+            if (authAdapter && token) {
+              try {
+                socketSession = await authAdapter.resolveToken(token);
+              } catch {
+                socketSession = null;
+              }
+            } else {
+              socketSession = null;
             }
-          } else {
-            callback?.({ userId: null });
-          }
-        });
+            callback?.({ userId: socketSession?.user?.id ?? null });
+          },
+        );
+
+        socket.on(
+          "resync",
+          async (
+            payload: {
+              queries?: Array<{
+                key: string;
+                modelType: string;
+                steps: unknown[];
+                queryHash?: string | null;
+              }>;
+            },
+            callback: any,
+          ) => {
+            const entries = payload?.queries ?? [];
+            if (entries.length === 0) {
+              callback?.({ success: true, results: [] });
+              return;
+            }
+            try {
+              const results = await resyncQueries(
+                socket.id,
+                socketSession,
+                entries,
+                adapter,
+                modelsByType,
+              );
+              callback?.({ success: true, results });
+            } catch (err: any) {
+              log.error("[socket] resync failed:", err);
+              callback?.({
+                success: false,
+                error:
+                  err instanceof ClientError
+                    ? err.message
+                    : "Resync failed",
+              });
+            }
+          },
+        );
 
         // ── route.on() — custom Socket.IO event handlers ──────────
         const socketHandlers = getSocketHandlers();

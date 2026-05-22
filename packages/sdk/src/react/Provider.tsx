@@ -5,23 +5,8 @@ import { createClient } from "../client";
 import type { ParcaeClient, ClientConfig } from "../client";
 import type { AuthClientAdapter } from "../auth-adapter";
 import { ParcaeContext } from "./context";
-import { _purgeCacheForUser } from "./useQuery";
+import { _onResyncRequired, _purgeCacheForUser } from "./useQuery";
 import { log } from "../log";
-
-async function handleReconnectAuth(
-  auth: Pick<AuthClientAdapter, "getToken">,
-  client: Pick<ParcaeClient, "authenticate">,
-): Promise<void> {
-  try {
-    const token = await auth.getToken();
-    if (token) await client.authenticate(token);
-  } catch {
-    // A reconnect-time session read is best-effort. The socket transport
-    // already re-authenticates with its retained token on reconnect;
-    // treating a transient HTTP/session failure as sign-out can downgrade
-    // a successfully re-authenticated socket back to unauthenticated.
-  }
-}
 
 export interface ParcaeProviderProps {
   /** Pre-created client instance. */
@@ -31,18 +16,18 @@ export interface ParcaeProviderProps {
   /** Auth adapter — handles session resolution internally. */
   auth?: AuthClientAdapter;
   version?: string;
-  transport?: ClientConfig["transport"];
   children: React.ReactNode;
   onReady?: (client: ParcaeClient) => void;
   onError?: (error: Error) => void;
 }
+
+const noopToken = async () => null;
 
 export const ParcaeProvider: React.FC<ParcaeProviderProps> = ({
   client: externalClient,
   url,
   auth,
   version = "v1",
-  transport = "socket",
   children,
   onReady,
   onError,
@@ -53,75 +38,38 @@ export const ParcaeProvider: React.FC<ParcaeProviderProps> = ({
       throw new Error(
         "ParcaeProvider requires either a `client` or `url` prop",
       );
-    // When an auth adapter is supplied, pre-thread its `getToken`
-    // into the transport so the auth handshake can fire as soon as
-    // the socket connects (in parallel with React mount), instead
-    // of waiting for this Provider's useEffect to run AFTER every
-    // child effect (DOL-1037). Falls back to the legacy
-    // useEffect-driven `client.authenticate(token)` flow when no
-    // adapter is supplied or for downstream-only token rotation.
-    const eagerGetToken = auth
+
+    const getToken: ClientConfig["getToken"] = auth
       ? async () => {
           try {
-            // Initialise the adapter if the consumer didn't pass a
-            // pre-initialised one. `betterAuth({ baseUrl })` already
-            // primed `getSession` at module-eval; this is a cheap
-            // idempotent guard for the lazy-init case.
             auth.init(url);
             return await auth.getToken();
           } catch {
             return null;
           }
         }
-      : undefined;
-    return createClient({ url, version, transport, getToken: eagerGetToken });
-  }, [externalClient, url, version, transport, auth]);
+      : noopToken;
+
+    return createClient({ url, version, getToken });
+  }, [externalClient, url, version, auth]);
 
   const onReadyRef = useRef(onReady);
   onReadyRef.current = onReady;
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
 
-  // Initialize auth adapter and resolve session
+  // ── Session lifecycle ───────────────────────────────────────────
   useEffect(() => {
-    if (!auth) {
-      // No auth adapter — resolve as unauthenticated immediately
-      client.authenticate(null).catch(() => {});
-      return;
-    }
-
-    // Init adapter with the backend URL (idempotent — the eager
-    // `getToken` factory above may have already called this).
+    if (!auth) return;
     auth.init(url || "");
 
-    // The initial auth handshake is driven by the transport's
-    // constructor-supplied `getToken` (passed via `createClient`
-    // above). We deliberately do NOT call `client.authenticate(token)`
-    // here on first mount — doing so would race the eager handshake
-    // and cause the AuthGate to resolve twice (the v=1 / v=2 double-
-    // resolve we saw earlier in the DOL-1037 trace). The
-    // `onReady` callback is still surfaced; we fire it once the gate
-    // settles (whether authenticated or unauthenticated).
+    let lastUserId: string | null = client.session.state.userId;
 
-    // Belt-and-suspenders cache eviction on user transitions
-    // (DOL-1037 prefetch safety). When userId changes — sign-out to
-    // null, or sign-in as a new user — drop every `useQuery` cache
-    // entry that was keyed under the prior userId. Without this,
-    // entries linger for the 60s GC window after the session ends.
-    // Not a security issue (the keys differ across users so the
-    // stale data isn't reachable from the new session) but cleans
-    // up memory promptly and shortens the privacy window.
-    const transport: any = client.transport;
-    let lastUserId: string | null =
-      transport?.auth?.state?.userId ?? null;
-
-    // One-shot onReady — fires the first time the gate leaves
-    // "pending". The transport's eager handshake settles the gate
-    // independently of this effect's scheduling.
+    // Fire onReady the first time the session leaves "pending".
     let readyFired = false;
     const fireReady = () => {
       if (readyFired) return;
-      if (transport?.auth?.state?.status === "pending") return;
+      if (client.session.state.status === "pending") return;
       readyFired = true;
       try {
         onReadyRef.current?.(client);
@@ -130,50 +78,41 @@ export const ParcaeProvider: React.FC<ParcaeProviderProps> = ({
       }
     };
 
-    const unsubGate: undefined | (() => void) =
-      transport?.auth?.subscribe?.(() => {
-        const nowUserId: string | null =
-          transport?.auth?.state?.userId ?? null;
-        if (lastUserId !== null && nowUserId !== lastUserId) {
-          _purgeCacheForUser(lastUserId);
-        }
-        lastUserId = nowUserId;
-        fireReady();
-      });
-    // If the transport's eager handshake already settled before this
-    // effect ran (very likely on cold start), fire onReady right away.
+    const unsubSession = client.session.subscribe(() => {
+      const nowUserId = client.session.state.userId;
+      if (lastUserId !== null && nowUserId !== lastUserId) {
+        _purgeCacheForUser(lastUserId);
+      }
+      lastUserId = nowUserId;
+      fireReady();
+    });
     fireReady();
 
-    // Subscribe to session changes (login/logout). Token rotation
-    // still flows through the explicit `client.authenticate(token)`
-    // path — that's the only place the AuthGate gets a *new* token
-    // after the initial handshake, so there's no race.
-    const unsub = auth.onChange((token) => {
-      client.authenticate(token).catch(() => {});
+    // Token rotation / login / logout from the adapter.
+    const unsubChange = auth.onChange((token) => {
+      if (token === null) {
+        client.terminateSession().catch(() => {});
+      } else {
+        client.refreshSession().catch(() => {});
+      }
     });
 
     return () => {
-      unsub();
-      unsubGate?.();
+      unsubSession();
+      unsubChange();
     };
   }, [auth, client, url]);
 
-  // On socket reconnect, re-resolve session via auth adapter
+  // ── Resync on reconnect ─────────────────────────────────────────
   useEffect(() => {
-    if (!auth) return;
-
-    const onReconnect = async () => {
-      log.debug("reconnected — re-resolving session");
-      await handleReconnectAuth(auth, client);
-    };
-
-    client.on("connected", onReconnect);
+    const onResync = () => _onResyncRequired(client);
+    client.on("resync-required", onResync);
     return () => {
-      client.off("connected", onReconnect);
+      client.off("resync-required", onResync);
     };
-  }, [auth, client]);
+  }, [client]);
 
-  // Forward errors
+  // ── Error forwarding ────────────────────────────────────────────
   useEffect(() => {
     const onErr = (err: Error) => onErrorRef.current?.(err);
     client.on("error", onErr);
@@ -186,5 +125,3 @@ export const ParcaeProvider: React.FC<ParcaeProviderProps> = ({
     <ParcaeContext.Provider value={client}>{children}</ParcaeContext.Provider>
   );
 };
-
-export const __test = { handleReconnectAuth };

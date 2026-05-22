@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { useAuthStatus } from "./useAuth";
+import { useSession } from "./useSession";
 
 interface GateProps {
   children: React.ReactNode;
@@ -9,16 +9,16 @@ interface GateProps {
 }
 
 export function Authenticated({ children, fallback = null }: GateProps) {
-  const { status } = useAuthStatus();
+  const { status } = useSession();
   return status === "authenticated" ? <>{children}</> : <>{fallback}</>;
 }
 
 export function Unauthenticated({ children, fallback = null }: GateProps) {
-  const { status } = useAuthStatus();
-  return status === "unauthenticated" ? <>{children}</> : <>{fallback}</>;
+  const { status } = useSession();
+  return status === "anonymous" ? <>{children}</> : <>{fallback}</>;
 }
 
-export function AuthLoading({ children, fallback = null }: GateProps) {
-  const { status } = useAuthStatus();
+export function SessionLoading({ children, fallback = null }: GateProps) {
+  const { status } = useSession();
   return status === "pending" ? <>{children}</> : <>{fallback}</>;
 }

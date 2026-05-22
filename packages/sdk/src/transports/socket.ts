@@ -1,8 +1,22 @@
 /**
- * SocketTransport — Socket.IO with Valtio-reactive AuthGate.
+ * SocketTransport — Socket.IO with separated session/connection state.
  *
- * Auth state lives in a Valtio proxy. React reads via useSnapshot().
- * Transport writes directly — no React involvement.
+ * The transport owns three orthogonal concerns:
+ *   - the underlying socket (Socket.IO)
+ *   - the ConnectionMachine (is the wire usable?)
+ *   - the SessionMachine (who is the user?)
+ *
+ * Wire protocol:
+ *   client → server:  "hello" + { token } → ack({ userId })
+ *   client → server:  "call" (RPC, unchanged)
+ *   client → server:  "resync" + { queries: [...] } → ack(results)
+ *   server → client:  "query:<hash>" ops streams (unchanged)
+ *
+ * Lifecycle invariants:
+ *   - socket connect runs `hello` exactly once per connection
+ *   - disconnect does NOT touch session state
+ *   - reconnect emits a single `resync` event after `hello` resolves
+ *   - session changes propagate through SessionMachine.resolve only
  */
 
 import SocketIO from "socket.io-client";
@@ -11,7 +25,8 @@ import { decompress } from "compress-json";
 import { EventEmitter } from "eventemitter3";
 import ShortId from "short-unique-id";
 import type { Transport, RequestOptions } from "@parcae/model";
-import { AuthGate } from "../auth-gate";
+import { SessionMachine } from "../session-machine";
+import { ConnectionMachine } from "../connection-machine";
 import { log } from "../log";
 
 const DEFAULT_TIMEOUT = 120_000;
@@ -19,92 +34,62 @@ const DEFAULT_TIMEOUT = 120_000;
 const uid = new ShortId({ length: 10 });
 const SOCKETS = new Map<string, any>();
 
+/** @internal — test-only. Clears the cached socket map between tests. */
+export function _resetSockets(): void {
+  for (const socket of SOCKETS.values()) {
+    try {
+      socket.removeAllListeners?.();
+    } catch {}
+  }
+  SOCKETS.clear();
+}
+
 export interface SocketTransportConfig {
   url: string;
   version?: string;
   path?: string;
-  token?: string | null;
   /**
-   * Async token resolver. When provided, the transport starts
-   * resolving the token immediately at construction (so it runs in
-   * parallel with React mount and socket connect) and emits the
-   * `authenticate` handshake as soon as BOTH the socket is connected
-   * AND the token has resolved — without waiting for the consumer's
-   * useEffect lifecycle.
-   *
-   * This is the load-bearing fix for the "React-mount auth hole" we
-   * see in the DOL-1037 trace: previously, the Provider's
-   * `useEffect` had to fire (after every child effect, per React's
-   * effect ordering) before it could call `client.authenticate()`,
-   * adding 200–300 ms of dead time on cold starts. With `getToken`
-   * wired in, the handshake races React rendering and typically
-   * lands first.
-   *
-   * Mutually exclusive with `token` — pass one or the other.
+   * Async token resolver. Called once before the initial connect and
+   * once on every reconnect (handing back the latest token from the
+   * auth adapter). Return `null` for anonymous sessions.
    */
-  getToken?: () => Promise<string | null>;
+  getToken: () => Promise<string | null>;
+}
+
+/** Wire shape for a single `resync` entry. */
+export interface ResyncEntry {
+  key: string;
+  modelType: string;
+  steps: unknown[];
+  /** Last-known queryHash, so the server can skip resending unchanged subscriptions. */
+  queryHash?: string | null;
+}
+
+/** Wire shape for a single resolved entry coming back from the server. */
+export interface ResyncResult {
+  key: string;
+  hash: string;
+  items: any[];
+  totalCount: number;
 }
 
 export class SocketTransport extends EventEmitter implements Transport {
-  public auth = new AuthGate();
-  public isConnected = false;
+  public session = new SessionMachine();
+  public connection = new ConnectionMachine();
 
   private socket: any;
   private url: string;
   private version: string;
-  private token: string | null | undefined;
+  private getToken: () => Promise<string | null>;
   private inflight = new Map<string, Promise<any>>();
-  /**
-   * Resolves once the constructor-supplied `getToken` Promise (if any)
-   * has settled. The `connect` handler awaits this before `_doAuth`
-   * runs so the token is in hand by the time we emit the
-   * `authenticate` event.
-   *
-   * For the legacy / no-getToken path this is `Promise.resolve()`
-   * immediately, so the connect-time `_doAuth` runs as before.
-   */
-  private tokenReady: Promise<void>;
-  /**
-   * `true` while `tokenReady` hasn't settled. Used by the `connect`
-   * handler to decide whether to fall through synchronously (legacy
-   * path, no getToken) or defer `_doAuth` until the token lands.
-   */
-  private tokenAwaitNeeded: boolean;
+  /** Resolves when the most recent `hello` ack lands. */
+  private helloReady: Promise<void> = Promise.resolve();
 
   constructor(config: SocketTransportConfig) {
     super();
     this.url = config.url;
     this.version = config.version ?? "v1";
-    this.token = config.token;
-
-    // Eager token resolver — race with React mount + socket connect
-    // so the auth handshake doesn't get serialised behind useEffect.
-    // See `SocketTransportConfig.getToken` for the rationale.
-    //
-    // `tokenAwaitNeeded` is the load-bearing branch: when no
-    // resolver was supplied, we keep the legacy sync `connect` →
-    // `_doAuth` path so existing tests + consumers see identical
-    // timing. Only when a resolver IS supplied do we wait on it
-    // before authenticating.
-    if (config.getToken) {
-      // Token starts as undefined so any external `authenticate()`
-      // call landing first overrides this path cleanly.
-      this.token = undefined;
-      this.tokenAwaitNeeded = true;
-      this.tokenReady = config
-        .getToken()
-        .then((t) => {
-          this.token = t ?? null;
-          this.tokenAwaitNeeded = false;
-        })
-        .catch(() => {
-          this.token = null;
-          this.tokenAwaitNeeded = false;
-        });
-    } else {
-      this.tokenReady = Promise.resolve();
-      this.tokenAwaitNeeded = false;
-    }
+    this.getToken = config.getToken;
 
     const socketPath = config.path ?? "/ws";
     const socketKey = `${this.url}:${socketPath}`;
@@ -120,117 +105,117 @@ export class SocketTransport extends EventEmitter implements Transport {
       SOCKETS.set(socketKey, this.socket);
     }
 
+    this.connection.connecting();
+
     this.socket.on("connect", () => {
-      this.isConnected = true;
-      log.debug("socket connected");
-      // Legacy path: no constructor `getToken`. Run `_doAuth` +
-      // emit `connected` synchronously so existing consumers /
-      // tests see identical timing.
-      //
-      // Eager-token path: defer `_doAuth` until the in-flight
-      // resolver lands. `connected` still fires synchronously
-      // because it's a socket-state event, not an auth event.
+      this.connection.connected();
       this.emit("connected");
-      if (this.tokenAwaitNeeded) {
-        this.tokenReady.then(() => this._doAuth());
-      } else {
-        this._doAuth();
-      }
+      void this._handshake();
     });
 
     this.socket.on("disconnect", () => {
-      this.isConnected = false;
-      // Keep the auth token across socket reconnects. The token
-      // belongs to the user's session, not this particular websocket
-      // connection. Clearing it here makes the next `connect` call
-      // into `_doAuth()` bail with token=undefined, leaving AuthGate
-      // pending until a higher-level Provider happens to fetch a
-      // token again. Backend restarts then silently kill existing
-      // `useQuery` subscriptions because nothing re-authenticates
-      // and re-subscribes them.
-      log.debug("socket disconnected");
-      this.auth.reset();
+      // Critical: disconnect does NOT touch session.
+      // Session is identity; identity outlives any single socket.
+      this.connection.disconnected();
       this.emit("disconnected");
     });
 
-    this.socket.on("error", (err: Error) => this.emit("error", err));
+    this.socket.on("error", (err: Error) => {
+      this.connection.disconnected(err);
+      this.emit("error", err);
+    });
 
     if (this.socket.connected) {
-      this.isConnected = true;
-      log.debug("socket connected");
-      // Same await-then-_doAuth pattern as the on('connect') handler
-      // — kept in sync so the eager-getToken path works even when
-      // we attach to an already-connected cached socket.
-      this.tokenReady.then(() => this._doAuth());
-    }
-
-    if (this.token === null) {
-      this.auth.resolveUnauthenticated();
+      this.connection.connected();
+      void this._handshake();
     }
   }
 
-  private _doAuth(): void {
-    if (this.token === undefined) return;
-    if (this.token === null) {
-      this.auth.resolveUnauthenticated();
-      return;
+  // ── Hello / resync handshake ─────────────────────────────────────
+
+  private async _handshake(): Promise<void> {
+    let resolveHello!: () => void;
+    this.helloReady = new Promise<void>((r) => {
+      resolveHello = r;
+    });
+
+    let token: string | null = null;
+    try {
+      token = await this.getToken();
+    } catch {
+      token = null;
     }
 
     const t0 = performance.now();
-    log.debug("authenticating...");
-    this.socket.emit("authenticate", this.token, (response: any) => {
-      const ms = (performance.now() - t0).toFixed(0);
-      const userId = response?.userId ?? null;
-      if (userId) {
-        this.auth.resolve(userId);
-        log.debug(`authenticated as ${userId} (${ms}ms)`);
-      } else {
-        this.auth.resolveUnauthenticated();
-        log.debug(`auth rejected (${ms}ms)`);
-      }
-    });
-  }
-
-  async authenticate(token: string | null): Promise<{ userId: string | null }> {
-    if (token === this.token && this.auth.state.status === "authenticated") {
-      return { userId: this.auth.state.userId };
-    }
-
-    this.token = token;
-    this.auth.reset();
-
-    if (token === null) {
-      this.auth.resolveUnauthenticated();
-      return { userId: null };
-    }
-
-    // Wait for connection if not connected (with timeout)
-    if (!this.socket.connected) {
-      await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          this.socket.off("connect", onConnect);
-          this.auth.resolveUnauthenticated();
-          reject(new Error("Authentication timeout: socket not connected"));
-        }, DEFAULT_TIMEOUT);
-        const onConnect = () => {
-          clearTimeout(timeout);
-          resolve();
-        };
-        this.socket.once("connect", onConnect);
-      });
-    }
-
-    return new Promise((resolve) => {
-      this.socket.emit("authenticate", token, (response: any) => {
+    return new Promise<void>((resolve) => {
+      this.socket.emit("hello", { token }, (response: any) => {
+        const ms = (performance.now() - t0).toFixed(0);
         const userId = response?.userId ?? null;
-        if (userId) this.auth.resolve(userId);
-        else this.auth.resolveUnauthenticated();
-        resolve({ userId });
+        log.debug(
+          `hello: ${userId ? `userId=${userId}` : "anonymous"} (${ms}ms)`,
+        );
+        this.session.resolve(userId);
+        resolveHello();
+        // Resync runs after every successful hello. Consumers track
+        // their own cache state and decide whether they have anything
+        // to ask the server about; the transport just publishes the
+        // signal once per handshake.
+        this.emit("resync-required");
+        resolve();
       });
     });
   }
 
-  // ── Request/Response ──────────────────────────────────────────────
+  /**
+   * Resync RPC. Used by `useQuery` after every reconnect to
+   * re-establish server-side query subscriptions in a single round
+   * trip. Returns the freshly-evaluated results for every entry.
+   */
+  async resync(entries: ResyncEntry[]): Promise<ResyncResult[]> {
+    if (entries.length === 0) return [];
+    await this.helloReady;
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error("resync timeout"));
+      }, DEFAULT_TIMEOUT);
+      this.socket.emit("resync", { queries: entries }, (response: any) => {
+        clearTimeout(timeout);
+        if (response?.success === false) {
+          reject(new Error(response?.error || "resync failed"));
+          return;
+        }
+        resolve(response?.results ?? []);
+      });
+    });
+  }
+
+  // ── Public API ───────────────────────────────────────────────────
+
+  /**
+   * Token rotation / explicit sign-in. Triggers a fresh hello on the
+   * existing socket so the server updates its socket→session mapping.
+   * Sign-out path (token === null) goes through `terminate()`.
+   */
+  async refreshSession(): Promise<{ userId: string | null }> {
+    await this._handshake();
+    return { userId: this.session.state.userId };
+  }
+
+  /** Explicit sign-out. Marks the session terminated and drops the socket auth. */
+  async terminateSession(): Promise<void> {
+    this.session.terminate();
+    if (this.socket.connected) {
+      await new Promise<void>((resolve) => {
+        this.socket.emit("hello", { token: null }, () => resolve());
+      });
+    }
+  }
+
+  get isConnected(): boolean {
+    return this.connection.state.status === "connected";
+  }
+
+  // ── Request/Response ─────────────────────────────────────────────
 
   private async fetch(
     method: string,
@@ -238,7 +223,11 @@ export class SocketTransport extends EventEmitter implements Transport {
     data: any = {},
     options?: RequestOptions,
   ): Promise<any> {
-    await this.auth.ready;
+    // Wait for the first hello to land — guarantees the socket is
+    // authenticated before the call goes out. Subsequent calls don't
+    // re-await because `helloReady` resolves once and stays resolved
+    // until the next reconnect kicks a new handshake.
+    await this.helloReady;
 
     if (!this.socket.connected) {
       await new Promise<void>((resolve, reject) => {
@@ -263,6 +252,7 @@ export class SocketTransport extends EventEmitter implements Transport {
         this.socket.once("connect", onConnect);
         this.socket.once("connect_error", onError);
       });
+      await this.helloReady;
     }
 
     const upper = method.toUpperCase();
@@ -272,12 +262,6 @@ export class SocketTransport extends EventEmitter implements Transport {
       if (existing) return existing;
       const req = this._call(method, path, data, options);
       this.inflight.set(dedupeKey, req);
-      // Clear the dedup slot on resolve / reject without creating an
-      // unhandled-rejection side chain — `.finally(...)` returns a new
-      // promise that re-rejects with the original error; without an
-      // attached `.catch` on THAT chain, the rejection leaks even when
-      // the caller awaits and handles `req` directly. `.then(_, _)`
-      // closes the loop with a no-op rejection handler.
       req.then(
         () => this.inflight.delete(dedupeKey),
         () => this.inflight.delete(dedupeKey),
@@ -379,22 +363,17 @@ export class SocketTransport extends EventEmitter implements Transport {
     this.socket.off(event, handler);
   }
 
-  async send(event: string, ...args: any[]): Promise<void> {
-    await this.auth.ready;
+  send(event: string, ...args: any[]): void {
     this.socket.emit(event, ...args);
   }
 
   disconnect(): void {
     this.socket.disconnect();
-    this.isConnected = false;
-    log.debug("socket disconnected");
   }
+
   async reconnect(): Promise<void> {
+    if (this.socket.connected) return;
+    this.connection.connecting();
     this.socket.connect();
   }
-}
-
-/** @internal — clear socket cache (for testing) */
-export function _resetSockets(): void {
-  SOCKETS.clear();
 }

@@ -1,22 +1,22 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useParcae } from "./context";
-import { useAuthStatus } from "./useAuth";
+import { useSession } from "./useSession";
 
 export function useSetting<T = string>(
   key: string,
   defaultValue: T,
 ): [T, (value: T) => Promise<void>, { isLoading: boolean }] {
   const client = useParcae();
-  const { status: authStatus } = useAuthStatus();
+  const { status } = useSession();
 
   const [value, setValue] = useState<T>(defaultValue);
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    if (authStatus === "pending") return;
-    if (authStatus === "unauthenticated") {
+    if (status === "pending") return;
+    if (status !== "authenticated") {
       setIsLoading(false);
       return;
     }
@@ -34,7 +34,7 @@ export function useSetting<T = string>(
     return () => {
       cancelled = true;
     };
-  }, [key, client, authStatus]);
+  }, [key, client, status]);
 
   const update = useCallback(
     async (newValue: T) => {

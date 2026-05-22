@@ -1,49 +1,20 @@
 /**
- * SocketTransport — connect / disconnect / reconnect & listener
- * lifecycle tests.
+ * SocketTransport — hello/resync protocol + lifecycle contract.
  *
- * Mocks `socket.io-client` so the transport runs against a
- * deterministic in-memory EventEmitter that we can step through
- * one event at a time. No real network. Tests the contract
- * SocketTransport publishes:
+ * The transport runs against a deterministic FakeSocket (in-memory
+ * EventEmitter mock of socket.io-client). Tests cover:
  *
- *   - "connected" / "disconnected" / "error" events on the
- *     transport itself (consumers like `useApi` subscribe here)
- *   - `subscribe(event, handler)` registers a socket-level
- *     handler and returns an idempotent unsubscribe
- *   - the connect path triggers auth re-resolution; disconnect
- *     resets auth and clears the token
- *   - listeners attached BEFORE the socket is connected still
- *     fire on the eventual connect, and listeners attached
- *     DURING a disconnect stay attached for the next connect
- *     (no listener loss across the gap)
+ *   - `hello` fires once per connect, populates SessionMachine.
+ *   - `disconnect` does NOT mutate SessionMachine.
+ *   - reconnect emits `resync-required` exactly once per hello ack.
+ *   - `refreshSession()` re-runs the hello handshake.
+ *   - `terminateSession()` puts the SessionMachine into terminated.
  */
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from "vitest";
-
-// ─── socket.io-client mock ──────────────────────────────────────────────────
-
-/**
- * Minimal Socket.IO-shaped EventEmitter. Mirrors the surface
- * `SocketTransport` uses: `on` / `off` / `once` / `emit` /
- * `connect()` / `disconnect()` / `connected` boolean.
- *
- * `_fire(event, ...args)` is the test-side hook to drive
- * lifecycle events ("connect", "disconnect", "error") through the
- * transport's listeners.
- */
 class FakeSocket {
   connected = false;
-  // Map<event, Set<handler>>
   private handlers = new Map<string, Set<(...args: any[]) => void>>();
-  // Capture every `emit` call so tests can inspect outgoing RPCs.
   public emits: { event: string; args: any[] }[] = [];
 
   on(event: string, handler: (...args: any[]) => void): this {
@@ -57,14 +28,6 @@ class FakeSocket {
       this.off(event, wrapped);
       handler(...args);
     };
-    // Tag the wrapper so off(event, originalHandler) can find it
-    // — Socket.IO's `off` matches by handler identity, but our
-    // tests `_fire("connect")` directly through `_fire` which
-    // walks the wrappers, so identity tagging isn't needed for
-    // dispatch. It IS needed for `socket.off("connect", onConnect)`
-    // matching the original. We mirror Socket.IO's behaviour:
-    // off(event, original) removes any wrapper that closed over
-    // `original`. Easiest: store the original on the wrapper.
     (wrapped as any).__original = handler;
     this.on(event, wrapped);
     return this;
@@ -77,8 +40,6 @@ class FakeSocket {
       set.clear();
       return this;
     }
-    // Match either direct handler OR a wrapper that wraps it
-    // (the once() shape).
     for (const h of set) {
       if (h === handler || (h as any).__original === handler) set.delete(h);
     }
@@ -90,11 +51,13 @@ class FakeSocket {
     return true;
   }
 
-  /** Drive an "incoming" socket event through every registered handler. */
+  removeAllListeners(): void {
+    this.handlers.clear();
+  }
+
   _fire(event: string, ...args: any[]): void {
     const set = this.handlers.get(event);
     if (!set) return;
-    // Snapshot — handlers may mutate the Set (e.g. once() wrappers).
     for (const h of [...set]) h(...args);
   }
 
@@ -118,273 +81,181 @@ vi.mock("socket.io-client", () => ({
   }),
 }));
 
-// Imports MUST come after `vi.mock` so the SDK picks up the stub.
 // eslint-disable-next-line import/first
 import { SocketTransport, _resetSockets } from "../transports/socket";
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-function makeTransport(token: string | null | undefined = "tok") {
-  // SOCKETS is a module-level cache keyed by url+path; clear
-  // between tests so each transport gets its own FakeSocket.
+function makeTransport(getToken: () => Promise<string | null>) {
   _resetSockets();
-  return new SocketTransport({ url: "http://localhost:0", token });
+  return new SocketTransport({ url: "http://localhost:0", getToken });
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
+/** Drain the most recent `hello` emit's callback with a fake server response. */
+function ackHello(userId: string | null): void {
+  const hello = [...currentSocket.emits].reverse().find((e) => e.event === "hello");
+  if (!hello) throw new Error("no hello emit found");
+  const cb = hello.args[1] as (resp: any) => void;
+  cb({ userId });
+}
 
-describe("SocketTransport — lifecycle & listener flow", () => {
+describe("SocketTransport — hello/resync protocol", () => {
   beforeEach(() => {
     _resetSockets();
   });
-
   afterEach(() => {
     _resetSockets();
   });
 
-  // ── Initial state ─────────────────────────────────────────────────
-
-  it("starts disconnected when the underlying socket is not yet connected", () => {
-    const t = makeTransport();
-    expect(t.isConnected).toBe(false);
+  it("starts in connecting and flips to connected on socket connect", () => {
+    const t = makeTransport(async () => "tok");
+    expect(t.connection.state.status).toBe("connecting");
+    currentSocket.connect();
+    expect(t.connection.state.status).toBe("connected");
   });
 
-  it("reports already-connected when the cached socket was connected at construct time", () => {
-    // Fake a pre-connected socket cache by constructing one,
-    // marking it connected, then re-constructing through the
-    // module cache. Since `_resetSockets()` clears the cache, we
-    // construct, then mutate the underlying socket directly.
-    const t1 = makeTransport();
-    currentSocket.connected = true;
-    // Construct another transport with the SAME url+path so it
-    // reuses the cached socket (same SOCKETS key).
-    const t2 = new SocketTransport({
-      url: "http://localhost:0",
-      token: "tok",
+  it("emits hello with the token after connect and resolves the session on ack", async () => {
+    const t = makeTransport(async () => "tok-1");
+    currentSocket.connect();
+
+    // Yield twice so getToken().then(emit hello) chain settles.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const hello = currentSocket.emits.find((e) => e.event === "hello");
+    expect(hello).toBeDefined();
+    expect(hello!.args[0]).toEqual({ token: "tok-1" });
+
+    expect(t.session.state.status).toBe("pending");
+    ackHello("u-42");
+    expect(t.session.state.status).toBe("authenticated");
+    expect(t.session.state.userId).toBe("u-42");
+  });
+
+  it("hello with null token resolves anonymous", async () => {
+    const t = makeTransport(async () => null);
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello(null);
+    expect(t.session.state.status).toBe("anonymous");
+    expect(t.session.state.userId).toBeNull();
+  });
+
+  it("disconnect does NOT mutate the SessionMachine", async () => {
+    const t = makeTransport(async () => "tok");
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("u-1");
+    expect(t.session.state.status).toBe("authenticated");
+
+    currentSocket.disconnect();
+
+    expect(t.connection.state.status).toBe("disconnected");
+    expect(t.session.state.status).toBe("authenticated");
+    expect(t.session.state.userId).toBe("u-1");
+  });
+
+  it("emits resync-required exactly once per hello ack", async () => {
+    const t = makeTransport(async () => "tok");
+    const onResync = vi.fn();
+    t.on("resync-required", onResync);
+
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("u-1");
+    expect(onResync).toHaveBeenCalledTimes(1);
+
+    currentSocket.disconnect();
+    expect(onResync).toHaveBeenCalledTimes(1);
+
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("u-1");
+    expect(onResync).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshSession() re-emits hello and updates the session", async () => {
+    let token: string | null = "tok-1";
+    const t = makeTransport(async () => token);
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("u-1");
+
+    token = "tok-2";
+    const promise = t.refreshSession();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("u-2");
+    const result = await promise;
+
+    expect(result).toEqual({ userId: "u-2" });
+    expect(t.session.state.userId).toBe("u-2");
+  });
+
+  it("terminateSession() locks the session machine", async () => {
+    const t = makeTransport(async () => "tok");
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("u-1");
+
+    // The terminate path emits a final hello to clear the socket
+    // session server-side. Ack it so the await resolves.
+    const promise = t.terminateSession();
+    // hello has 2 args; capture and ack with no userId.
+    const helloAfter = [...currentSocket.emits].reverse().find((e) => e.event === "hello");
+    if (helloAfter) {
+      const cb = helloAfter.args[1] as (resp: any) => void;
+      cb({ userId: null });
+    }
+    await promise;
+
+    expect(t.session.state.status).toBe("terminated");
+  });
+
+  it("resync RPC sends a queries envelope and resolves with the results", async () => {
+    const t = makeTransport(async () => "tok");
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("u-1");
+
+    const promise = t.resync([
+      {
+        key: "post:u-1:[]",
+        modelType: "post",
+        steps: [],
+      },
+    ]);
+
+    // Flush the `await helloReady` microtask so the resync emit lands.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const resyncEmit = [...currentSocket.emits].reverse().find((e) => e.event === "resync");
+    expect(resyncEmit).toBeDefined();
+    expect(resyncEmit!.args[0]).toEqual({
+      queries: [{ key: "post:u-1:[]", modelType: "post", steps: [] }],
     });
-    expect(t2.isConnected).toBe(true);
-    void t1;
-  });
 
-  // ── connect → "connected" event ───────────────────────────────────
+    const cb = resyncEmit!.args[1] as (resp: any) => void;
+    cb({
+      success: true,
+      results: [
+        {
+          key: "post:u-1:[]",
+          hash: "h-1",
+          items: [{ id: "p1" }],
+          totalCount: 1,
+        },
+      ],
+    });
 
-  it("emits 'connected' on the transport when the socket connects", () => {
-    const t = makeTransport();
-    const onConnected = vi.fn();
-    t.on("connected", onConnected);
-    currentSocket.connect();
-    expect(onConnected).toHaveBeenCalledTimes(1);
-    expect(t.isConnected).toBe(true);
-  });
-
-  it("attempts authentication on connect when a token is set", () => {
-    const t = makeTransport("tok-abc");
-    currentSocket.connect();
-    // The transport emits 'authenticate' through the socket as
-    // part of _doAuth.
-    const authenticateEmits = currentSocket.emits.filter(
-      (e) => e.event === "authenticate",
-    );
-    expect(authenticateEmits.length).toBe(1);
-    expect(authenticateEmits[0]?.args[0]).toBe("tok-abc");
-    void t;
-  });
-
-  // ── disconnect → "disconnected" event ─────────────────────────────
-
-  it("emits 'disconnected' on the transport when the socket disconnects", () => {
-    const t = makeTransport();
-    currentSocket.connect();
-    const onDisconnected = vi.fn();
-    t.on("disconnected", onDisconnected);
-    currentSocket.disconnect();
-    expect(onDisconnected).toHaveBeenCalledTimes(1);
-    expect(t.isConnected).toBe(false);
-  });
-
-  it("resets auth on disconnect but keeps the token for reconnect", async () => {
-    const t = makeTransport("tok-abc");
-    currentSocket.connect();
-    // Simulate the server callback for `authenticate` so auth
-    // resolves before we disconnect.
-    const authEmit = currentSocket.emits.find(
-      (e) => e.event === "authenticate",
-    );
-    const callback = authEmit?.args[1] as (resp: any) => void;
-    callback({ userId: "u1" });
-    expect(t.auth.state.status).toBe("authenticated");
-
-    currentSocket.disconnect();
-    expect(t.auth.state.status).toBe("pending");
-  });
-
-  // ── error event passthrough ───────────────────────────────────────
-
-  it("re-emits socket 'error' events on the transport", () => {
-    const t = makeTransport();
-    const onError = vi.fn();
-    t.on("error", onError);
-    const err = new Error("boom");
-    currentSocket._fire("error", err);
-    expect(onError).toHaveBeenCalledTimes(1);
-    expect(onError).toHaveBeenCalledWith(err);
-  });
-
-  // ── full disconnect → reconnect cycle ─────────────────────────────
-
-  it("fires connected/disconnected listeners across a full reconnect cycle", () => {
-    const t = makeTransport();
-    const onConnected = vi.fn();
-    const onDisconnected = vi.fn();
-    t.on("connected", onConnected);
-    t.on("disconnected", onDisconnected);
-
-    currentSocket.connect();
-    currentSocket.disconnect();
-    currentSocket.connect();
-    currentSocket.disconnect();
-    currentSocket.connect();
-
-    expect(onConnected).toHaveBeenCalledTimes(3);
-    expect(onDisconnected).toHaveBeenCalledTimes(2);
-    expect(t.isConnected).toBe(true);
-  });
-
-  it("re-attempts auth on every reconnect (assuming a token is still set on construct)", () => {
-    // The token belongs to the user's session, not a particular
-    // websocket connection. Keep it across disconnect so backend
-    // restarts can reconnect and re-authenticate without waiting for
-    // a higher-level Provider to fetch a token via HTTP.
-    const t = makeTransport("tok-abc");
-    currentSocket.connect();
-    expect(
-      currentSocket.emits.filter((e) => e.event === "authenticate").length,
-    ).toBe(1);
-    currentSocket.disconnect();
-    currentSocket.connect();
-    expect(
-      currentSocket.emits.filter((e) => e.event === "authenticate").length,
-    ).toBe(2);
-    void t;
-  });
-
-  // ── subscribe() — socket-event listener API ───────────────────────
-
-  it("subscribe() forwards events to the handler and returns an unsubscribe", () => {
-    const t = makeTransport();
-    const handler = vi.fn();
-    const unsubscribe = t.subscribe("project:patched", handler);
-
-    currentSocket._fire("project:patched", { id: "p1" });
-    currentSocket._fire("project:patched", { id: "p2" });
-    expect(handler).toHaveBeenCalledTimes(2);
-
-    unsubscribe();
-    currentSocket._fire("project:patched", { id: "p3" });
-    expect(handler).toHaveBeenCalledTimes(2);
-  });
-
-  it("supports multiple subscribers for the same event", () => {
-    const t = makeTransport();
-    const a = vi.fn();
-    const b = vi.fn();
-    t.subscribe("chat:chunk", a);
-    t.subscribe("chat:chunk", b);
-
-    currentSocket._fire("chat:chunk", { idx: 0 });
-    expect(a).toHaveBeenCalledTimes(1);
-    expect(b).toHaveBeenCalledTimes(1);
-  });
-
-  it("unsubscribe() called twice is a safe no-op", () => {
-    const t = makeTransport();
-    const handler = vi.fn();
-    const unsub = t.subscribe("evt", handler);
-    unsub();
-    expect(() => unsub()).not.toThrow();
-    currentSocket._fire("evt", "data");
-    expect(handler).not.toHaveBeenCalled();
-  });
-
-  // ── Listener-survives-cycle (the regression-shaped tests) ─────────
-
-  it("listeners added BEFORE connect still fire when connect happens", () => {
-    // A common React pattern: useEffect on mount calls
-    // transport.subscribe(...). The mount may run before the
-    // socket's first `connect`. The handler must still receive
-    // events emitted after the eventual connect.
-    const t = makeTransport();
-    const handler = vi.fn();
-    t.subscribe("project:patched", handler);
-
-    // Connect, then fire events.
-    currentSocket.connect();
-    currentSocket._fire("project:patched", { v: 1 });
-    expect(handler).toHaveBeenCalledTimes(1);
-
-    void t;
-  });
-
-  it("subscribe()'d handlers persist across a disconnect → reconnect (the underlying socket is the SAME instance)", () => {
-    // SocketTransport reuses the SAME socket.io socket across
-    // disconnect/reconnect — `disconnect()` and `reconnect()`
-    // toggle the connection but don't replace the socket. So
-    // listeners stay attached and fire after reconnect.
-    const t = makeTransport();
-    const handler = vi.fn();
-    t.subscribe("project:patched", handler);
-
-    currentSocket.connect();
-    currentSocket._fire("project:patched", { v: 1 });
-    currentSocket.disconnect();
-    // Add ANOTHER listener during the disconnected window.
-    const lateHandler = vi.fn();
-    t.subscribe("project:patched", lateHandler);
-    currentSocket.connect();
-    currentSocket._fire("project:patched", { v: 2 });
-
-    expect(handler).toHaveBeenCalledTimes(2); // both pre and post reconnect
-    expect(lateHandler).toHaveBeenCalledTimes(1); // post-reconnect only
-  });
-
-  it("transport-level listeners (connected/disconnected) added AFTER an earlier cycle still fire on the next cycle", () => {
-    // The `useApi` pattern: a component mounts, attaches its
-    // own connected/disconnected listeners, and expects to
-    // observe every subsequent transition.
-    const t = makeTransport();
-    currentSocket.connect();
-    currentSocket.disconnect();
-
-    const onConnected = vi.fn();
-    const onDisconnected = vi.fn();
-    t.on("connected", onConnected);
-    t.on("disconnected", onDisconnected);
-
-    currentSocket.connect();
-    expect(onConnected).toHaveBeenCalledTimes(1);
-    expect(onDisconnected).toHaveBeenCalledTimes(0);
-
-    currentSocket.disconnect();
-    expect(onConnected).toHaveBeenCalledTimes(1);
-    expect(onDisconnected).toHaveBeenCalledTimes(1);
-  });
-
-  // ── disconnect() / reconnect() instance methods ───────────────────
-
-  it("disconnect() flips isConnected and calls socket.disconnect()", () => {
-    const t = makeTransport();
-    currentSocket.connect();
-    expect(t.isConnected).toBe(true);
-    t.disconnect();
-    expect(t.isConnected).toBe(false);
-    expect(currentSocket.connected).toBe(false);
-  });
-
-  it("reconnect() calls socket.connect() — the connect handler then flips state", () => {
-    const t = makeTransport();
-    expect(t.isConnected).toBe(false);
-    void t.reconnect();
-    // socket.connect() in our fake fires "connect" synchronously
-    expect(t.isConnected).toBe(true);
+    const results = await promise;
+    expect(results).toHaveLength(1);
+    expect(results[0]!.hash).toBe("h-1");
   });
 });
