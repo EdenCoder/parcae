@@ -1,6 +1,7 @@
 export { ParcaeProvider } from "./Provider";
 
-export { useQuery } from "./useQuery";
+export { useQuery, prefetch } from "./useQuery";
+export type { PrefetchOptions } from "./useQuery";
 export { useModel } from "./useModel";
 export { useModelAtomic } from "./useModelAtomic";
 export { useApi, useSDK, useConnectionStatus } from "./useApi";

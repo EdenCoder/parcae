@@ -42,7 +42,31 @@ interface UseQueryOptions {
 
 interface UseQueryResult<T> {
   items: T[];
+  /**
+   * `true` while no items have been delivered yet AND the consumer
+   * should display some kind of placeholder. This covers BOTH the
+   * "auth still resolving" and "wire request in flight" phases —
+   * which is the historical contract — but blurs them. Use
+   * `awaitingAuth` to distinguish if you want phase-specific UX.
+   */
   loading: boolean;
+  /**
+   * `true` while `useQuery` is parked because the auth gate hasn't
+   * resolved yet (and `waitForAuth` is on, which is the default).
+   * The hook hasn't even attempted a wire request — the cache key
+   * is `null` because `userId` isn't known.
+   *
+   * Recommended UX split:
+   *
+   *   - `awaitingAuth: true` → "Signing you in…"
+   *   - `loading: true && !awaitingAuth` → real fetch in flight,
+   *      show a data skeleton.
+   *   - `loading: false` → items are populated (possibly empty).
+   *
+   * Always `false` when `waitForAuth: false` was passed — anonymous
+   * queries fire immediately and skip the auth gate.
+   */
+  awaitingAuth: boolean;
   error: Error | null;
   refetch: () => void;
   /** Total matching records on the server (before limit/offset). */
@@ -120,6 +144,30 @@ const cache = new Map<string, CacheEntry>();
 const GC_DELAY = 60_000;
 const EMPTY: any[] = [];
 const INITIAL_HASH = "L"; // loading=true, no items
+
+/**
+ * Drop every cache entry whose key was generated for a different
+ * user than `currentUserId`. Used on auth transitions
+ * (sign-out → `null`; user switch → new userId) to evict stale
+ * entries that belonged to the previous session BEFORE the 60s GC
+ * timer would otherwise reach them.
+ *
+ * Cache keys are `${modelType}:${userId ?? "anon"}:${JSON.stringify(steps)}`,
+ * so the prior-user segment is exactly `:${prevUserId}:`. We don't
+ * touch entries for the current user or for explicitly-anonymous
+ * (`:anon:`) chains, since those belong to ongoing consumers.
+ */
+function purgeCacheForUser(prevUserId: string | null): void {
+  if (prevUserId === null) return;
+  const needle = `:${prevUserId}:`;
+  for (const [key, entry] of cache) {
+    if (!key.includes(needle)) continue;
+    entry.dispose?.();
+    if (entry.gcTimer) clearTimeout(entry.gcTimer);
+    if (entry.retryTimer) clearTimeout(entry.retryTimer);
+    cache.delete(key);
+  }
+}
 
 const MAX_RETRIES = 3;
 const RETRY_DELAYS = [1_000, 3_000, 10_000];
@@ -736,6 +784,7 @@ function doFetch(
     .find()
     .then((result: any[]) => {
       log.debug("useQuery: got", result.length, "items for", chain.__modelType);
+      const hash = (result as any).__queryHash;
       if (prevSnapshot) {
         // Drift detection — log only. The new data will overwrite
         // the cache below; this is purely diagnostic so we can
@@ -766,7 +815,6 @@ function doFetch(
       }
 
       // Pick up the query subscription hash from the backend response
-      const hash = (result as any).__queryHash;
       if (hash && hash !== entry.queryHash) {
         entry.dispose?.();
         entry.queryHash = hash;
@@ -924,15 +972,22 @@ export function useQuery<T>(
       entry.retryTimer = null;
     }
 
-    if (entry.items === EMPTY && !entry.loading) {
-      // Entry was created but never fetched (or was reset)
+    // Single-source-of-truth for "should we kick a fetch off?":
+    // `entry.chain` is set on the very first line of `doFetch` (before
+    // any await), so its absence is the canonical "no fetch has ever
+    // started for this key" signal. A combined check like
+    // `items === EMPTY && !loading && !dispose` would let a SECOND
+    // hook landing on the same key fire `doFetch` while the first
+    // fetch is still in flight — `dispose` is only set AFTER the
+    // fetch resolves and the subscription opens, so the second hook
+    // would slip through and run a redundant cache update +
+    // notify cascade. Gating on `entry.chain` closes that.
+    if (!entry.chain) {
       doFetch(key, entry, currentChain, clientRef.current);
-    } else if (
-      entry.items === EMPTY &&
-      entry.error === null &&
-      !entry.dispose
-    ) {
-      // Fresh entry — needs initial fetch
+    } else if (entry.items === EMPTY && !entry.loading && !entry.error) {
+      // Entry exists but was somehow reset (chain set, loading false,
+      // items still EMPTY sentinel, no error). Edge case — kick a
+      // fresh fetch.
       doFetch(key, entry, currentChain, clientRef.current);
     }
   }, [key]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -1144,21 +1199,33 @@ export function useQuery<T>(
     [entryForOps],
   );
 
+  // `awaitingAuth` reflects "we're parked on the auth gate" — only
+  // true when the consumer asked us to wait (default) AND the gate
+  // is still in flight. Distinct from `loading` (which also covers
+  // wire-in-flight). See `UseQueryResult.awaitingAuth` JSDoc.
+  const awaitingAuth = waitForAuth && authStatus === "pending";
+
   // ── Stable result-object memoization (DOL-1041) ─────────────────
   //
   // Without this, every render produces a fresh `{items, loading, ...}`
   // literal and any consumer doing `useEffect(..., [result])` or
   // destructuring into a dep array sees a new reference every commit.
   // We cache the last result on a ref and re-use it while the
-  // observable hash (cache entry hash + auth ready + key) is stable.
+  // observable hash (cache entry hash + auth ready + awaitingAuth + key)
+  // is stable.
   //
   // The callbacks (`refetch`, `addOptimistic`, `removeOptimistic`,
   // `onOps`) are already stable via their own `useCallback`s, so they
   // don't need to factor into the cache key.
+  //
+  // `awaitingAuth` is folded into the hash because it's derived from
+  // `authStatus`, which goes `pending → authenticated` (authReady flips
+  // R→U) but can also go `pending → unauthenticated` (authReady stays
+  // U but awaitingAuth flips A→_).
   const resultRef = useRef<UseQueryResult<T> | null>(null);
   const resultHashRef = useRef<string>("");
   const entry = key ? cache.get(key) : undefined;
-  const observableHash = `${key ?? ""}|${entry?.hash ?? "L"}|${authReady ? "R" : "U"}`;
+  const observableHash = `${key ?? ""}|${entry?.hash ?? "L"}|${authReady ? "R" : "U"}|${awaitingAuth ? "A" : "_"}`;
 
   if (resultRef.current && resultHashRef.current === observableHash) {
     return resultRef.current;
@@ -1169,6 +1236,7 @@ export function useQuery<T>(
     next = {
       items: EMPTY as T[],
       loading: !authReady,
+      awaitingAuth,
       error: null,
       total: 0,
       refetch: noop,
@@ -1188,6 +1256,7 @@ export function useQuery<T>(
     next = {
       items,
       loading: entry?.loading ?? true,
+      awaitingAuth,
       error: entry?.error ?? null,
       total: entry?.totalCount ?? 0,
       refetch,
@@ -1207,6 +1276,152 @@ export function useQuery<T>(
 // retry scheduling, and applyOps without going through React render.
 // Not part of the public surface — the names are deliberately prefixed
 // with `__` so consumers know they're framework-internal.
+
+// ─── prefetch ────────────────────────────────────────────────────────────────
+
+/**
+ * Options for `prefetch(client, chain, options?)`.
+ */
+export interface PrefetchOptions {
+  /**
+   * Wait for the auth gate to resolve before building the cache key
+   * and firing the request. Default `true`.
+   *
+   * Critical for auth safety: without this gate, a prefetch called
+   * during the "pending" window would build a key with `userId ??
+   * "anon"` (i.e. literally `:anon:`), then the wire request would
+   * pause on `auth.ready` and ultimately fire with the resolved
+   * user's cookie. The authenticated response would land in a cache
+   * entry KEYED AS ANONYMOUS — visible to any subsequent
+   * `useQuery({ waitForAuth: false })` looking up the same chain.
+   *
+   * With `waitForAuth: true` (default), we don't build the key until
+   * the gate resolves, so the entry is keyed under the actual user.
+   *
+   * Set to `false` only for legitimately-public queries.
+   */
+  waitForAuth?: boolean;
+}
+
+/**
+ * Prime the `useQuery` cache so a later component mount finds items
+ * already loaded — skipping the `mount → commit → useEffect → fetch`
+ * cascade.
+ *
+ * Typical usage: a route loader, a parent component effect, or the
+ * `ParcaeProvider`'s `onReady` callback warms the cache for known
+ * routes before the leaf components mount.
+ *
+ *   await client.prefetch(Project.where({ id: params.id }).limit(1));
+ *
+ * The returned Promise resolves with the loaded items (or rejects
+ * on error). Subscriptions open automatically — the cache entry
+ * stays live so the eventual `useQuery` consumer joins an existing
+ * subscription.
+ *
+ * Returns the existing cache entry's items if the same key was
+ * primed earlier (or is currently in flight) — no duplicate work.
+ *
+ * Auth-safe by default. See `PrefetchOptions.waitForAuth` for the
+ * `:anon:` key pollution threat model.
+ */
+export async function prefetch<T>(
+  client: ParcaeClient,
+  chain: QueryChain<T>,
+  options: PrefetchOptions = {},
+): Promise<T[]> {
+  const waitForAuth = options.waitForAuth ?? true;
+  const auth = (client.transport as any)?.auth as
+    | { ready: Promise<void>; state: { userId: string | null } }
+    | undefined;
+
+  // Critical for auth safety — see `PrefetchOptions.waitForAuth`.
+  // We build the key AFTER the gate resolves so the entry is keyed
+  // by the actual userId, not by `:anon:`.
+  if (waitForAuth && auth) {
+    await auth.ready;
+  }
+
+  const userId = auth?.state?.userId ?? null;
+  const modelType = (chain as any).__modelType;
+  if (!modelType) {
+    throw new Error(
+      "prefetch: chain has no __modelType — was it built from a real Model class?",
+    );
+  }
+  const steps = (chain as any).__steps ?? [];
+  const key = `${modelType}:${userId ?? "anon"}:${JSON.stringify(steps)}`;
+
+  const entry = getOrCreate(key);
+
+  // Retain the entry while we're waiting so the 60s GC doesn't fire
+  // mid-flight. Released when the Promise settles.
+  entry.refs++;
+  if (entry.gcTimer) {
+    clearTimeout(entry.gcTimer);
+    entry.gcTimer = null;
+  }
+
+  return new Promise<T[]>((resolve, reject) => {
+    let settled = false;
+
+    const release = () => {
+      entry.refs--;
+      if (entry.refs <= 0) {
+        // Same GC delay useQuery uses — gives a window for a
+        // consumer to mount and pick up the primed entry without
+        // re-fetching.
+        entry.gcTimer = setTimeout(() => {
+          entry.dispose?.();
+          cache.delete(key);
+        }, GC_DELAY);
+      }
+    };
+
+    const settle = (value: T[] | Error) => {
+      if (settled) return;
+      settled = true;
+      entry.listeners.delete(onChange);
+      release();
+      if (value instanceof Error) reject(value);
+      else resolve(value);
+    };
+
+    const onChange = () => {
+      if (entry.error) settle(entry.error);
+      else if (!entry.loading) settle(entry.items as T[]);
+    };
+
+    // Already errored? Surface synchronously.
+    if (entry.error) {
+      settle(entry.error);
+      return;
+    }
+    // Already loaded? Items may be `[]` (loaded-but-empty) — that
+    // still counts as "done". `entry.queryHash !== null` distinguishes
+    // "loaded into an empty result" from "fresh entry, never fetched".
+    if (!entry.loading && entry.queryHash !== null) {
+      settle(entry.items as T[]);
+      return;
+    }
+
+    // Either in flight (a parallel prefetch or a mounted useQuery is
+    // already fetching) or fresh. Subscribe for the completion notify.
+    entry.listeners.add(onChange);
+
+    // Kick off the fetch if nothing has yet — `entry.chain` is set
+    // by `doFetch` so its absence is the canonical "never fetched"
+    // signal. Avoids re-firing when a useQuery already started one.
+    if (!entry.chain) {
+      doFetch(key, entry, chain as any, client);
+    }
+  });
+}
+
+/** @internal — exposed so the auth gate can drive evictions. */
+export function _purgeCacheForUser(prevUserId: string | null): void {
+  purgeCacheForUser(prevUserId);
+}
 
 /** @internal */
 export const __test = {
