@@ -13,11 +13,21 @@
  */
 
 import type { ModelConstructor, ScopeContext } from "@parcae/model";
-import { Model } from "@parcae/model";
+import {
+  Model,
+  extractExpandFields,
+  stripExpandSteps,
+} from "@parcae/model";
 import pluralize from "pluralize";
 import { ClientError } from "../helpers";
 import { log } from "../logger";
 import { route } from "../routing/route";
+import {
+  hydrateExpansions,
+  parseExpandSpecs,
+  validateExpandSpecs,
+} from "../services/hydrate-expansions";
+import { getRefLoader } from "../services/context";
 import type { BackendAdapter } from "./model";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -206,6 +216,15 @@ export function registerModelRoutes(
 ): number {
   let count = 0;
 
+  // Build a type → ModelConstructor index once for the whole batch.
+  // `validateExpandSpecs` accepts this so the LIST handler can
+  // resolve a ref's target without coupling to BackendAdapter's
+  // private `_models` map. Frozen — registration runs once at boot.
+  const modelByType = new Map<string, ModelConstructor>();
+  for (const M of models) {
+    if (M.type) modelByType.set(M.type, M);
+  }
+
   for (const ModelClass of models) {
     const scope = ModelClass.scope;
     if (!scope) continue;
@@ -222,9 +241,38 @@ export function registerModelRoutes(
         if (!scopeResult) return forbidden(res);
 
         const data = req.query || {};
-        const steps = data.__query ?? [];
+        const rawSteps = data.__query ?? [];
 
         try {
+          // Peel `.expand(...)` projections off the recorded steps
+          // before SQL replay. Expand is a wire-shape directive, not
+          // a SQL operation; the route layer applies it after
+          // `query.find()` via the request-scoped `RefLoader`.
+          // `extractExpandFields` does its own array-or-string
+          // normalisation — same shape `queryFromClient` accepts.
+          const normalisedSteps = Array.isArray(rawSteps)
+            ? rawSteps
+            : (() => {
+                if (typeof rawSteps !== "string") return [];
+                try {
+                  const parsed = JSON.parse(rawSteps);
+                  return Array.isArray(parsed) ? parsed : [];
+                } catch {
+                  return [];
+                }
+              })();
+          const expandSpecs = parseExpandSpecs(
+            extractExpandFields(normalisedSteps),
+          );
+          const expandResolved = validateExpandSpecs(
+            expandSpecs,
+            ModelClass,
+            modelByType,
+          );
+          const steps = expandResolved.length > 0
+            ? stripExpandSteps(normalisedSteps)
+            : rawSteps;
+
           const query = adapter.queryFromClient(ModelClass, scopeResult, steps);
 
           if (data.__count === "true" || data.__count === true) {
@@ -259,11 +307,31 @@ export function registerModelRoutes(
             const force = data.__forceRefresh === true ||
               data.__forceRefresh === "true";
             const [sub, totalCount] = await Promise.all([
-              adapter.subscriptions.subscribe({ socketId, query }, { force }),
+              adapter.subscriptions.subscribe(
+                { socketId, query, expand: expandResolved },
+                { force },
+              ),
               countQuery.count(),
             ]);
 
+            // Subscription items come pre-projected from
+            // `_execQuery`'s sanitize pass inside the manager. If
+            // the request asked for expansions we hydrate them here
+            // for the immediate response; the manager handles the
+            // ongoing delta emissions itself.
             const items = [...sub.items];
+            if (expandResolved.length > 0) {
+              const loader = getRefLoader();
+              if (loader) {
+                await hydrateExpansions(
+                  items,
+                  expandResolved,
+                  loader,
+                  ctx.user ?? null,
+                );
+              }
+            }
+
             json(res, 200, {
               result: {
                 total: items.length,
@@ -281,15 +349,31 @@ export function registerModelRoutes(
             countQuery.count(),
           ]);
 
+          const wireItems = await Promise.all(
+            items.map((m: RouteModelRow) => projectForWire(m, ctx.user)),
+          );
+
+          if (expandResolved.length > 0) {
+            const loader = getRefLoader();
+            if (loader) {
+              await hydrateExpansions(
+                wireItems,
+                expandResolved,
+                loader,
+                ctx.user ?? null,
+              );
+            }
+            // No RefLoader (request frame absent) → rows go out
+            // un-expanded. Defensive: this only happens for code
+            // paths that bypass `runWithRequestContext`, which the
+            // app bootstrap installs for every HTTP request.
+          }
+
           json(res, 200, {
             result: {
               total: items.length,
               totalCount,
-              [type + "s"]: await Promise.all(
-                items.map((m: RouteModelRow) =>
-                  projectForWire(m, ctx.user),
-                ),
-              ),
+              [type + "s"]: wireItems,
             },
             success: true,
           });

@@ -755,5 +755,100 @@ describe("Model", () => {
       expect(article.author).toBeNull();
       expect((article as any).$author).toBeNull();
     });
+
+    // ── Pre-hydrated ref proxy (DOL-1093 `.expand("file")` payload) ─────────
+    //
+    // When the wire payload includes a nested object on a ref field
+    // (e.g. `.expand("file")` inlines the full File row), `_apply`
+    // should:
+    //
+    //   1. Store the inline object's id as the raw id (`$file`).
+    //   2. Hydrate the object into a target-class instance.
+    //   3. Pre-populate the ref proxy's `loaded` slot so property
+    //      access is SYNCHRONOUS — no `findById`, no Suspense throw.
+    //
+    // Without (3), the editor's `asset.file.url` reads would Suspense
+    // even when the row was right there in the payload.
+    describe("pre-hydrated ref proxy from inline expand payload", () => {
+      it("hydrates an inline object into a target instance and serves fields synchronously", () => {
+        const findByIdSpy = vi.fn(async () => null);
+        const oldFindById = adapter.findById;
+        adapter.findById = findByIdSpy as any;
+        try {
+          const article = Article.hydrate(adapter, {
+            title: "x",
+            author: { id: "a1", name: "Alice" },
+          });
+          // Synchronous read — no Suspense, no findById trip.
+          expect((article.author as any).name).toBe("Alice");
+          expect(findByIdSpy).not.toHaveBeenCalled();
+        } finally {
+          adapter.findById = oldFindById;
+        }
+      });
+
+      it("still stamps $author with the inline object's id", () => {
+        const article = Article.hydrate(adapter, {
+          title: "x",
+          author: { id: "a1", name: "Alice" },
+        });
+        expect((article as any).$author).toBe("a1");
+      });
+
+      it("memoizes the pre-hydrated proxy across reads", () => {
+        const article = Article.hydrate(adapter, {
+          title: "x",
+          author: { id: "a1", name: "Alice" },
+        });
+        const first = article.author;
+        const second = article.author;
+        expect(first === second).toBe(true);
+      });
+
+      it("falls through to lazy load when the field is reassigned to a bare string id", () => {
+        const findByIdSpy = vi.fn(async (_cls: any, _id: string) => null);
+        const oldFindById = adapter.findById;
+        adapter.findById = findByIdSpy as any;
+        try {
+          const article = Article.hydrate(adapter, {
+            title: "x",
+            author: { id: "a1", name: "Alice" },
+          });
+          // Synchronous on the pre-hydrated id.
+          expect((article.author as any).name).toBe("Alice");
+          expect(findByIdSpy).not.toHaveBeenCalled();
+          // Reassign to a different id — must shed the pre-hydrated
+          // proxy. The Model __refCache is module-scoped and keyed
+          // by `${type}:${id}`; even if a prior test cached "a2",
+          // the reassignment invalidates the instance-level cache
+          // and a new read mints a fresh lazy proxy.
+          article.author = "a2" as any;
+          // Reading a non-whitelisted field now throws the lazy
+          // load Promise (Suspense integration). Catch it so we
+          // can assert findById was called.
+          try {
+            void (article.author as any).name;
+          } catch (e) {
+            if (!(e && typeof (e as any).then === "function")) throw e;
+          }
+          // findById is called synchronously inside the get trap;
+          // the spy is recorded before the Promise resolves.
+          expect(findByIdSpy).toHaveBeenCalledTimes(1);
+          expect(findByIdSpy.mock.calls[0]![1]).toBe("a2");
+        } finally {
+          adapter.findById = oldFindById;
+        }
+      });
+
+      it("ignores inline payloads without an id (defensive — falls through to null)", () => {
+        const article = Article.hydrate(adapter, {
+          title: "x",
+          author: { name: "no-id" } as any,
+        });
+        // No id → no raw id, no proxy. Same as `author: null`.
+        expect(article.author).toBeNull();
+        expect((article as any).$author).toBeNull();
+      });
+    });
   });
 });

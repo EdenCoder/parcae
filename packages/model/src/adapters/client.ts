@@ -11,6 +11,7 @@
 import { proxy } from "valtio";
 import {
   CHAINABLE_METHODS,
+  extractExpandFields,
   type ModelAdapter,
   type ModelConstructor,
   type PatchOp,
@@ -255,6 +256,12 @@ export class FrontendAdapter implements ModelAdapter {
     chain.__modelClass = modelClass;
     chain.__adapter = this;
     chain.__forceRefresh = options.forceRefresh === true;
+    // `.expand(...)` projections, recovered from the recorded steps.
+    // The frontend doesn't act on them — the backend route handler
+    // re-derives the same list from `__query` — but consumers / tests
+    // benefit from being able to read the projection without walking
+    // the step array.
+    chain.__expand = extractExpandFields(steps);
 
     return chain as QueryChain<T>;
   }

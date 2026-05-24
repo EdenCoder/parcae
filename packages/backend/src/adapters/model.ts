@@ -1196,11 +1196,26 @@ export class BackendAdapter implements ModelAdapter {
   private _buildQuery<T>(
     modelClass: ModelConstructor<T>,
     knexQuery: any,
+    expand: readonly string[] = [],
   ): QueryChain<T> {
     const chain: any = {};
 
     for (const method of CHAINABLE_METHODS) {
       chain[method] = (...args: any[]) => {
+        // expand() — records ref field projections for the route /
+        // subscription layer to apply after `.find()`. Not a SQL
+        // operation; never reaches Knex. Stored as a sidecar list
+        // on the chain so `routes.ts` / `subscriptions.ts` can
+        // recover the projection without re-walking `__steps`.
+        if (method === "expand") {
+          const additions = args
+            .filter((a): a is string => typeof a === "string" && a.length > 0);
+          return this._buildQuery(
+            modelClass,
+            knexQuery,
+            additions.length > 0 ? [...expand, ...additions] : expand,
+          );
+        }
         // Dot-notation ref subquery rewriting for server-side queries
         if (
           typeof args[0] === "string" &&
@@ -1245,10 +1260,15 @@ export class BackendAdapter implements ModelAdapter {
                 args[0] as string,
                 args[1] as any[],
               ),
+              expand,
             );
           }
         }
-        return this._buildQuery(modelClass, knexQuery[method](...args));
+        return this._buildQuery(
+          modelClass,
+          knexQuery[method](...args),
+          expand,
+        );
       };
     }
 
@@ -1258,10 +1278,10 @@ export class BackendAdapter implements ModelAdapter {
         | string[]
         | undefined;
       if (!searchFields?.length || !term.trim()) {
-        return this._buildQuery(modelClass, knexQuery);
+        return this._buildQuery(modelClass, knexQuery, expand);
       }
       const modified = this._applySearch(knexQuery, term, modelClass);
-      return this._buildQuery(modelClass, modified);
+      return this._buildQuery(modelClass, modified, expand);
     };
 
     chain.find = async (): Promise<T[]> => {
@@ -1286,12 +1306,16 @@ export class BackendAdapter implements ModelAdapter {
     };
 
     chain.exec = () => knexQuery;
-    chain.clone = () => this._buildQuery(modelClass, knexQuery.clone());
+    chain.clone = () => this._buildQuery(modelClass, knexQuery.clone(), expand);
 
     // Internal metadata — used by subscription manager for type indexing
     chain.__modelType = modelClass.type;
     chain.__modelClass = modelClass;
     chain.__adapter = this;
+    // `.expand(...)` projections recorded for the route / subscription
+    // layer to apply after `.find()`. Empty when the caller did not
+    // opt in — preserves the current "string-id-only" wire shape.
+    chain.__expand = expand;
 
     return chain as QueryChain<T>;
   }

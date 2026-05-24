@@ -29,6 +29,11 @@ import { createHash } from "node:crypto";
 import type { QueryChain } from "@parcae/model";
 import fastJsonPatch from "fast-json-patch";
 import type { Operation } from "fast-json-patch";
+import { RefLoader } from "./ref-loader";
+import {
+  hydrateExpansions,
+  type ResolvedExpand,
+} from "./hydrate-expansions";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -48,6 +53,13 @@ interface CachedQuery {
   hash: string;
   modelType: string;
   query: QueryChain<any>;
+  /**
+   * Per-query ref expansions recorded by `.expand(...)`. Drives the
+   * per-emit `hydrateExpansions` pass that inlines linked rows in
+   * the cached result. Empty when the subscriber didn't ask for any
+   * expansions — identical to the pre-DOL-1093 emit path.
+   */
+  expand: readonly ResolvedExpand[];
   /**
    * Iteration order of this Map IS the order rows came back from the
    * DB on the last re-eval (and therefore matches the orderBy spec
@@ -75,6 +87,15 @@ interface CachedQuery {
 interface SubscriptionOptions {
   socketId: string;
   query: QueryChain<any>;
+  /**
+   * Per-query ref expansions recorded by `.expand(...)` on the
+   * client. Subscriptions with different expand projections live as
+   * distinct cached queries (the hash includes the projection key
+   * via `expandHashKey`) so emits ship the right shape per
+   * consumer. Empty → no expansions, identical to pre-DOL-1093
+   * behavior.
+   */
+  expand?: readonly ResolvedExpand[];
 }
 
 interface SubscribeExtraOptions {
@@ -134,8 +155,30 @@ interface IoBackend {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function hashFrom(toSQL: { sql: string; bindings: any[] }): string {
-  const payload = JSON.stringify({ sql: toSQL.sql, bindings: toSQL.bindings });
+function hashFrom(
+  toSQL: { sql: string; bindings: any[] },
+  expand: readonly ResolvedExpand[],
+): string {
+  // Expand projections are part of the cache key: a `.find()` with
+  // and without `.expand("file")` returns different wire shapes and
+  // must NOT share a cached subscription. Per-ref projection lists
+  // are sorted so callers that vary argument order still collapse.
+  const expandKey =
+    expand.length === 0
+      ? ""
+      : expand
+          .map((e) => {
+            if (!e.projection) return e.refField;
+            const fields = Array.from(e.projection).sort();
+            return `${e.refField}.{${fields.join(",")}}`;
+          })
+          .sort()
+          .join("|");
+  const payload = JSON.stringify({
+    sql: toSQL.sql,
+    bindings: toSQL.bindings,
+    expand: expandKey,
+  });
   return createHash("sha256").update(payload).digest("hex").slice(0, 16);
 }
 
@@ -270,10 +313,22 @@ const DEFAULT_DEBOUNCE_MS = 25;
 const DEFAULT_MAX_WAIT_MS = 100;
 const DEFAULT_REEVAL_CONCURRENCY = 8;
 
+const EMPTY_EXPAND: readonly ResolvedExpand[] = Object.freeze([]);
+
 export class QuerySubscriptionManager {
   private queries = new Map<string, CachedQuery>();
   private socketQueries = new Map<string, Set<string>>();
   private typeIndex = new Map<string, Set<string>>();
+  /**
+   * Secondary index from expanded-target-type → cached query hashes.
+   * When a `File` row changes, every cached query that expanded
+   * `file` (regardless of which parent type) needs a re-eval so the
+   * inlined linked row stays fresh. v1 invalidation is naive: any
+   * change to the target type wakes every subscriber that expanded
+   * it, regardless of projection (see DOL-1093 open questions for
+   * the field-aware follow-up).
+   */
+  private expandTargetIndex = new Map<string, Set<string>>();
 
   private emitToSocket: EmitToSocket;
   private emitToRoom: EmitToRoom | null;
@@ -322,11 +377,12 @@ export class QuerySubscriptionManager {
     extra: SubscribeExtraOptions = {},
   ): Promise<{ hash: string; items: Record<string, any>[] }> {
     const { socketId, query } = opts;
+    const expand = opts.expand ?? EMPTY_EXPAND;
     // `__modelType` lives on the QueryChain interface as @internal —
     // populated by every chain factory (`Model._query` → `lazyQuery`
     // server-side, the adapter's `query()` factory client-side).
     const modelType = query.__modelType;
-    const hash = hashFrom(query.exec().toSQL());
+    const hash = hashFrom(query.exec().toSQL(), expand);
 
     // Per-socket cap enforced BEFORE the cache lookup so a socket
     // can't unlock new subscriptions by re-requesting an already-
@@ -359,7 +415,7 @@ export class QuerySubscriptionManager {
         await this._reeval(cached);
       }
     } else {
-      const rows = await this._execQuery(query);
+      const rows = await this._execQuery(query, expand);
       const result = new Map<string, Record<string, any>>();
       for (const row of rows) {
         const clean = dateSafeClone(row);
@@ -371,6 +427,7 @@ export class QuerySubscriptionManager {
         hash,
         modelType,
         query,
+        expand,
         result,
         subscribers: new Set([socketId]),
         coalesce: {
@@ -388,6 +445,17 @@ export class QuerySubscriptionManager {
         this.typeIndex.set(modelType, new Set());
       }
       this.typeIndex.get(modelType)!.add(hash);
+
+      // Cross-type invalidation index: whenever any of this query's
+      // expanded targets is written, this hash needs a re-eval.
+      for (const exp of expand) {
+        let bucket = this.expandTargetIndex.get(exp.targetType);
+        if (!bucket) {
+          bucket = new Set();
+          this.expandTargetIndex.set(exp.targetType, bucket);
+        }
+        bucket.add(hash);
+      }
     }
 
     if (!this.socketQueries.has(socketId)) {
@@ -423,6 +491,9 @@ export class QuerySubscriptionManager {
       this._teardownCoalesce(cached);
       this.queries.delete(hash);
       this.typeIndex.get(cached.modelType)?.delete(hash);
+      for (const exp of cached.expand) {
+        this.expandTargetIndex.get(exp.targetType)?.delete(hash);
+      }
     }
   }
 
@@ -441,6 +512,9 @@ export class QuerySubscriptionManager {
         this._teardownCoalesce(cached);
         this.queries.delete(hash);
         this.typeIndex.get(cached.modelType)?.delete(hash);
+        for (const exp of cached.expand) {
+          this.expandTargetIndex.get(exp.targetType)?.delete(hash);
+        }
       }
     }
 
@@ -458,10 +532,28 @@ export class QuerySubscriptionManager {
    * `maxWaitMs` intervals — clients never stall behind a write loop.
    */
   onModelChange(modelType: string): void {
-    const hashes = this.typeIndex.get(modelType);
-    if (!hashes || hashes.size === 0) return;
+    // Primary path: direct subscribers to this model type.
+    const direct = this.typeIndex.get(modelType);
+    if (direct) {
+      for (const hash of direct) {
+        const cached = this.queries.get(hash);
+        if (!cached) continue;
+        this._scheduleReeval(cached);
+      }
+    }
 
-    for (const hash of hashes) {
+    // Expand-aware cross-type invalidation: a `File` write wakes
+    // every cached query that expanded `file`, regardless of the
+    // parent model type. v1 is naive — no field-aware filtering —
+    // so a `File.blurhash` change re-emits even to subscribers that
+    // only projected `file.url`. Trade-off accepted in DOL-1093.
+    const viaExpand = this.expandTargetIndex.get(modelType);
+    if (!viaExpand || viaExpand.size === 0) return;
+    for (const hash of viaExpand) {
+      // Skip queries we already woke through the direct index (a
+      // query whose parent type IS the changed type AND that expands
+      // the same type back into itself — pathological but possible).
+      if (direct?.has(hash)) continue;
       const cached = this.queries.get(hash);
       if (!cached) continue;
       this._scheduleReeval(cached);
@@ -554,7 +646,7 @@ export class QuerySubscriptionManager {
   private async _reeval(cached: CachedQuery): Promise<void> {
     if (cached.subscribers.size === 0) return;
 
-    const rows = await this._execQuery(cached.query);
+    const rows = await this._execQuery(cached.query, cached.expand);
     const newResult = new Map<string, Record<string, any>>();
     for (const row of rows) {
       const clean = dateSafeClone(row);
@@ -617,6 +709,7 @@ export class QuerySubscriptionManager {
 
   private async _execQuery(
     query: QueryChain<any>,
+    expand: readonly ResolvedExpand[],
   ): Promise<Record<string, any>[]> {
     const models = await query.clone().find();
     // `query.find()` returns `Promise<any[]>` (the chain's generic is
@@ -625,9 +718,34 @@ export class QuerySubscriptionManager {
     // through (defensive — the default `sanitize` is now on Model
     // itself, so the fallback is effectively unreachable for real
     // model classes).
-    return Promise.all(
+    const wireRows = await Promise.all(
       models.map((m: any) => m.sanitize?.() ?? m.__data ?? m),
     );
+
+    if (expand.length === 0) return wireRows;
+
+    // Build an ephemeral RefLoader pointed at the adapter's batch
+    // entrypoint. This runs OUTSIDE a request scope (re-eval fires
+    // on `onModelChange`, which has no AsyncLocalStorage frame), so
+    // we can't reuse `getRefLoader()`. The per-reeval loader still
+    // collapses every ref-id-per-row into one query per target
+    // type via the same microtask batching.
+    const adapter = (query as any).__adapter as
+      | {
+          batchFindByType?: (type: string, ids: string[]) => Promise<Map<string, any>>;
+        }
+      | null;
+    if (!adapter?.batchFindByType) return wireRows;
+    const loader = new RefLoader((type, ids) =>
+      adapter.batchFindByType!(type, ids),
+    );
+    // No request user available outside a request scope. Privacy-
+    // sensitive refs (e.g. expanding a `user` ref with private
+    // fields) would need to opt in via subscription-time user
+    // carriage — out of scope for v1 since the only expanded ref in
+    // anger right now is `File`, which has no `privateFields`.
+    await hydrateExpansions(wireRows, expand, loader, null);
+    return wireRows;
   }
 
   // ── Stats ──────────────────────────────────────────────────────────

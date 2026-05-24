@@ -615,14 +615,60 @@ export class Model extends EventEmitter {
     }
     for (const [field, target] of refTargets) {
       // Seed the closure's raw-id slot from whatever the caller passed
-      // in (Model instance → its id; raw string id → as-is) or whatever
-      // the subclass's field initializer landed before this ran.
+      // in. Three shapes:
+      //   - Model instance     — use its id as raw; instance is already
+      //                          a Model, no pre-hydration needed.
+      //   - Inline ref object  — wire payload from `.expand("file")` /
+      //                          `.expand("file.url")`. Hydrate the
+      //                          object into a target-class instance
+      //                          and pre-populate the ref proxy so
+      //                          consumers don't trigger a Suspense
+      //                          throw on first access (DOL-1093).
+      //   - String id / null   — bare raw id (or no value). Lazy load
+      //                          on first access via `_createRefProxy`.
       const incoming = data[field] ?? (this as any)[field];
-      const raw =
-        incoming instanceof Model
-          ? ((incoming as any).id ?? null)
-          : ((incoming as string | null | undefined) ?? null);
-      this._installRefField(field, target, raw);
+      let raw: string | null;
+      let prehydrated: Model | null = null;
+      if (incoming instanceof Model) {
+        raw = (incoming as any).id ?? null;
+      } else if (
+        incoming &&
+        typeof incoming === "object" &&
+        typeof (incoming as Record<string, any>).id === "string"
+      ) {
+        // Inline expanded ref. Hydrate via the target's `.hydrate(...)`
+        // factory so the produced instance has the same shape as one
+        // returned by `findById` — including its own ref-field
+        // accessors and __serverSnapshot, so a subsequent edit on the
+        // linked row diffs / saves cleanly.
+        //
+        // `target` here is the schema entry's `target` constructor —
+        // when the schema was built from ts-morph (`schema/resolver.ts`)
+        // this may be a stub with just `{ type }`. The backend's
+        // schema generator (`schema/generate.ts:200-205`) and
+        // BackendAdapter's `_models` lookup (model.ts:359) both
+        // resolve it back to a real constructor before any hydrate
+        // runs server-side; the runtime `_apply` path here only
+        // executes on already-resolved schemas (model bodies that
+        // direct-imported their ref targets). The `hydrate`
+        // type-guard below is the safety net for the stub case.
+        raw = (incoming as Record<string, any>).id as string;
+        if (typeof (target as any).hydrate === "function") {
+          prehydrated = (target as any).hydrate(
+            this[SYM_ADAPTER],
+            incoming,
+          ) as Model;
+        }
+      } else if (typeof incoming === "string") {
+        raw = incoming || null;
+      } else {
+        // Anything else (object without id, number, Date, etc.) is
+        // not a usable ref payload. Treat it as null so the accessor
+        // returns null and a downstream read can't synthesise a
+        // garbage findById call against a stringified non-id.
+        raw = null;
+      }
+      this._installRefField(field, target, raw, prehydrated);
     }
 
     // Apply provided non-system, non-ref data. These OVERWRITE subclass
@@ -663,18 +709,32 @@ export class Model extends EventEmitter {
    * non-ref user data, so the most common path (no subclass field
    * initializer with `= null` default) goes through one hidden-class
    * transition per ref instead of three (DOL-1045).
+   *
+   * `prehydrated` lets the caller pre-populate the ref proxy with a
+   * fully-loaded target Model — DOL-1093's `.expand("file")` path
+   * uses it to embed the linked row inline so consumers don't
+   * Suspense-throw on first access. The pre-population mints a
+   * fresh proxy (bypassing the per-id cache) so a prior lazy proxy
+   * holding `loaded: null` doesn't shadow the freshly-known row.
+   * On any subsequent reassignment the cached proxy is cleared and
+   * the lazy path resumes (correct: the new ref id may not have
+   * been expanded).
    */
   private _installRefField(
     field: string,
     targetClass: ModelConstructor,
     initialRaw: string | null,
+    prehydrated: Model | null = null,
   ): void {
     let raw: string | null = initialRaw;
     // Per-instance proxy memoization. The same `raw` id returns the
     // same Proxy reference across reads, so `<UserCard user={post.author}>`
     // rendered at 60 fps doesn't allocate a fresh Proxy per frame.
-    let cachedProxy: any = null;
-    let cachedRaw: string | null = null;
+    let cachedProxy: any =
+      prehydrated && raw
+        ? this._createPrehydratedRefProxy(targetClass, raw, prehydrated)
+        : null;
+    let cachedRaw: string | null = cachedProxy ? raw : null;
     const self = this;
 
     const invalidate = (): void => {
@@ -1151,14 +1211,68 @@ export class Model extends EventEmitter {
   >();
   private static REF_CACHE_TTL = 30_000; // 30 seconds
 
+  /**
+   * Pre-hydrated ref proxy — same shape as `_createRefProxy` but
+   * `loaded` starts populated, so property access is synchronous
+   * and never fires `findById` / throws Suspense.
+   *
+   * Used by `_apply` when the wire payload included a `.expand(...)`
+   * inline object for this ref field. The cache slot for
+   * `${type}:${id}` is overwritten so a sibling read of the same
+   * ref id elsewhere on the same instance (or across instances
+   * within the 30s TTL) reuses this same hydrated proxy rather
+   * than a stale lazy one.
+   *
+   * Field-projection note: `.expand("file.url")` builds an inline
+   * row with only `{ id, type, url }`. Reading
+   * `asset.file.blurhash` after a projected expand returns
+   * `undefined` rather than triggering a lazy load — the caller
+   * opted out of the other columns by projecting. If the caller
+   * needs them, they ask for the whole row (`.expand("file")`).
+   */
+  private _createPrehydratedRefProxy(
+    targetClass: ModelConstructor,
+    refId: string,
+    loadedInstance: Model,
+  ): any {
+    const proxy = this._buildRefProxy(targetClass, refId, loadedInstance);
+    Model.__refCache.set(`${targetClass.type}:${refId}`, {
+      value: proxy,
+      expires: Date.now() + Model.REF_CACHE_TTL,
+    });
+    return proxy;
+  }
+
   private _createRefProxy(targetClass: ModelConstructor, refId: string): any {
     const cacheKey = `${targetClass.type}:${refId}`;
     const cached = Model.__refCache.get(cacheKey);
     if (cached && cached.expires > Date.now()) return cached.value;
     if (cached) Model.__refCache.delete(cacheKey);
 
-    let loaded: any = null;
+    const proxy = this._buildRefProxy(targetClass, refId, null);
+    return proxy;
+  }
+
+  /**
+   * Shared proxy factory for `_createRefProxy` (lazy) and
+   * `_createPrehydratedRefProxy` (eager). `initialLoaded === null`
+   * routes the first non-whitelisted read through `findById`;
+   * any other value short-circuits the lazy load entirely so the
+   * read is synchronous.
+   *
+   * The trap shape stays identical between the two cases — DOL-1045
+   * iteration safety still applies. Pre-hydration is fundamentally
+   * a "preload the cache slot" optimization, not a different proxy
+   * protocol.
+   */
+  private _buildRefProxy(
+    targetClass: ModelConstructor,
+    refId: string,
+    initialLoaded: Model | null,
+  ): any {
+    let loaded: any = initialLoaded;
     let loading: Promise<any> | null = null;
+    const cacheKey = `${targetClass.type}:${refId}`;
 
     const proxy = new Proxy({} as any, {
       get(_target, prop) {

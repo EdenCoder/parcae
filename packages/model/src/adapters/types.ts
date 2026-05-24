@@ -239,6 +239,64 @@ export interface QueryChain<T> {
   clearLimit(): QueryChain<T>;
   from(table: string): QueryChain<T>;
 
+  /**
+   * Inline named ref fields in the LIST response, batched on the
+   * backend via the request-scoped `RefLoader`.
+   *
+   * Without `.expand(...)`, ref columns serialize as raw id strings;
+   * the client has to round-trip `findById` per row to paint anything.
+   * That's the canonical N+1 — one `GET /v1/files/:id` per asset on
+   * editor mount.
+   *
+   * Two shapes:
+   *
+   *     .expand("file")              // full linked row inlined
+   *     .expand("file.url")          // single field projected
+   *     .expand("file.url", "file.mime")  // projection of N fields
+   *     .expand("project")           // multiple distinct refs
+   *
+   * Whole-row vs projection per ref field:
+   *   - Bare ref name (`"file"`) — server emits the full
+   *     `sanitize()` projection of the linked row.
+   *   - One or more `"file.<field>"` entries — server emits ONLY
+   *     `{ id, type, <fields> }`. The id and type are always
+   *     present so the frontend can still hydrate a ref-proxy.
+   *   - Mixing a bare ref with dotted projections of the same ref
+   *     promotes to whole-row (the bare entry wins).
+   *
+   * The raw id ALWAYS lands in `$file` regardless — the frontend
+   * accessor pair `(file, $file)` is the same shape the lazy ref
+   * proxy has used since DOL-148. `.expand()` only changes whether
+   * the linked row is pre-hydrated, not whether the id is present.
+   *
+   * Realtime: subscription invalidation is currently **naive** for
+   * projected expands. Any change to a linked-row column re-emits
+   * to every subscriber that expanded the parent ref, regardless of
+   * which fields the subscriber projected. That over-notifies in
+   * the projection case (a `blurhash` flip wakes a `file.url`
+   * subscriber) but stays correct. Field-aware invalidation is a
+   * follow-up (see DOL-1093 open questions).
+   *
+   * `Model.hydrate` walks the schema; ref-field objects pre-populate
+   * the ref-proxy's loaded slot so `asset.file.url` is synchronous
+   * (no Suspense throw, no extra HTTP). Field projections come
+   * back as a partial linked row — the proxy serves whatever fields
+   * the server included and falls through to a lazy `findById` only
+   * when the consumer asks for an unprojected field.
+   *
+   * Validation runs on the backend:
+   *   - Bare field (`"file"`) — must exist in `ModelClass.__schema`
+   *     as `{ kind: "ref", target }`.
+   *   - Dotted field (`"file.url"`) — the `"file"` segment must be
+   *     a ref; the `"url"` segment must exist in `target.__schema`.
+   *   - Unknown / non-ref field → 400.
+   *
+   * v1 is one-hop. Nested ref-chaining (`"project.user"` where both
+   * are refs) is a follow-up; dot-syntax is reserved for "ref +
+   * field projection" right now.
+   */
+  expand(...fields: string[]): QueryChain<T>;
+
   // Chainable — aggregates (chainable versions)
   sum(column: string): QueryChain<T>;
   avg(column: string): QueryChain<T>;
@@ -290,6 +348,14 @@ export interface QueryChain<T> {
   /** @internal */ __adapter: ModelAdapter;
   /** @internal — true when `.withForceRefresh()` was applied. */
   __forceRefresh?: boolean;
+  /**
+   * @internal — ref field names recorded by `.expand(...)`. Used by
+   * backend route handlers / the subscription manager to drive
+   * `hydrateExpansions` after the SQL query runs. Frontend never
+   * reads this; it lives on the chain so the backend can recover
+   * the list without re-walking `__steps`.
+   */
+  __expand?: readonly string[];
 }
 
 // ─── Model Adapter ───────────────────────────────────────────────────────────
@@ -385,4 +451,68 @@ export const CHAINABLE_METHODS = [
   "max",
   "increment",
   "decrement",
+  "expand",
 ] as const;
+
+// ─── Expand step helpers ─────────────────────────────────────────────────────
+
+const EMPTY_EXPAND: readonly string[] = Object.freeze([]);
+
+/**
+ * Collect ref-field projections recorded by `.expand(...)`. Returns
+ * the flattened, de-duplicated list of expand specs in the order
+ * the client recorded them (stable so the route handler can derive
+ * a deterministic subscription hash; see
+ * `services/subscriptions.ts`).
+ *
+ * Specs can be:
+ *   - `"file"`           — full linked row inlined.
+ *   - `"file.url"`       — single projected field.
+ *   - `"file.url", "file.mime"` — multiple fields on the same ref.
+ *
+ * The route handler reconciles a bare-ref spec against per-field
+ * specs on the same ref (bare wins → whole-row).
+ *
+ * Lives next to `CHAINABLE_METHODS` because step manipulation is
+ * pure data — no Knex, no transport. Both the frontend client and
+ * the backend route handler import this same function so the
+ * frontend-sidecar `__expand` and the route-handler validation
+ * agree on what was requested.
+ */
+export function extractExpandFields(
+  steps: QueryStep[] | null | undefined,
+): readonly string[] {
+  if (!Array.isArray(steps) || steps.length === 0) return EMPTY_EXPAND;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const step of steps) {
+    if (step.method !== "expand") continue;
+    for (const arg of step.args) {
+      if (typeof arg !== "string") continue;
+      const trimmed = arg.trim();
+      if (!trimmed) continue;
+      if (seen.has(trimmed)) continue;
+      seen.add(trimmed);
+      out.push(trimmed);
+    }
+  }
+  return out.length > 0 ? out : EMPTY_EXPAND;
+}
+
+/** Strip every `expand` step from the array. Used by the backend route
+ * handler before replaying steps through `queryFromClient` — expand is
+ * a metadata projection, not a SQL operation. */
+export function stripExpandSteps(
+  steps: QueryStep[] | null | undefined,
+): QueryStep[] {
+  if (!Array.isArray(steps) || steps.length === 0) return [];
+  let stripped: QueryStep[] | null = null;
+  for (let i = 0; i < steps.length; i++) {
+    if (steps[i]!.method === "expand") {
+      if (stripped === null) stripped = steps.slice(0, i);
+      continue;
+    }
+    if (stripped !== null) stripped.push(steps[i]!);
+  }
+  return stripped ?? steps;
+}
