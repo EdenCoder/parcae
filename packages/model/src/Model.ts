@@ -1348,9 +1348,19 @@ export class Model extends EventEmitter {
  * Adds typed `$`-prefixed string accessors for all reference fields.
  * The accessor installation in `_apply()` provides these at runtime —
  * this type just surfaces them to TypeScript so no casting is needed.
+ *
+ * The mapped-type predicate uses `NonNullable<T[K]> extends Model`
+ * (rather than `T[K] extends Model`) so nullable ref columns like
+ * `file: File | null = null` still surface their `$file` accessor.
+ * Without the unwrap, `File | null extends Model` resolves to
+ * `never` and the `$<ref>` accessor disappears from the projected
+ * type — even though the runtime installer fires regardless of
+ * nullability.
  */
 export type WithRefs<T extends Model> = T & {
-  [K in keyof T as T[K] extends Model ? `$${string & K}` : never]: string;
+  [K in keyof T as NonNullable<T[K]> extends Model
+    ? `$${string & K}`
+    : never]: string;
 };
 
 // Symbol declarations for TypeScript

@@ -849,6 +849,28 @@ describe("Model", () => {
         expect(article.author).toBeNull();
         expect((article as any).$author).toBeNull();
       });
+
+      it("WithRefs<T> surfaces `$<refField>` even for nullable ref columns", () => {
+        // Type-level assertion — the new `Nullable | Model` Model
+        // class lets us declare `file: File | null = null` and have
+        // `WithRefs<File>` still project the `$file` accessor.
+        // Without the `NonNullable<T[K]> extends Model` predicate
+        // change, this test wouldn't typecheck.
+        class NullableRefModel extends Model {
+          static override type = "nrm" as const;
+          static override __schema = {
+            author: { kind: "ref", target: Author },
+          } as any;
+          declare author: Author | null;
+        }
+        type Refs = import("../Model").WithRefs<NullableRefModel>;
+        const sample = NullableRefModel.create({
+          author: "a1",
+        }) as Refs;
+        // Type assertion + runtime sanity: $author is a string id.
+        expect(typeof sample.$author).toBe("string");
+        expect(sample.$author).toBe("a1");
+      });
     });
   });
 });
