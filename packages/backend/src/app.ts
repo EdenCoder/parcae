@@ -48,6 +48,10 @@ import {
   _setRuntimeFlags,
   runWithRequestContext,
 } from "./services/context";
+import {
+  prepareClientQuery,
+  runQuerySubscription,
+} from "./services/query-subscription";
 import { getJobs } from "./routing/job";
 import { getHooks } from "./routing/hook";
 import { getCrons } from "./routing/cron";
@@ -974,48 +978,40 @@ export function createApp(config: AppConfig): ParcaeApp {
           items: any[];
           totalCount: number;
         }> = [];
+        const user = socketSession?.user ?? null;
         for (const entry of entries) {
           const ModelClass = registry.get(entry.modelType);
           if (!ModelClass) continue;
           const scope = (ModelClass as any).scope;
           if (!scope?.read) continue;
 
-          const ctx = {
-            user: socketSession?.user ?? null,
+          const scopeResult = scope.read({
+            user,
             params: {},
             data: {},
-          } as any;
-          const scopeResult = scope.read(ctx);
+          } as any);
           if (!scopeResult) continue;
-
-          const steps = Array.isArray(entry.steps) ? entry.steps : [];
-          const query = adapter.queryFromClient(
-            ModelClass,
-            scopeResult,
-            steps as any,
-          );
-
-          const stepsWithoutPagination = steps.filter(
-            (s: any) => s?.method !== "limit" && s?.method !== "offset",
-          );
-          const countQuery = adapter.queryFromClient(
-            ModelClass,
-            scopeResult,
-            stepsWithoutPagination as any,
-          );
-
           if (!adapter.subscriptions) continue;
-          const [sub, totalCount] = await Promise.all([
-            adapter.subscriptions.subscribe({ socketId, query }),
-            countQuery.count(),
-          ]);
 
-          results.push({
-            key: entry.key,
-            hash: sub.hash,
-            items: [...sub.items],
-            totalCount,
+          // Canonical query subscription pipeline — same orchestration
+          // the HTTP LIST handler uses, so `.expand(...)` projections
+          // survive the reconnect and the editor's pre-hydrated ref
+          // proxies don't snap to null on resync (DOL-1095).
+          const prep = prepareClientQuery({
+            ModelClass,
+            scopeResult,
+            rawSteps: entry.steps,
+            modelByType: registry,
+            adapter,
           });
+          const { items, hash, totalCount } = await runQuerySubscription({
+            prep,
+            socketId,
+            user,
+            adapter,
+          });
+
+          results.push({ key: entry.key, hash, items, totalCount });
         }
         return results;
       }
@@ -1149,13 +1145,27 @@ export function createApp(config: AppConfig): ParcaeApp {
               callback?.({ success: true, results: [] });
               return;
             }
+            // Install a request-scoped context so `runQuerySubscription`
+            // → `hydrateExpansions` → `getRefLoader()` finds a loader.
+            // Without this, `.expand("file")` projections silently
+            // no-op on every reconnect and the editor's pre-hydrated
+            // ref proxies snap to null. Mirrors the Polka middleware
+            // at server.polka.use(...) that wraps every HTTP request.
+            const user = socketSession?.user ?? null;
+            const refLoader = new RefLoader((type, ids) =>
+              adapter.batchFindByType(type, ids),
+            );
             try {
-              const results = await resyncQueries(
-                socket.id,
-                socketSession,
-                entries,
-                adapter,
-                modelsByType,
+              const results = await runWithRequestContext(
+                { user, refLoader },
+                () =>
+                  resyncQueries(
+                    socket.id,
+                    socketSession,
+                    entries,
+                    adapter,
+                    modelsByType,
+                  ),
               );
               callback?.({ success: true, results });
             } catch (err: any) {

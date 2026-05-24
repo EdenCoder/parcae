@@ -36,21 +36,17 @@
  */
 
 import type { ModelConstructor, ScopeContext } from "@parcae/model";
-import {
-  Model,
-  extractExpandFields,
-  stripExpandSteps,
-} from "@parcae/model";
+import { Model } from "@parcae/model";
 import pluralize from "pluralize";
 import { ClientError } from "../helpers";
 import { log } from "../logger";
 import { route } from "../routing/route";
-import {
-  hydrateExpansions,
-  parseExpandSpecs,
-  validateExpandSpecs,
-} from "../services/hydrate-expansions";
+import { hydrateExpansions } from "../services/hydrate-expansions";
 import { getRefLoader } from "../services/context";
+import {
+  prepareClientQuery,
+  runQuerySubscription,
+} from "../services/query-subscription";
 import type { BackendAdapter } from "./model";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -278,99 +274,44 @@ export function registerModelRoutes(
         const rawSteps = data.__query ?? [];
 
         try {
-          // Peel `.expand(...)` projections off the recorded steps
-          // before SQL replay. Expand is a wire-shape directive, not
-          // a SQL operation; the route layer applies it after
-          // `query.find()` via the request-scoped `RefLoader`.
-          // `extractExpandFields` does its own array-or-string
-          // normalisation — same shape `queryFromClient` accepts.
-          const normalisedSteps = Array.isArray(rawSteps)
-            ? rawSteps
-            : (() => {
-                if (typeof rawSteps !== "string") return [];
-                try {
-                  const parsed = JSON.parse(rawSteps);
-                  return Array.isArray(parsed) ? parsed : [];
-                } catch {
-                  return [];
-                }
-              })();
-          const expandSpecs = parseExpandSpecs(
-            extractExpandFields(normalisedSteps),
-          );
-          const expandResolved = validateExpandSpecs(
-            expandSpecs,
+          const prep = prepareClientQuery({
             ModelClass,
+            scopeResult,
+            rawSteps,
             modelByType,
-          );
-          const steps = expandResolved.length > 0
-            ? stripExpandSteps(normalisedSteps)
-            : rawSteps;
-
-          const query = adapter.queryFromClient(ModelClass, scopeResult, steps);
+            adapter,
+          });
 
           if (data.__count === "true" || data.__count === true) {
-            const total = await query.count();
+            const total = await prep.query.count();
             return json(res, 200, { result: { total }, success: true });
           }
 
-          // Build a parallel count query (same filters, no limit/offset)
-          // so clients can compute page counts.
-          const stepsWithoutPagination = Array.isArray(steps)
-            ? steps.filter(
-                (s: any) => s.method !== "limit" && s.method !== "offset",
-              )
-            : [];
-          const countQuery = adapter.queryFromClient(
-            ModelClass,
-            scopeResult,
-            stepsWithoutPagination,
-          );
-
-          // For socket RPC, subscribe to query-level change notifications.
-          // The subscription manager will re-eval this query on model changes
-          // and emit surgical add/remove/update ops to this socket.
-          //
-          // `__forceRefresh: true` is the drift-poll hook — the client's
-          // periodic refetch sets it so we re-execute the cached query
-          // against the DB and emit any drift ops to every subscriber
-          // on the same hash. Without it, repeated LIST calls just
-          // hand back whatever's in the cache.
+          // Socket-RPC LIST → subscribe to query-level change
+          // notifications. The subscription manager re-evals on model
+          // changes and emits surgical add/remove/update ops to this
+          // socket. `__forceRefresh: true` is the client's drift-poll
+          // hook — periodic refetches set it so we re-execute the
+          // cached query against the DB and emit any drift ops to
+          // every subscriber on the same hash. Without it, repeated
+          // LIST calls just hand back the cached row set.
           const socketId = req._socketId;
           if (socketId && adapter.subscriptions) {
-            const force = data.__forceRefresh === true ||
-              data.__forceRefresh === "true";
-            const [sub, totalCount] = await Promise.all([
-              adapter.subscriptions.subscribe(
-                { socketId, query, expand: expandResolved },
-                { force },
-              ),
-              countQuery.count(),
-            ]);
-
-            // Subscription items come pre-projected from
-            // `_execQuery`'s sanitize pass inside the manager. If
-            // the request asked for expansions we hydrate them here
-            // for the immediate response; the manager handles the
-            // ongoing delta emissions itself.
-            const items = [...sub.items];
-            if (expandResolved.length > 0) {
-              const loader = getRefLoader();
-              if (loader) {
-                await hydrateExpansions(
-                  items,
-                  expandResolved,
-                  loader,
-                  ctx.user ?? null,
-                );
-              }
-            }
+            const force =
+              data.__forceRefresh === true || data.__forceRefresh === "true";
+            const { items, hash, totalCount } = await runQuerySubscription({
+              prep,
+              socketId,
+              user: ctx.user ?? null,
+              adapter,
+              force,
+            });
 
             json(res, 200, {
               result: {
                 total: items.length,
                 totalCount,
-                __queryHash: sub.hash,
+                __queryHash: hash,
                 [type + "s"]: items,
               },
               success: true,
@@ -378,21 +319,23 @@ export function registerModelRoutes(
             return;
           }
 
+          // Non-socket fetch fallback. No subscription, no realtime —
+          // one-shot find() + sanitise + optional expand hydrate.
           const [items, totalCount] = await Promise.all([
-            query.find(),
-            countQuery.count(),
+            prep.query.find(),
+            prep.countQuery.count(),
           ]);
 
           const wireItems = await Promise.all(
             items.map((m: RouteModelRow) => projectForWire(m, ctx.user)),
           );
 
-          if (expandResolved.length > 0) {
+          if (prep.expandResolved.length > 0) {
             const loader = getRefLoader();
             if (loader) {
               await hydrateExpansions(
                 wireItems,
-                expandResolved,
+                prep.expandResolved,
                 loader,
                 ctx.user ?? null,
               );
