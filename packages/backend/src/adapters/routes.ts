@@ -10,6 +10,29 @@
  *   PATCH  /v1/{type}s/:id   → atomic JSON Patch (scoped)
  *
  * Extracted from Dollhouse Studio's adapters/routes.ts (373 lines).
+ *
+ * Route-priority contract
+ * Every auto-CRUD route is registered with `priority: AUTO_CRUD_PRIORITY`
+ * (200), which is intentionally HIGHER than the framework's default
+ * priority (100) used by user-written controllers. Lower numbers sort
+ * first in `getRoutes()`, so user routes attach to polka before
+ * auto-CRUD when both register the same prefix.
+ *
+ * Without this gap, a user controller like
+ *
+ *   route.get("/v1/sources/providers", ...)
+ *
+ * would be shadowed by the auto-CRUD `GET /v1/sources/:id` (which
+ * registers at boot step 12, before custom controllers are discovered
+ * at step 13). The shadow turned the literal segment `"providers"`
+ * into an attempted Source id lookup, which 404'd as `"source not
+ * found"` — invisible at the user's call site. The priority gap moves
+ * the resolution rule out of "whoever registered first" and into
+ * "explicit routes always win," which is what every framework user
+ * already expects.
+ *
+ * Users who deliberately set a priority outside the [0, 199] band keep
+ * that ordering — the gap only changes the DEFAULT for auto-CRUD.
  */
 
 import type { ModelConstructor, ScopeContext } from "@parcae/model";
@@ -29,6 +52,17 @@ import {
 } from "../services/hydrate-expansions";
 import { getRefLoader } from "../services/context";
 import type { BackendAdapter } from "./model";
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+/**
+ * Priority bucket every auto-CRUD route is registered into. Higher
+ * number = LOWER precedence in `getRoutes()`'s ascending sort, so user
+ * routes (default `priority: 100`) attach to polka first and shadow
+ * the framework-generated `:id` patterns. See the module header for
+ * the full rationale.
+ */
+const AUTO_CRUD_PRIORITY = 200;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -380,7 +414,7 @@ export function registerModelRoutes(
         } catch (err) {
           respondWithError(res, err, `GET ${path}`);
         }
-      });
+      }, { priority: AUTO_CRUD_PRIORITY });
       count++;
     }
 
@@ -408,7 +442,7 @@ export function registerModelRoutes(
         } catch (err) {
           respondWithError(res, err, `GET ${path}/:id`);
         }
-      });
+      }, { priority: AUTO_CRUD_PRIORITY });
       count++;
     }
 
@@ -440,7 +474,7 @@ export function registerModelRoutes(
         } catch (err) {
           respondWithError(res, err, `POST ${path}`);
         }
-      });
+      }, { priority: AUTO_CRUD_PRIORITY });
       count++;
     }
 
@@ -479,7 +513,7 @@ export function registerModelRoutes(
         } catch (err) {
           respondWithError(res, err, `PUT ${path}/:id`);
         }
-      });
+      }, { priority: AUTO_CRUD_PRIORITY });
       count++;
     }
 
@@ -506,7 +540,7 @@ export function registerModelRoutes(
         } catch (err) {
           respondWithError(res, err, `DELETE ${path}/:id`);
         }
-      });
+      }, { priority: AUTO_CRUD_PRIORITY });
       count++;
     }
 
@@ -564,7 +598,7 @@ export function registerModelRoutes(
         } catch (err) {
           respondWithError(res, err, `PATCH ${path}/:id`);
         }
-      });
+      }, { priority: AUTO_CRUD_PRIORITY });
       count++;
     }
   }
