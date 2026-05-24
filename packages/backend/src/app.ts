@@ -123,6 +123,21 @@ export interface AppConfig {
     session: AuthSession | null,
     res: any,
   ) => void | Promise<void>;
+  /**
+   * Per-socket subscription cap. Defaults to 500 (see
+   * `DEFAULT_MAX_SUBSCRIPTIONS_PER_SOCKET` in
+   * `services/subscriptions.ts`). Bump higher for apps with very
+   * subscription-heavy navigation (the client SDK keeps each query
+   * warm for ~60s after unmount, so deep clicks-per-minute can pile
+   * distinct hashes against a single socket). The
+   * `PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET` env var overrides this if
+   * set.
+   *
+   * Hitting the cap is normally a runaway-render-loop signal — the
+   * server log warns loudly when it fires. If you legitimately need
+   * more, raise this; don't disable.
+   */
+  maxSubscriptionsPerSocket?: number;
 }
 
 export interface ParcaeApp {
@@ -526,6 +541,13 @@ export function createApp(config: AppConfig): ParcaeApp {
       const reevalConcurrency = process.env.PARCAE_REEVAL_CONCURRENCY
         ? Math.max(1, Number(process.env.PARCAE_REEVAL_CONCURRENCY))
         : undefined;
+      const maxSubscriptionsPerSocket = process.env
+        .PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET
+        ? Math.max(
+            1,
+            Number(process.env.PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET),
+          )
+        : config.maxSubscriptionsPerSocket;
       const subscriptions = new QuerySubscriptionManager(
         {
           emitToSocket: (socketId, event, data) => {
@@ -548,7 +570,12 @@ export function createApp(config: AppConfig): ParcaeApp {
             socket?.leave(room);
           },
         },
-        reevalConcurrency !== undefined ? { reevalConcurrency } : {},
+        {
+          ...(reevalConcurrency !== undefined ? { reevalConcurrency } : {}),
+          ...(maxSubscriptionsPerSocket !== undefined
+            ? { maxSubscriptionsPerSocket }
+            : {}),
+        },
       );
       adapter.subscriptions = subscriptions;
 

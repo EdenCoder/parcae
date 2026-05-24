@@ -166,29 +166,38 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("caps subscriptions per socket and returns empty items on overflow", async () => {
+      // Use a small explicit cap so we don't burn time creating 500
+      // distinct queries (the default in production). The
+      // configurability itself is what's being tested — runaway
+      // detection at the limit is observable at any cap size.
+      const CAP = 10;
+      const cappedManager = new QuerySubscriptionManager(
+        (socketId, event, data) => {
+          emitted.push({ socketId, event, data });
+        },
+        { debounceMs: 0, maxWaitMs: 0, maxSubscriptionsPerSocket: CAP },
+      );
       source.setResults([row("p1")]);
-      // Fill up to the cap with 100 distinct queries on one socket.
-      // Each `query("project", filter)` produces a different hash.
-      for (let i = 0; i < 100; i++) {
-        await manager.subscribe({
+      for (let i = 0; i < CAP; i++) {
+        await cappedManager.subscribe({
           socketId: "attacker",
           query: source.query("project", `bucket_${i}`),
         });
       }
-      expect(manager.stats.queries).toBe(100);
+      expect(cappedManager.stats.queries).toBe(CAP);
 
-      // The 101st subscription is rejected — returns the hash so the
-      // client can correlate but with an empty items list.
-      const overflow = await manager.subscribe({
+      // The (CAP+1)th subscription is rejected — returns the hash so
+      // the client can correlate but with an empty items list.
+      const overflow = await cappedManager.subscribe({
         socketId: "attacker",
         query: source.query("project", `bucket_overflow`),
       });
       expect(overflow.items).toEqual([]);
       // The rejected subscription was NOT cached server-side.
-      expect(manager.stats.queries).toBe(100);
+      expect(cappedManager.stats.queries).toBe(CAP);
 
       // A DIFFERENT socket isn't affected by attacker's quota.
-      const otherSocket = await manager.subscribe({
+      const otherSocket = await cappedManager.subscribe({
         socketId: "honest",
         query: source.query("project", `bucket_overflow`),
       });
@@ -196,16 +205,23 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("re-subscribing to a cached hash on the same socket doesn't count against the cap", async () => {
+      const CAP = 10;
+      const cappedManager = new QuerySubscriptionManager(
+        (socketId, event, data) => {
+          emitted.push({ socketId, event, data });
+        },
+        { debounceMs: 0, maxWaitMs: 0, maxSubscriptionsPerSocket: CAP },
+      );
       source.setResults([row("p1")]);
-      // 100 distinct → cap reached.
-      for (let i = 0; i < 100; i++) {
-        await manager.subscribe({
+      // Fill to the cap.
+      for (let i = 0; i < CAP; i++) {
+        await cappedManager.subscribe({
           socketId: "s1",
           query: source.query("project", `b_${i}`),
         });
       }
       // Re-subscribing to one we already have → success.
-      const dup = await manager.subscribe({
+      const dup = await cappedManager.subscribe({
         socketId: "s1",
         query: source.query("project", `b_5`),
       });

@@ -125,6 +125,21 @@ interface ManagerOptions {
    * (parsed by `createApp()` and passed in via this option).
    */
   reevalConcurrency?: number;
+  /**
+   * Per-socket distinct-subscription cap. See the
+   * `DEFAULT_MAX_SUBSCRIPTIONS_PER_SOCKET` JSDoc below for the
+   * rationale; the default (500) is sized to cover heavy SPA
+   * navigation (every visited page leaves its useQuery subscriptions
+   * warm for ~60s via the SDK's GC delay, so a user clicking through
+   * ~50 detail pages with ~10 queries each in under a minute stays
+   * under the cap). Apps with much heavier subscription footprints
+   * can bump it higher; the cap is per-socket so the cost is bounded
+   * by `(cap × concurrent sockets)`.
+   *
+   * Overridable at boot via the `PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET`
+   * env var (parsed by `createApp()` and passed in via this option).
+   */
+  maxSubscriptionsPerSocket?: number;
 }
 
 /**
@@ -295,19 +310,24 @@ function ordersEqual(a: string[], b: string[]): boolean {
 // ─── Manager ─────────────────────────────────────────────────────────────────
 
 /**
- * Per-socket subscription cap. Without it, a misbehaving client can
- * subscribe to N distinct queries — each cached server-side with its
- * own row set + per-model-change re-eval cost — and exhaust the
- * server. 100 is well above typical UI usage (each page mounts a
- * handful of `useQuery`s) and well below the threshold where a
- * single socket starts to materially impact server memory.
+ * Default per-socket subscription cap. Without it, a misbehaving
+ * client can subscribe to N distinct queries — each cached
+ * server-side with its own row set + per-model-change re-eval cost —
+ * and exhaust the server.
  *
- * Hitting the cap is a development-time mistake or an attack, not a
- * legitimate runtime case — log loudly and silently drop the new
+ * 500 is sized for SPA navigation: the client SDK keeps each
+ * subscription warm for ~60s after the React component unmounts
+ * (cheap back-navigation), so a user clicking through ~50 detail
+ * pages with ~10 useQuery calls each within that window stays under
+ * the cap. Apps with heavier footprints can override via
+ * `ManagerOptions.maxSubscriptionsPerSocket`.
+ *
+ * Hitting the cap is a runaway-render-loop mistake or an attack, not
+ * a legitimate runtime case — log loudly and silently drop the new
  * subscription's items (the client gets an empty result for that
  * query, consistent with how an unsubscribed query reads).
  */
-const MAX_SUBSCRIPTIONS_PER_SOCKET = 100;
+const DEFAULT_MAX_SUBSCRIPTIONS_PER_SOCKET = 500;
 
 const DEFAULT_DEBOUNCE_MS = 25;
 const DEFAULT_MAX_WAIT_MS = 100;
@@ -337,6 +357,7 @@ export class QuerySubscriptionManager {
   private defaultDebounceMs: number;
   private defaultMaxWaitMs: number;
   private reevalSemaphore: Semaphore;
+  private maxSubscriptionsPerSocket: number;
 
   constructor(io: EmitToSocket | IoBackend, opts: ManagerOptions = {}) {
     // Two shapes for backward compatibility. The legacy form (a bare
@@ -357,6 +378,10 @@ export class QuerySubscriptionManager {
     this.defaultMaxWaitMs = opts.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
     this.reevalSemaphore = new Semaphore(
       Math.max(1, opts.reevalConcurrency ?? DEFAULT_REEVAL_CONCURRENCY),
+    );
+    this.maxSubscriptionsPerSocket = Math.max(
+      1,
+      opts.maxSubscriptionsPerSocket ?? DEFAULT_MAX_SUBSCRIPTIONS_PER_SOCKET,
     );
   }
 
@@ -393,10 +418,10 @@ export class QuerySubscriptionManager {
     const alreadySubscribed = existing?.has(hash) ?? false;
     if (
       !alreadySubscribed &&
-      (existing?.size ?? 0) >= MAX_SUBSCRIPTIONS_PER_SOCKET
+      (existing?.size ?? 0) >= this.maxSubscriptionsPerSocket
     ) {
       log.warn(
-        `subscriptions: socket ${socketId} hit the ${MAX_SUBSCRIPTIONS_PER_SOCKET} subscription cap — refusing new query for ${modelType}`,
+        `subscriptions: socket ${socketId} hit the ${this.maxSubscriptionsPerSocket} subscription cap — refusing new query for ${modelType}`,
       );
       return { hash, items: [] };
     }
