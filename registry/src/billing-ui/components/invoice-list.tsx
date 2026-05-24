@@ -24,7 +24,7 @@ import {
 } from "@dollhousestudio/ui/components/table";
 import { Badge } from "@dollhousestudio/ui/components/badge";
 import { Button } from "@dollhousestudio/ui/components/button";
-import { cn } from "@dollhousestudio/ui/lib/utils";
+import { cn } from "@dollhousestudio/ui/lib/cn";
 import { CalendarDays, Download, ReceiptText } from "lucide-react";
 import type { InvoiceItem } from "../lib/billing-transformers";
 

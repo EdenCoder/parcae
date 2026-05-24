@@ -9,7 +9,7 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@dollhousestudio/ui/components/card";
 import { Badge } from "@dollhousestudio/ui/components/badge";
 import { Separator } from "@dollhousestudio/ui/components/separator";
-import { cn } from "@dollhousestudio/ui/lib/utils";
+import { cn } from "@dollhousestudio/ui/lib/cn";
 import { Calendar, CreditCard } from "lucide-react";
 import type { CurrentPlan } from "../lib/billing-transformers";
 import { CustomerPortalButton } from "./customer-portal-button";

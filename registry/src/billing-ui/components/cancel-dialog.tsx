@@ -17,7 +17,7 @@ import {
   DialogTrigger,
 } from "@dollhousestudio/ui/components/dialog";
 import { X, Circle } from "lucide-react";
-import { cn } from "@dollhousestudio/ui/lib/utils";
+import { cn } from "@dollhousestudio/ui/lib/cn";
 import type { Plan } from "../lib/billing-transformers";
 
 export interface CancelDialogProps {

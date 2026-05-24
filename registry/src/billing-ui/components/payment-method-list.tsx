@@ -9,7 +9,7 @@
  */
 import { Card, CardContent, CardHeader, CardTitle } from "@dollhousestudio/ui/components/card";
 import { Badge } from "@dollhousestudio/ui/components/badge";
-import { cn } from "@dollhousestudio/ui/lib/utils";
+import { cn } from "@dollhousestudio/ui/lib/cn";
 import { CreditCard, Wallet } from "lucide-react";
 import { CustomerPortalButton } from "./customer-portal-button";
 

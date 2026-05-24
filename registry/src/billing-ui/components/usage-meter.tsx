@@ -16,7 +16,7 @@ import {
   CardTitle,
 } from "@dollhousestudio/ui/components/card";
 import { Badge } from "@dollhousestudio/ui/components/badge";
-import { cn } from "@dollhousestudio/ui/lib/utils";
+import { cn } from "@dollhousestudio/ui/lib/cn";
 
 export interface UsageItem {
   name: string;

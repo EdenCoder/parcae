@@ -20,7 +20,7 @@ import { Badge } from "@dollhousestudio/ui/components/badge";
 import { Label } from "@dollhousestudio/ui/components/label";
 import { RadioGroup, RadioGroupItem } from "@dollhousestudio/ui/components/radio-group";
 import { Toggle } from "@dollhousestudio/ui/components/toggle";
-import { cn } from "@dollhousestudio/ui/lib/utils";
+import { cn } from "@dollhousestudio/ui/lib/cn";
 import type { Plan } from "../lib/billing-transformers";
 
 const easing = [0.4, 0, 0.2, 1] as const;

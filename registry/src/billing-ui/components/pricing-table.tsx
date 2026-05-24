@@ -17,7 +17,7 @@ import { Button } from "@dollhousestudio/ui/components/button";
 import { Label } from "@dollhousestudio/ui/components/label";
 import { RadioGroup, RadioGroupItem } from "@dollhousestudio/ui/components/radio-group";
 import { Separator } from "@dollhousestudio/ui/components/separator";
-import { cn } from "@dollhousestudio/ui/lib/utils";
+import { cn } from "@dollhousestudio/ui/lib/cn";
 
 import type { Plan } from "../lib/billing-transformers";
 
