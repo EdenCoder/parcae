@@ -32,6 +32,12 @@
  * with explicit ops). `useModel` / `useModelAtomic` subscribe to
  * `"change"`; reference identity across merges is trivially stable
  * because `this` is stable.
+ *
+ * `patch()` / `flush()` emit synchronously (optimistic UI relies on
+ * the immediate update). `SYM_SERVER_MERGE` emits via a microtask-
+ * batched queue — multiple per-row merges in a single server frame
+ * coalesce into one render commit per instance. See
+ * `scheduleChangeEmit` for the batching contract.
  */
 
 import { EventEmitter } from "eventemitter3";
@@ -74,7 +80,12 @@ const SYM_FLUSH_TRAILING = Symbol("parcae:flushTrailing");
  *
  * Skips keys with pending local writes (SYM_PATCHING), deletes keys the
  * server no longer has, refreshes `__serverSnapshot`, and emits
- * `"change"` iff something actually changed.
+ * `"change"` iff something actually changed. The emit is **batched**
+ * via `scheduleChangeEmit`: multiple merges within one synchronous
+ * tick coalesce into a single per-instance notification on the next
+ * microtask. This is the hot path for `useQuery` list re-syncs;
+ * synchronous emit there caused a render-storm freeze on large lists
+ * (~500 rows × N subscribers each).
  *
  * Defined as a plain method — `this` identity is stable, so there's no
  * need for the old get-trap closure indirection.
@@ -87,6 +98,81 @@ export const SYM_SERVER_MERGE = Symbol("parcae:serverMerge");
  * `useSyncExternalStore` snapshot.
  */
 export const SYM_VERSION = Symbol("parcae:version");
+
+// ─── Batched `"change"` emission for server merges ───────────────────────────
+//
+// `SYM_SERVER_MERGE` is the hot path for server-driven updates: every
+// row in a `useQuery` list re-sync runs through it once, and each call
+// historically fired `this.emit("change")` synchronously. With a list
+// of N rows updating in one server frame (e.g. `expand("file")`
+// resolving 500 linked rows on initial load) that's N synchronous
+// emits in a tight loop — each fanning out to every
+// `useModelAtomic` / `useModel` listener subscribed to that row.
+// For dollhouse this is the difference between an editor that opens
+// in <1s and one that freezes for 10+s while React serially commits
+// hundreds of subscriber wakes.
+//
+// Buffer per-instance: each merge that actually changed something
+// inserts itself into the queue and schedules a microtask flush.
+// Repeat merges within the same tick coalesce (Set semantics). The
+// microtask drains the queue and emits `"change"` on each instance
+// once. React's `useSyncExternalStore`-backed hooks (`useModel`,
+// `useModelAtomic`) read the live `SYM_VERSION` on notify so the
+// batch's per-instance scalar values are already current.
+//
+// Other emit sites are unaffected: `patch()` keeps its synchronous
+// emit (user-initiated, one model, optimistic UI relies on
+// immediate update), and `remove` / `patching` / `saving` aren't
+// batched either.
+const pendingChangeEmits = new Set<Model>();
+let flushScheduled = false;
+
+function flushPendingChangeEmits(): void {
+  flushScheduled = false;
+  if (pendingChangeEmits.size === 0) return;
+  // Snapshot before iterating: a listener may trigger another merge
+  // (e.g. derived store mirror) and re-enqueue into the live Set.
+  // Drain into a local array so re-entry queues are picked up by
+  // the next microtask, not this one.
+  const drain = Array.from(pendingChangeEmits);
+  pendingChangeEmits.clear();
+  for (const model of drain) {
+    try {
+      model.emit("change");
+    } catch (err) {
+      // Listeners must not break sibling listeners. Surface but
+      // keep draining.
+      console.error("[parcae] change listener threw", err);
+    }
+  }
+}
+
+/**
+ * Drain the deferred `"change"` emit queue synchronously.
+ *
+ * `SYM_SERVER_MERGE` schedules its `change` emit on the microtask
+ * queue (see the batcher above). Most callers can rely on the
+ * implicit drain — React's `useSyncExternalStore` consumes the
+ * notification when the microtask runs, before the next render.
+ *
+ * Synchronous callers that need to observe the merge result
+ * immediately (tests, server-side coordinators) use
+ * `flushChangeEmits()` to force a drain right now without waiting
+ * for the microtask scheduler.
+ *
+ * Safe to call repeatedly; a no-op when the queue is empty.
+ */
+export function flushChangeEmits(): void {
+  flushPendingChangeEmits();
+}
+
+function scheduleChangeEmit(model: Model): void {
+  pendingChangeEmits.add(model);
+  if (!flushScheduled) {
+    flushScheduled = true;
+    queueMicrotask(flushPendingChangeEmits);
+  }
+}
 
 // ─── Keys that should NOT be treated as data ─────────────────────────────────
 
@@ -1176,7 +1262,9 @@ export class Model extends EventEmitter {
 
     if (didChange) {
       (this as any)[SYM_VERSION] = ((this as any)[SYM_VERSION] ?? 0) + 1;
-      this.emit("change");
+      // Batched — fires once per microtask flush instead of N times
+      // per server-frame burst. See `scheduleChangeEmit` above.
+      scheduleChangeEmit(this);
     }
 
     return this;

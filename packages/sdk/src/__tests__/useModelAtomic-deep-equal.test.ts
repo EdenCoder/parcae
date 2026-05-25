@@ -27,7 +27,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Model, SYM_SERVER_MERGE } from "@parcae/model";
+import { flushChangeEmits, Model, SYM_SERVER_MERGE } from "@parcae/model";
 import type { ModelAdapter, QueryChain } from "@parcae/model";
 
 import { defaultEqual } from "../react/useModelAtomic";
@@ -117,9 +117,18 @@ function makeHarness<V>(
   let active = false;
   return {
     current(): V | undefined {
+      // Drain the parcae batched-change queue before reading the
+      // snapshot — `SYM_SERVER_MERGE` defers its `"change"` emit
+      // to a microtask, but tests assert synchronously.
+      flushChangeEmits();
       return computeSnapshot();
     },
-    notifications,
+    get notifications(): (V | undefined)[] {
+      // Same — drain before exposing the captured notifications
+      // array so synchronous assertions see the latest count.
+      flushChangeEmits();
+      return notifications;
+    },
     subscribe(): void {
       if (active) return;
       active = true;
