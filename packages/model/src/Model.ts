@@ -1088,6 +1088,7 @@ export class Model extends EventEmitter {
   [SYM_SERVER_MERGE](serverData: Record<string, any>): this {
     const pending = this[SYM_PATCHING];
     const serverKeys = new Set(Object.keys(serverData));
+    const schema = (this.constructor as typeof Model).__schema;
     let didChange = false;
 
     const keyHasPending = (key: string): boolean => {
@@ -1102,6 +1103,34 @@ export class Model extends EventEmitter {
     for (const key of serverKeys) {
       if (keyHasPending(key)) continue;
       const nextVal = serverData[key];
+
+      // Ref-field shortcut: incoming server data carries the raw id
+      // (see `__data` getter — refs serialize via the `$field`
+      // accessor). Compare against the raw-id slot, NOT against the
+      // public getter (which returns the proxy / Model instance and
+      // never equals the incoming string).
+      //
+      // Without this, every patch arriving over a subscription would
+      // call the ref-field setter and `invalidate()` the cached
+      // proxy — including the pre-hydrated proxy installed by
+      // `.expand("file")` (DOL-1093). The editor's `useAssetFile`
+      // would then snap to `null` on every status flip / job update
+      // until a fresh `findById` round-tripped the linked row again.
+      //
+      // When the raw id IS unchanged, skip the assignment so the
+      // existing proxy survives. When it changed (reshoot, swap),
+      // fall through to the setter so the stale proxy is correctly
+      // invalidated.
+      const col = schema?.[key];
+      const isRef =
+        col && typeof col === "object" && "kind" in col && col.kind === "ref";
+      if (isRef) {
+        if (Object.is((this as any)[`$${key}`], nextVal)) continue;
+        (this as any)[key] = nextVal;
+        didChange = true;
+        continue;
+      }
+
       if (!Object.is((this as any)[key], nextVal)) {
         (this as any)[key] = nextVal;
         didChange = true;
@@ -1111,6 +1140,16 @@ export class Model extends EventEmitter {
     // Delete keys the server no longer has. Same filter as __data so
     // we don't accidentally prune methods, EE internals, ref accessor
     // storage, or private state.
+    //
+    // Ref fields are also skipped — they're not regular data
+    // properties, they're getter/setter pairs installed by
+    // `_installRefField`. Deleting them tears out the accessor and
+    // leaves `instance.fieldName` as `undefined` instead of the lazy
+    // / pre-hydrated proxy. A payload that omits the ref key is
+    // either a partial update (live diff) or a bug; either way we
+    // leave the accessor alone. Real "ref cleared" goes through the
+    // `serverData[key] = null` path in the loop above, which writes
+    // through the setter correctly.
     for (const key of Object.keys(this)) {
       if (SYSTEM_DATA_KEYS.has(key)) continue;
       if (INSTANCE_METHODS.has(key)) continue;
@@ -1118,6 +1157,15 @@ export class Model extends EventEmitter {
       if (key.startsWith("_") || key.startsWith("$")) continue;
       if (serverKeys.has(key)) continue;
       if (keyHasPending(key)) continue;
+      const col = schema?.[key];
+      if (
+        col &&
+        typeof col === "object" &&
+        "kind" in col &&
+        col.kind === "ref"
+      ) {
+        continue;
+      }
       delete (this as any)[key];
       didChange = true;
     }

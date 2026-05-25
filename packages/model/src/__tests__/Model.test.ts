@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { Model, generateId } from "../Model";
+import { Model, SYM_SERVER_MERGE, generateId } from "../Model";
 import type { ModelAdapter, QueryChain } from "../adapters/types";
 
 // ─── Mock Adapter ────────────────────────────────────────────────────────────
@@ -870,6 +870,91 @@ describe("Model", () => {
         // Type assertion + runtime sanity: $author is a string id.
         expect(typeof sample.$author).toBe("string");
         expect(sample.$author).toBe("a1");
+      });
+    });
+
+    // ── SYM_SERVER_MERGE preserves pre-hydrated ref proxy (DOL-1097) ────────
+    //
+    // Subscriptions ship `__data`-style server snapshots: ref columns
+    // serialize as raw id strings (`{ file: "f1" }`), NOT as inlined
+    // objects. When the merge writes the incoming string into the
+    // ref-field setter, `invalidate()` drops the cached proxy — which
+    // means the pre-hydrated proxy installed by `.expand("file")` is
+    // wiped on every patch and the lazy `_createRefProxy` path takes
+    // over until a fresh `findById` round-trips. The editor's
+    // `useAssetFile` snaps to `null` on every status flip / job
+    // update.
+    //
+    // Fix: in SYM_SERVER_MERGE, compare against the `$field` raw-id
+    // slot and skip the assignment when the raw id is unchanged. The
+    // proxy survives unchanged-ref patches; genuine ref changes (a
+    // reshoot, a swap) still flow through the setter and invalidate.
+    describe("SYM_SERVER_MERGE — ref-field stability (DOL-1097)", () => {
+      it("preserves the pre-hydrated proxy when serverData carries the same raw id", () => {
+        const findByIdSpy = vi.fn(async () => null);
+        const oldFindById = adapter.findById;
+        adapter.findById = findByIdSpy as any;
+        try {
+          const article = Article.hydrate(adapter, {
+            title: "x",
+            author: { id: "a1", name: "Alice" },
+          });
+          // Capture the pre-hydrated proxy and confirm synchronous
+          // read (proves it's hydrated, not lazy).
+          const before = article.author;
+          expect((before as any).name).toBe("Alice");
+          expect(findByIdSpy).not.toHaveBeenCalled();
+
+          // Server emits an unrelated `status` flip; the patch
+          // pipeline rebuilds the snapshot from `__data` which
+          // serializes `author` as the raw id "a1". Apply via
+          // SYM_SERVER_MERGE — the same shape `useQuery.applyOps`
+          // uses for every subscription patch.
+          article[SYM_SERVER_MERGE]({
+            title: "x",
+            author: "a1",
+            status: "ready",
+          } as any);
+
+          const after = article.author;
+          // Same proxy reference. Pre-hydrated data still present —
+          // no findById round-trip needed.
+          expect(after === before).toBe(true);
+          expect((after as any).name).toBe("Alice");
+          expect(findByIdSpy).not.toHaveBeenCalled();
+        } finally {
+          adapter.findById = oldFindById;
+        }
+      });
+
+      it("invalidates the proxy when serverData carries a different raw id", () => {
+        const article = Article.hydrate(adapter, {
+          title: "x",
+          author: "a1",
+        });
+        const before = article.author;
+        article[SYM_SERVER_MERGE]({
+          title: "x",
+          author: "a2",
+        } as any);
+        const after = article.author;
+        // Different raw id → fresh proxy, raw id updated.
+        expect(after === before).toBe(false);
+        expect((article as any).$author).toBe("a2");
+      });
+
+      it("does not touch the ref accessor when serverData omits the ref field", () => {
+        // A patch that only changes `title` doesn't include the
+        // `author` key — the loop body never sees it, so the proxy
+        // is untouched regardless of this fix.
+        const article = Article.hydrate(adapter, {
+          title: "x",
+          author: { id: "a1", name: "Alice" },
+        });
+        const before = article.author;
+        article[SYM_SERVER_MERGE]({ title: "y" } as any);
+        expect(article.title).toBe("y");
+        expect(article.author === before).toBe(true);
       });
     });
   });
