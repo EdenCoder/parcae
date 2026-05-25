@@ -236,6 +236,38 @@ describe("SocketTransport — hello/resync protocol", () => {
     expect(t.session.state.status).toBe("terminated");
   });
 
+  it("refreshSession() after termination revives the session (sign-out → sign-in flow)", async () => {
+    let token: string | null = "tok-1";
+    const t = makeTransport(async () => token);
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("u-1");
+    expect(t.session.state.status).toBe("authenticated");
+
+    // Sign out — terminates the machine.
+    token = null;
+    const termPromise = t.terminateSession();
+    const helloOut = [...currentSocket.emits].reverse().find((e) => e.event === "hello");
+    if (helloOut) (helloOut.args[1] as (r: any) => void)({ userId: null });
+    await termPromise;
+    expect(t.session.state.status).toBe("terminated");
+
+    // Sign back in — same client, new token. Without revival, the
+    // session machine would stay "terminated" and resolve(userId)
+    // would no-op, leaving consumers stuck on the sign-in gate.
+    token = "tok-2";
+    const refreshPromise = t.refreshSession();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("u-2");
+    const result = await refreshPromise;
+
+    expect(result).toEqual({ userId: "u-2" });
+    expect(t.session.state.status).toBe("authenticated");
+    expect(t.session.state.userId).toBe("u-2");
+  });
+
   it("resync RPC sends a queries envelope and resolves with the results", async () => {
     const t = makeTransport(async () => "tok");
     currentSocket.connect();

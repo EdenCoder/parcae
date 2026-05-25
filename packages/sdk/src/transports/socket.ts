@@ -203,8 +203,16 @@ export class SocketTransport extends EventEmitter implements Transport {
    * Token rotation / explicit sign-in. Triggers a fresh hello on the
    * existing socket so the server updates its socket→session mapping.
    * Sign-out path (token === null) goes through `terminate()`.
+   *
+   * If the session was previously terminated (sign-out), this resets
+   * the machine back to "pending" before handshaking. That covers the
+   * sign-out → sign-in-again flow in long-lived single-page apps where
+   * the same SDK client is reused across multiple user identities.
    */
   async refreshSession(): Promise<{ userId: string | null }> {
+    if (this.session.state.status === "terminated") {
+      this.session.reset();
+    }
     await this._handshake();
     return { userId: this.session.state.userId };
   }
