@@ -166,11 +166,11 @@ export async function runQuerySubscription(
     );
   }
 
-  const { query, countQuery, expandResolved } = prep;
+  const { query, countQuery, expandResolved, steps } = prep;
 
   const [sub, totalCount] = await Promise.all([
     adapter.subscriptions.subscribe(
-      { socketId, query, expand: expandResolved },
+      { socketId, query, expand: expandResolved, steps },
       { force },
     ),
     countQuery.count(),

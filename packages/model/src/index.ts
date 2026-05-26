@@ -30,6 +30,7 @@ export type { Transport, RequestOptions } from "./adapters/client";
 export {
   CHAINABLE_METHODS,
   extractExpandFields,
+  orderEmissionDisabled,
   stripExpandSteps,
 } from "./adapters/types";
 export type {

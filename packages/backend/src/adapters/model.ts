@@ -1216,6 +1216,13 @@ export class BackendAdapter implements ModelAdapter {
             additions.length > 0 ? [...expand, ...additions] : expand,
           );
         }
+        // orderBy(false) — opt the query out of order envelope
+        // emission. Records the step in `__steps` (read by the
+        // subscriptions manager via `orderEmissionDisabled`) but
+        // never touches Knex.
+        if (method === "orderBy" && args.length === 1 && args[0] === false) {
+          return this._buildQuery(modelClass, knexQuery, expand);
+        }
         // Dot-notation ref subquery rewriting for server-side queries
         if (
           typeof args[0] === "string" &&

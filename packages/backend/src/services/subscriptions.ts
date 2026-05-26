@@ -26,7 +26,11 @@ import { log } from "../logger";
  */
 
 import { createHash } from "node:crypto";
-import type { QueryChain } from "@parcae/model";
+import {
+  orderEmissionDisabled,
+  type QueryChain,
+  type QueryStep,
+} from "@parcae/model";
 import fastJsonPatch from "fast-json-patch";
 import type { Operation } from "fast-json-patch";
 import { RefLoader } from "./ref-loader";
@@ -69,6 +73,22 @@ interface CachedQuery {
    */
   result: Map<string, Record<string, any>>;
   subscribers: Set<string>;
+  /**
+   * Whether to emit the `order` field on the wire envelope. `false`
+   * when the query carries `.orderBy(false)` — consumers don't
+   * care about the ordered id list and we save bytes + spare the
+   * client a `reorderByIds` pass (DOL-1101).
+   *
+   * Always `true` for the first subscriber's `subscribe()` call; if
+   * a later subscriber for the same hash opts out, we honour the
+   * opt-out (one false poisons the channel). In practice the hash
+   * is derived from the SQL the query produces, so two distinct
+   * subscriptions with different `orderBy(false)` choices would
+   * share a hash only if their other steps and SQL are identical
+   * — and in that case the false-leaning preference is what every
+   * caller actually wants.
+   */
+  emitOrder: boolean;
   /** Coalescing state, lazily initialised on first onModelChange. */
   coalesce: {
     /** Trailing debounce — reset on each onModelChange. */
@@ -96,6 +116,16 @@ interface SubscriptionOptions {
    * behavior.
    */
   expand?: readonly ResolvedExpand[];
+  /**
+   * Raw client-sent steps. Used to detect `.orderBy(false)` so the
+   * subscriptions manager skips order envelope emission for queries
+   * whose consumers don't care about ordering (DOL-1101).
+   *
+   * `undefined` means "use the default" (emit order whenever it
+   * changes). Pass the original step list from `prepareClientQuery`
+   * to honour an `orderBy(false)` opt-out.
+   */
+  steps?: QueryStep[];
 }
 
 interface SubscribeExtraOptions {
@@ -401,8 +431,9 @@ export class QuerySubscriptionManager {
     opts: SubscriptionOptions,
     extra: SubscribeExtraOptions = {},
   ): Promise<{ hash: string; items: Record<string, any>[] }> {
-    const { socketId, query } = opts;
+    const { socketId, query, steps } = opts;
     const expand = opts.expand ?? EMPTY_EXPAND;
+    const orderOptedOut = orderEmissionDisabled(steps);
     // `__modelType` lives on the QueryChain interface as @internal —
     // populated by every chain factory (`Model._query` → `lazyQuery`
     // server-side, the adapter's `query()` factory client-side).
@@ -430,6 +461,11 @@ export class QuerySubscriptionManager {
 
     if (cached) {
       cached.subscribers.add(socketId);
+      // Honour the most-restrictive emitOrder choice across all
+      // subscribers sharing this hash: any single `orderBy(false)`
+      // opts the channel out for everyone. Subscribers that wanted
+      // order can't actually use it anyway if the SQL is identical.
+      if (orderOptedOut) cached.emitOrder = false;
       // Drift-poll path: caller asked us to re-execute the cached
       // query against the DB and diff to every subscriber. We run
       // _reeval inline so the LIST response that follows returns
@@ -455,6 +491,7 @@ export class QuerySubscriptionManager {
         expand,
         result,
         subscribers: new Set([socketId]),
+        emitOrder: !orderOptedOut,
         coalesce: {
           debounceTimer: null,
           maxWaitTimer: null,
@@ -701,13 +738,21 @@ export class QuerySubscriptionManager {
     // when membership changed (any add/remove) OR when the ordering
     // of surviving ids differs. Stable updates with stable order skip
     // it so we don't waste bytes.
-    const prevOrder = [...cached.result.keys()];
-    const newOrder = [...newResult.keys()];
-    const hasMembershipChange = ops.some(
-      (o) => o.op === "add" || o.op === "remove",
-    );
-    const orderChanged = !ordersEqual(prevOrder, newOrder);
-    const includeOrder = hasMembershipChange || orderChanged;
+    //
+    // DOL-1101: queries that opted out via `.orderBy(false)` get NO
+    // order envelope, ever. We still emit op-only frames when ops
+    // exist; we just never compute or ship the ordered id list.
+    let includeOrder = false;
+    let newOrder: string[] = [];
+    if (cached.emitOrder) {
+      const prevOrder = [...cached.result.keys()];
+      newOrder = [...newResult.keys()];
+      const hasMembershipChange = ops.some(
+        (o) => o.op === "add" || o.op === "remove",
+      );
+      const orderChanged = !ordersEqual(prevOrder, newOrder);
+      includeOrder = hasMembershipChange || orderChanged;
+    }
 
     cached.result = newResult;
 

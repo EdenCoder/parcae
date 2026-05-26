@@ -8,7 +8,6 @@
  * - Or any custom transport
  */
 
-import { proxy } from "valtio";
 import {
   CHAINABLE_METHODS,
   extractExpandFields,
@@ -111,9 +110,15 @@ export class FrontendAdapter implements ModelAdapter {
   }
 
   // ── createStore ──────────────────────────────────────────────────────
-
+  //
+  // The Model class never calls this — model reactivity flows
+  // through `EventEmitter` (`model.on("change", ...)`), not through
+  // a proxied store. The method is part of the adapter interface
+  // for symmetry with the backend adapter (which builds rows for
+  // the DB layer). Return a shallow copy to match the typeshape;
+  // no behavioural use of valtio anywhere in the SDK.
   createStore(data: Record<string, any>): Record<string, any> {
-    return proxy(data);
+    return { ...data };
   }
 
   // ── save ─────────────────────────────────────────────────────────────

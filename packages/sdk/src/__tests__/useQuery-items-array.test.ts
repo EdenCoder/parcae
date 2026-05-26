@@ -2,27 +2,32 @@
  * useQuery — items-array reference contract.
  *
  * `applyOps` is the function that takes a subscription op batch and
- * produces the next cache `items` array. It has three distinct
- * reference-stability regimes that downstream consumers depend on:
+ * produces the next cache `items` array. It has three reference-
+ * stability regimes that downstream consumers depend on:
  *
  *   1. No-op batch (empty ops, or ops that don't touch any item in
  *      the result set) → return the SAME items reference. Skips
- *      every downstream invalidation. Critical for hot paths where
- *      a subscription receives a flood of ops for items not in our
- *      query result.
+ *      every downstream invalidation.
  *
  *   2. Update-only batch (one or more `op: "update"` matches; no
- *      adds / no removes) → return a NEW items array reference,
- *      shallow-copied. Per-item Model instances inside the new
- *      array are the SAME references as before (`SYM_SERVER_MERGE`
- *      mutates in place). The new array reference is what
- *      downstream `useMemo([items])` and `useEffect([items])`
- *      consumers need to see in order to recompute / re-fire. The
- *      per-item identity is what `React.memo(Row, item)` relies
- *      on to short-circuit unchanged rows. This is the
- *      "items.slice() invariant" introduced by the upstream
- *      veb fix (`fix(sdk): rebuild items array on update-only ops
- *      so downstream useMemo invalidates`).
+ *      adds / no removes) → return the SAME items array reference
+ *      (DOL-1101). The per-item Model instances are mutated in
+ *      place by `SYM_SERVER_MERGE`; the wrapping array doesn't
+ *      need to flip. Consumers that need to react to scalar field
+ *      changes wake through parcae's per-model `change` event bus
+ *      (`useModelAtomic(model, "field")`). Consumers reading the
+ *      `items` array for membership/order bail on `Object.is` and
+ *      skip the re-render — exactly what we want for status /
+ *      readAt / file patches that don't move membership.
+ *
+ *      Pre-DOL-1101 this regime returned `items.slice()` so
+ *      downstream `useMemo([items])` would re-fire on every patch.
+ *      That fan-out made the editor unusable on bursty backends:
+ *      one job lifecycle (queued → generating → uploading → ready)
+ *      flipped the items reference 4× and woke every consumer of
+ *      the query 4× with no semantic change. Per-field reactivity
+ *      via `useModelAtomic` is the correct way to observe scalar
+ *      moves; the items array is for membership.
  *
  *   3. Add / remove batch → return a fresh items array built from
  *      scratch. New reference, new membership.
@@ -165,15 +170,15 @@ describe("useQuery — items-array reference contract", () => {
       },
     ]);
 
-    // The wrapping array MUST be a new reference so downstream
-    // `useMemo([items])` and `useEffect([items])` consumers see a
-    // dep change and recompute / re-fire. This is the load-bearing
-    // invariant from the upstream `items.slice()` fix.
-    expect(entry.items).not.toBe(beforeArray);
+    // DOL-1101: the wrapping array reference STAYS THE SAME on
+    // an update-only batch. The per-item models were mutated in
+    // place; the array slot is unchanged. Consumers that need
+    // scalar reactivity use `useModelAtomic(model, field)`;
+    // consumers using `useMemo([items])` correctly bail.
+    expect(entry.items).toBe(beforeArray);
 
-    // Per-item Model identity stays stable — only the wrapping
-    // array is fresh. Critical so `React.memo(Row, prevItem ===
-    // nextItem)` short-circuits cleanly for unchanged rows.
+    // Per-item Model identity stays stable — `SYM_SERVER_MERGE`
+    // mutates the existing instance.
     expect(entry.items[0]).toBe(beforeP1);
     expect(entry.items[1]).toBe(beforeP2);
 
@@ -190,7 +195,7 @@ describe("useQuery — items-array reference contract", () => {
     release();
   });
 
-  it("multiple update ops in one batch still return a single shallow-copied array", async () => {
+  it("multiple update ops in one batch preserve the items reference (no shallow copy)", async () => {
     const client = new FakeClient();
     const { entry, release } = await primeCache(client, "h-multi", [
       { id: "p1", title: "first" },
@@ -214,7 +219,10 @@ describe("useQuery — items-array reference contract", () => {
       },
     ]);
 
-    expect(entry.items).not.toBe(beforeArray);
+    // DOL-1101: even multiple update ops keep the items reference.
+    // The whole batch lands as in-place mutations through
+    // `SYM_SERVER_MERGE`; the array slot is unchanged.
+    expect(entry.items).toBe(beforeArray);
     expect(entry.items).toHaveLength(3);
     // Per-item identity preserved across the whole batch.
     for (let i = 0; i < 3; i++) {
@@ -376,9 +384,10 @@ describe("useQuery — items-array reference contract", () => {
     release();
   });
 
-  it("envelope-shape update without `order` behaves like the legacy array path", async () => {
+  it("envelope-shape update without `order` preserves the items reference (DOL-1101)", async () => {
     // Membership stable + order stable → the server omits `order`.
-    // Result must still be the new-array-reference update.
+    // Result preserves the items reference; the in-place mutation
+    // is visible through the unchanged model identity.
     const client = new FakeClient();
     const { entry, release } = await primeCache(client, "h-env-update", [
       { id: "p1", title: "first" },
@@ -397,57 +406,48 @@ describe("useQuery — items-array reference contract", () => {
       ],
     });
 
-    expect(entry.items).not.toBe(beforeArray);
+    expect(entry.items).toBe(beforeArray);
     expect(entry.items[0].title).toBe("updated");
     release();
   });
 
-  // ── 5. Regression — the bug the slice() fix prevents ──────────────
+  // ── 5. DOL-1101 — items reference stability across scalar bursts
 
-  it("downstream useMemo-style dep arrays see a NEW items reference on update (regression: items.slice fix)", async () => {
-    // Models the canonical bug: a consumer wrapping items in a
-    // useMemo derives row objects. Pre-fix, the items reference
-    // was identical after an update-only op so the useMemo
-    // returned its cached value and the UI stayed stale even
-    // though the underlying Model field mutated. This test pins
-    // the contract by simulating exactly what useMemo's
-    // dep-array compare does (Object.is on the items ref).
+  it("downstream useMemo-style dep arrays keep their reference across update-only frames (DOL-1101)", async () => {
+    // The lockup symptom: a busy backend emits 4 update frames for
+    // one job lifecycle (queued → generating → uploading → ready).
+    // Pre-DOL-1101 each frame flipped `entry.items` reference, so
+    // every `useMemo([items])` consumer recomputed 4× — including
+    // bridges that walk 250 blocks per recompute. Post-DOL-1101
+    // the items reference is preserved through the burst; scalar
+    // reactivity flows through `useModelAtomic` per-model events.
+    // This test pins that contract.
     const client = new FakeClient();
     const { entry, release } = await primeCache(client, "h-memo", [
       { id: "p1", title: "first" },
     ]);
 
     const memoizedDep = entry.items;
-    // Simulate `useMemo(() => items.map(toRow), [items])` — the
-    // cached value is keyed on the items reference at memo time.
-    const cachedRows = memoizedDep.map((i: any) => ({
-      id: i.id,
-      label: i.title,
-    }));
 
-    client.emitQueryOps("h-memo", [
-      {
-        op: "update",
-        id: "p1",
-        patch: [{ op: "replace", path: "/title", value: "after" }],
-      },
-    ]);
+    // Burst of 4 scalar updates — simulates a job lifecycle.
+    for (const title of ["queued", "generating", "uploading", "after"]) {
+      client.emitQueryOps("h-memo", [
+        {
+          op: "update",
+          id: "p1",
+          patch: [{ op: "replace", path: "/title", value: title }],
+        },
+      ]);
+    }
 
-    // The dep-array compare must see a new reference. Pre-fix
-    // this would be `true` and React would return the stale
-    // cachedRows. Post-fix it's `false` and the consumer
-    // recomputes against the mutated model state.
-    expect(Object.is(entry.items, memoizedDep)).toBe(false);
+    // Items reference unchanged across all 4 frames. A
+    // `useMemo([items])` keyed on this reference bails — no work.
+    expect(entry.items).toBe(memoizedDep);
 
-    // The freshly recomputed derived state reflects the
-    // mutation. (Recomputing here mirrors what useMemo's body
-    // would do when the dep array changed.)
-    const freshRows = entry.items.map((i: any) => ({
-      id: i.id,
-      label: i.title,
-    }));
-    expect(freshRows[0].label).toBe("after");
-    expect(cachedRows[0].label).toBe("first"); // sanity: pre-update snapshot
+    // The mutations all landed on the in-place model. Consumers
+    // that need this scalar use `useModelAtomic(model, "title")`,
+    // which fires through parcae's per-model `change` event bus.
+    expect(entry.items[0].title).toBe("after");
 
     release();
   });

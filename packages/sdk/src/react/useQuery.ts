@@ -324,7 +324,19 @@ function applyOps(
   }
 
   if (!hasRemoves && !hasAdds) {
-    return { items: items.slice(), changed: true };
+    // Update-only frame (DOL-1101). The models in the array were
+    // mutated in place via `SYM_SERVER_MERGE`; the array slot
+    // identity doesn't need to flip. Consumers that care about
+    // field-level reactivity wake through parcae's per-model
+    // `change` event bus (`useModelAtomic`). Consumers reading the
+    // `items` array bail on `Object.is(prev, next)` and skip the
+    // re-render — exactly what we want for status / readAt / file
+    // patches that don't move membership.
+    //
+    // Returning `changed: true` keeps `entry.version++` ticking so
+    // downstream code that meters "did SOMETHING happen on this
+    // query" still sees the bump.
+    return { items, changed: true };
   }
 
   const result: any[] = [];

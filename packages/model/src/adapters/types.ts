@@ -213,7 +213,34 @@ export interface QueryChain<T> {
   search(term: string): QueryChain<T>;
 
   // Chainable — ordering & pagination
+  /**
+   * Order the result set.
+   *
+   *   .orderBy("createdAt", "desc")
+   *
+   * # Opt out of order entirely — `.orderBy(false)`
+   *
+   * The subscriptions manager normally ships an `order: string[]`
+   * field on the wire envelope whenever the ordered id list
+   * changes. For queries whose consumers don't care about ordering
+   * (set membership only — the client looks up models by id /
+   * path), that's wasted bytes AND causes the client's items array
+   * reference to flip whenever Postgres returns rows in a different
+   * heap order after an UPDATE.
+   *
+   * Pass `false` instead of a column name to:
+   *   - Skip ORDER BY in the SQL.
+   *   - Tell the subscriptions manager to omit `order` from the
+   *     envelope entirely.
+   *   - Make the client's `useQuery` never run `reorderByIds`, so
+   *     the items reference stays stable across pure-scalar patches.
+   *
+   * `.orderBy(false)` and `.orderBy(column, dir)` are mutually
+   * exclusive within one chain — the last call wins. Default is
+   * "emit order" for back-compat.
+   */
   orderBy(column: string, direction?: "asc" | "desc"): QueryChain<T>;
+  orderBy(emit: false): QueryChain<T>;
   orderByRaw(query: string, ...bindings: any[]): QueryChain<T>;
   limit(count: number): QueryChain<T>;
   offset(count: number): QueryChain<T>;
@@ -515,4 +542,25 @@ export function stripExpandSteps(
     if (stripped !== null) stripped.push(steps[i]!);
   }
   return stripped ?? steps;
+}
+
+/**
+ * Detect `.orderBy(false)` in a step list. The subscriptions manager
+ * reads this to decide whether to compute and emit the `order` field
+ * on the wire envelope.
+ *
+ * Returns `true` when ANY `orderBy` step in the chain was passed
+ * `false` (caller opted out of order emission). The last call in
+ * the chain doesn't have to be the false one — if any opt-out
+ * appears, we honour it.
+ */
+export function orderEmissionDisabled(
+  steps: QueryStep[] | null | undefined,
+): boolean {
+  if (!Array.isArray(steps) || steps.length === 0) return false;
+  for (const step of steps) {
+    if (step.method !== "orderBy") continue;
+    if (step.args.length === 1 && step.args[0] === false) return true;
+  }
+  return false;
 }
