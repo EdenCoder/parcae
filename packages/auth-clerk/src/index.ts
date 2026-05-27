@@ -52,6 +52,14 @@ export interface ClerkConfig {
    * Default maps: id, name (firstName + lastName), email, image.
    */
   mapUser?: (clerkUser: any) => Record<string, any>;
+  /**
+   * Names of additional Clerk JWT claims to surface on session.user.
+   * Use when the Clerk session token template publishes custom keys
+   * (e.g. {{user.public_metadata.X}}) and the application wants
+   * to read them via session.user.X. Absent / empty = no extras.
+   * Values pass through unmodified; consumers do their own type coercion.
+   */
+  publishClaims?: string[];
 }
 
 // ─── Default user mapping ────────────────────────────────────────────────────
@@ -164,12 +172,23 @@ export function clerk(config: ClerkConfig): AuthAdapter {
       // no second factor was verified.
       const fva = (payload as any).fva;
 
+      // Pass through any extra claim names listed in config.publishClaims.
+      // Values come straight from the verified JWT payload; consumers do
+      // their own type coercion.
+      const extras: Record<string, unknown> = {};
+      for (const key of config.publishClaims ?? []) {
+        if (key in (payload as object)) {
+          extras[key] = (payload as Record<string, unknown>)[key];
+        }
+      }
+
       return {
         user: {
           id: userId,
           ...(orgId && { orgId }),
           ...(orgRole && { orgRole }),
           ...(orgSlug && { orgSlug }),
+          ...extras,
           ...(Array.isArray(fva) && fva.length === 2 && { fva }),
         },
       };
