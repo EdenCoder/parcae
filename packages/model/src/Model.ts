@@ -382,6 +382,19 @@ export class Model extends EventEmitter {
   /** True if this instance has never been persisted (fresh Model.create()). */
   __isNew: boolean = false;
 
+  // ── Symbol-keyed slots — declared here so TypeScript sees them on the
+  // class type regardless of how the module is resolved (package import,
+  // tsconfig path alias, or relative import). A `declare module "./Model"`
+  // augmentation does not propagate when the consumer resolves the module
+  // under a different specifier (e.g. `@parcae/model`).
+  declare [SYM_ADAPTER]: ModelAdapter;
+  declare [SYM_PATCHING]: Set<string>;
+  declare [SYM_SNAPSHOT]: Record<string, any>;
+  declare [SYM_PENDING_DATA]: Record<string, any> | undefined;
+  declare [SYM_FLUSH_INFLIGHT]: Promise<void> | null | undefined;
+  declare [SYM_FLUSH_TRAILING]: Promise<void> | null | undefined;
+  declare [SYM_VERSION]: number | undefined;
+
   // ── Static ─────────────────────────────────────────────────────────
 
   /**
@@ -1499,14 +1512,3 @@ export type WithRefs<T extends Model> = T & {
     : never]: string;
 };
 
-// Symbol declarations for TypeScript
-declare module "./Model" {
-  interface Model {
-    [SYM_ADAPTER]: ModelAdapter;
-    [SYM_PATCHING]: Set<string>;
-    [SYM_SNAPSHOT]: Record<string, any>;
-    [SYM_PENDING_DATA]?: Record<string, any>;
-    [SYM_FLUSH_INFLIGHT]: Promise<void> | null | undefined;
-    [SYM_FLUSH_TRAILING]: Promise<void> | null | undefined;
-  }
-}
