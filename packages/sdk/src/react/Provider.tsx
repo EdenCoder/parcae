@@ -16,6 +16,11 @@ export interface ParcaeProviderProps {
   /** Auth adapter — handles session resolution internally. */
   auth?: AuthClientAdapter;
   version?: string;
+  /**
+   * socket.io transports list. Defaults to `["websocket"]`. Pass
+   * `["polling"]` on runtimes without a WebSocket global.
+   */
+  transports?: ("websocket" | "polling")[];
   children: React.ReactNode;
   onReady?: (client: ParcaeClient) => void;
   onError?: (error: Error) => void;
@@ -28,6 +33,7 @@ export const ParcaeProvider: React.FC<ParcaeProviderProps> = ({
   url,
   auth,
   version = "v1",
+  transports,
   children,
   onReady,
   onError,
@@ -46,8 +52,8 @@ export const ParcaeProvider: React.FC<ParcaeProviderProps> = ({
         }
       : noopToken;
 
-    return createClient({ url, version, getToken });
-  }, [externalClient, url, version, auth]);
+    return createClient({ url, version, getToken, transports });
+  }, [externalClient, url, version, auth, transports]);
 
   const onReadyRef = useRef(onReady);
   onReadyRef.current = onReady;

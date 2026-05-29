@@ -54,6 +54,14 @@ export interface SocketTransportConfig {
    * auth adapter). Return `null` for anonymous sessions.
    */
   getToken: () => Promise<string | null>;
+  /**
+   * socket.io transports list. Defaults to `["websocket"]` — the
+   * fast path used by web, Node, and any runtime with a WebSocket
+   * global. Pass `["polling"]` (or `["polling", "websocket"]`) for
+   * runtimes that don't expose `WebSocket` natively (e.g. Lynx
+   * PrimJS in a custom native shell without LynxWebSocketModule).
+   */
+  transports?: ("websocket" | "polling")[];
 }
 
 /** Wire shape for a single `resync` entry. */
@@ -92,14 +100,15 @@ export class SocketTransport extends EventEmitter implements Transport {
     this.getToken = config.getToken;
 
     const socketPath = config.path ?? "/ws";
-    const socketKey = `${this.url}:${socketPath}`;
+    const transports = config.transports ?? ["websocket"];
+    const socketKey = `${this.url}:${socketPath}:${transports.join(",")}`;
 
     if (SOCKETS.has(socketKey)) {
       this.socket = SOCKETS.get(socketKey);
     } else {
       this.socket = SocketIO(this.url, {
         path: socketPath,
-        transports: ["websocket"],
+        transports,
         withCredentials: true,
       });
       SOCKETS.set(socketKey, this.socket);

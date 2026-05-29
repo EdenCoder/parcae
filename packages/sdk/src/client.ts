@@ -22,6 +22,12 @@ export interface ClientConfig {
    * per reconnect. Return `null` for anonymous sessions.
    */
   getToken: () => Promise<string | null>;
+  /**
+   * socket.io transports list. Defaults to `["websocket"]`. Pass
+   * `["polling"]` on runtimes without a WebSocket global (e.g. Lynx
+   * PrimJS in a custom native shell).
+   */
+  transports?: ("websocket" | "polling")[];
 }
 
 export interface ParcaeClient {
@@ -58,6 +64,7 @@ export function createClient(config: ClientConfig): ParcaeClient {
     url: config.url,
     version: config.version ?? "v1",
     getToken: config.getToken,
+    transports: config.transports,
   });
 
   Model.use(new FrontendAdapter(transport));
