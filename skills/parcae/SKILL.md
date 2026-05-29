@@ -1,24 +1,18 @@
 ---
 name: parcae
 description: >
-  Parcae TypeScript backend framework guide. Use when working on or asking about
-  code using @parcae/model, @parcae/backend, or @parcae/sdk. Covers: Model class
-  (class-is-schema, adapter pattern, static query API, Proxy-based change tracking),
-  createApp() bootstrap, auto-CRUD routes from scopes, custom routes via route.*,
-  model lifecycle hooks via hook.before/hook.after, BullMQ background jobs,
-  BackendAdapter (Knex/Postgres, atomic JSON Patch, overflow JSONB column),
-  FrontendAdapter (Valtio + transport), createClient() SDK, SocketTransport,
-  SSETransport, React hooks (useQuery, useApi, useSetting, auth gates),
-  ParcaeProvider, PubSub (Redis), QuerySubscriptionManager (realtime list diffs),
-  ts-morph schema resolution, Better Auth integration, Clerk integration,
-  search (full-text + trigram + vector), or any Parcae application code.
+  Guide to the Parcae TypeScript backend framework, where a Model class is
+  simultaneously the schema, the REST/realtime API, and the type system. Use
+  when reading, writing, or debugging code that imports @parcae/model,
+  @parcae/backend, @parcae/sdk, or the Parcae auth/analytics packages — defining
+  Models, createApp() bootstrap, scopes, hooks, jobs, migrations, the React SDK,
+  or realtime queries. Do not use for unrelated TypeScript, generic ORMs
+  (Prisma/Drizzle), or non-Parcae Socket.IO/Knex code.
 ---
 
 # Parcae
 
-Your class IS the schema, the API, and the type system. One `createApp()` call bootstraps Postgres persistence, auto-CRUD REST routes, realtime WebSocket subscriptions, background jobs, and authentication from your Model classes.
-
-No codegen, no dashboard, no vendor lock-in. Everything is TypeScript.
+Your class IS the schema, the API, and the type system. One `createApp()` call bootstraps persistence (Postgres, with SQLite and AlloyDB also supported via Knex), auto-CRUD REST routes, realtime Socket.IO subscriptions, background jobs, and authentication from your Model classes. No codegen, no dashboard — everything is TypeScript.
 
 ## Packages
 
@@ -26,183 +20,61 @@ No codegen, no dashboard, no vendor lock-in. Everything is TypeScript.
 
 ## Architecture
 
-Three-layer design with an adapter pattern at the center:
+| Layer   | Package           | Purpose                                                                        |
+| ------- | ----------------- | ----------------------------------------------------------------------------- |
+| Model   | `@parcae/model`   | Universal base class; runs isomorphically on frontend and backend             |
+| Backend | `@parcae/backend` | Server: Polka + Socket.IO + Knex (Postgres/SQLite/AlloyDB) + BullMQ           |
+| SDK     | `@parcae/sdk`     | Client: Socket.IO transport (the only transport), React hooks, session gates  |
 
-| Layer   | Package           | Purpose                                                           |
-| ------- | ----------------- | ----------------------------------------------------------------- |
-| Model   | `@parcae/model`   | Universal base class, runs isomorphically on frontend and backend |
-| Backend | `@parcae/backend` | Server framework: Polka + Socket.IO + Knex/Postgres + BullMQ      |
-| SDK     | `@parcae/sdk`     | Client: transports (Socket.IO / SSE), React hooks, auth gates     |
+`@parcae/model` is standalone; backend and SDK both depend on it. Auth packages depend on backend + model.
 
-**Key dependency flow:** `@parcae/model` is standalone. Backend and SDK both depend on it. Auth packages peer-depend on backend + model.
-
-## Quick Reference
-
-### Defining a Model
+## Model + createApp
 
 ```typescript
 import { Model } from "@parcae/model";
 
 class Post extends Model {
-  static type = "post" as const;
+  static type = "post" as const; // table = pluralize(type) → "posts"
   static scope = {
-    read: (ctx) => (qb) =>
-      qb.where("published", true).orWhere("user", ctx.user?.id),
+    read: (ctx) => (qb) => qb.where("user", ctx.user?.id),
     create: (ctx) => (ctx.user ? { user: ctx.user.id } : null),
-    update: (ctx) => (ctx.user ? (qb) => qb.where("user", ctx.user.id) : null),
-    delete: (ctx) => (ctx.user ? (qb) => qb.where("user", ctx.user.id) : null),
   };
 
-  user!: User; // Reference -> VARCHAR foreign key
-  title: string = ""; // string -> VARCHAR(2048)
-  body: PostBody = {}; // object -> JSONB
+  user!: User; // Reference → VARCHAR FK
+  title: string = ""; // → VARCHAR
   published: boolean = false;
-  views: number = 0; // number -> INTEGER
 }
-```
 
-No decorators. TypeScript property types are resolved by ts-morph at startup and mapped to Postgres columns. Undeclared properties spill into a `data` JSONB overflow column.
-
-### Backend App
-
-```typescript
 import { createApp } from "@parcae/backend";
-import { betterAuth } from "@parcae/auth-betterauth";
 
-const app = createApp({
-  models: [User, Post], // or "./models" for auto-discovery
-  controllers: "./controllers",
-  hooks: "./hooks",
-  jobs: "./jobs",
-  auth: betterAuth({ providers: ["email"] }),
-});
-
+const app = createApp({ models: [User, Post], controllers: "./controllers" });
 await app.start({ port: 3000 });
 ```
 
-### Custom Routes, Hooks, Jobs
-
-```typescript
-// controllers/stats.ts
-import { route, ok } from "@parcae/backend";
-
-route.get("/v1/stats", async (req, res) => {
-  ok(res, { count: await Post.count() });
-});
-
-// hooks/post-log.ts
-import { hook } from "@parcae/backend";
-
-hook.after(Post, "save", async ({ model, enqueue }) => {
-  await enqueue("post:index", { postId: model.id });
-});
-
-// jobs/post-index.ts
-import { job } from "@parcae/backend";
-
-job("post:index", async ({ data }) => {
-  const post = await Post.findById(data.postId);
-  // ... index logic
-});
-```
-
-Files in `controllers/`, `hooks/`, `jobs/` self-register at import time via global registries. No manual wiring.
-
-### Client SDK
-
-```tsx
-import { createClient } from "@parcae/sdk";
-import { ParcaeProvider, useQuery, Authenticated } from "@parcae/sdk/react";
-import { betterAuth } from "@parcae/auth-betterauth/client";
-
-// Standalone
-const client = createClient({ url: "http://localhost:3000" });
-
-// React
-<ParcaeProvider url="http://localhost:3000" auth={betterAuth()}>
-  <Authenticated>
-    <PostList />
-  </Authenticated>
-</ParcaeProvider>;
-
-function PostList() {
-  const { items, loading } = useQuery(
-    Post.where({ published: true }).orderBy("createdAt", "desc"),
-  );
-  // items update in realtime via QuerySubscriptionManager
-}
-```
+Table name, the auto-CRUD path, and the list-response collection key all derive from `pluralize(static type)` on both backend and SDK.
 
 ## Key Patterns
 
-1. **Class IS the schema** -- No decorators, no separate schema files. ts-morph reads TypeScript types and maps them to Postgres columns.
+- **Class IS the schema** — ts-morph resolves TypeScript property types into Postgres columns at startup; no decorators or schema files.
+- **Adapter pattern** — `Model.use(adapter)` swaps `BackendAdapter` (Knex/Postgres) for `FrontendAdapter` (transport); identical query code runs everywhere.
+- **Explicit writes** — instance is the data store (no Proxy); persist via `save()`, `patch(ops)`, or `flush()`.
+- **Scopes are row-level security** — composable functions returning a query modifier, a defaults object, or `null` (deny).
+- **Self-registration** — files in `controllers/`, `hooks/`, `jobs/`, `crons/`, `migrations/` register via `route.*`, `hook.before/after`, `job()`, `cron()`, `migration()` at import time.
+- **Socket RPC bridge** — Socket.IO calls reuse the HTTP middleware/auth/routing path.
 
-2. **Adapter pattern** -- `Model.use(adapter)` switches between BackendAdapter (Knex/Postgres) and FrontendAdapter (Valtio/Transport). Same query code runs everywhere.
+## Gotchas
 
-3. **Scopes as security** -- Row-level security via composable functions. Return `null` to deny, a query modifier function to filter, or an object to inject defaults.
-
-4. **Global self-registration** -- Routes, hooks, and jobs register into module-level arrays at import time. `createApp()` auto-discovers files in configured directories.
-
-5. **Overflow column** -- Undeclared properties spill into a `data` JSONB column. Declared properties get typed Postgres columns for indexing/querying.
-
-6. **Socket RPC bridge** -- Socket.IO calls are piped through Polka's HTTP handler as fake requests, so sockets share identical middleware, auth, and routing with HTTP.
-
-7. **Additive-only migration** -- `ensureAllTables()` creates tables, columns, and indexes if missing. Never drops anything. For renames, type changes, data backfills, and new constraints, register a `migration()` -- runs via Knex's migrator against `parcae_migrations` with multi-replica locking and per-migration transactions. Companion `parcae_migration_meta` table tracks checksums (drift detection), description, ticket, and duration. CLI surface: `parcae migrate:{make,list,status,latest,baseline,unlock,rollback,plan}`.
-
-8. **Lazy query chains** -- Queries can be built before the adapter is set. Terminal methods (`.find()`, `.first()`, `.count()`) wait for the adapter asynchronously.
+- The **backend** injects a default `.limit(25)` when a client query sends none — list views silently truncate to 25 rows. Set an explicit `.limit(N)`, or `.clearLimit()` to opt out.
+- Never call `Model.where()` with no arguments.
+- Migrations are additive-only: `ensureAllTables()` creates missing tables/columns/indexes but never drops; use `migration()` for renames, type changes, and backfills.
+- Undeclared properties spill into a `data` JSONB overflow column; only declared properties get typed, indexable columns.
+- A scope function returning `null` denies the request (responds forbidden).
 
 ## Reference Files
 
-For detailed API reference, read these as needed:
-
-- **[references/model.md](references/model.md)** -- Model class internals, schema resolution, column types, query chain API, Proxy mechanics, change tracking, reference proxies
-- **[references/backend.md](references/backend.md)** -- createApp() startup sequence, BackendAdapter (save/patch/query), auto-CRUD routes, custom routes, hooks, jobs, response helpers, config/env vars
-- **[references/sdk.md](references/sdk.md)** -- createClient(), SocketTransport, SSETransport, AuthGate, React hooks (useQuery, useApi, useSetting), ParcaeProvider, auth gate components
-- **[references/auth.md](references/auth.md)** -- AuthAdapter interface, Better Auth server/client setup, Clerk adapter, session resolution
-- **[references/realtime.md](references/realtime.md)** -- PubSub (Redis), QuerySubscriptionManager, subscription lifecycle, diff ops, Socket.IO connection handling
-- **[references/analytics.md](references/analytics.md)** -- @parcae/analytics: Period, ActivityEvent + metric.event() decorator, Metric base + analytics_snapshot, Detector / Finding / StoryComposer / projection runner, Contract base for page-shaped read endpoints, materialized view orchestration
-
-## Directory Structure
-
-```
-packages/
-  model/src/
-    Model.ts                 # Core Model class (~750 lines)
-    adapters/types.ts        # ModelAdapter interface, QueryChain, column types
-    adapters/client.ts       # FrontendAdapter (Valtio + Transport)
-  backend/src/
-    app.ts                   # createApp() entry point
-    server.ts                # Polka + Socket.IO server
-    config.ts                # Zod-validated env config
-    adapters/model.ts        # BackendAdapter (Knex/Postgres, ~1250 lines)
-    adapters/routes.ts       # Auto-CRUD route generator
-    routing/route.ts         # route.get/post/put/patch/delete + Controller class
-    routing/hook.ts          # hook.before/hook.after
-    routing/job.ts           # job() registration
-    routing/migration.ts     # migration() registration
-    adapters/migrations.ts   # ParcaeMigrationSource + runMigrations()
-    adapters/migration-meta.ts       # parcae_migration_meta + checksum verification
-    adapters/migration-discovery.ts  # file-based discovery that tags entries with paths
-    adapters/engine.ts       # detectEngine() — shared by BackendAdapter and CLI
-    cli/                     # `parcae migrate:*` CLI entry + commands
-    services/pubsub.ts       # Redis pub/sub + distributed lock
-    services/queue.ts        # BullMQ queue service
-    services/subscriptions.ts # QuerySubscriptionManager
-    schema/resolver.ts       # ts-morph schema resolution
-    schema/generate.ts       # Schema generation + caching (.parcae/)
-  sdk/src/
-    client.ts                # createClient() factory
-    auth-gate.ts             # Valtio-reactive auth state machine
-    transports/socket.ts     # SocketTransport (Socket.IO)
-    transports/sse.ts        # SSETransport (HTTP + EventSource)
-    react/Provider.tsx        # ParcaeProvider
-    react/useQuery.ts         # Realtime query hook
-    react/useApi.ts           # HTTP method hooks
-    react/useSetting.ts       # Persistent setting hook
-    react/gates.tsx           # Authenticated/Unauthenticated/AuthLoading
-  auth-betterauth/src/
-    index.ts                 # betterAuth() server adapter
-    client.ts                # betterAuth() client adapter
-  auth-clerk/src/
-    index.ts                 # clerk() server adapter
-```
+- **references/model.md** — Model class, schema resolution, column types, query chain, save/patch/flush, references.
+- **references/backend.md** — createApp() startup, BackendAdapter, auto-CRUD + custom routes, hooks, jobs, migrations, config/env.
+- **references/sdk.md** — createClient(), SocketTransport, React hooks (useQuery, useApi, useSetting, session gates), ParcaeProvider.
+- **references/auth.md** — AuthAdapter interface, Better Auth, Clerk, session resolution.
+- **references/realtime.md** — PubSub (Redis), QuerySubscriptionManager, subscription lifecycle, diff ops.
+- **references/analytics.md** — @parcae/analytics: Period, ActivityEvent, Metric, Detector/Finding/StoryComposer, Contract, materialized views.

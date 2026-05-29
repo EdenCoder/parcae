@@ -8,6 +8,7 @@
  * - Or any custom transport
  */
 
+import pluralize from "pluralize";
 import {
   CHAINABLE_METHODS,
   extractExpandFields,
@@ -205,7 +206,15 @@ export class FrontendAdapter implements ModelAdapter {
       // periodic drift poll to recover from missed events.
       if (options.forceRefresh) requestData.__forceRefresh = true;
       const result = await this.transport.get(path, requestData);
-      const items = result?.[modelClass.type + "s"] ?? result?.items ?? [];
+      // Read the list envelope under the pluralized collection key
+      // (matching the backend route). The `${type}s` key is kept as a
+      // fallback so a newer SDK still reads an older backend that emits
+      // the naive key; `items` is the final generic fallback.
+      const items =
+        result?.[pluralize(modelClass.type)] ??
+        result?.[modelClass.type + "s"] ??
+        result?.items ??
+        [];
       const models = items.map((row: any) =>
         (modelClass as any).hydrate(this, row),
       );
@@ -311,7 +320,7 @@ export class FrontendAdapter implements ModelAdapter {
     if (!modelClass.path && !modelClass.type) {
       throw new Error("Model has no path or type");
     }
-    const fullPath = modelClass.path ?? `/v1/${modelClass.type}s`;
+    const fullPath = modelClass.path ?? `/v1/${pluralize(modelClass.type)}`;
     return this.p(fullPath);
   }
 }
