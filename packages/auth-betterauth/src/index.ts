@@ -23,6 +23,7 @@ import { betterAuth as createBetterAuth } from "better-auth";
 import { log } from "@parcae/backend";
 import { bearer } from "better-auth/plugins/bearer";
 import pg from "pg";
+import pluralize from "pluralize";
 import { generateId } from "@parcae/model";
 import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
 import type {
@@ -170,9 +171,12 @@ export function betterAuth(config: BetterAuthConfig = {}): AuthAdapter {
         "http://localhost:*",
       ].filter(Boolean);
 
-      // Determine user table name from the Model
-      // Convention: type "user" → table "users"
-      const userTableName = userModel ? (userModel as any).type + "s" : "users";
+      // Determine user table name from the Model. Must match the table
+      // the BackendAdapter creates, which is `pluralize(type)` — so an
+      // irregular user type (e.g. "person" → "people") still lines up.
+      const userTableName = userModel
+        ? pluralize((userModel as any).type)
+        : "users";
 
       // Infer additional fields from the User model schema
       const additionalFields = userModel

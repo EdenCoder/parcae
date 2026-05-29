@@ -28,7 +28,8 @@
   },
   "dependencies": {
     "better-auth": "^1.2.0",
-    "pg": "^8.13.0"
+    "pg": "^8.13.0",
+    "pluralize": "^8.0.0"
   },
   "peerDependencies": {
     "@parcae/backend": "workspace:*",
@@ -39,6 +40,7 @@
     "@parcae/model": "workspace:*",
     "@types/node": "^22.0.0",
     "@types/pg": "^8.18.0",
+    "@types/pluralize": "^0.0.33",
     "tsup": "^8.5.0",
     "typescript": "^5.8.0"
   },
