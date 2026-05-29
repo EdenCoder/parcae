@@ -1,200 +1,284 @@
 # Model Reference
 
-Source: `packages/model/src/Model.ts` (~750 lines)
+Source: `packages/model/src/Model.ts`, `patch.ts`, `adapters/types.ts`, `adapters/client.ts`
 
 ## Model Class
 
-Extends `EventEmitter`. Constructor returns a **Proxy** that intercepts property access for change tracking, reference resolution, and raw ID access.
+Extends `EventEmitter` (eventemitter3). **The instance IS the data store** — there is no Proxy wrapper and no write interception. Plain field assignment (`post.title = "x"`) mutates the instance directly. It does NOT emit `"change"` and does NOT persist. Persistence and reactivity flow only through the three explicit write primitives below.
+
+Reference fields are the one exception: `_apply()` installs getter/setter accessor pairs for them (see Reference Fields). Everything else is an ordinary own property.
+
+> Never call `new Post(...)` directly — the constructor stages data but does not apply it (ES2022 subclass field initializers run after `super()` and would clobber it). Use `Post.create(data)` or `Post.hydrate(adapter, data)`; both run `_apply()` for you.
 
 ### Static Properties
 
 ```typescript
 class Post extends Model {
-  static type = "post" as const; // Model identifier, derives table name (pluralized)
-  static path?: string; // Custom API path (default: /v1/{type}s)
-  static scope?: ScopeDefinition; // Row-level security
-  static indexes?: (string | string[])[];
-  static searchFields?: string[]; // Fields for full-text search
+  static type = "post"; // singular, lowercase discriminator (see below)
+  static path?: string; // custom API path; default `/v1/${pluralize(type)}`
+  static scope?: ModelScope; // { read?, create?, update?, delete?, patch? } row-level security
+  static indexes?: (string | string[])[]; // single or composite indexes
+  static searchFields?: string[]; // PLAIN-TEXT columns only (see gotcha)
   static managed: boolean = true; // false = skip DDL migration (externally managed tables)
-  static __schema?: SchemaDefinition; // Resolved at startup by ts-morph
+  static readonly readonlyFields: readonly string[] = []; // stripped from POST/PUT/PATCH bodies
+  static readonly privateFields: readonly string[] = []; // stripped by default sanitize()
+  static __schema?: SchemaDefinition; // @internal, resolved at startup
 }
 ```
 
+`static type` derives, via `pluralize(type)`, all of:
+
+- the table name (`pluralize("post")` → `posts`)
+- the auto-CRUD path (`/v1/${pluralize(type)}`)
+- the list-response collection key (`{ posts: [...] }`)
+
+`pluralize` is irregular-aware: `category` → `categories`, `person` → `people`, and a type already ending in `s` is not double-pluralized. Both the backend and the SDK derive these the same way (`client.ts` uses `pluralize(modelClass.type)` for the path and the response key), so there is no client/backend split-brain. `type` is NOT stored as an instance field — read it from the static (`Post.type`) or `(post.constructor as typeof Model).type`. The framework re-injects a `type` key into `sanitize()` / `toJSON()` projections.
+
+`readonlyFields` is layered on top of the always-protected system fields `id` / `createdAt` / `updatedAt` / `type`. Server-side code can still write readonly fields directly via `model.x = ...; await model.save()` — the restriction only applies to HTTP-driven entry points.
+
 ### Instance Properties
 
-Instance data lives in `__data` (Valtio proxy on frontend, plain object on backend). Internal state uses Symbols to avoid collisions with data properties:
+- `id: string`, `createdAt: Date | string`, `updatedAt: Date | string` — system fields, always set by `_apply()`.
+- `tmp?: string` — client-side temporary ID for optimistic matching; stored in the JSONB overflow.
+- `__savingCount: number` — in-flight save/patch count (0 = idle). Consumed by `useSaving`.
+- `__isNew: boolean` — plain field, `true` for a fresh `create()`, `false` after `hydrate()` or a successful `save()`. Routes `flush()` → `save()`.
+- `__data` — a computed **getter** (not a stored object), returning a plain snapshot filtered of methods, EventEmitter internals, `_`-prefixed fields, and `$field` ref accessors. Ref fields serialize to their raw id. (There is no Valtio store; `FrontendAdapter.createStore()` is unused.)
 
-- `SYM_ADAPTER` -- ModelAdapter reference
-- `SYM_UPDATES` -- Accumulated changes array
-- `SYM_IS_NEW` -- True if not yet saved
-- `SYM_INIT_DATA` -- Keys from constructor data (prevents defaults overwriting explicit values)
+### Internal Symbols
 
-### Proxy Mechanics
+Internal state uses Symbols so it never collides with data properties:
 
-The constructor Proxy intercepts:
+- `SYM_ADAPTER` — the `ModelAdapter` for this instance
+- `SYM_PATCHING` — `Set<string>` of full RFC 6902 paths currently in-flight via `patch()`; server-merge and `useQuery` skip echoes for these sub-paths
+- `SYM_SNAPSHOT` (`__serverSnapshot`) — last server-authoritative view of the document; `flush()` diffs against this
+- `SYM_PENDING_DATA` — constructor data staged until subclass field initializers finish; consumed by `_apply()`
+- `SYM_FLUSH_INFLIGHT` / `SYM_FLUSH_TRAILING` — concurrency control for `flush()` coalescing
+- `SYM_SERVER_MERGE` (exported) — method symbol; atomically merges server-authoritative data
+- `SYM_VERSION` (exported) — monotonic counter bumped on every `"change"` emit; backs `useModel` / `useModelAtomic` via `useSyncExternalStore`
 
-- **`get`**: Returns data properties, handles `$property` for raw reference IDs, creates lazy-loading reference proxies for Model-typed properties
-- **`set`**: Tracks changes in `SYM_UPDATES` array (only after construction completes via `queueMicrotask`)
-- **`has`** / **`defineProperty`**: Standard forwarding
+## Write Primitives
 
-### Change Tracking
+There are exactly three ways to persist:
 
-Every property set pushes to `SYM_UPDATES`. On `save()`, the adapter receives a `ChangeSet` containing all accumulated changes. After save, updates are cleared.
+```typescript
+await post.save();           // (1) full-document upsert
+await post.patch(ops);       // (2) apply RFC 6902 ops locally + send them
+await post.flush();          // (3) diff snapshot vs current, send the delta as a patch
+```
 
-## Static Query API
+### `save()`
 
-All static methods build lazy chains via `lazyQuery()`. The adapter is resolved only when a terminal method is called:
+Upsert the entire current document. No diffing, no dirty-tracking, no debounce — takes **no arguments** and is always immediate. Locally it stamps `updatedAt`, clears `__isNew`, and refreshes `__serverSnapshot` from the post-write state (so an immediately following `flush()` is a no-op). The adapter sends the full body; on create it adopts a server-returned `id`. Emits `"saving"` / `"saved"` (and `"__saving"`), but does NOT emit `"change"`.
+
+### `patch(ops: PatchOp[])`
+
+Apply a batch of RFC 6902 ops to the instance optimistically, then send them. Empty batches are a no-op. Ops are normalized via `dedupOps` (any op whose path lives under another `remove` in the same batch is dropped, plus duplicate identical removes). Missing intermediate objects/arrays are auto-vivified before `applyPatch`. Emits `"change"` **synchronously** (optimistic UI), bumps `SYM_VERSION`, records the op paths in `SYM_PATCHING` for the round-trip, then replays the ops onto `__serverSnapshot` so a later `flush()` won't re-emit them.
+
+### `flush()`
+
+The canonical "persist my edits" call. Diffs `__serverSnapshot` against the current `__data` (via `fast-json-patch.compare`) and sends the delta through `patch()` (which is what emits `"change"`). Routes to `save()` when `__isNew` (a PATCH to a nonexistent id would 404). No-op on an empty diff. Before diffing, both sides have `SYSTEM_DATA_KEYS` (`id`, `type`, `createdAt`, `updatedAt`, `tmp`) stripped and `Date` values coerced to ISO strings (otherwise `compare` emits ~24 char-level ops per Date field).
+
+**Self-serializing:** concurrent `flush()` calls coalesce to at most two round-trips per burst — the first runs on the leading edge; all callers arriving while it is in flight share one "trailing" flush that captures changes made during the window. Streaming call sites can fire `flush()` per delta and `await Promise.all(...)` at the end without rolling their own debounce.
+
+### Reactivity
+
+`"change"` fires from exactly three sites: `patch()`, `flush()` (via its inner `patch()`), and `SYM_SERVER_MERGE`. **Plain field writes do not emit and do not re-render.** `patch()` / `flush()` emit synchronously; `SYM_SERVER_MERGE` emits via a microtask-batched queue (`scheduleChangeEmit`) so N per-row merges in one server frame coalesce into one commit per instance — critical for large `useQuery` list re-syncs. `flushChangeEmits()` (exported) force-drains the batched queue synchronously (tests, server coordinators).
+
+## Dot-path Accessors
+
+Both are **pure** — no I/O, no events, no persistence. Call `flush()` (or `patch([...])`) afterward to persist.
+
+```typescript
+const url = project.get<string>("blocks.abc.image.url"); // pure read; undefined if any segment missing
+project.set("blocks.abc.image.url", "https://...");        // pure write; auto-vivifies intermediate objects
+await project.flush();                                     // now persist
+```
+
+`set()` with a single-segment path is a plain top-level assignment; multi-segment paths walk and create missing intermediate objects (always objects, not arrays).
+
+## Other Instance Methods
+
+```typescript
+await post.remove();                  // delete; emits "removed"
+await post.refresh();                 // re-fetch via findById, merge via SYM_SERVER_MERGE
+const safe = await post.sanitize(user); // projection safe to return from routes (honours privateFields)
+const raw = post.toJSON();            // internal projection — IGNORES privateFields; do NOT return from routes
+```
+
+- `sanitize(user?)` — default projects every column except `static privateFields`, and injects `type`. The auto-CRUD GET routes call it on every row. Override for self-vs-other projections. `user` is passed but ignored by the default.
+- `toJSON()` — same shape but does NOT honour `privateFields`; used internally (subscription deltas, hook payloads, snapshot source). Never expose directly to clients.
+
+## Building Patch Ops
+
+`patch()` accepts a raw `PatchOp[]`. The `ops` builder (exported from `@parcae/model`) avoids hand-writing op objects and can scope a batch under a shared path prefix:
+
+```typescript
+import { ops } from "@parcae/model";
+
+await user.patch([
+  ops.replace("/email", "new@example.com"),
+  ops.remove("/pending/inviteToken"),
+]);
+
+// Scoped — every path under a shared base (leading slash is the caller's):
+const block = ops.scope(`/blocks/${blockId}`);
+await project.patch([
+  block.remove("/portrait/url"),
+  block.replace("/image/approved", true),
+]);
+```
+
+`OpBuilder` methods: `add(path, value)`, `remove(path)`, `replace(path, value)`, `copy(from, path)`, `move(from, path)`, `test(path, value)`. `dedupOps(ops)` is also exported (runs automatically inside `patch()`; exposed for tests / pre-submission inspection).
+
+## Query API
+
+There are two layers. **Static entry points** live on the `Model` class and return either a terminal `Promise` or a `QueryChain`. **Chain methods** only exist on the returned `QueryChain` — they are NOT static.
+
+### Static entry points
+
+```typescript
+Post.create(data?)                 // unsaved instance (marks __isNew)
+Post.hydrate(adapter, data)        // server/DB hydration (not __isNew)
+await Post.findById("abc123")      // single or null
+await Post.count()                 // number (whole-table)
+Post.where(...args)                // → QueryChain
+Post.whereRaw(query, ...bindings)  // → QueryChain
+Post.whereIn(col, values)          // → QueryChain
+Post.whereNot(...args)             // → QueryChain
+Post.whereNotIn(col, values)       // → QueryChain
+Post.whereNull(col)                // → QueryChain
+Post.whereNotNull(col)             // → QueryChain
+Post.select(...columns)            // → QueryChain
+Post.search(term)                  // → QueryChain (hybrid full-text + fuzzy)
+```
+
+These are the ONLY statics. `Post.orderBy(...)`, `Post.limit(...)`, `Post.sum(...)`, `Post.join(...)`, etc. **do not exist** as statics — start a chain first (e.g. `Post.where({}).orderBy(...)`).
+
+> **Gotcha — `Model.where()` with zero args crashes.** TypeScript accepts it (`...args: any[]`), but it crashes at `.find()` with `The operator "undefined" is not permitted`. To start an unfiltered chain use the empty-object form `Post.where({})`, or a static like `Post.whereIn(col, ids)` / `Post.select(...)`.
+
+### Chain methods (`QueryChain<T>`)
+
+Available only after a static returns a chain. From `CHAINABLE_METHODS` and the `QueryChain` interface:
 
 ```typescript
 // Filtering
-Post.where({ published: true });
-Post.where("views", ">", 100);
-Post.whereIn("status", ["draft", "review"]);
-Post.whereNot({ archived: true });
-Post.whereNotIn("role", ["banned"]);
-Post.whereNull("deletedAt");
-Post.whereNotNull("publishedAt");
-Post.whereBetween("views", [10, 1000]);
-Post.whereRaw("title ILIKE ?", ["%hello%"]);
-
-// Chaining
-Post.where({ published: true }).andWhere("views", ">", 10);
-Post.where({ published: true }).orWhere({ featured: true });
-Post.where({ published: true }).orWhereIn("id", ids);
-Post.where({ published: true }).orWhereNull("category");
-
-// Ordering and pagination
-Post.orderBy("createdAt", "desc");
-Post.orderByRaw("COALESCE(published_at, created_at) DESC");
-Post.limit(25).offset(50);
-Post.basic(25, "createdAt", "desc", 3); // limit, sort, direction, page
-
-// Selection
-Post.select("id", "title", "user");
-Post.distinct("category");
-Post.distinctOn("user");
-Post.groupBy("category");
-Post.having("count", ">", 5);
-
-// Joins
-Post.join("users", "posts.user", "users.id");
-Post.leftJoin("comments", "posts.id", "comments.post_id");
-
-// Aggregates
-Post.where({ published: true }).count();
-Post.sum("views");
-Post.avg("rating");
-Post.min("createdAt");
-Post.max("views");
-Post.increment("views", 1); // atomic increment
-Post.decrement("stock", 1);
+.where(...) .andWhere(...) .orWhere(...)
+.whereIn(col, vals) .whereNot(...) .whereNotIn(col, vals)
+.whereNull(col) .whereNotNull(col) .whereBetween(col, [a, b])
+.whereRaw(q, ...b) .orWhereRaw(q, ...b) .orWhereIn(col, vals) .orWhereNull(col) .whereExists(cb)
 
 // Search
-Post.search("hello world"); // hybrid full-text + fuzzy
+.search(term)
+
+// Ordering & pagination
+.orderBy(col, "asc" | "desc")  .orderBy(false)  // false → skip ORDER BY + suppress realtime `order` envelope
+.orderByRaw(q, ...b)  .limit(n)  .offset(n)
+// NOTE: .basic(...) is on the QueryChain TS interface but is NOT runtime-installed
+// (absent from CHAINABLE_METHODS) — calling it type-checks but throws at runtime.
+
+// Selection & grouping
+.select(...cols) .distinct(...cols) .distinctOn(...cols)
+.groupBy(...cols) .groupByRaw(q, ...b) .having(...) .havingRaw(q, ...b)
+
+// Joins
+.join(...) .innerJoin(...) .leftJoin(...) .rightJoin(...)
+
+// Modifiers
+.clearOrder() .clearSelect() .clearLimit() .from(table)
+
+// Aggregates (chainable form)
+.sum(col) .avg(col) .min(col) .max(col)
+.increment(col, amount?) .decrement(col, amount?)
+
+// Ref expansion (see below)
+.expand(...fields)
 
 // Terminals
-const posts = await Post.where({ published: true }).find(); // array
-const post = await Post.where({ slug: "hello" }).first(); // single or null
-const count = await Post.where({ published: true }).count(); // number
-
-// Direct lookup
-const post = await Post.findById("abc123");
-
-// Creation
-const post = Post.create({ title: "New Post", user: userId });
+await chain.find()   // Promise<T[]>
+await chain.first()  // Promise<T | null>
+await chain.count()  // Promise<number>
 ```
 
-## Instance Methods
+The list result array carries non-enumerable `__queryHash` and `__totalCount` properties attached by the frontend adapter.
+
+> **Gotcha — `clearLimit()` is a client-query opt-out only.** It tells the backend to skip its default-25 injection. Calling it on a server-side `Model.where(...).find()` chain throws `knexQuery.clearLimit is not a function` — it is in `CHAINABLE_METHODS` so it type-checks, but the server dispatches `knexQuery[method](...)` and Knex has no `clearLimit`. Server queries have no default limit anyway; for a safety cap write `.limit(10_000)` explicitly.
+
+### `expand()` — the N+1 fix
+
+Without `.expand()`, ref columns serialize as raw id strings and the client must `findById` per row. `.expand("file")` inlines the full linked row; `.expand("file.url", "file.mime")` projects only `{ id, type, ...fields }`. The expanded ref is pre-hydrated into the ref proxy, so reads are synchronous (no Suspense throw). v1 is one-hop only (dot-syntax is reserved for ref + field projection, not nested ref-chaining). Mixing a bare ref with dotted projections of the same ref promotes to whole-row. The raw id always lands in `$file` regardless. Backend validates each spec against `__schema` (unknown/non-ref → 400).
+
+## Reference Fields
+
+Properties typed as another `Model` get an accessor pair installed by `_apply()` (no Proxy on the Model itself; the *ref value* is a small Proxy):
 
 ```typescript
-await post.save(); // Flush changes to backend (debounce-capable)
-await post.save(true); // Immediate save, skip debounce
-await post.remove(); // Delete
-await post.refresh(); // Reload from backend, preserving pending changes
-await post.patch([
-  // RFC 6902 JSON Patch
-  { op: "replace", path: "/title", value: "New Title" },
-  { op: "add", path: "/tags/0", value: "new" },
-  { op: "remove", path: "/draft" },
-]);
-post.toJSON(); // Plain object snapshot
-await post.sanitize(user); // Override to strip sensitive fields for API response
+post.author       // lazy-loading ref proxy (memoized per raw id), or null
+post.author = u   // accepts a Model, an id string, or null; stores the raw id
+post.$author      // raw id string (no load); also settable
 ```
 
-### Save Behavior (Frontend)
+The ref proxy returns `.id` and `.type` **synchronously** (and handles `then` → `undefined`, `toJSON`, and `Symbol.toPrimitive` without loading). Most OTHER property reads before the row loads throw the pending `findById` promise (React Suspense). `ownKeys` / `has` / `getOwnPropertyDescriptor` restrict the visible surface to `{ id, type }`, so iteration / `isEqual` / DevTools expansion don't trip the lazy-load trap. Proxies are cached in `Model.__refCache`, a 30s-TTL map keyed `${type}:${id}`.
 
-When `save()` flushes, the FrontendAdapter chooses HTTP method by priority:
-
-1. **Creating** (new record) -> `POST /path` with all data
-2. **Ops** (patch ops accumulated) -> `PATCH /path/:id` with `{ ops }`
-3. **Updates** (field changes via `set()`) -> `PUT /path/:id` with changed fields
-
-## Reference Proxies
-
-Properties typed as another Model return lazy-loading reference proxies:
-
-```typescript
-// post.user is a User reference
-post.user.name; // Throws Promise (React Suspense) on first access
-post.$user; // Returns raw ID string without loading
-await post.user.name; // After loading, returns the actual name
-```
-
-References are cached globally in `Model.__refCache`.
-
-## Schema Resolution
-
-Source: `packages/backend/src/schema/resolver.ts`
-
-Uses **ts-morph** (TypeScript Compiler API) to read actual TypeScript types from source files at startup. No decorators, no codegen, no transformers.
-
-### Type Mapping
-
-| TypeScript                 | Column Type               | Postgres              |
-| -------------------------- | ------------------------- | --------------------- |
-| `string`                   | `"string"`                | VARCHAR(2048)         |
-| `string` (text annotation) | `"text"`                  | TEXT                  |
-| `number` (integer)         | `"integer"`               | INTEGER               |
-| `number` (float)           | `"number"`                | DOUBLE PRECISION      |
-| `boolean`                  | `"boolean"`               | BOOLEAN               |
-| `Date`                     | `"datetime"`              | TIMESTAMP             |
-| `AnotherModel`             | `{ kind: "ref", target }` | VARCHAR (foreign key) |
-| object / array             | `"json"`                  | JSONB                 |
-
-### Caching
-
-Schema resolution results are cached in `.parcae/schema.json` (gitignored). The cache is invalidated by SHA-256 hash of all model source files. Subsequent startups skip ts-morph if the hash matches.
+> **Gotchas.**
+> - Never write `'id' in ref` — the ref proxy wraps `{}` and only whitelists `id`/`type` in its `has` trap (`'someOtherKey' in ref` is false). Read `ref.id` directly.
+> - `$field` raw-id accessors are reliable on the server (schema resolved at startup). On the dashboard/client the `$field` getter may be undefined if `__schema` wasn't populated for that model — read ref ids via a runtime shape check (a string id, or an object with `.id`) rather than relying on `$field`.
 
 ## Adapter Interface
 
 ```typescript
 interface ModelAdapter {
-  createStore(data): Record<string, any>;
-  save(model, changes: ChangeSet): Promise<void>;
+  createStore(data): Record<string, any>;                 // backend builds DB rows; unused on frontend
+  save(model): Promise<void>;                              // full-document upsert (no ChangeSet)
   remove(model): Promise<void>;
   findById<T>(modelClass, id): Promise<T | null>;
   query<T>(modelClass): QueryChain<T>;
-  queryFromClient?<T>(modelClass, scope, rawSteps): QueryChain<T>;
-  patch(model, ops: PatchOp[]): Promise<void>;
+  queryFromClient?<T>(modelClass, scope, rawSteps): QueryChain<T>; // backend only; scope-first replay
+  patch(model, ops: PatchOp[]): Promise<void>;            // PATCH with RFC 6902 ops
 }
 ```
 
-The adapter is set globally via `Model.use(adapter)` and stored on `globalThis` so multiple copies of `@parcae/model` (common with pnpm) share the same state.
+There is no `ChangeSet` and no three-way HTTP-method priority. The adapter is set globally via `Model.use(adapter)` and stored on `globalThis.__parcae_adapter` so multiple copies of `@parcae/model` (common with pnpm) share one adapter.
 
 ## FrontendAdapter
 
-Source: `packages/model/src/adapters/client.ts`
+Source: `packages/model/src/adapters/client.ts`. Save is **2-way**:
 
-- `createStore()` returns a Valtio proxy for reactive data
-- `save()` sends changes over the transport (POST/PUT/PATCH)
-- `query()` serializes chain as `QueryStep[]` and sends to server
-- `findById()` sends `GET /path/:id`
-- GET requests are deduplicated (in-flight coalescing)
+- `save()` — `POST {full body}` when `__isNew` (adopting a server-echoed `id`), otherwise `PUT /path/:id {full body}`.
+- `patch()` / `flush()` — `PATCH /path/:id { ops }` via the separate `patch()` adapter method.
 
-### QueryStep Serialization
+`findById()` issues `GET /path/:id`. `query().find()` sends `{ __query: steps }` to `GET /path` and reads the list from `result[pluralize(type)]` (falling back to `result[type+"s"]` then `result.items`). `count()` sends `{ __query: steps, __count: true }`. Paths come from `modelClass.path ?? /v1/${pluralize(modelClass.type)}` with the `/v{n}` version prefix stripped (the transport re-adds it). Function args to where-callbacks are serialized as `{ __nested: steps }` recorders.
 
-Frontend queries are serialized as arrays of `{ method, args }` objects and sent to the server. The BackendAdapter replays them against a Knex query builder with scope enforcement.
+`createStore()` returns a shallow copy and is never called by the Model — frontend reactivity is purely EventEmitter (`model.on("change", ...)`), not Valtio.
+
+## Query Chains Are Lazy
+
+Static query methods build a `lazyQuery()` chain that records `{ method, args }` steps without an adapter. The adapter resolves only when a terminal (`find` / `first` / `count`) runs (`Model.hasAdapter()` ? `getAdapter()` : `await waitForAdapter()`), so queries can be constructed in React component bodies before `ParcaeProvider` mounts. The frontend adapter serializes the same steps as `QueryStep[]` and ships them to the server; the backend replays them against a scoped Knex builder.
+
+## Schema Resolution
+
+`__schema` is resolved at startup from TypeScript source types by a ts-morph-based resolver (`backend/src/schema/resolver.ts`; the schema layer is nicknamed "RTTIST" in `adapters/types.ts` comments). No decorators, no codegen at the model level.
+
+### Type Mapping (`PrimitiveColumnType`)
+
+| TypeScript                 | Column type | Postgres         |
+| -------------------------- | ----------- | ---------------- |
+| `string`                   | `"string"`  | VARCHAR(2048)    |
+| `string` (text annotation) | `"text"`    | TEXT             |
+| `number` (integer)         | `"integer"` | INTEGER          |
+| `number` (float)           | `"number"`  | DOUBLE PRECISION |
+| `boolean`                  | `"boolean"` | BOOLEAN          |
+| `Date`                     | `"datetime"`| TIMESTAMP        |
+| `AnotherModel`             | `{ kind: "ref", target }` | VARCHAR (foreign key id) |
+| object / array             | `"json"`    | JSONB            |
+
+> **Gotcha — inline union-literal alias resolves to JSONB.** Declare union-literal field types (`status: "a" | "b"`) in the SAME file as the model. Importing the alias from another workspace package can make the resolver treat it as opaque and fall back to JSONB instead of VARCHAR, producing `22P02 invalid input syntax for type json` in text-treating SQL. Keep a synced second definition rather than importing the type; verify with `information_schema.columns` (expect `character varying`).
+
+### `searchFields`
+
+When set, `ensureTable()` creates a generated `_search` tsvector column + GIN index, per-field trigram GIN indexes (pg_trgm), and on AlloyDB an `_embedding vector(768)` + ScaNN index. Fields are weighted by order (first = `A`, second = `B`, …). Query with `Project.search("...")`.
+
+> **Gotcha — `searchFields` must be plain text columns only.** Listing a JSONB/array field (e.g. `string[]`) makes the generated `_search` tsvector DDL fail with `invalid input syntax for type json`, aborting that table's schema sync halfway. For array fields use `static indexes` + `.where(col, "@>", [...])`, or denormalize into a computed text column for search.
 
 ## GlobalThis Pattern
 
-The adapter, client instances, and reference cache live on `globalThis` so they work correctly even when multiple copies of `@parcae/model` exist in the dependency tree (common in monorepos with pnpm).
+The active adapter (plus its `__parcae_pending` / `__parcae_resolve` await helpers) lives on `globalThis` so it behaves correctly when multiple copies of `@parcae/model` coexist in the dependency tree (common in pnpm monorepos). The reference cache is **not** global — it's a private static `Model.__refCache` map.
