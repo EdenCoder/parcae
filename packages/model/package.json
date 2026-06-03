@@ -36,10 +36,12 @@
   "dependencies": {
     "eventemitter3": "^5.0.4",
     "fast-json-patch": "^3.1.1",
+    "pluralize": "^8.0.0",
     "short-unique-id": "^5.3.2"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",
+    "@types/pluralize": "^0.0.33",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
     "vitest": "^4.1.8"

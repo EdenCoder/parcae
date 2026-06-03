@@ -312,7 +312,7 @@ export function registerModelRoutes(
                 total: items.length,
                 totalCount,
                 __queryHash: hash,
-                [type + "s"]: items,
+                [pluralize(type)]: items,
               },
               success: true,
             });
@@ -350,7 +350,7 @@ export function registerModelRoutes(
             result: {
               total: items.length,
               totalCount,
-              [type + "s"]: wireItems,
+              [pluralize(type)]: wireItems,
             },
             success: true,
           });
