@@ -34,15 +34,15 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "eventemitter3": "^5.0.1",
+    "eventemitter3": "^5.0.4",
     "fast-json-patch": "^3.1.1",
-    "short-unique-id": "^5.2.0"
+    "short-unique-id": "^5.3.2"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "tsup": "^8.5.0",
-    "typescript": "^5.8.0",
-    "vitest": "^4.0.18"
+    "@types/node": "^25.9.1",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.8"
   },
   "license": "MIT"
 }

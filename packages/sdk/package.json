@@ -31,21 +31,21 @@
   "dependencies": {
     "@observ33r/object-equals": "^1.1.6",
     "@parcae/model": "workspace:*",
-    "compress-json": "^3.1.0",
-    "eventemitter3": "^5.0.1",
+    "compress-json": "^3.4.0",
+    "eventemitter3": "^5.0.4",
     "fast-json-patch": "^3.1.1",
     "pako": "^2.1.0",
-    "short-unique-id": "^5.2.0",
-    "socket.io-client": "^4.8.0",
-    "valtio": "^2.1.0"
+    "short-unique-id": "^5.3.2",
+    "socket.io-client": "^4.8.3",
+    "valtio": "^2.3.2"
   },
   "devDependencies": {
-    "@types/pako": "^2.0.3",
-    "@types/react": "^19.0.0",
-    "react": "^19.0.0",
-    "tsup": "^8.5.0",
-    "typescript": "^5.8.0",
-    "vitest": "^4.0.18"
+    "@types/pako": "^2.0.4",
+    "@types/react": "^19.2.16",
+    "react": "^19.2.7",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.8"
   },
   "peerDependencies": {
     "react": ">=18.0.0"
