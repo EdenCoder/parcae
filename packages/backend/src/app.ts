@@ -410,6 +410,13 @@ export function createApp(config: AppConfig): ParcaeApp {
       let writeDb: ReturnType<typeof knex>;
       let readDb: ReturnType<typeof knex>;
 
+      // Postgres connection-pool size. The prior hardcoded max of 10 was
+      // exhausted when many scheduled jobs fired in the same minute on the
+      // daemon (which runs every job worker concurrently), so acquiring a
+      // connection timed out. Default raised to 25 so the fix does not
+      // depend on setting an env; DB_POOL_MAX overrides it per-deployment.
+      const dbPoolMax = Math.max(2, Number(process.env.DB_POOL_MAX) || 25);
+
       if (useSqlite) {
         const filename = sqliteFilename(envConfig.DATABASE_URL);
         writeDb = knex({
@@ -423,13 +430,13 @@ export function createApp(config: AppConfig): ParcaeApp {
         writeDb = knex({
           client: "pg",
           connection: envConfig.DATABASE_URL,
-          pool: { min: 2, max: 10 },
+          pool: { min: 2, max: dbPoolMax },
         });
         readDb = envConfig.DATABASE_READ_URL
           ? knex({
               client: "pg",
               connection: envConfig.DATABASE_READ_URL,
-              pool: { min: 2, max: 10 },
+              pool: { min: 2, max: dbPoolMax },
             })
           : writeDb;
       }
