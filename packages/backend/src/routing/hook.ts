@@ -45,7 +45,7 @@
  */
 
 import type { Job } from "bullmq";
-import type { ModelConstructor } from "@parcae/model";
+import type { Model, ModelConstructor, WithRefs } from "@parcae/model";
 import type { EnqueueOptions } from "../services/context";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -53,11 +53,18 @@ import type { EnqueueOptions } from "../services/context";
 export type HookTiming = "before" | "after";
 export type HookAction = "save" | "patch" | "remove" | "create" | "update";
 
-export type HookHandler = (ctx: HookContext) => Promise<void> | void;
+export type HookHandler<M = any> = (ctx: HookContext<M>) => Promise<void> | void;
 
-export interface HookContext {
-  /** The model instance being acted upon. */
-  model: any;
+export interface HookContext<M = any> {
+  /**
+   * The model instance being acted upon. When `M` is a concrete `Model`
+   * subclass, this resolves to `WithRefs<M>` so the `$ref` string accessors
+   * the adapter installs at runtime are typed without a cast — callers write
+   * `HookContext<Plan>` and read `model.$patient` directly. The `= any`
+   * default keeps a bare `HookContext` permissive for the rare handler that
+   * intentionally works untyped.
+   */
+  model: M extends Model ? WithRefs<M> : M;
   /** The action being performed. */
   action: HookAction;
   /** The raw request data (if applicable). */
@@ -191,10 +198,51 @@ function register(
  * hook.after(Post, "patch", handler, { async: true, priority: 200 });
  * ```
  */
-export const hook = {
+/**
+ * The hook registration API. Each method has a typed overload that
+ * threads the model class's instance type into the handler (so
+ * `ctx.model` is `WithRefs<Instance>` with no cast) plus a loose
+ * fallback overload that preserves the original flexible call shape.
+ */
+export interface HookApi {
   /**
    * Register an "after" hook — runs after the action completes.
+   *
+   * The model class threads its instance type into the handler, so
+   * `ctx.model` is typed `WithRefs<Instance>` (carrying the `$ref`
+   * accessors the adapter installs at runtime) with no cast needed.
    */
+  after<M extends Model>(
+    modelClass: ModelConstructor<M>,
+    action: HookAction,
+    handler: HookHandler<M>,
+    options?: HookOptions,
+  ): HookEntry;
+  after(
+    modelClass: ModelConstructor,
+    action: HookAction,
+    ...args: any[]
+  ): HookEntry;
+
+  /**
+   * Register a "before" hook — runs before the action.
+   *
+   * Same typing contract as `after`: `ctx.model` is `WithRefs<Instance>`.
+   */
+  before<M extends Model>(
+    modelClass: ModelConstructor<M>,
+    action: HookAction,
+    handler: HookHandler<M>,
+    options?: HookOptions,
+  ): HookEntry;
+  before(
+    modelClass: ModelConstructor,
+    action: HookAction,
+    ...args: any[]
+  ): HookEntry;
+}
+
+export const hook: HookApi = {
   after(
     modelClass: ModelConstructor,
     action: HookAction,
@@ -203,9 +251,6 @@ export const hook = {
     return register(modelClass, "after", action, ...args);
   },
 
-  /**
-   * Register a "before" hook — runs before the action.
-   */
   before(
     modelClass: ModelConstructor,
     action: HookAction,
