@@ -32,16 +32,37 @@ function loadEnvFile(dir: string = process.cwd()): void {
 }
 
 /**
+ * Parse a boolean-like env string. Returns `true`, `false`, or `null` for
+ * unrecognised values (which Zod converts to a validation error).
+ *
+ * Accepts: true/false, 1/0, yes/no, on/off, empty string → false.
+ * Used by both `envBoolean` and `parseNameList` so the accepted set
+ * is consistent.
+ */
+function parseBoolString(v: string): boolean | null {
+  switch (v.trim().toLowerCase()) {
+    case "true":
+    case "1":
+    case "yes":
+    case "on":
+      return true;
+    case "false":
+    case "0":
+    case "no":
+    case "off":
+    case "":
+      return false;
+    default:
+      return null;
+  }
+}
+
+/**
  * Strict boolean coercion for env vars.
  *
  * `z.coerce.boolean()` is a footgun — it delegates to JS `Boolean(x)` which
  * returns `true` for any non-empty string, so `"false"` becomes `true`.
- * That's exactly how the original `SERVER` / `DAEMON` flags ended up silently
- * non-functional.
- *
- * Instead: accept the strings we mean to accept, and reject the rest. Anything
- * outside `{true,false,1,0,yes,no,on,off}` (case-insensitive) is a config
- * error worth surfacing to the operator.
+ * Instead: accept the strings we mean to accept, and reject the rest.
  */
 const envBoolean = z
   .union([z.boolean(), z.string()])
@@ -49,25 +70,15 @@ const envBoolean = z
   .transform((v, ctx) => {
     if (v === undefined) return undefined;
     if (typeof v === "boolean") return v;
-    switch (v.trim().toLowerCase()) {
-      case "true":
-      case "1":
-      case "yes":
-      case "on":
-        return true;
-      case "false":
-      case "0":
-      case "no":
-      case "off":
-      case "":
-        return false;
-      default:
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: `Expected boolean-like value (true/false/1/0/yes/no/on/off), got "${v}"`,
-        });
-        return z.NEVER;
+    const result = parseBoolString(v);
+    if (result === null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Expected boolean-like value (true/false/1/0/yes/no/on/off), got "${v}"`,
+      });
+      return z.NEVER;
     }
+    return result;
   });
 
 export const configSchema = z.object({
@@ -143,19 +154,6 @@ export const configSchema = z.object({
    */
   RUN_CRONS: z.string().optional(),
 
-  /**
-   * @deprecated Use `RUN_SERVER` instead. Kept for backward compatibility.
-   * If both are set, `RUN_SERVER` wins.
-   */
-  SERVER: envBoolean,
-
-  /**
-   * @deprecated Use `RUN_HOOKS` and `RUN_JOBS` instead. Kept for backward compatibility.
-   * `DAEMON=true` is equivalent to `RUN_HOOKS=true RUN_JOBS=true`.
-   * If RUN_HOOKS / RUN_JOBS are explicitly set, they win over DAEMON.
-   */
-  DAEMON: envBoolean,
-
   /** Trusted origins for CORS. Comma-separated. */
   TRUSTED_ORIGINS: z.string().optional(),
 
@@ -202,11 +200,8 @@ export interface RuntimeFlags {
  */
 function parseNameList(value: string | undefined): true | false | Set<string> {
   if (value === undefined || value === "") return false;
-  const trimmed = value.trim().toLowerCase();
-  if (trimmed === "true" || trimmed === "1" || trimmed === "yes" || trimmed === "on")
-    return true;
-  if (trimmed === "false" || trimmed === "0" || trimmed === "no" || trimmed === "off")
-    return false;
+  const result = parseBoolString(value.trim());
+  if (result !== null) return result;
   const names = value
     .split(",")
     .map((s) => s.trim())
@@ -217,72 +212,15 @@ function parseNameList(value: string | undefined): true | false | Set<string> {
 
 /**
  * Resolve the three runtime flags (`server`, `hooks`, `jobs`) from raw env config.
- *
- * Honours legacy `SERVER` / `DAEMON` env vars with `RUN_*` taking precedence.
- * Emits one deprecation warning per legacy variable seen (caller supplies the
- * `warn` callback so this stays pure and unit-testable).
- *
- * @param config - Parsed env config from `parseConfig()`
- * @param warn - Sink for deprecation messages (e.g. `log.warn`)
  */
-export function resolveRuntimeFlags(
-  config: Config,
-  warn: (msg: string) => void = () => {},
-): RuntimeFlags {
-  // ── server ─────────────────────────────────────────────────────────
-  let server: boolean;
-  if (config.RUN_SERVER !== undefined) {
-    server = config.RUN_SERVER;
-  } else if (config.SERVER !== undefined) {
-    warn(
-      "[config] SERVER is deprecated — use RUN_SERVER. See @parcae/backend env docs.",
-    );
-    server = config.SERVER;
-  } else {
-    server = true;
-  }
-
-  // ── hooks ──────────────────────────────────────────────────────────
-  // Hooks default to ON whenever the operator hasn't explicitly opted out.
-  // Legacy DAEMON=true historically enabled both hooks and jobs; legacy
-  // DAEMON=false meant "server only" but hooks still ran because the
-  // adapter never consulted the flag. We preserve both shapes: hooks
-  // remain on unless RUN_HOOKS=false is explicitly set.
-  let hooks: boolean;
-  if (config.RUN_HOOKS !== undefined) {
-    hooks = config.RUN_HOOKS;
-  } else if (config.DAEMON !== undefined) {
-    warn(
-      "[config] DAEMON is deprecated — set RUN_HOOKS and RUN_JOBS explicitly. " +
-        "DAEMON does not control hook execution; hooks default to enabled.",
-    );
-    hooks = true;
-  } else {
-    hooks = true;
-  }
-
-  // ── jobs ───────────────────────────────────────────────────────────
-  let jobs: true | false | ReadonlySet<string>;
-  if (config.RUN_JOBS !== undefined) {
-    jobs = parseNameList(config.RUN_JOBS);
-  } else if (config.DAEMON !== undefined) {
-    // We may have already warned above; don't warn twice. DAEMON=true → jobs on.
-    jobs = config.DAEMON;
-  } else {
-    jobs = false;
-  }
-
-  // ── crons ──────────────────────────────────────────────────────────
-  // Default: any process opted in to jobs also runs every cron. Pure
-  // server processes (RUN_JOBS=false) leave crons off so we don't fire
-  // scheduled work from the HTTP-only fleet. Operators can override with
-  // explicit RUN_CRONS=true / false / name-list.
-  let crons: true | false | ReadonlySet<string>;
-  if (config.RUN_CRONS !== undefined) {
-    crons = parseNameList(config.RUN_CRONS);
-  } else {
-    crons = jobs !== false;
-  }
+export function resolveRuntimeFlags(config: Config): RuntimeFlags {
+  const server = config.RUN_SERVER ?? true;
+  const hooks = config.RUN_HOOKS ?? true;
+  const jobs = parseNameList(config.RUN_JOBS);
+  const crons =
+    config.RUN_CRONS !== undefined
+      ? parseNameList(config.RUN_CRONS)
+      : jobs !== false;
 
   return { server, hooks, jobs, crons };
 }

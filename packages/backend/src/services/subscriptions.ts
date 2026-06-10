@@ -1,3 +1,4 @@
+import { dateSafeClone } from "@parcae/model";
 import { log } from "../logger";
 /**
  * QuerySubscriptionManager — server-side realtime query subscriptions.
@@ -225,37 +226,6 @@ function hashFrom(
     expand: expandKey,
   });
   return createHash("sha256").update(payload).digest("hex").slice(0, 16);
-}
-
-/**
- * Single-pass recursive clone that coerces `Date` instances to ISO
- * strings, drops `undefined`, and strips functions — matching the
- * own-enumerable semantics of `JSON.parse(JSON.stringify(...))` but
- * without the intermediate string materialisation. Used per-row in
- * `_reeval` / `subscribe` so a 50-row × 5KB result set doesn't
- * round-trip through ~250KB of serialised JSON per re-eval (DOL-1047).
- */
-function dateSafeClone<T>(value: T): T {
-  if (value === null || value === undefined) return value;
-  if (value instanceof Date) return value.toISOString() as unknown as T;
-  if (Array.isArray(value)) {
-    const out: any[] = new Array(value.length);
-    for (let i = 0; i < value.length; i++) {
-      out[i] = dateSafeClone(value[i]);
-    }
-    return out as unknown as T;
-  }
-  if (typeof value === "object") {
-    const out: Record<string, any> = {};
-    for (const key of Object.keys(value as object)) {
-      const v = (value as any)[key];
-      if (v === undefined) continue; // match JSON.stringify own-property drop
-      if (typeof v === "function") continue;
-      out[key] = dateSafeClone(v);
-    }
-    return out as unknown as T;
-  }
-  return value;
 }
 
 /**

@@ -30,28 +30,23 @@ function time(): string {
 
 // ─── Log functions ───────────────────────────────────────────────────────────
 
-export function info(...args: any[]): void {
+function info(...args: any[]): void {
   console.log(`${time()} ${c.blue("INF")}`, ...args);
 }
 
-export function warn(...args: any[]): void {
+function warn(...args: any[]): void {
   console.log(`${time()} ${c.yellow("WRN")}`, ...args);
 }
 
-export function error(...args: any[]): void {
+function error(...args: any[]): void {
   console.error(`${time()} ${c.red("ERR")}`, ...args);
 }
 
-export function success(...args: any[]): void {
+function success(...args: any[]): void {
   console.log(`${time()} ${c.green("OK ")}`, ...args);
 }
 
-/**
- * Debug logging. Suppressed unless `PARCAE_DEBUG` is truthy in the
- * environment. Kept out of the default log stream so production output stays
- * readable.
- */
-export function debug(...args: any[]): void {
+function debug(...args: any[]): void {
   if (!process.env.PARCAE_DEBUG) return;
   console.log(`${time()} ${c.dim("DBG")}`, ...args);
 }

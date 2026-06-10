@@ -6,6 +6,7 @@
  */
 
 export {
+  dateSafeClone,
   flushChangeEmits,
   generateId,
   Model,

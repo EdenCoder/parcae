@@ -331,7 +331,7 @@ function ensureIntermediates(
  * traversal (we use `Object.keys` not `for...in` so prototype-chain
  * properties stay absent from the clone, same as the JSON round-trip).
  */
-function dateSafeClone(value: any): any {
+export function dateSafeClone(value: any): any {
   if (value === null || value === undefined) return value;
   if (value instanceof Date) return value.toISOString();
   if (Array.isArray(value)) {

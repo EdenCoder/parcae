@@ -38,7 +38,7 @@
 import type { ModelConstructor, ScopeContext } from "@parcae/model";
 import { Model } from "@parcae/model";
 import pluralize from "pluralize";
-import { ClientError } from "../helpers";
+import { ClientError, json, notFound, forbidden } from "../helpers";
 import { log } from "../logger";
 import { route } from "../routing/route";
 import {
@@ -67,19 +67,6 @@ function buildScopeContext(req: any, res: any): ScopeContext {
     params: req.params ?? {},
     data: req.body ?? {},
   };
-}
-
-function json(res: any, status: number, body: any): void {
-  res.writeHead(status, { "Content-Type": "application/json" });
-  res.end(JSON.stringify(body));
-}
-
-function forbidden(res: any): void {
-  json(res, 403, { result: null, success: false, error: "Forbidden" });
-}
-
-function notFound(res: any, type: string): void {
-  json(res, 404, { result: null, success: false, error: `${type} not found` });
 }
 
 function resolvePath(modelClass: ModelConstructor, version: string): string {

@@ -189,6 +189,7 @@ export {
   ok,
   error,
   unauthorized,
+  forbidden,
   notFound,
   badRequest,
   ClientError,

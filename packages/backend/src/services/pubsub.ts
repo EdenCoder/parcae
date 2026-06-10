@@ -16,6 +16,10 @@ import { Redlock } from "@sesamecare-oss/redlock";
 import EventEmitter from "eventemitter3";
 import { log } from "../logger";
 
+// Namespaced Redis channel so multiple apps sharing one Redis
+// instance don't cross-contaminate each other's pub/sub traffic.
+const REDIS_CHANNEL = "parcae:events";
+
 export interface PubSubConfig {
   /** Redis URL. If not provided, falls back to in-process events only. */
   url?: string;
@@ -48,7 +52,6 @@ export class PubSub {
     this.redisRead = new Client(url, opts);
     this.redisWrite = new Client(url, opts);
 
-    // Log connection lifecycle for each client
     for (const [name, client] of [
       ["lock", this.redisLock],
       ["read", this.redisRead],
@@ -58,7 +61,7 @@ export class PubSub {
         log.info(`PubSub redis:${name} connected (${Date.now() - t0}ms)`),
       );
       (client as Client).on("error", (err) =>
-        log.info(`PubSub redis:${name} error: ${err.message}`),
+        log.warn(`PubSub redis:${name} error: ${err.message}`),
       );
       (client as Client).on("ready", () =>
         log.info(`PubSub redis:${name} ready (${Date.now() - t0}ms)`),
@@ -73,7 +76,7 @@ export class PubSub {
     });
 
     log.info("PubSub subscribing to events channel...");
-    await this.redisRead.subscribe("events");
+    await this.redisRead.subscribe(REDIS_CHANNEL);
     log.info(`PubSub subscribed (${Date.now() - t0}ms)`);
 
     this.redisRead.on("message", (_channel: string, message: string) => {
@@ -88,7 +91,7 @@ export class PubSub {
 
   emit(event: string, ...args: any[]): void {
     if (this.redisWrite) {
-      this.redisWrite.publish("events", JSON.stringify([event, ...args]));
+      this.redisWrite.publish(REDIS_CHANNEL, JSON.stringify([event, ...args]));
     } else {
       // In-process fallback
       this.__events.emit(event, ...args);
@@ -107,7 +110,6 @@ export class PubSub {
   async lock(
     key: string,
     timeout = 5000,
-    retry = 0,
   ): Promise<() => Promise<void>> {
     const MAX_RETRIES = 10;
 
@@ -135,52 +137,50 @@ export class PubSub {
       });
     }
 
-    // Redlock path: acquire the distributed lock first, *then* enter
-    // the in-process queue. Splitting these out (rather than nesting
-    // them inside a single try/catch) keeps the existing retry loop
-    // scoped to Redis-level contention. An in-process queue-wait
-    // timeout means the same Node process is genuinely holding the
-    // lock — retrying immediately would just time out again, so we
-    // surface that as a clean rejection and let the caller decide.
-    let redLock: Awaited<ReturnType<NonNullable<typeof this.redlock>["acquire"]>>;
-    try {
-      redLock = await this.redlock.acquire([key], timeout);
-    } catch {
-      if (retry >= MAX_RETRIES) {
-        throw new Error(
-          `Failed to acquire lock for "${key}" after ${MAX_RETRIES} retries`,
-        );
+    // Redlock path with iterative retry.
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      let redLock: Awaited<ReturnType<NonNullable<typeof this.redlock>["acquire"]>>;
+      try {
+        redLock = await this.redlock.acquire([key], timeout);
+      } catch {
+        if (attempt >= MAX_RETRIES) {
+          throw new Error(
+            `Failed to acquire lock for "${key}" after ${MAX_RETRIES} retries`,
+          );
+        }
+        await new Promise<void>((r) => setTimeout(r, 50));
+        continue;
       }
-      await new Promise<void>((r) => setTimeout(r, 50));
-      return this.lock(key, timeout, retry + 1);
+
+      return new Promise<() => Promise<void>>((resolve, reject) => {
+        this.__lock
+          .acquire(
+            key,
+            () =>
+              new Promise<void>((sub) => {
+                resolve(async () => {
+                  try {
+                    await redLock.release();
+                  } catch {}
+                  sub();
+                });
+              }),
+            { timeout },
+          )
+          .catch(async (err) => {
+            // In-process queue-wait timed out while we already held the
+            // Redis lock. Release it eagerly so we don't leak the
+            // distributed lock for its full TTL.
+            try {
+              await redLock.release();
+            } catch {}
+            reject(err);
+          });
+      });
     }
 
-    return new Promise<() => Promise<void>>((resolve, reject) => {
-      this.__lock
-        .acquire(
-          key,
-          () =>
-            new Promise<void>((sub) => {
-              resolve(async () => {
-                try {
-                  await redLock.release();
-                } catch {}
-                sub();
-              });
-            }),
-          { timeout },
-        )
-        .catch(async (err) => {
-          // In-process queue-wait timed out while we already held the
-          // Redis lock. Release it eagerly so we don't leak the
-          // distributed lock for its full TTL and block every other
-          // instance from acquiring it.
-          try {
-            await redLock.release();
-          } catch {}
-          reject(err);
-        });
-    });
+    // Unreachable — the loop above always returns or throws.
+    throw new Error(`Failed to acquire lock for "${key}"`);
   }
 
   // ── Try-lock (non-blocking) ──────────────────────────────────────────
@@ -190,24 +190,10 @@ export class PubSub {
    * if this caller won the key, `false` if someone else already holds it.
    *
    * Uses `SET NX EX` semantics — the key is auto-released when the TTL
-   * elapses, so callers don't need to remember to unlock. Suitable for
-   * cheap "only one of us runs this tick" patterns like cron deduplication
-   * where every contender computes the same key for the same scheduled
-   * moment and only the first SET succeeds.
-   *
-   * Falls back to in-process state when no Redis is configured (single-
-   * process dev mode): the in-memory Map plays the same role.
-   *
-   * @param key  Identifier for the lock window. Include the tick timestamp
-   *             when used for periodic dedup so each tick has its own key.
-   * @param ttlMs  Time-to-live in milliseconds. Set to the cron interval
-   *             (or a bit longer) so a missed expiry doesn't block the
-   *             next tick.
+   * elapses. Falls back to in-process state when no Redis is configured.
    */
   async tryLock(key: string, ttlMs: number): Promise<boolean> {
     if (this.redisWrite) {
-      // ioredis: `SET key value EX seconds NX` — atomic, returns "OK" on
-      // success or null if the key already exists.
       const ttlSeconds = Math.max(1, Math.ceil(ttlMs / 1000));
       const result = await this.redisWrite.set(
         key,
@@ -219,12 +205,11 @@ export class PubSub {
       return result === "OK";
     }
 
-    // In-process fallback. Track a per-key expiry; reject if still live.
+    // In-process fallback.
     const now = Date.now();
     const existing = this.__tryLocks.get(key);
     if (existing && existing > now) return false;
     this.__tryLocks.set(key, now + ttlMs);
-    // Lazy GC so the map doesn't grow unbounded in long-lived processes.
     if (this.__tryLocks.size > 1024) {
       for (const [k, exp] of this.__tryLocks) {
         if (exp <= now) this.__tryLocks.delete(k);

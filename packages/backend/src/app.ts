@@ -325,6 +325,59 @@ function startCron(entry: CronEntry, pubsub: PubSub): Cron {
   );
 }
 
+// ─── Socket helpers ──────────────────────────────────────────────────────────
+
+async function resyncQueries(
+  socketId: string,
+  socketSession: AuthSession | null,
+  entries: Array<{
+    key: string;
+    modelType: string;
+    steps: unknown[];
+    queryHash?: string | null;
+    subscribe?: boolean;
+  }>,
+  adapter: BackendAdapter,
+  registry: Map<string, ModelConstructor>,
+): Promise<Array<{ key: string; hash: string | null; items: any[]; totalCount: number }>> {
+  const results: Array<{ key: string; hash: string | null; items: any[]; totalCount: number }> = [];
+  const user = socketSession?.user ?? null;
+  for (const entry of entries) {
+    const ModelClass = registry.get(entry.modelType);
+    if (!ModelClass) continue;
+    const scope = (ModelClass as any).scope;
+    if (!scope?.read) continue;
+
+    const scopeResult = scope.read({ user, params: {}, data: {} } as any);
+    if (!scopeResult) continue;
+
+    const prep = prepareClientQuery({
+      ModelClass,
+      scopeResult,
+      rawSteps: entry.steps,
+      modelByType: registry,
+      adapter,
+    });
+
+    if (entry.subscribe === false) {
+      const { items, totalCount } = await runQueryStatic({ prep, user, adapter });
+      results.push({ key: entry.key, hash: null, items, totalCount });
+      continue;
+    }
+
+    if (!adapter.subscriptions) continue;
+
+    const { items, hash, totalCount } = await runQuerySubscription({
+      prep,
+      socketId,
+      user,
+      adapter,
+    });
+    results.push({ key: entry.key, hash, items, totalCount });
+  }
+  return results;
+}
+
 // ─── createApp ───────────────────────────────────────────────────────────────
 
 export function createApp(config: AppConfig): ParcaeApp {
@@ -336,6 +389,7 @@ export function createApp(config: AppConfig): ParcaeApp {
   let server: ServerContext | null = null;
   let envConfig: Config | null = null;
   let flags: RuntimeFlags | null = null;
+  let teardown: Parameters<typeof shutdownResources>[0] | null = null;
 
   return {
     get schemas() {
@@ -355,7 +409,7 @@ export function createApp(config: AppConfig): ParcaeApp {
       // into RUN_SERVER/RUN_HOOKS/RUN_JOBS here; the rest of startup only
       // consults `flags`. We also publish them into the service context
       // so downstream code (e.g. BackendAdapter.runHooks) can branch on them.
-      flags = resolveRuntimeFlags(envConfig, (m) => log.warn(m));
+      flags = resolveRuntimeFlags(envConfig);
       _setRuntimeFlags(flags);
 
       const jobsLabel =
@@ -629,20 +683,18 @@ export function createApp(config: AppConfig): ParcaeApp {
         }
       }
 
-      // Stash teardown handles so `app.stop()` can clean up.
-      //
-      // `stop()` reads these off the server object and hands them to
-      // `shutdownResources()`. We stash the resources rather than
-      // closing over them so that the `stop` closure doesn't pin them
-      // to memory when the app object is held without ever being
-      // started (e.g. in test setup).
-      (server as any)._parcaeChangeBus = changeBus;
-      (server as any)._parcaeOffChange = offChange;
-      (server as any)._parcaeListenNotify = listenNotify;
-      (server as any)._parcaePubSub = pubsub;
-      (server as any)._parcaeQueue = queue;
-      (server as any)._parcaeWriteDb = writeDb;
-      (server as any)._parcaeReadDb = readDb;
+      teardown = {
+        io: server.io,
+        httpServer: server.httpServer,
+        changeBus,
+        offChange,
+        listenNotify,
+        pubsub,
+        queue,
+        writeDb,
+        readDb,
+        crons: null,
+      };
 
       // ── Step 10: Mount auth routes + middleware ─────────────────────
       if (authAdapter) {
@@ -965,8 +1017,7 @@ export function createApp(config: AppConfig): ParcaeApp {
           startedCrons.push(startCron(entry, pubsub));
           scheduled.push(`${entry.name}@"${entry.pattern}"`);
         }
-        // Stash teardown handles so `app.stop()` cleans up.
-        (server as any)._parcaeCrons = startedCrons;
+        if (teardown) teardown.crons = startedCrons;
         if (scheduled.length > 0) {
           log.info(`Scheduled ${scheduled.length} cron(s): ${scheduled.join(", ")}`);
         }
@@ -987,98 +1038,6 @@ export function createApp(config: AppConfig): ParcaeApp {
       // expects it), but on worker-only processes it sits idle — no
       // clients should be hitting the worker URL anyway.
       const modelsByType = new Map(models.map((m) => [m.type, m]));
-
-      // Resync RPC handler — see `transports/socket.ts` for the wire
-      // contract. Re-evaluates each client-supplied chain through the
-      // owning Model's `scope.read`, then rebinds a fresh subscription
-      // on the (post-reconnect) socket id. One round trip restores N
-      // queries.
-      async function resyncQueries(
-        socketId: string,
-        socketSession: AuthSession | null,
-        entries: Array<{
-          key: string;
-          modelType: string;
-          steps: unknown[];
-          queryHash?: string | null;
-          /**
-           * `false` when the client mounted the matching `useQuery`
-           * with `{ subscribe: false }`. Static entries take the
-           * `runQueryStatic` path on reconnect — fresh fetch, no
-           * subscription registered server-side, `hash: null`
-           * returned. Absence ⇒ subscribed (legacy behaviour).
-           */
-          subscribe?: boolean;
-        }>,
-        adapter: BackendAdapter,
-        registry: Map<string, ModelConstructor>,
-      ): Promise<
-        Array<{
-          key: string;
-          hash: string | null;
-          items: any[];
-          totalCount: number;
-        }>
-      > {
-        const results: Array<{
-          key: string;
-          hash: string | null;
-          items: any[];
-          totalCount: number;
-        }> = [];
-        const user = socketSession?.user ?? null;
-        for (const entry of entries) {
-          const ModelClass = registry.get(entry.modelType);
-          if (!ModelClass) continue;
-          const scope = (ModelClass as any).scope;
-          if (!scope?.read) continue;
-
-          const scopeResult = scope.read({
-            user,
-            params: {},
-            data: {},
-          } as any);
-          if (!scopeResult) continue;
-
-          // Canonical query subscription pipeline — same orchestration
-          // the HTTP LIST handler uses, so `.expand(...)` projections
-          // survive the reconnect and the editor's pre-hydrated ref
-          // proxies don't snap to null on resync (DOL-1095).
-          const prep = prepareClientQuery({
-            ModelClass,
-            scopeResult,
-            rawSteps: entry.steps,
-            modelByType: registry,
-            adapter,
-          });
-
-          if (entry.subscribe === false) {
-            // Static entry — `useQuery({ subscribe: false })`. Fresh
-            // fetch on reconnect (Q2=B in DOL-1148), but no
-            // subscription registered server-side. `hash: null`
-            // tells the SDK not to attach a `query:${hash}` listener.
-            const { items, totalCount } = await runQueryStatic({
-              prep,
-              user,
-              adapter,
-            });
-            results.push({ key: entry.key, hash: null, items, totalCount });
-            continue;
-          }
-
-          if (!adapter.subscriptions) continue;
-
-          const { items, hash, totalCount } = await runQuerySubscription({
-            prep,
-            socketId,
-            user,
-            adapter,
-          });
-
-          results.push({ key: entry.key, hash, items, totalCount });
-        }
-        return results;
-      }
 
       if (flags.server) server.io.on("connection", (socket) => {
         let socketSession: any = null;
@@ -1315,30 +1274,10 @@ export function createApp(config: AppConfig): ParcaeApp {
       if (!server) return;
       log.info("Shutting down...");
 
-      // Pull every stashed resource off the server object and hand it
-      // to the shared shutdown helper. The helper drives the ordering
-      // and swallows per-resource errors so a slow Redis can't stop
-      // the DB pool from closing. See `./shutdown.ts` for the contract.
-      const stash = server as any;
-      await shutdownResources({
-        io: server.io,
-        httpServer: server.httpServer,
-        crons: (stash._parcaeCrons as Cron[] | undefined) ?? null,
-        listenNotify:
-          (stash._parcaeListenNotify as ListenNotifyPoller | null | undefined) ??
-          null,
-        offChange:
-          (stash._parcaeOffChange as (() => void) | undefined) ?? null,
-        changeBus: (stash._parcaeChangeBus as ChangeBus | undefined) ?? null,
-        queue: (stash._parcaeQueue as QueueService | undefined) ?? null,
-        pubsub: (stash._parcaePubSub as PubSub | undefined) ?? null,
-        writeDb: (stash._parcaeWriteDb as ReturnType<typeof knex> | undefined) ?? null,
-        readDb: (stash._parcaeReadDb as ReturnType<typeof knex> | undefined) ?? null,
-      });
+      await shutdownResources(teardown ?? {});
 
-      // Null out the closure so a follow-up stop() is a no-op rather
-      // than re-running the cleanup against half-closed handles.
       server = null;
+      teardown = null;
       log.info("Shutdown complete");
     },
   };

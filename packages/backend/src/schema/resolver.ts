@@ -91,11 +91,10 @@ function resolveType(type: Type): ColumnType {
     return "json";
   }
 
-  // Text — unlimited text column (vs string which is VARCHAR 2048)
-  if (text === "Text" || text.includes("Text")) return "text";
-
-  // Text — branded string type for unlimited TEXT columns
-  // Matches `Text` (string & { __brand: "Text" }) from @parcae/model
+  // Text — branded string type for unlimited TEXT columns.
+  // Matches `Text` (string & { __brand: "Text" }) from @parcae/model.
+  // The `'"Text"'` check catches the branded intersection form that
+  // ts-morph represents as `string & { readonly __brand: "Text" }`.
   if (text === "Text" || text.includes('"Text"')) return "text";
 
   // Primitives

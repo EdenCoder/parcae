@@ -184,15 +184,11 @@ describe("config", () => {
   it("should use defaults", () => {
     const config = parseConfig({ DATABASE_URL: "postgres://localhost/test" });
     expect(config.PORT).toBe(3000);
-    // RUN_* flags are intentionally undefined at the raw-config layer —
-    // resolution into booleans happens in resolveRuntimeFlags(). The
-    // legacy SERVER/DAEMON aliases default to undefined too so we can
-    // distinguish "user didn't set" from an explicit value.
+    // RUN_* flags are undefined at the raw-config layer; resolution
+    // into booleans happens in resolveRuntimeFlags().
     expect(config.RUN_SERVER).toBeUndefined();
     expect(config.RUN_HOOKS).toBeUndefined();
     expect(config.RUN_JOBS).toBeUndefined();
-    expect(config.SERVER).toBeUndefined();
-    expect(config.DAEMON).toBeUndefined();
   });
 });
 
@@ -243,40 +239,9 @@ describe("resolveRuntimeFlags", () => {
     ]);
   });
 
-  // Legacy SERVER=true should still produce server=true. Deprecation warning
-  // is captured so we can assert it fires exactly once.
-  it("maps legacy SERVER to RUN_SERVER with a deprecation warning", () => {
+  it("RUN_HOOKS / RUN_JOBS=false override defaults", () => {
     const cfg = parseConfig({
       DATABASE_URL: "postgres://localhost/test",
-      SERVER: "false",
-    });
-    const warnings: string[] = [];
-    const flags = resolveRuntimeFlags(cfg, (m) => warnings.push(m));
-    expect(flags.server).toBe(false);
-    expect(warnings.some((w) => w.includes("SERVER is deprecated"))).toBe(true);
-  });
-
-  // Legacy DAEMON=true should map to hooks+jobs both on, with a single
-  // deprecation warning. The warning is keyed on DAEMON so callers can
-  // upgrade in one go.
-  it("maps legacy DAEMON=true to hooks=true jobs=true", () => {
-    const cfg = parseConfig({
-      DATABASE_URL: "postgres://localhost/test",
-      DAEMON: "true",
-    });
-    const warnings: string[] = [];
-    const flags = resolveRuntimeFlags(cfg, (m) => warnings.push(m));
-    expect(flags.hooks).toBe(true);
-    expect(flags.jobs).toBe(true);
-    expect(warnings.some((w) => w.includes("DAEMON is deprecated"))).toBe(true);
-  });
-
-  // Explicit RUN_HOOKS / RUN_JOBS override legacy DAEMON. No surprise
-  // collisions when an operator is mid-migration.
-  it("RUN_HOOKS / RUN_JOBS override legacy DAEMON", () => {
-    const cfg = parseConfig({
-      DATABASE_URL: "postgres://localhost/test",
-      DAEMON: "true",
       RUN_HOOKS: "false",
       RUN_JOBS: "false",
     });
@@ -285,19 +250,12 @@ describe("resolveRuntimeFlags", () => {
     expect(flags.jobs).toBe(false);
   });
 
-  // RUN_SERVER overrides legacy SERVER, no warning fires for SERVER.
-  it("RUN_SERVER overrides legacy SERVER without warning", () => {
+  it("RUN_SERVER=false takes effect when set", () => {
     const cfg = parseConfig({
       DATABASE_URL: "postgres://localhost/test",
-      SERVER: "true",
       RUN_SERVER: "false",
     });
-    const warnings: string[] = [];
-    const flags = resolveRuntimeFlags(cfg, (m) => warnings.push(m));
-    expect(flags.server).toBe(false);
-    expect(warnings.some((w) => w.includes("SERVER is deprecated"))).toBe(
-      false,
-    );
+    expect(resolveRuntimeFlags(cfg).server).toBe(false);
   });
 });
 

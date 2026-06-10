@@ -71,6 +71,13 @@ export function unauthorized(res: any): void {
 }
 
 /**
+ * 403 Forbidden shorthand.
+ */
+export function forbidden(res: any): void {
+  error(res, 403, "Forbidden");
+}
+
+/**
  * 404 Not Found shorthand.
  */
 export function notFound(res: any, what?: string): void {

@@ -1,4 +1,5 @@
 export { ParcaeProvider } from "./Provider";
+export { useParcae } from "./context";
 
 export { useQuery, prefetch } from "./useQuery";
 export type { PrefetchOptions } from "./useQuery";
@@ -9,7 +10,7 @@ export {
   scheduleCoalesced,
   cancelCoalesced,
 } from "./useModelAtomic";
-export { useApi, useSDK, useConnectionStatus } from "./useApi";
+export { useApi } from "./useApi";
 export { useSocket } from "./useSocket";
 export type { SocketHook } from "./useSocket";
 export { useSetting } from "./useSetting";
