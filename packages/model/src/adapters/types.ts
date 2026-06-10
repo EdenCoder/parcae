@@ -368,6 +368,23 @@ export interface QueryChain<T> {
    */
   withForceRefresh?(): QueryChain<T>;
 
+  /**
+   * Return a sibling chain whose `.find()` injects
+   * `__subscribe: false` into the request. The backend's auto-CRUD
+   * LIST handler skips `QuerySubscriptionManager.subscribe` and
+   * returns the result set without a `__queryHash`. The frontend
+   * `useQuery` hook uses this to honour `{ subscribe: false }` —
+   * static queries that don't need realtime push (frozen historical
+   * reports, cold registry rows, etc.). Composable with
+   * `withForceRefresh` for the polled-but-static case.
+   *
+   * Optional — backends that don't implement realtime can leave it
+   * unimplemented; the flag is a no-op server-side anyway.
+   *
+   * @internal
+   */
+  withSubscribe?(subscribe: boolean): QueryChain<T>;
+
   // Internal — used by hooks and subscription manager
   /** @internal */ __steps: QueryStep[];
   /** @internal */ __modelType: string;
@@ -375,6 +392,8 @@ export interface QueryChain<T> {
   /** @internal */ __adapter: ModelAdapter;
   /** @internal — true when `.withForceRefresh()` was applied. */
   __forceRefresh?: boolean;
+  /** @internal — false when `.withSubscribe(false)` was applied. */
+  __subscribe?: boolean;
   /**
    * @internal — ref field names recorded by `.expand(...)`. Used by
    * backend route handlers / the subscription manager to drive

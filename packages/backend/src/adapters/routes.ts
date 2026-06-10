@@ -41,11 +41,10 @@ import pluralize from "pluralize";
 import { ClientError } from "../helpers";
 import { log } from "../logger";
 import { route } from "../routing/route";
-import { hydrateExpansions } from "../services/hydrate-expansions";
-import { getRefLoader } from "../services/context";
 import {
   prepareClientQuery,
   runQuerySubscription,
+  runQueryStatic,
 } from "../services/query-subscription";
 import type { BackendAdapter } from "./model";
 
@@ -287,6 +286,16 @@ export function registerModelRoutes(
             return json(res, 200, { result: { total }, success: true });
           }
 
+          // `__subscribe: false` is the client's static-query opt-out
+          // — set by `useQuery({ subscribe: false })` and `prefetch(...,
+          // { subscribe: false })`. The wire request short-circuits
+          // the subscribe branch below, falls through to
+          // `runQueryStatic`, and the response omits `__queryHash`
+          // so the SDK never attaches a `query:${hash}` listener.
+          const wantsSubscription = !(
+            data.__subscribe === false || data.__subscribe === "false"
+          );
+
           // Socket-RPC LIST → subscribe to query-level change
           // notifications. The subscription manager re-evals on model
           // changes and emits surgical add/remove/update ops to this
@@ -296,7 +305,7 @@ export function registerModelRoutes(
           // every subscriber on the same hash. Without it, repeated
           // LIST calls just hand back the cached row set.
           const socketId = req._socketId;
-          if (socketId && adapter.subscriptions) {
+          if (socketId && adapter.subscriptions && wantsSubscription) {
             const force =
               data.__forceRefresh === true || data.__forceRefresh === "true";
             const { items, hash, totalCount } = await runQuerySubscription({
@@ -319,38 +328,23 @@ export function registerModelRoutes(
             return;
           }
 
-          // Non-socket fetch fallback. No subscription, no realtime —
-          // one-shot find() + sanitise + optional expand hydrate.
-          const [items, totalCount] = await Promise.all([
-            prep.query.find(),
-            prep.countQuery.count(),
-          ]);
-
-          const wireItems = await Promise.all(
-            items.map((m: RouteModelRow) => projectForWire(m, ctx.user)),
-          );
-
-          if (prep.expandResolved.length > 0) {
-            const loader = getRefLoader();
-            if (loader) {
-              await hydrateExpansions(
-                wireItems,
-                prep.expandResolved,
-                loader,
-                ctx.user ?? null,
-              );
-            }
-            // No RefLoader (request frame absent) → rows go out
-            // un-expanded. Defensive: this only happens for code
-            // paths that bypass `runWithRequestContext`, which the
-            // app bootstrap installs for every HTTP request.
-          }
+          // Static path — no subscription, no realtime. Used for the
+          // non-socket fetch fallback and for socket requests that
+          // opted out via `__subscribe: false`. The pipeline (plain
+          // find + sanitise + expand hydrate) is shared with the
+          // socket-RPC resync handler so the two paths can't drift
+          // apart again (see DOL-1095 / DOL-1148).
+          const { items, totalCount } = await runQueryStatic({
+            prep,
+            user: ctx.user ?? null,
+            adapter,
+          });
 
           json(res, 200, {
             result: {
               total: items.length,
               totalCount,
-              [pluralize(type)]: wireItems,
+              [pluralize(type)]: items,
             },
             success: true,
           });

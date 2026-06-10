@@ -16,6 +16,8 @@ interface QueryChain<T> {
   __adapter?: any;
   /** Returns a sibling chain whose `.find()` sends `__forceRefresh: true`. */
   withForceRefresh?: () => QueryChain<T>;
+  /** Returns a sibling chain whose `.find()` sends `__subscribe: false`. */
+  withSubscribe?: (subscribe: boolean) => QueryChain<T>;
 }
 
 interface UseQueryOptions {
@@ -25,6 +27,16 @@ interface UseQueryOptions {
    * 0 to disable.
    */
   poll?: number;
+  /**
+   * When `false`, the query is treated as static: no server-side
+   * `QuerySubscriptionManager` registration, no `client.subscribe`
+   * listener for `query:${hash}` ops. The find request carries
+   * `__subscribe: false` and the response omits `__queryHash`. On
+   * reconnect, static entries are re-fetched (no subscription
+   * registered server-side). Orthogonal to `poll` — set both for a
+   * poll-driven refresh without realtime push. Default `true`.
+   */
+  subscribe?: boolean;
 }
 
 interface UseQueryResult<T> {
@@ -61,6 +73,14 @@ interface CacheEntry {
   retryCount: number;
   retryTimer: ReturnType<typeof setTimeout> | null;
   opsListeners: Set<(ops: QueryOp[]) => void>;
+  /**
+   * `false` when this entry was created from a `{ subscribe: false }`
+   * call site. Captured at entry creation (and baked into the cache
+   * key, so static and dynamic mounts of the same chain don't share
+   * an entry). `doFetch` injects `__subscribe: false` on the wire and
+   * `_onResyncRequired` skips re-registering a subscription.
+   */
+  subscribe: boolean;
 }
 
 const cache = new Map<string, CacheEntry>();
@@ -123,9 +143,15 @@ export function getMergedItems(entry: CacheEntry): any[] {
   return merged;
 }
 
-function getOrCreate(key: string): CacheEntry {
+function getOrCreate(key: string, subscribe?: boolean): CacheEntry {
   let e = cache.get(key);
   if (!e) {
+    // Derive from the key suffix when not passed explicitly. Lets
+    // `addOptimistic` / `refetch` / `__test.fetch` callers stay
+    // ignorant of the subscribe contract — the key already encodes
+    // it (see `buildKey`'s `:nosub` suffix). Prevents a GC'd entry
+    // from being re-created with the wrong mode.
+    const resolved = subscribe ?? !key.endsWith(":nosub");
     e = {
       items: EMPTY,
       optimistic: [],
@@ -146,6 +172,7 @@ function getOrCreate(key: string): CacheEntry {
       retryCount: 0,
       retryTimer: null,
       opsListeners: new Set(),
+      subscribe: resolved,
     };
     cache.set(key, e);
   }
@@ -463,10 +490,13 @@ function doFetch(
   entry.error = null;
   notify(entry);
 
-  const fetchChain =
-    opts.force && typeof chain.withForceRefresh === "function"
-      ? chain.withForceRefresh()
-      : chain;
+  let fetchChain: QueryChain<any> = chain;
+  if (opts.force && typeof fetchChain.withForceRefresh === "function") {
+    fetchChain = fetchChain.withForceRefresh();
+  }
+  if (entry.subscribe === false && typeof fetchChain.withSubscribe === "function") {
+    fetchChain = fetchChain.withSubscribe(false);
+  }
 
   fetchChain
     .find()
@@ -488,7 +518,11 @@ function doFetch(
         entry.retryTimer = null;
       }
 
-      if (hash && hash !== entry.queryHash) {
+      // `entry.subscribe === false` is the static-query opt-out; the
+      // backend should never have returned a hash for these, but
+      // gate defensively so a misbehaving backend can't trick us
+      // into attaching a `query:${hash}` listener anyway.
+      if (hash && hash !== entry.queryHash && entry.subscribe !== false) {
         entry.dispose?.();
         entry.queryHash = hash;
 
@@ -554,6 +588,7 @@ export function _onResyncRequired(client: ParcaeClient): void {
     modelType: string;
     steps: unknown[];
     queryHash: string | null;
+    subscribe: boolean;
   }[] = [];
 
   for (const [cacheKey, entry] of cache) {
@@ -566,6 +601,7 @@ export function _onResyncRequired(client: ParcaeClient): void {
       modelType,
       steps: entry.chain.__steps ?? [],
       queryHash: entry.queryHash,
+      subscribe: entry.subscribe,
     });
   }
 
@@ -578,6 +614,10 @@ export function _onResyncRequired(client: ParcaeClient): void {
         modelType: e.modelType,
         steps: e.steps,
         queryHash: e.queryHash,
+        // Omit `subscribe` when default `true` so older backends that
+        // don't know the field continue to work — they treat absence
+        // as subscribed, which is the existing behaviour.
+        ...(e.subscribe === false ? { subscribe: false } : {}),
       })),
     )
     .then((results) => {
@@ -607,8 +647,17 @@ export function _onResyncRequired(client: ParcaeClient): void {
 
         // The server may have rebuilt a fresh subscription on the new
         // socket — wire it up if the hash changed. The old listener
-        // is disposed by the swap.
-        if (result.hash && result.hash !== entry.queryHash && entry.client) {
+        // is disposed by the swap. Static entries (`subscribe:
+        // false`) get `hash: null` back from the resync handler, so
+        // this block naturally skips; the explicit `subscribe !==
+        // false` guard is defensive in case a misbehaving backend
+        // hands one out.
+        if (
+          result.hash &&
+          result.hash !== entry.queryHash &&
+          entry.client &&
+          entry.subscribe !== false
+        ) {
           entry.dispose?.();
           entry.queryHash = result.hash;
           const subClient = entry.client;
@@ -663,14 +712,20 @@ export function _onResyncRequired(client: ParcaeClient): void {
 /**
  * Build the cache key from a chain + session. Identity-stable across
  * disconnects because session.userId doesn't change on disconnect.
+ * `subscribe: false` mounts get a distinct `:nosub` suffix so a
+ * static and a dynamic consumer of the same chain don't share the
+ * same cache entry (they would otherwise conflict on `queryHash` and
+ * the wire shape of the find request).
  */
 function buildKey(
   modelType: string | undefined,
   userId: string | null,
   steps: any[] | undefined,
+  subscribe = true,
 ): string | null {
   if (!modelType) return null;
-  return `${modelType}:${userId ?? "anon"}:${JSON.stringify(steps ?? [])}`;
+  const subPart = subscribe === false ? ":nosub" : "";
+  return `${modelType}:${userId ?? "anon"}:${JSON.stringify(steps ?? [])}${subPart}`;
 }
 
 export function useQuery<T>(
@@ -680,6 +735,8 @@ export function useQuery<T>(
   const client = useParcae();
   const { status: sessionStatus, userId } = useSession();
 
+  const subscribe = options.subscribe !== false;
+
   // Hold off building a key until the session has resolved. Identity
   // is required for both correctness (queries scope by user) and key
   // stability (we can't change keys mid-flight just because the
@@ -687,7 +744,7 @@ export function useQuery<T>(
   // or authenticated), the key is final until userId changes.
   const sessionReady = sessionStatus !== "pending";
   const key = sessionReady
-    ? buildKey(chain?.__modelType, userId, chain?.__steps)
+    ? buildKey(chain?.__modelType, userId, chain?.__steps, subscribe)
     : null;
 
   const chainRef = useRef(chain);
@@ -697,10 +754,10 @@ export function useQuery<T>(
   const keyRef = useRef(key);
   keyRef.current = key;
 
-  const subscribe = useCallback(
+  const subscribeToCache = useCallback(
     (onChange: () => void) => {
       if (!key) return () => {};
-      const e = getOrCreate(key);
+      const e = getOrCreate(key, subscribe);
       e.refs++;
       e.listeners.add(onChange);
       if (e.gcTimer) {
@@ -730,7 +787,7 @@ export function useQuery<T>(
     return cache.get(key)?.hash ?? INITIAL_HASH;
   }, [key]);
 
-  useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  useSyncExternalStore(subscribeToCache, getSnapshot, getSnapshot);
 
   // First-time fetch on key change.
   useEffect(() => {
@@ -738,7 +795,7 @@ export function useQuery<T>(
     const currentChain = chainRef.current;
     if (!currentChain) return;
 
-    const entry = getOrCreate(key);
+    const entry = getOrCreate(key, subscribe);
     entry.retryCount = 0;
     if (entry.retryTimer) {
       clearTimeout(entry.retryTimer);
@@ -932,6 +989,17 @@ export function useQuery<T>(
 export interface PrefetchOptions {
   /** Wait for the session to resolve before building the cache key. Default `true`. */
   waitForSession?: boolean;
+  /**
+   * When `false`, the prefetch is treated as static — same semantics
+   * as `useQuery({ subscribe: false })`. The wire request carries
+   * `__subscribe: false`, the backend skips `QuerySubscriptionManager
+   * .subscribe`, and the resulting cache entry never has a
+   * `queryHash`. Use this when prefetching for SSR / warm-cache of a
+   * chain whose matching `useQuery` will also be `{ subscribe: false }`
+   * — otherwise the two will produce separate cache entries because
+   * `subscribe` is part of the cache key. Default `true`.
+   */
+  subscribe?: boolean;
 }
 
 export async function prefetch<T>(
@@ -940,6 +1008,7 @@ export async function prefetch<T>(
   options: PrefetchOptions = {},
 ): Promise<T[]> {
   const waitForSession = options.waitForSession ?? true;
+  const subscribe = options.subscribe !== false;
 
   if (waitForSession) {
     await client.session.ready;
@@ -952,10 +1021,10 @@ export async function prefetch<T>(
       "prefetch: chain has no __modelType — was it built from a real Model class?",
     );
   }
-  const key = buildKey(modelType, userId, (chain as any).__steps);
+  const key = buildKey(modelType, userId, (chain as any).__steps, subscribe);
   if (!key) throw new Error("prefetch: failed to build cache key");
 
-  const entry = getOrCreate(key);
+  const entry = getOrCreate(key, subscribe);
 
   entry.refs++;
   if (entry.gcTimer) {
@@ -994,7 +1063,15 @@ export async function prefetch<T>(
       settle(entry.error);
       return;
     }
-    if (!entry.loading && entry.queryHash !== null) {
+    // "Already loaded" fast path. For subscribed entries the
+    // `queryHash !== null` check stands in for "the backend completed
+    // the subscribe handshake" — without it we might short-circuit on
+    // a half-populated entry. For static entries (`subscribe: false`)
+    // there is no hash, so the fast path is just `!loading && !error`.
+    const fullyLoaded = subscribe
+      ? !entry.loading && entry.queryHash !== null
+      : !entry.loading && entry.chain !== null;
+    if (fullyLoaded) {
       settle(entry.items as T[]);
       return;
     }
@@ -1025,20 +1102,31 @@ export const __test = {
   getEntry(key: string): CacheEntry | undefined {
     return cache.get(key);
   },
-  buildKey(modelType: string, userId: string | null, steps: unknown[]): string {
-    return `${modelType}:${userId ?? "anon"}:${JSON.stringify(steps)}`;
+  buildKey(
+    modelType: string,
+    userId: string | null,
+    steps: unknown[],
+    subscribe = true,
+  ): string {
+    const subPart = subscribe === false ? ":nosub" : "";
+    return `${modelType}:${userId ?? "anon"}:${JSON.stringify(steps)}${subPart}`;
   },
   fetch(
     key: string,
     chain: QueryChain<any>,
     client: ParcaeClient,
+    subscribe?: boolean,
   ): CacheEntry {
-    const entry = getOrCreate(key);
+    const entry = getOrCreate(key, subscribe);
     doFetch(key, entry, chain, client);
     return entry;
   },
-  retain(key: string, onChange: () => void): () => void {
-    const entry = getOrCreate(key);
+  retain(
+    key: string,
+    onChange: () => void,
+    subscribe?: boolean,
+  ): () => void {
+    const entry = getOrCreate(key, subscribe);
     entry.refs++;
     entry.listeners.add(onChange);
     return () => {

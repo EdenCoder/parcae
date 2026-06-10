@@ -71,12 +71,26 @@ export interface ResyncEntry {
   steps: unknown[];
   /** Last-known queryHash, so the server can skip resending unchanged subscriptions. */
   queryHash?: string | null;
+  /**
+   * `false` when the matching `useQuery` was mounted with
+   * `{ subscribe: false }`. The server's resync handler takes the
+   * static path for these entries — fresh fetch, no subscription
+   * registered, `hash: null` in the result. Absence ⇒ subscribed
+   * (legacy behaviour), so older backends remain compatible.
+   */
+  subscribe?: boolean;
 }
 
 /** Wire shape for a single resolved entry coming back from the server. */
 export interface ResyncResult {
   key: string;
-  hash: string;
+  /**
+   * `null` for static (`subscribe: false`) entries — no subscription
+   * was registered server-side, so there's no hash to attach a
+   * `query:${hash}` listener to. The SDK uses this to short-circuit
+   * the subscribe block in `_onResyncRequired`.
+   */
+  hash: string | null;
   items: any[];
   totalCount: number;
 }

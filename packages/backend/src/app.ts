@@ -51,6 +51,7 @@ import {
 import {
   prepareClientQuery,
   runQuerySubscription,
+  runQueryStatic,
 } from "./services/query-subscription";
 import { getJobs } from "./routing/job";
 import { getHooks } from "./routing/hook";
@@ -1000,15 +1001,28 @@ export function createApp(config: AppConfig): ParcaeApp {
           modelType: string;
           steps: unknown[];
           queryHash?: string | null;
+          /**
+           * `false` when the client mounted the matching `useQuery`
+           * with `{ subscribe: false }`. Static entries take the
+           * `runQueryStatic` path on reconnect — fresh fetch, no
+           * subscription registered server-side, `hash: null`
+           * returned. Absence ⇒ subscribed (legacy behaviour).
+           */
+          subscribe?: boolean;
         }>,
         adapter: BackendAdapter,
         registry: Map<string, ModelConstructor>,
       ): Promise<
-        Array<{ key: string; hash: string; items: any[]; totalCount: number }>
+        Array<{
+          key: string;
+          hash: string | null;
+          items: any[];
+          totalCount: number;
+        }>
       > {
         const results: Array<{
           key: string;
-          hash: string;
+          hash: string | null;
           items: any[];
           totalCount: number;
         }> = [];
@@ -1025,7 +1039,6 @@ export function createApp(config: AppConfig): ParcaeApp {
             data: {},
           } as any);
           if (!scopeResult) continue;
-          if (!adapter.subscriptions) continue;
 
           // Canonical query subscription pipeline — same orchestration
           // the HTTP LIST handler uses, so `.expand(...)` projections
@@ -1038,6 +1051,23 @@ export function createApp(config: AppConfig): ParcaeApp {
             modelByType: registry,
             adapter,
           });
+
+          if (entry.subscribe === false) {
+            // Static entry — `useQuery({ subscribe: false })`. Fresh
+            // fetch on reconnect (Q2=B in DOL-1148), but no
+            // subscription registered server-side. `hash: null`
+            // tells the SDK not to attach a `query:${hash}` listener.
+            const { items, totalCount } = await runQueryStatic({
+              prep,
+              user,
+              adapter,
+            });
+            results.push({ key: entry.key, hash: null, items, totalCount });
+            continue;
+          }
+
+          if (!adapter.subscriptions) continue;
+
           const { items, hash, totalCount } = await runQuerySubscription({
             prep,
             socketId,
@@ -1170,6 +1200,13 @@ export function createApp(config: AppConfig): ParcaeApp {
                 modelType: string;
                 steps: unknown[];
                 queryHash?: string | null;
+                /**
+                 * `false` when the client mounted the matching
+                 * `useQuery` with `{ subscribe: false }`. Forwarded
+                 * to `resyncQueries`, which takes the
+                 * `runQueryStatic` path for these entries.
+                 */
+                subscribe?: boolean;
               }>;
             },
             callback: any,

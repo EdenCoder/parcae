@@ -3,7 +3,7 @@
  * `__query` steps → either a subscribed result with expand or a raw
  * query."
  *
- * Two helpers, each owning a discrete slice of the work:
+ * Three helpers, each owning a discrete slice of the work:
  *
  *   prepareClientQuery({ ModelClass, scopeResult, rawSteps, ... })
  *     → { query, countQuery, expandResolved, steps }
@@ -11,20 +11,34 @@
  *   runQuerySubscription({ ...prep, socketId, user, force? })
  *     → { items, hash, totalCount }
  *
+ *   runQueryStatic({ ...prep, user })
+ *     → { items, totalCount }
+ *
  * `prepareClientQuery` is pure step-manipulation + query construction —
  * no I/O, no subscription side effects. It normalises raw steps, peels
  * off `.expand(...)`, strips expand from the SQL replay, and builds the
- * count companion. Three call sites use it: the LIST handler's
- * count-short-circuit, the LIST handler's non-socket fetch fallback,
- * and the subscribe path (LIST + resync).
+ * count companion. Four call sites use it: the LIST handler's
+ * count-short-circuit, the LIST handler's static and subscribed fetch
+ * paths, and the socket-RPC resync handler.
  *
  * `runQuerySubscription` consumes a prep result, runs the subscribe +
  * hydrate handshake against `adapter.subscriptions`, and returns the
  * wire-ready row set. Two call sites use it: the LIST handler (when
- * `req._socketId` is set) and the socket-RPC `resync` handler.
+ * `req._socketId` is set AND the request didn't opt out via
+ * `__subscribe: false`) and the socket-RPC `resync` handler (for
+ * dynamic entries).
  *
- * Before this consolidation, both call sites had their own diverged
- * copies of the pipeline. The resync copy skipped `parseExpandSpecs`,
+ * `runQueryStatic` mirrors `runQuerySubscription` for the static
+ * path — plain find + sanitise + expand hydrate, no subscription
+ * registered. Used by the LIST handler when `__subscribe: false`
+ * (set by `useQuery({ subscribe: false })` / `prefetch(...,
+ * { subscribe: false })`), the LIST handler's non-socket fallback,
+ * and the socket-RPC `resync` handler for static entries on
+ * reconnect.
+ *
+ * Before this consolidation, the LIST handler's non-socket path and
+ * the resync handler's pipeline each had their own diverged copies of
+ * the subscribe path. The resync copy skipped `parseExpandSpecs`,
  * `validateExpandSpecs`, `stripExpandSteps`, `expand:` on `subscribe`,
  * and `hydrateExpansions` entirely — which meant every WebSocket
  * reconnect served un-expanded rows to clients that had originally
@@ -192,4 +206,66 @@ export async function runQuerySubscription(
   }
 
   return { items, hash: sub.hash, totalCount };
+}
+
+// ─── runQueryStatic ──────────────────────────────────────────────────────────
+
+export interface RunQueryStaticOptions {
+  /** Output of `prepareClientQuery` — the chains + resolved expand. */
+  prep: PreparedClientQuery;
+  /** Request user — passed to model `sanitize()` and `hydrateExpansions`. */
+  user: { id: string } | null;
+  adapter: BackendAdapter;
+}
+
+export interface RunQueryStaticResult {
+  /** Sanitised, expand-hydrated rows ready to ship to the client. */
+  items: any[];
+  /** Filter-matched row count without limit/offset, for pagination UI. */
+  totalCount: number;
+}
+
+/**
+ * Run the static (no-subscription) pipeline: plain find + sanitise +
+ * expand hydrate, no `QuerySubscriptionManager` registration, no
+ * `__queryHash` produced. The LIST handler uses this for the
+ * non-socket fallback and for `__subscribe: false` requests; the
+ * socket-RPC resync handler uses it for entries the client marked
+ * static.
+ */
+export async function runQueryStatic(
+  opts: RunQueryStaticOptions,
+): Promise<RunQueryStaticResult> {
+  const { prep, user } = opts;
+  const { query, countQuery, expandResolved } = prep;
+
+  const [rawItems, totalCount] = await Promise.all([
+    query.find(),
+    countQuery.count(),
+  ]);
+
+  // Sanitise to wire shape — mirrors routes.ts's `projectForWire`.
+  // Models that ship a `sanitize(user)` method honour their declared
+  // privateFields; the fallback covers test fixtures and oddball
+  // model implementations that don't define sanitize.
+  const items = await Promise.all(
+    rawItems.map(async (m: any) => {
+      if (typeof m?.sanitize === "function") {
+        return await m.sanitize(user ?? undefined);
+      }
+      return m?.__data ?? m;
+    }),
+  );
+
+  if (expandResolved.length > 0) {
+    const loader = getRefLoader();
+    if (loader) {
+      await hydrateExpansions(items, expandResolved, loader, user);
+    }
+    // No RefLoader → rows go out un-expanded. Mirrors
+    // `runQuerySubscription`'s behaviour — only happens for paths
+    // that bypass `runWithRequestContext`.
+  }
+
+  return { items, totalCount };
 }

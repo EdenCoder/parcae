@@ -180,7 +180,7 @@ export class FrontendAdapter implements ModelAdapter {
   private _buildQuery<T>(
     modelClass: ModelConstructor<T>,
     steps: QueryStep[],
-    options: { forceRefresh?: boolean } = {},
+    options: { forceRefresh?: boolean; subscribe?: boolean } = {},
   ): QueryChain<T> {
     const chain: any = {};
 
@@ -205,6 +205,12 @@ export class FrontendAdapter implements ModelAdapter {
       // emit any drift to every subscriber. Used by `useQuery`'s
       // periodic drift poll to recover from missed events.
       if (options.forceRefresh) requestData.__forceRefresh = true;
+      // `__subscribe: false` tells the backend's LIST handler to skip
+      // `QuerySubscriptionManager.subscribe` and omit `__queryHash`
+      // from the response. The frontend `useQuery` hook uses this to
+      // honour `{ subscribe: false }` — static queries that never
+      // need realtime push. Default (absent) means subscribed.
+      if (options.subscribe === false) requestData.__subscribe = false;
       const result = await this.transport.get(path, requestData);
       // Read the list envelope under the pluralized collection key
       // (matching the backend route). The `${type}s` key is kept as a
@@ -265,11 +271,28 @@ export class FrontendAdapter implements ModelAdapter {
       });
     };
 
+    /**
+     * Returns a sibling chain that, on `.find()`, sets the
+     * `__subscribe: false` request flag. The backend's LIST handler
+     * skips `QuerySubscriptionManager.subscribe` and omits the
+     * `__queryHash` from the response, so the frontend never attaches
+     * a `query:${hash}` socket listener. Used by `useQuery({
+     * subscribe: false })` and `prefetch(..., { subscribe: false })`
+     * for static queries.
+     */
+    chain.withSubscribe = (subscribe: boolean): QueryChain<T> => {
+      return this._buildQuery(modelClass, steps, {
+        ...options,
+        subscribe,
+      });
+    };
+
     chain.__steps = steps;
     chain.__modelType = modelClass.type;
     chain.__modelClass = modelClass;
     chain.__adapter = this;
     chain.__forceRefresh = options.forceRefresh === true;
+    if (options.subscribe !== undefined) chain.__subscribe = options.subscribe;
     // `.expand(...)` projections, recovered from the recorded steps.
     // The frontend doesn't act on them — the backend route handler
     // re-derives the same list from `__query` — but consumers / tests
