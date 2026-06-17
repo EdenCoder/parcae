@@ -31,6 +31,7 @@ import {
   getRoutes,
   getSocketHandlers,
   runSocketChain,
+  type Middleware,
   type SocketContext,
 } from "./routing/route";
 import { BackendAdapter } from "./adapters/model";
@@ -91,6 +92,13 @@ export interface AppConfig {
   migrations?: string;
   /** Authentication adapter. Opt-in — omit to skip auth entirely. */
   auth?: AuthAdapter;
+  /**
+   * App-wide HTTP middleware. Mounted after auth/session resolution and the
+   * per-request Parcae context, before health, auto-CRUD, and custom routes.
+   * Socket RPC calls pass through the same middleware chain via the fake
+   * request path.
+   */
+  middleware?: Middleware[];
   /** API version prefix. Default: "v1" */
   version?: string;
   /** Project root directory. Default: process.cwd() */
@@ -738,6 +746,12 @@ export function createApp(config: AppConfig): ParcaeApp {
           next();
         });
       });
+
+      if (config.middleware?.length) {
+        for (const middleware of config.middleware) {
+          server.polka.use(middleware);
+        }
+      }
 
       // Middleware: optional post-auth hook. Fires for every request
       // that has reached this point with a resolved session — covers

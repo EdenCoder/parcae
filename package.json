@@ -6,8 +6,7 @@
     "dev": "turbo dev",
     "lint": "turbo lint",
     "clean": "turbo clean",
-    "typecheck": "turbo typecheck",
-    "build:registry": "tsx registry/scripts/build.ts"
+    "typecheck": "turbo typecheck"
   },
   "devDependencies": {
     "tsx": "^4.20.5",

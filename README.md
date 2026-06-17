@@ -121,6 +121,7 @@ GET    /v1/health         status, uptime, model count
 | [`@parcae/sdk`](./packages/sdk)                         | Client SDK — Socket.IO and SSE transports, React hooks              |
 | [`@parcae/auth-betterauth`](./packages/auth-betterauth) | Better Auth adapter — self-hosted, same Postgres                    |
 | [`@parcae/auth-clerk`](./packages/auth-clerk)           | Clerk adapter — external auth proxied to your User model            |
+| [`@parcae/i18n`](./packages/i18n)                       | Lingui-powered locale negotiation, backend middleware, React helper |
 
 ## Models
 
@@ -343,6 +344,7 @@ packages/
   sdk/                @parcae/sdk         — the client
   auth-betterauth/    @parcae/auth-betterauth
   auth-clerk/         @parcae/auth-clerk
+  i18n/               @parcae/i18n        — Lingui integration helpers
 examples/
   basic/              working example app
 ```

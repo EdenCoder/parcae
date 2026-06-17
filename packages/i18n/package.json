@@ -1,0 +1,55 @@
+{
+  "name": "@parcae/i18n",
+  "version": "0.1.0",
+  "description": "Parcae i18n helpers powered by Lingui",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./react": {
+      "types": "./dist/react/index.d.ts",
+      "import": "./dist/react/index.js",
+      "default": "./dist/react/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@lingui/core": "^6.4.0"
+  },
+  "peerDependencies": {
+    "@lingui/react": "^6.4.0",
+    "react": ">=18.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@lingui/react": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@lingui/react": "^6.4.0",
+    "@types/react": "^19.2.16",
+    "react": "^19.2.7",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.8"
+  },
+  "license": "MIT"
+}
