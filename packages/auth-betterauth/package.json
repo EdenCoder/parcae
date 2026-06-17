@@ -27,7 +27,7 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "better-auth": "^1.6.14",
+    "better-auth": "^1.6.19",
     "pg": "^8.21.0",
     "pluralize": "^8.0.0"
   },
@@ -38,11 +38,11 @@
   "devDependencies": {
     "@parcae/backend": "workspace:*",
     "@parcae/model": "workspace:*",
-    "@types/node": "^25.9.1",
+    "@types/node": "^25.9.3",
     "@types/pg": "^8.20.0",
     "@types/pluralize": "^0.0.33",
     "tsup": "^8.5.1",
-    "typescript": "^5.9.3"
+    "typescript": "^6.0.3"
   },
   "license": "MIT"
 }

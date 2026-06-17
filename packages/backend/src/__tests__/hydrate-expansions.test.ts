@@ -279,7 +279,7 @@ describe("hydrateExpansions", () => {
   });
 
   it("projects to the requested fields, always including id + type", async () => {
-    const items = [{ id: "a1", type: "asset", file: "f1" }];
+    const items: any[] = [{ id: "a1", type: "asset", file: "f1" }];
     const loader = new RefLoader(async (_type, ids) => {
       const m = new Map<string, unknown>();
       for (const id of ids) m.set(id, buildFile(id, "https://x", "image/png"));
@@ -303,7 +303,7 @@ describe("hydrateExpansions", () => {
   });
 
   it("dedupes ids across rows — one underlying batch per ref type", async () => {
-    const items = [
+    const items: any[] = [
       { id: "a1", type: "asset", file: "f1" },
       { id: "a2", type: "asset", file: "f1" },
       { id: "a3", type: "asset", file: "f1" },
@@ -336,7 +336,7 @@ describe("hydrateExpansions", () => {
   });
 
   it("nulls the ref when the linked row is missing, but still stamps $<ref>", async () => {
-    const items = [{ id: "a1", type: "asset", file: "ghost" }];
+    const items: any[] = [{ id: "a1", type: "asset", file: "ghost" }];
     const loader = new RefLoader(async () => new Map());
     await hydrateExpansions(
       items,
@@ -356,7 +356,7 @@ describe("hydrateExpansions", () => {
   });
 
   it("nulls the ref AND stamps $<ref>: null when the row has no ref id", async () => {
-    const items = [{ id: "a1", type: "asset", file: "" }];
+    const items: any[] = [{ id: "a1", type: "asset", file: "" }];
     const loadByIds = vi.fn(async () => new Map());
     const loader = new RefLoader(loadByIds);
     await hydrateExpansions(
@@ -382,7 +382,7 @@ describe("hydrateExpansions", () => {
     // Hydrating both should coalesce per type — 1 query for users,
     // 1 query for files, regardless of how many ref fields point at
     // each.
-    const items = [
+    const items: any[] = [
       { id: "a1", type: "asset", file: "f1", owner: "u1" },
       { id: "a2", type: "asset", file: "f1", owner: "u2" },
     ];

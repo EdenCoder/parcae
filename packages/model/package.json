@@ -40,11 +40,11 @@
     "short-unique-id": "^5.3.2"
   },
   "devDependencies": {
-    "@types/node": "^25.9.1",
+    "@types/node": "^25.9.3",
     "@types/pluralize": "^0.0.33",
     "tsup": "^8.5.1",
-    "typescript": "^5.9.3",
-    "vitest": "^4.1.8"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
   },
   "license": "MIT"
 }
