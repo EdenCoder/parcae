@@ -8,7 +8,13 @@ const shared = {
   target: "es2022",
   splitting: false,
   treeshake: true,
-  external: ["@lingui/core", "@lingui/react", "react", "react-dom"],
+  external: [
+    "@lingui/core",
+    "@lingui/react",
+    "@parcae/backend",
+    "react",
+    "react-dom",
+  ],
 } as const;
 
 export default defineConfig([
@@ -17,6 +23,12 @@ export default defineConfig([
     entry: ["src/index.ts"],
     outDir: "dist",
     clean: true,
+  },
+  {
+    ...shared,
+    entry: ["src/backend.ts"],
+    outDir: "dist",
+    clean: false,
   },
   {
     ...shared,

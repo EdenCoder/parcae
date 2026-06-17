@@ -44,12 +44,16 @@ imports.
 
 ## Backend
 
-Attach request-local Lingui state with middleware:
+Attach request-local Lingui state with middleware and register the default
+catalog routes:
 
 ```ts
 import { createApp, route, ok } from "@parcae/backend";
 import { createI18nMiddleware } from "@parcae/i18n";
+import { registerI18nRoutes } from "@parcae/i18n/backend";
 import { i18nConfig } from "./i18n";
+
+registerI18nRoutes(i18nConfig);
 
 route.get("/v1/greeting", (req, res) => {
   ok(res, {
@@ -65,6 +69,16 @@ createApp({
   middleware: [createI18nMiddleware(i18nConfig)],
 });
 ```
+
+`registerI18nRoutes()` serves flattened Lingui messages at:
+
+```txt
+GET /v1/locale
+GET /v1/locale/:locale
+```
+
+Pass `{ path: "/api/messages" }` only when an app needs a non-standard
+endpoint.
 
 For route-local usage without middleware:
 
