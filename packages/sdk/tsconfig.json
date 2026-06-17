@@ -5,7 +5,7 @@
     "rootDir": "./src",
     "jsx": "react-jsx",
     "lib": ["ES2022", "DOM"],
-    "types": ["react", "pako"]
+    "types": ["node", "react", "pako"]
   },
   "include": ["src"]
 }

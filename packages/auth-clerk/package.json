@@ -27,8 +27,8 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "@clerk/backend": "^3.4.14",
-    "svix": "^1.95.1"
+    "@clerk/backend": "^3.7.1",
+    "svix": "^1.95.2"
   },
   "peerDependencies": {
     "@parcae/backend": "workspace:*",
@@ -38,9 +38,9 @@
   "devDependencies": {
     "@parcae/backend": "workspace:*",
     "@parcae/model": "workspace:*",
-    "@types/node": "^25.9.1",
+    "@types/node": "^25.9.3",
     "tsup": "^8.5.1",
-    "typescript": "^5.9.3"
+    "typescript": "^6.0.3"
   },
   "license": "MIT"
 }

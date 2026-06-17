@@ -87,7 +87,7 @@ async function makeAdapter(db: Knex): Promise<BackendAdapter> {
   return adapter as BackendAdapter;
 }
 
-const REGISTRY: ReadonlyMap<string, any> = new Map([
+const REGISTRY: ReadonlyMap<string, any> = new Map<string, any>([
   ["file", FileM],
   ["asset", AssetM],
 ]);

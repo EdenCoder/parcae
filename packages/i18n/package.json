@@ -37,8 +37,8 @@
     "@lingui/core": "^6.4.0"
   },
   "peerDependencies": {
-    "@parcae/backend": "workspace:*",
     "@lingui/react": "^6.4.0",
+    "@parcae/backend": "workspace:*",
     "react": ">=18.0.0"
   },
   "peerDependenciesMeta": {
@@ -55,11 +55,11 @@
   "devDependencies": {
     "@lingui/react": "^6.4.0",
     "@parcae/backend": "workspace:*",
-    "@types/react": "^19.2.16",
+    "@types/react": "^19.2.17",
     "react": "^19.2.7",
     "tsup": "^8.5.1",
-    "typescript": "^5.9.3",
-    "vitest": "^4.1.8"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
   },
   "license": "MIT"
 }
