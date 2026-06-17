@@ -1,13 +1,34 @@
+import { readFileSync, writeFileSync } from "node:fs";
 import { defineConfig } from "tsup";
 
-export default defineConfig({
-  entry: ["src/index.ts", "src/react/index.tsx"],
+const shared = {
   format: ["esm"],
   dts: true,
   sourcemap: true,
-  clean: true,
   target: "es2022",
-  splitting: true,
+  splitting: false,
   treeshake: true,
   external: ["@lingui/core", "@lingui/react", "react", "react-dom"],
-});
+} as const;
+
+export default defineConfig([
+  {
+    ...shared,
+    entry: ["src/index.ts"],
+    outDir: "dist",
+    clean: true,
+  },
+  {
+    ...shared,
+    entry: ["src/react/index.tsx"],
+    outDir: "dist/react",
+    clean: false,
+    async onSuccess() {
+      const file = "dist/react/index.js";
+      const contents = readFileSync(file, "utf-8");
+      if (!contents.startsWith('"use client";')) {
+        writeFileSync(file, `"use client";\n${contents}`, "utf-8");
+      }
+    },
+  },
+]);
