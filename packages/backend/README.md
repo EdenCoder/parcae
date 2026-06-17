@@ -63,9 +63,10 @@ Controllers, hooks, and jobs self-register on import — just put files in the d
 8. Create HTTP server (Polka) + WebSocket server (Socket.IO)
 9. Set up `QuerySubscriptionManager` for realtime
 10. Mount auth middleware + routes (if configured)
-11. Register auto-CRUD routes for scoped models
-12. Auto-discover and import controllers, hooks, jobs
-13. Start BullMQ workers + HTTP listener
+11. Mount app-wide middleware (if configured)
+12. Register auto-CRUD routes for scoped models
+13. Auto-discover and import controllers, hooks, jobs
+14. Start BullMQ workers + HTTP listener
 
 ### ParcaeApp
 
@@ -139,6 +140,26 @@ route.get("/v1/health", (req, res) => {
 
 route.post("/v1/upload", requireAuth, rateLimit(100), async (req, res) => {
   // req.session available if auth is configured
+});
+```
+
+### App Middleware
+
+Use `createApp({ middleware: [...] })` for middleware that should apply to
+health checks, auto-CRUD, custom routes, and socket RPC. Middleware is mounted
+after auth/session resolution and before routes.
+
+```typescript
+import { createApp } from "@parcae/backend";
+
+createApp({
+  models: [User, Post],
+  middleware: [
+    (req, _res, next) => {
+      req.requestId = crypto.randomUUID();
+      next();
+    },
+  ],
 });
 ```
 
