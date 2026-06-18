@@ -235,15 +235,46 @@ function markNew(instance: any, value: boolean): void {
   instance.__isNew = value;
 }
 
+function serializeLazyQueryArgs(args: any[]): any[] {
+  return args.map((arg) => {
+    if (typeof arg === "function") {
+      const nestedSteps: any[] = [];
+      const recorder: any = new Proxy(
+        {},
+        {
+          get: (_target, method: string | symbol) => {
+            if (typeof method !== "string") return undefined;
+            return (...innerArgs: any[]) => {
+              nestedSteps.push({
+                method,
+                args: serializeLazyQueryArgs(innerArgs),
+              });
+              return recorder;
+            };
+          },
+        },
+      );
+      arg(recorder);
+      return { __nested: nestedSteps };
+    }
+    return arg;
+  });
+}
+
 function lazyQuery<T>(
   modelClass: ModelConstructor<T>,
   steps: any[] = [],
+  keySteps: any[] = [],
 ): QueryChain<T> {
   const chain: any = {};
 
   for (const method of CHAINABLE_METHODS) {
     chain[method] = (...args: any[]) =>
-      lazyQuery(modelClass, [...steps, { method, args }]);
+      lazyQuery(
+        modelClass,
+        [...steps, { method, args }],
+        [...keySteps, { method, args: serializeLazyQueryArgs(args) }],
+      );
   }
 
   const resolve = async (): Promise<QueryChain<T>> => {
@@ -261,7 +292,7 @@ function lazyQuery<T>(
   chain.first = async () => (await resolve()).first();
   chain.count = async () => (await resolve()).count();
 
-  chain.__steps = steps;
+  chain.__steps = keySteps;
   chain.__modelType = modelClass.type;
   chain.__modelClass = modelClass;
   chain.__adapter = null;
@@ -1511,4 +1542,3 @@ export type WithRefs<T extends Model> = T & {
     ? `$${string & K}`
     : never]: string;
 };
-
