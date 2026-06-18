@@ -645,6 +645,32 @@ describe("Model", () => {
       // Restore
       (Model as any).__adapter = saved;
     });
+
+    it("serializes callback query steps for stable cache keys", () => {
+      const first = Post.where((query: any) => {
+        query.where("id", "thedaywalker").orWhere("username", "thedaywalker");
+      });
+      const second = Post.where((query: any) => {
+        query.where("id", "happytruth").orWhere("username", "happytruth");
+      });
+
+      expect(first.__steps).toEqual([
+        {
+          method: "where",
+          args: [
+            {
+              __nested: [
+                { method: "where", args: ["id", "thedaywalker"] },
+                { method: "orWhere", args: ["username", "thedaywalker"] },
+              ],
+            },
+          ],
+        },
+      ]);
+      expect(JSON.stringify(first.__steps)).not.toBe(
+        JSON.stringify(second.__steps),
+      );
+    });
   });
 
   // ── Reference field accessors (DOL-1045) ──────────────────────────
