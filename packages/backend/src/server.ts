@@ -37,7 +37,19 @@ export function createServer_(options: ServerOptions): ServerContext {
 
   // Create Polka app with body parsing + query string parsing
   const app = polka();
-  app.use(bodyParser.json({ limit: "50mb" }));
+  app.use(
+    bodyParser.json({
+      limit: "50mb",
+      // Stash the unparsed body so webhook handlers can verify HMAC
+      // signatures (Stripe, GitHub, Svix, etc.) against the exact bytes the
+      // sender signed. body-parser discards the raw stream once it parses,
+      // and a re-serialised object is not byte-identical to the original, so
+      // verification needs the buffer captured here.
+      verify: (req, _res, buf) => {
+        (req as unknown as { rawBody?: Buffer }).rawBody = buf;
+      },
+    }),
+  );
   app.use(bodyParser.urlencoded({ extended: true }));
 
   // Polka's handler unconditionally sets req.query = querystring.parse(info.query),
