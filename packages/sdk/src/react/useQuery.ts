@@ -710,6 +710,57 @@ export function _onResyncRequired(client: ParcaeClient): void {
 // ── useQuery ───────────────────────────────────────────────────────────────
 
 /**
+ * Serialize one step's args into a JSON-safe form for the cache key.
+ *
+ * A `.where(callback)` step records the callback FUNCTION in its args
+ * (see `lazyQuery` in @parcae/model). `JSON.stringify` turns a function
+ * into `null`, so two callbacks that close over different values
+ * (`name ilike %Jane%` vs `%Jill%`) serialize identically and collide
+ * on one cache entry — the query then never refetches when the
+ * closed-over value changes, because the cache key is unchanged. Mirror
+ * the wire serialization (the FrontendAdapter's `{ __nested: steps }`
+ * recorder) by replaying the callback against a recording proxy so the
+ * nested builder calls, and the values they close over, land in the key.
+ */
+function serializeStepArgs(args: any[]): any[] {
+  return args.map((arg) => {
+    if (typeof arg !== "function") return arg;
+    const nested: { method: string; args: any[] }[] = [];
+    const recorder: any = new Proxy(
+      {},
+      {
+        get:
+          (_t, method: string | symbol) =>
+          (...innerArgs: any[]) => {
+            if (typeof method === "string") {
+              nested.push({ method, args: serializeStepArgs(innerArgs) });
+            }
+            return recorder;
+          },
+      },
+    );
+    try {
+      arg(recorder);
+    } catch {
+      // A callback that isn't a plain builder chain can't be captured;
+      // fall back to a stable marker so it stays distinct from a
+      // non-function arg without throwing in the render path.
+      return { __nested: "__opaque__" };
+    }
+    return { __nested: nested };
+  });
+}
+
+function serializeStepsForKey(steps: any[] | undefined): string {
+  return JSON.stringify(
+    (steps ?? []).map((s) => ({
+      method: s?.method,
+      args: serializeStepArgs(s?.args ?? []),
+    })),
+  );
+}
+
+/**
  * Build the cache key from a chain + session. Identity-stable across
  * disconnects because session.userId doesn't change on disconnect.
  * `subscribe: false` mounts get a distinct `:nosub` suffix so a
@@ -725,7 +776,7 @@ function buildKey(
 ): string | null {
   if (!modelType) return null;
   const subPart = subscribe === false ? ":nosub" : "";
-  return `${modelType}:${userId ?? "anon"}:${JSON.stringify(steps ?? [])}${subPart}`;
+  return `${modelType}:${userId ?? "anon"}:${serializeStepsForKey(steps)}${subPart}`;
 }
 
 export function useQuery<T>(
@@ -1108,8 +1159,7 @@ export const __test = {
     steps: unknown[],
     subscribe = true,
   ): string {
-    const subPart = subscribe === false ? ":nosub" : "";
-    return `${modelType}:${userId ?? "anon"}:${JSON.stringify(steps)}${subPart}`;
+    return buildKey(modelType, userId, steps as any[], subscribe) as string;
   },
   fetch(
     key: string,
