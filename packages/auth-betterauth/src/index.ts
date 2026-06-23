@@ -49,6 +49,17 @@ export interface BetterAuthConfig {
   basePath?: string;
   /** Base URL (for OAuth callbacks). Auto-detected from PORT if not set. */
   baseURL?: string;
+  /**
+   * Passthrough merged into Better Auth's `emailAndPassword` options — e.g. a
+   * custom `password.hash` / `password.verify` to validate legacy password
+   * hashes after a migration. `enabled` is still derived from `providers`, so
+   * callers only supply the extras. */
+  emailAndPassword?: {
+    password?: {
+      hash?: (password: string) => Promise<string>;
+      verify?: (data: { hash: string; password: string }) => Promise<boolean>;
+    };
+  };
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -218,6 +229,7 @@ export function betterAuth(config: BetterAuthConfig = {}): AuthAdapter {
 
         emailAndPassword: {
           enabled: providers.includes("email"),
+          ...(config.emailAndPassword ?? {}),
         },
 
         socialProviders:
@@ -269,10 +281,31 @@ export function betterAuth(config: BetterAuthConfig = {}): AuthAdapter {
 
           const response = await auth!.handler(webRequest);
           if (response && typeof response.status === "number") {
-            const headers: Record<string, string> = {};
+            const headers: Record<string, string | string[]> = {};
             response.headers.forEach((value: string, key: string) => {
+              // Set-Cookie is handled separately — a plain object can't
+              // hold more than one `set-cookie` entry, and `forEach`
+              // comma-merges multiple cookies into a single corrupt
+              // header. Better Auth sets >1 cookie on common flows
+              // (e.g. `session_token` + `dont_remember` when a sign-in
+              // passes `rememberMe: false`, or `session_data` with the
+              // cookie cache), so collapsing here silently drops the
+              // session cookie and every later get-session returns null.
+              if (key.toLowerCase() === "set-cookie") return;
               headers[key] = value;
             });
+
+            // Preserve EACH Set-Cookie as a distinct header. `getSetCookie()`
+            // returns them as an array (undici/Node ≥18.14); Node's
+            // writeHead emits one `Set-Cookie:` line per array element.
+            const setCookies =
+              typeof response.headers.getSetCookie === "function"
+                ? response.headers.getSetCookie()
+                : [];
+            if (setCookies.length > 0) {
+              headers["set-cookie"] = setCookies;
+            }
+
             res.writeHead(response.status, headers);
             const body = await response.text();
             res.end(body);
