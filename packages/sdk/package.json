@@ -36,8 +36,7 @@
     "fast-json-patch": "^3.1.1",
     "pako": "^2.1.0",
     "short-unique-id": "^5.3.2",
-    "socket.io-client": "^4.8.3",
-    "valtio": "^2.3.2"
+    "socket.io-client": "^4.8.3"
   },
   "devDependencies": {
     "@types/node": "^25.9.3",

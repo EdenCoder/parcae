@@ -156,7 +156,7 @@ interface ModelAdapter {
 
 | Adapter           | Store                   | Persistence                     |
 | ----------------- | ----------------------- | ------------------------------- |
-| `FrontendAdapter` | Valtio proxy (reactive) | Transport RPC (Socket.IO / SSE) |
+| `FrontendAdapter` | Plain object (EventEmitter) | Transport RPC (Socket.IO / SSE) |
 | `BackendAdapter`  | Plain object            | Knex + PostgreSQL               |
 
 Set the adapter once at startup:

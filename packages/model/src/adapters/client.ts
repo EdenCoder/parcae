@@ -1,5 +1,5 @@
 /**
- * FrontendAdapter — Valtio + Transport for Parcae Model.
+ * FrontendAdapter — Transport for Parcae Model.
  *
  * Transport-agnostic. Works with any implementation of the Transport interface:
  * - SocketTransport (Socket.IO — bidirectional, realtime)
@@ -116,8 +116,7 @@ export class FrontendAdapter implements ModelAdapter {
   // through `EventEmitter` (`model.on("change", ...)`), not through
   // a proxied store. The method is part of the adapter interface
   // for symmetry with the backend adapter (which builds rows for
-  // the DB layer). Return a shallow copy to match the typeshape;
-  // no behavioural use of valtio anywhere in the SDK.
+  // the DB layer). Return a shallow copy to match the typeshape.
   createStore(data: Record<string, any>): Record<string, any> {
     return { ...data };
   }

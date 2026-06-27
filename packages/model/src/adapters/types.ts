@@ -2,7 +2,7 @@
  * @parcae/model — Adapter Types
  *
  * Defines the adapter interface that decouples Model from persistence.
- * Frontend: Valtio + Socket.IO transport
+ * Frontend: EventEmitter + transport
  * Backend: Knex + PostgreSQL
  */
 
@@ -409,11 +409,11 @@ export interface QueryChain<T> {
 /**
  * The adapter interface. Decouples Model from persistence.
  *
- * - FrontendAdapter: Valtio proxy + Socket.IO transport
+ * - FrontendAdapter: EventEmitter + transport
  * - BackendAdapter: Knex + PostgreSQL + hooks + pub/sub
  */
 export interface ModelAdapter {
-  /** Create the reactive data store. Frontend: Valtio proxy. Backend: plain object. */
+  /** Create the data store. Frontend: shallow copy. Backend: plain object. */
   createStore(data: Record<string, any>): Record<string, any>;
 
   /**
