@@ -1,6 +1,6 @@
 # @parcae/model
 
-The core Model system for Parcae. Class properties are the schema. Direct property access via Proxy with change tracking, lazy-loading references, and a pluggable adapter pattern that runs the same code on frontend and backend.
+The core Model system for Parcae. Class properties are the schema. Direct property access with EventEmitter-based change tracking, lazy-loading references, and a pluggable adapter pattern that runs the same code on frontend and backend.
 
 ## Install
 
@@ -29,13 +29,13 @@ No decorators, no separate schema definition, no Zod. The class properties _are_
 
 ## Property Access
 
-The Model constructor returns a Proxy. Data properties read/write to an internal store with automatic change tracking.
+The Model instance IS the data store — no Proxy wrapper, no write interception. Direct property reads/writes hit an internal `__data` object. Reactivity flows through `EventEmitter` (`model.on("change", ...)`); the React SDK subscribes via `useSyncExternalStore`.
 
 ```typescript
 const post = await Post.findById("abc");
 
-post.title; // "Hello" — reads from data store
-post.title = "Updated"; // change tracked automatically
+post.title; // "Hello" — direct read from __data
+post.title = "Updated"; // change tracked automatically, emits "change"
 post.published; // false — typed as boolean
 
 await post.save(); // flushes tracked changes
@@ -98,10 +98,12 @@ post.id; // auto-generated 20-char ID
 // Save (insert or update)
 await post.save();
 
-// Save with debounce (frontend batching)
-post.__debounceMs = 500;
+// Concurrent saves auto-coalesce — N rapid save/flush calls produce at
+// most two round-trips per burst (leading edge + trailing edge), so
+// streaming call sites can fire `post.flush()` per delta without
+// hand-rolling debounce.
 post.title = "A";
-post.title = "AB"; // batched into single save
+post.title = "AB"; // folded into the in-flight save
 await post.save();
 
 // Atomic JSON Patch (RFC 6902)
@@ -201,14 +203,17 @@ interface Transport {
 
 ## Static Properties
 
-| Property   | Type                 | Description                                                         |
-| ---------- | -------------------- | ------------------------------------------------------------------- |
-| `type`     | `string`             | Model identifier. Used for table naming and routing.                |
-| `path`     | `string?`            | Custom API path. Defaults to `/v1/{type}s`.                         |
-| `scope`    | `ModelScope?`        | Row-level security rules.                                           |
-| `indexes`  | `IndexDefinition[]?` | Database index definitions.                                         |
-| `managed`  | `boolean`            | `false` for externally managed tables (e.g. auth). Default: `true`. |
-| `__schema` | `SchemaDefinition?`  | Resolved at startup by RTTIST. Maps properties to column types.     |
+| Property           | Type                 | Description                                                                       |
+| ------------------ | -------------------- | --------------------------------------------------------------------------------- |
+| `type`             | `string`             | Model identifier. Used for table naming and routing.                              |
+| `path`             | `string?`            | Custom API path. Defaults to `/v1/{type}s`.                                       |
+| `scope`            | `ModelScope?`        | Row-level security rules.                                                          |
+| `indexes`          | `IndexDefinition[]?` | Database index definitions.                                                        |
+| `searchFields`     | `string[]?`          | Fields to index for full-text + fuzzy search (weighted by order).                 |
+| `readonlyFields`   | `readonly string[]?` | Columns stripped from client request bodies before apply (server can still write).|
+| `privateFields`    | `readonly string[]?` | Columns stripped from the default `sanitize()` projection (don't leak via GET).   |
+| `managed`          | `boolean`            | `false` for externally managed tables (e.g. auth). Default: `true`.               |
+| `__schema`         | `SchemaDefinition?`  | Resolved at startup by ts-morph. Maps properties to column types.                 |
 
 ## Type Mapping
 
@@ -226,23 +231,36 @@ interface Transport {
 ## Exports
 
 ```typescript
-import { Model, generateId, FrontendAdapter } from "@parcae/model";
+import {
+  Model,
+  generateId,
+  dateSafeClone,
+  flushChangeEmits,
+  FrontendAdapter,
+  ops,
+  dedupOps,
+  CHAINABLE_METHODS,
+  extractExpandFields,
+  orderEmissionDisabled,
+  stripExpandSteps,
+  SYM_SERVER_MERGE,
+  SYM_VERSION,
+} from "@parcae/model";
 import type {
   Transport,
+  RequestOptions,
   ModelAdapter,
+  ModelClass,
   ModelConstructor,
-  ChangeSet,
   QueryChain,
   QueryStep,
   SchemaDefinition,
   ColumnType,
-  PrimitiveColumnType,
-  IndexDefinition,
-  ModelScope,
   ScopeContext,
-  ScopeResult,
-  ScopeFunction,
   PatchOp,
+  WithRefs,
+  OpBuilder,
+  Text,
 } from "@parcae/model";
 ```
 

@@ -1,6 +1,6 @@
 # @parcae/sdk
 
-Client SDK for Parcae backends. Pluggable transport layer (Socket.IO or SSE), React provider, and hooks for realtime data fetching.
+Client SDK for Parcae backends. Socket.IO transport with a hello/resync handshake, React provider, and hooks for realtime data fetching.
 
 ## Install
 
@@ -13,87 +13,87 @@ npm install @parcae/sdk @parcae/model
 ```typescript
 import { createClient } from "@parcae/sdk";
 
-// Socket.IO (default) — bidirectional, realtime subscriptions
-const client = createClient({ url: "http://localhost:3000" });
-
-// SSE — HTTP + Server-Sent Events, simpler infrastructure
-const client = createClient({ url: "http://localhost:3000", transport: "sse" });
-
-// Custom transport
 const client = createClient({
   url: "http://localhost:3000",
-  transport: myTransport,
+  getToken: async () => localStorage.getItem("token"),
 });
 ```
+
+`createClient()` also calls `Model.use(new FrontendAdapter(transport))` automatically, so `Model.where()`, `Model.findById()`, and other static methods work immediately.
 
 ### ClientConfig
 
 ```typescript
 interface ClientConfig {
   url: string;
-  key?: string | null | (() => Promise<string | null>);
   version?: string; // default: "v1"
-  transport?: "socket" | "sse" | Transport; // default: "socket"
+  /**
+   * Token resolver — called once before the initial hello and once
+   * per reconnect. Return `null` for anonymous sessions.
+   */
+  getToken: () => Promise<string | null>;
+  /**
+   * socket.io transports list. Defaults to ["websocket"].
+   * Pass ["polling"] on runtimes without a WebSocket global.
+   */
+  transports?: ("websocket" | "polling")[];
 }
 ```
 
 ### ParcaeClient
 
-`createClient()` returns a `ParcaeClient` with the following API:
+`createClient()` returns a `ParcaeClient`:
 
 ```typescript
 interface ParcaeClient {
-  // HTTP methods (delegated to transport)
-  get(path, data?): Promise<any>;
-  post(path, data?): Promise<any>;
-  put(path, data?): Promise<any>;
-  patch(path, data?): Promise<any>;
-  delete(path, data?): Promise<any>;
+  transport: Transport;
+  session: SessionMachine; // authenticated identity state
+  connection: ConnectionMachine; // transport connection state
 
-  // Realtime
+  // HTTP-style RPC (delegated to transport)
+  get(path, data?, options?): Promise<any>;
+  post(path, data?, options?): Promise<any>;
+  put(path, data?, options?): Promise<any>;
+  patch(path, data?, options?): Promise<any>;
+  delete(path, data?, options?): Promise<any>;
+
+  // Realtime pub/sub
   subscribe(event, handler): () => void;
   unsubscribe(event, handler?): void;
   send(event, ...args): void;
 
-  // Connection
+  // Connection state
   readonly isConnected: boolean;
-  readonly isLoading: boolean;
-  loading: Promise<void>;
   on(event, handler): void;
   off(event, handler?): void;
   disconnect(): void;
   reconnect(): Promise<void>;
 
-  // Auth
-  setKey(key): Promise<void>;
-  readonly authVersion: number;
+  // Session lifecycle
+  refreshSession(): Promise<{ userId: string | null }>;
+  terminateSession(): Promise<void>;
+  resync(entries: ResyncEntry[]): Promise<ResyncResult[]>;
 }
 ```
 
-The client also calls `Model.use(new FrontendAdapter(transport))` automatically, so `Model.where()`, `Model.findById()`, and other static methods work immediately after creating a client.
+The client is cached on `globalThis` per `url:version` so cross-package callers share the same socket pool.
 
-## Transports
+## Transport
 
 ### SocketTransport
 
-Default transport. Socket.IO over WebSocket.
+The only built-in transport. Socket.IO over WebSocket.
 
 - Bidirectional communication
-- Connection pooling (shared socket per url:version)
-- Request/response via `"call"` event with request IDs
-- gzip + compress-json response encoding
+- Connection pooling (shared socket per `url:version` via global `SOCKETS` Map)
+- Hello/resync handshake — server confirms `userId` on every connect/reconnect
+- Request/response via `"call"` event with short unique request IDs
+- gzip + `compress-json` response encoding (`pako.ungzip` → `JSON.parse` → `compress-json.decompress`)
 - GET request deduplication (in-flight coalescing)
-- 30s connection wait timeout for pending requests
-- Auth via `"authenticate"` event
+- 30s timeout for pending requests
+- Token rotation triggers `refreshSession()`; explicit sign-out triggers `terminateSession()`
 
-### SSETransport
-
-HTTP + Server-Sent Events. Better for read-heavy workloads or environments where WebSocket is not available.
-
-- Standard `fetch()` for request/response
-- `EventSource` per subscription channel at `/__events/{event}`
-- Control messages via POST to `/__control`
-- Bearer token auth via `Authorization` header
+Pass `transports: ["polling"]` in `ClientConfig` for runtimes without a WebSocket global (e.g. some React Native shells).
 
 ## React
 
@@ -103,28 +103,26 @@ Wrap your app in `ParcaeProvider` to make the client available to hooks.
 
 ```tsx
 import { ParcaeProvider } from "@parcae/sdk/react";
+import { betterAuth } from "@parcae/auth-betterauth/client";
 
-// With a pre-created client
-const client = createClient({ url: "http://localhost:3000" });
-
-<ParcaeProvider client={client}>
-  <App />
-</ParcaeProvider>
-
-// Or with inline config
+// With inline config + auth adapter
 <ParcaeProvider
   url="http://localhost:3000"
-  apiKey={token}
-  userId={user.id}
-  transport="socket"
-  onReady={(client) => console.log("connected")}
+  auth={betterAuth({ baseUrl: "http://localhost:3000" })}
+  transports={["websocket"]}
+  onReady={(client) => console.log("ready", client.session.state)}
   onError={(err) => console.error(err)}
 >
   <App />
 </ParcaeProvider>
+
+// Or with a pre-created client (auth handled out-of-band)
+<ParcaeProvider client={client}>
+  <App />
+</ParcaeProvider>
 ```
 
-Re-authenticates automatically when `userId` changes. Forwards transport errors via `onError`.
+`ParcaeProvider` resolves the initial session, subscribes to the auth adapter's `onChange` for token rotation / login / logout, and re-runs the hello handshake on socket reconnect. `auth` is optional — omit it for anonymous-only clients.
 
 ### useQuery
 
@@ -155,7 +153,7 @@ function PostList() {
 **How it works:**
 
 1. On mount, calls `chain.find()` to fetch initial data
-2. Sends `subscribe:query` to the server with the serialized query steps
+2. Backend response includes a `__queryHash` — client subscribes to `query:{hash}` socket event
 3. Server re-evaluates the query when matching models change
 4. Diff ops (`add`, `remove`, `update`) are pushed and applied client-side
 5. Uses `useSyncExternalStore` for tear-safe rendering
@@ -164,13 +162,31 @@ function PostList() {
 
 - Global query cache keyed by `modelType:authVersion:steps`
 - Reference counting with 60s GC timeout after last subscriber unmounts
-- Debounced diff-op application (default 100ms)
+- A periodic drift poll (via `withForceRefresh()`) recovers from missed cross-process events
 
 Pass `null` or `undefined` to skip the query:
 
 ```tsx
 const { items } = useQuery(userId ? Post.where({ user: userId }) : null);
 ```
+
+Pass `{ subscribe: false }` for static queries that don't need realtime push.
+
+### useModel / useModelAtomic
+
+Subscribe to a single model instance and re-render on change.
+
+```tsx
+import { useModelAtomic } from "@parcae/sdk/react";
+
+function VideoPlayer({ block }: { block: Block }) {
+  // Re-render ONLY when video.url changes — other field writes are skipped.
+  const url = useModelAtomic(block, "video.url");
+  return url ? <video src={url} /> : null;
+}
+```
+
+`useModel` re-renders on any change to the model. `useModelAtomic(model, path)` narrows re-renders to a single dot-notation path (`"content"`, `"video.url"`, `"blocks.0.name"`). The default comparator is structural deep equality — pass `Object.is` as the third arg for hot primitive paths.
 
 ### useApi
 
@@ -188,30 +204,46 @@ function UploadButton() {
 }
 ```
 
-### useSDK
+### useParcae
 
 Raw client instance access.
 
 ```tsx
-import { useSDK } from "@parcae/sdk/react";
+import { useParcae } from "@parcae/sdk/react";
 
-const client = useSDK();
+const client = useParcae();
 client.send("some:event", data);
 ```
 
-### useConnectionStatus
+### useConnection
 
-Connection state snapshot for the transport.
+Transport connection state.
 
 ```tsx
-import { useConnectionStatus } from "@parcae/sdk/react";
+import { useConnection } from "@parcae/sdk/react";
 
 function StatusBadge() {
-  const { isConnected, isLoading } = useConnectionStatus();
-
-  if (isLoading) return <span>Connecting...</span>;
+  const { isConnected, status, lastError } = useConnection();
+  // status: "connecting" | "connected" | "reconnecting" | "disconnected"
   return <span>{isConnected ? "Online" : "Offline"}</span>;
 }
+```
+
+### useSession
+
+Authenticated identity state from `SessionMachine`.
+
+```tsx
+import { useSession, Authenticated, Unauthenticated, SessionLoading } from "@parcae/sdk/react";
+
+function Account() {
+  const { status, userId } = useSession();
+  // status: "pending" | "anonymous" | "authenticated" | "terminated"
+}
+
+<Authenticated>Welcome back</Authenticated>
+<Unauthenticated>Please sign in</Unauthenticated>
+<SessionLoading>Connecting…</SessionLoading>
 ```
 
 ### useSetting
@@ -236,31 +268,46 @@ function ThemeToggle() {
 
 ```typescript
 // Main
-import { createClient, SocketTransport, SSETransport } from "@parcae/sdk";
+import {
+  createClient,
+  SocketTransport,
+  SessionMachine,
+  ConnectionMachine,
+} from "@parcae/sdk";
 import type {
   ClientConfig,
   ParcaeClient,
   SocketTransportConfig,
-  SSETransportConfig,
-  Transport,
+  ResyncEntry,
+  ResyncResult,
+  SessionState,
+  SessionStatus,
+  ConnectionState,
+  ConnectionStatus,
 } from "@parcae/sdk";
-
-// Re-exports from @parcae/model
-import { Model, FrontendAdapter } from "@parcae/sdk";
 
 // React
 import {
   ParcaeProvider,
-  ParcaeContext,
   useParcae,
   useQuery,
+  prefetch,
+  useModel,
+  useModelAtomic,
+  useModelsAtomic,
   useApi,
-  useSDK,
-  useConnectionStatus,
+  useSocket,
   useSetting,
+  useSession,
+  useConnection,
+  useSaving,
+  Authenticated,
+  Unauthenticated,
+  SessionLoading,
 } from "@parcae/sdk/react";
-import type { ParcaeProviderProps } from "@parcae/sdk/react";
 ```
+
+`Model` and `FrontendAdapter` are not re-exported by `@parcae/sdk` — import them from `@parcae/model`.
 
 ## License
 

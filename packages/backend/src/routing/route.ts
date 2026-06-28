@@ -4,20 +4,26 @@
  * Express-compatible routing API. Middleware support.
  * These are the plain function APIs — Controllers are sugar on top.
  *
+ * Use the `ok(res, …)` / `json(res, …)` / `error(res, …)` helpers from
+ * `helpers.ts` to write responses — `res.send` / `res.json` (Express)
+ * are NOT available on Polka's `http.ServerResponse`.
+ *
  * @example
  * ```typescript
- * import { route } from "@parcae/backend";
+ * import { route, ok, unauthorized } from "@parcae/backend";
  *
  * route.post("/media/upload", (req, res) => {
- *   res.send({ url: "..." });
+ *   if (!req.session?.user) return unauthorized(res);
+ *   ok(res, { url: "..." });
  * });
  *
- * route.post("/media/upload", requireAuth, rateLimit(100), (req, res) => {
- *   res.send({ url: "..." });
+ * // With middleware (any (req, res, next) => void function):
+ * route.post("/media/upload", auditLogMiddleware, rateLimiter, (req, res) => {
+ *   ok(res, { url: "..." });
  * });
  *
  * route.get("/health", (req, res) => {
- *   res.json({ ok: true });
+ *   ok(res, { ok: true });
  * }, { priority: 0 });
  *
  * // Socket.IO event handlers:
@@ -188,9 +194,9 @@ function registerRoute(method: string, path: string, ...args: any[]): void {
  * Express-style route registration.
  *
  * ```typescript
- * route.get("/health", (req, res) => res.json({ ok: true }));
- * route.post("/upload", requireAuth, (req, res) => { ... });
- * route.post("/upload", requireAuth, (req, res) => { ... }, { priority: 50 });
+ * route.get("/health", (req, res) => ok(res, { ok: true }));
+ * route.post("/upload", auditLogMiddleware, (req, res) => { ... });
+ * route.post("/upload", auditLogMiddleware, (req, res) => { ... }, { priority: 50 });
  *
  * // Socket.IO event handlers (registered once per connection):
  * route.on("chat:message", requireSocketAuth, async (ctx) => {
@@ -249,7 +255,8 @@ export const route = {
 
 /**
  * Socket middleware that requires an authenticated session.
- * Equivalent to requireAuth for HTTP routes.
+ * HTTP routes typically gate via the scope system or by checking
+ * `req.session?.user?.id` directly (or via custom middleware).
  */
 export const requireSocketAuth: SocketMiddleware = (ctx, next) => {
   if (!ctx.session?.user?.id) {

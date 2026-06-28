@@ -104,9 +104,10 @@ export interface AppConfig {
   /** Project root directory. Default: process.cwd() */
   root?: string;
   /**
-   * Path to the models package (where reflect.config.json lives).
-   * Used by RTTIST for type generation. Can be absolute or relative to root.
-   * If not set, auto-detected from common monorepo locations.
+   * Path to the models package (where tsconfig.json + model sources live).
+   * Used by the ts-morph schema resolver at startup. Can be absolute or
+   * relative to root. If not set, auto-detected from common monorepo
+   * locations.
    */
   modelsPath?: string;
   /**
@@ -413,10 +414,10 @@ export function createApp(config: AppConfig): ParcaeApp {
       const port = options.port ?? envConfig.PORT;
       const dev = options.dev ?? envConfig.NODE_ENV === "development";
 
-      // Resolve per-process runtime flags. Legacy SERVER/DAEMON are mapped
-      // into RUN_SERVER/RUN_HOOKS/RUN_JOBS here; the rest of startup only
-      // consults `flags`. We also publish them into the service context
-      // so downstream code (e.g. BackendAdapter.runHooks) can branch on them.
+      // Resolve per-process runtime flags from RUN_SERVER / RUN_HOOKS /
+      // RUN_JOBS / RUN_CRONS. The rest of startup only consults `flags`.
+      // We also publish them into the service context so downstream
+      // code (e.g. BackendAdapter.runHooks) can branch on them.
       flags = resolveRuntimeFlags(envConfig);
       _setRuntimeFlags(flags);
 

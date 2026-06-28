@@ -88,7 +88,7 @@ export interface AuthSetupContext {
    * (e.g. Better Auth's runMigrations()) to create auth tables like
    * users, sessions, accounts, verifications.
    *
-   * Set when ENSURE_SCHEMA=true (i.e. `pnpm run generate:schema`).
+   * Set via `ENSURE_SCHEMA=true` at boot.
    */
   ensureSchema?: boolean;
 }

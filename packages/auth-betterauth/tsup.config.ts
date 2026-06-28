@@ -12,6 +12,7 @@ export default defineConfig({
   external: [
     "@parcae/backend",
     "@parcae/model",
+    "@parcae/sdk",
     "better-auth",
     "better-auth/plugins/bearer",
     "pg",

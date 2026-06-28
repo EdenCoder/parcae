@@ -1211,9 +1211,6 @@ export class Model extends EventEmitter {
    * `__patchingPaths`), deletes keys the server no longer has, refreshes
    * `__serverSnapshot` to mirror what the server actually holds, and
    * emits `"change"` exactly when something changed.
-   *
-   * Returns `this` so call sites that expected a "fresh instance" from
-   * the previous Proxy-swapping design keep working unchanged.
    */
   [SYM_SERVER_MERGE](serverData: Record<string, any>): this {
     const pending = this[SYM_PATCHING];

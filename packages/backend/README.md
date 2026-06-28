@@ -55,7 +55,7 @@ Controllers, hooks, and jobs self-register on import — just put files in the d
 
 1. Parse and validate env config (Zod), auto-load `.env`
 2. Discover models (array or directory scan)
-3. Generate `.parcae/` type metadata (RTTIST)
+3. Generate `.parcae/` type metadata (ts-morph schema resolver)
 4. Connect Postgres (Knex, optional read replica)
 5. Connect Redis (PubSub + Queue, optional — falls back to in-process)
 6. Create `BackendAdapter`, call `Model.use()`
@@ -138,8 +138,8 @@ route.get("/v1/health", (req, res) => {
   res.end(JSON.stringify({ status: "ok" }));
 });
 
-route.post("/v1/upload", requireAuth, rateLimit(100), async (req, res) => {
-  // req.session available if auth is configured
+route.post("/v1/upload", auditLogMiddleware, rateLimiter, async (req, res) => {
+  // req.session available if auth is configured; use ok(res, …) to respond
 });
 ```
 
@@ -249,9 +249,12 @@ interface HookContext {
   data?: Record<string, any>;
   user?: { id: string; [key: string]: any } | null;
   lock(key, ttl?): Promise<() => Promise<void>>;
-  enqueue(name, data, opts?): Promise<boolean>;
+  enqueue(name, data, opts?): Promise<Job | false | null>;
+  onError(fn: () => Promise<void> | void): void;
 }
 ```
+
+`enqueue` returns the BullMQ `Job` if added, `null` if deduped by `jobId`, or `false` if no queue is configured (REDIS_URL not set). `onError` registers a compensating cleanup that runs in LIFO order if any later before-hook, the DB write, or an after-hook throws — use it to roll back external side effects (Clerk users, S3 uploads, Stripe subscriptions).
 
 ### Hook Options
 
@@ -305,7 +308,6 @@ const adapter = new BackendAdapter({
   read: readDb, // Knex instance (read replica or same as write)
   write: writeDb, // Knex instance
   pubsub, // PubSub instance (optional)
-  logger, // Winston logger (optional)
 });
 
 Model.use(adapter);
@@ -415,9 +417,9 @@ The `User` Model is always a real, managed Parcae Model. Auth adapters resolve i
 
 At startup, `createApp()` generates type metadata into `.parcae/` (gitignored, like `.next/`):
 
-1. Runs RTTIST typegen to extract TypeScript type metadata
+1. Runs the ts-morph schema resolver to extract TypeScript type metadata
 2. `SchemaResolver` maps types to column definitions
-3. Falls back to default-value inference if RTTIST is unavailable
+3. Falls back to default-value inference if a type can't be resolved
 4. Caches resolved schemas to `.parcae/schema.json`
 
 ## Configuration
@@ -437,8 +439,6 @@ Environment variables validated at startup via Zod. `.env` files are auto-loaded
 | `RUN_HOOKS`         | No       | `true`        | Run model lifecycle hooks                         |
 | `RUN_JOBS`          | No       | `false`       | `true` / `false` / `"name1,name2"` (workers)      |
 | `RUN_CRONS`         | No       | follows JOBS  | `true` / `false` / `"name1,name2"` (schedulers)   |
-| `SERVER`            | No       | --            | _Deprecated alias for_ `RUN_SERVER`               |
-| `DAEMON`            | No       | --            | _Deprecated: equivalent to_ `RUN_HOOKS=true RUN_JOBS=true` |
 
 ### Process roles
 

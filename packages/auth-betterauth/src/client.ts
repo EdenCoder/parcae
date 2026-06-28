@@ -27,12 +27,7 @@
  */
 
 import { createAuthClient } from "better-auth/react";
-
-interface AuthClientAdapter {
-  init(baseUrl: string): void;
-  getToken(): Promise<string | null>;
-  onChange(callback: (token: string | null) => void): () => void;
-}
+import type { AuthClientAdapter } from "@parcae/sdk";
 
 export interface BetterAuthOptions {
   /**

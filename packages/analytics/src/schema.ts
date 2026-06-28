@@ -139,8 +139,6 @@ export function createKnexEmitter(db: Knex): EventEmitter {
   };
 }
 
-export type AnalyticsEventRow = AnalyticsEvent;
-
 /**
  * Wire up: ensure tables exist, install the default Knex emitter.
  * Idempotent — safe to call multiple times.

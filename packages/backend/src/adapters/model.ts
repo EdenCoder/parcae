@@ -5,9 +5,9 @@ import { loadCachedSchemas } from "../schema/generate";
 /**
  * BackendAdapter — Knex + Postgres persistence for Parcae Model.
  *
- * Extracted from Dollhouse Studio's adapters/model.ts (829 lines).
- * Adapted to use RTTIST-resolved schemas instead of static columns,
- * and Parcae's hook/pubsub systems.
+ * Uses ts-morph-resolved schemas (resolved at startup, cached to
+ * `.parcae/schema.json`) to map Model classes to Postgres columns,
+ * plus Parcae's hook/pubsub systems.
  */
 
 import {
@@ -555,7 +555,7 @@ export class BackendAdapter implements ModelAdapter {
   // ── createStore ──────────────────────────────────────────────────────
 
   createStore(data: Record<string, any>): Record<string, any> {
-    return data; // Plain object on backend — no Valtio proxy
+    return data; // Plain object on backend — no proxy wrapping
   }
 
   // ── save ─────────────────────────────────────────────────────────────

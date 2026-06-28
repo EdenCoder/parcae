@@ -33,11 +33,13 @@
   },
   "peerDependencies": {
     "@parcae/backend": "workspace:*",
-    "@parcae/model": "workspace:*"
+    "@parcae/model": "workspace:*",
+    "@parcae/sdk": "workspace:*"
   },
   "devDependencies": {
     "@parcae/backend": "workspace:*",
     "@parcae/model": "workspace:*",
+    "@parcae/sdk": "workspace:*",
     "@types/node": "^25.9.3",
     "@types/pg": "^8.20.0",
     "@types/pluralize": "^0.0.33",

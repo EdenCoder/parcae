@@ -211,7 +211,8 @@ function parseNameList(value: string | undefined): true | false | Set<string> {
 }
 
 /**
- * Resolve the three runtime flags (`server`, `hooks`, `jobs`) from raw env config.
+ * Resolve the four runtime flags (`server`, `hooks`, `jobs`, `crons`)
+ * from raw env config.
  */
 export function resolveRuntimeFlags(config: Config): RuntimeFlags {
   const server = config.RUN_SERVER ?? true;

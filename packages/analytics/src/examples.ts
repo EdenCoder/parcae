@@ -18,7 +18,6 @@ import {
   ANALYTICS_SNAPSHOT_TABLE,
   canonicalDimensions,
 } from "./schema.js";
-import { Period } from "./period.js";
 
 /**
  * Weekly active users. The canonical event-stream metric: distinct
@@ -171,5 +170,3 @@ function roundTo(n: number, decimals: number): number {
   const f = 10 ** decimals;
   return Math.round(n * f) / f;
 }
-
-export { Period };
