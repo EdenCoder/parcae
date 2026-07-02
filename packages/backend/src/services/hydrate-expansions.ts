@@ -26,7 +26,7 @@
  * The raw id is preserved on the wire as `$file` alongside the
  * embedded object so the frontend lazy-ref-proxy contract stays
  * intact — the accessor pair `(file, $file)` is the same shape the
- * client has used since DOL-148, regardless of whether the row was
+ * client has used, regardless of whether the row was
  * expanded.
  *
  * Errors:
@@ -43,7 +43,7 @@
  * `services/subscriptions.ts`. Realtime invalidation is **naive** in
  * v1: any change to a linked-row column wakes every subscriber that
  * expanded the parent ref, regardless of which fields they
- * projected (see DOL-1093 open questions).
+ * projected (field-aware invalidation is a follow-up).
  */
 
 import type {

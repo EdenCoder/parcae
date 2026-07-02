@@ -43,7 +43,7 @@
  * and `hydrateExpansions` entirely — which meant every WebSocket
  * reconnect served un-expanded rows to clients that had originally
  * requested `.expand("file")`. The editor's `useAssetFile` snapped to
- * `null` on every reconnect until a manual refetch. See DOL-1095.
+ * `null` on every reconnect until a manual refetch.
  */
 
 import type { ModelConstructor, QueryChain } from "@parcae/model";

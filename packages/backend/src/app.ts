@@ -8,7 +8,7 @@
  */
 
 import { resolve, join } from "node:path";
-import { readdirSync, existsSync, statSync } from "node:fs";
+import { readdirSync, existsSync } from "node:fs";
 import pako from "pako";
 import { compress } from "compress-json";
 import pluralize from "pluralize";
@@ -175,16 +175,15 @@ async function discoverModels(dir: string): Promise<ModelConstructor[]> {
   }
 
   const models: ModelConstructor[] = [];
-  const entries = readdirSync(absDir);
+  const entries = readdirSync(absDir, { withFileTypes: true });
 
-  for (const entry of entries) {
-    if (!entry.endsWith(".ts") && !entry.endsWith(".js")) continue;
-    if (entry.startsWith(".") || entry.startsWith("_")) continue;
+  for (const dirent of entries) {
+    if (!dirent.isFile()) continue;
+    const name = dirent.name;
+    if (!name.endsWith(".ts") && !name.endsWith(".js")) continue;
+    if (name.startsWith(".") || name.startsWith("_")) continue;
 
-    const filePath = join(absDir, entry);
-    const stat = statSync(filePath);
-    if (!stat.isFile()) continue;
-
+    const filePath = join(absDir, name);
     try {
       const mod = await import(filePath);
       // Check all exports for Model constructors — anything with a
@@ -200,7 +199,7 @@ async function discoverModels(dir: string): Promise<ModelConstructor[]> {
       }
     } catch (err) {
       log.warn(
-        `Failed to import model from ${entry}:`,
+        `Failed to import model from ${name}:`,
         err instanceof Error ? err.message : err,
       );
     }
@@ -233,18 +232,17 @@ async function discoverAndImport(
   if (!existsSync(absDir)) return 0;
 
   let count = 0;
-  const entries = readdirSync(absDir, { recursive: true });
+  const entries = readdirSync(absDir, { recursive: true, withFileTypes: true });
 
-  for (const entry of entries) {
-    const entryStr = entry.toString();
-    if (!entryStr.endsWith(".ts") && !entryStr.endsWith(".js")) continue;
-    if (entryStr.startsWith(".") || entryStr.startsWith("_")) continue;
-    if (entryStr.includes("node_modules")) continue;
-    if (entryStr === "index.ts" || entryStr === "index.js") continue;
+  for (const dirent of entries) {
+    if (!dirent.isFile()) continue;
+    const name = dirent.name;
+    if (!name.endsWith(".ts") && !name.endsWith(".js")) continue;
+    if (name.startsWith(".") || name.startsWith("_")) continue;
+    if (dirent.path.includes("node_modules")) continue;
+    if (name === "index.ts" || name === "index.js") continue;
 
-    const filePath = join(absDir, entryStr);
-    const stat = statSync(filePath);
-    if (!stat.isFile()) continue;
+    const filePath = join(dirent.path, name);
 
     if (importedFiles.has(filePath)) {
       // Already imported (probably via a side-effect chain from an
@@ -262,7 +260,7 @@ async function discoverAndImport(
       count++;
     } catch (err) {
       log.warn(
-        `Failed to import ${label} from ${entryStr}:`,
+        `Failed to import ${label} from ${name}:`,
         err instanceof Error ? err.message : err,
       );
     }
@@ -347,12 +345,11 @@ async function resyncQueries(
     subscribe?: boolean;
   }>,
   adapter: BackendAdapter,
-  registry: Map<string, ModelConstructor>,
 ): Promise<Array<{ key: string; hash: string | null; items: any[]; totalCount: number }>> {
   const results: Array<{ key: string; hash: string | null; items: any[]; totalCount: number }> = [];
   const user = socketSession?.user ?? null;
   for (const entry of entries) {
-    const ModelClass = registry.get(entry.modelType);
+    const ModelClass = adapter.modelsByType.get(entry.modelType);
     if (!ModelClass) continue;
     const scope = (ModelClass as any).scope;
     if (!scope?.read) continue;
@@ -364,7 +361,7 @@ async function resyncQueries(
       ModelClass,
       scopeResult,
       rawSteps: entry.steps,
-      modelByType: registry,
+      modelByType: adapter.modelsByType,
       adapter,
     });
 
@@ -602,8 +599,8 @@ export function createApp(config: AppConfig): ParcaeApp {
       _setIo(server.io);
 
       // ── Step 9: Set up QuerySubscriptionManager ────────────────────
-      // The IO backend wires Socket.IO rooms (DOL-1047): every
-      // subscriber for a given cached query joins `query:${hash}` at
+      // The IO backend wires Socket.IO rooms: every subscriber for a
+      // given cached query joins `query:${hash}` at
       // subscribe time so re-eval can broadcast ONCE via `io.to(room)`
       // instead of N times via `io.to(socketId)`. The legacy
       // `emitToSocket` is still provided as a fallback for any path
@@ -1052,8 +1049,6 @@ export function createApp(config: AppConfig): ParcaeApp {
       // server itself is always constructed (the createServer_ contract
       // expects it), but on worker-only processes it sits idle — no
       // clients should be hitting the worker URL anyway.
-      const modelsByType = new Map(models.map((m) => [m.type, m]));
-
       if (flags.server) server.io.on("connection", (socket) => {
         let socketSession: any = null;
 
@@ -1209,7 +1204,6 @@ export function createApp(config: AppConfig): ParcaeApp {
                     socketSession,
                     entries,
                     adapter,
-                    modelsByType,
                   ),
               );
               callback?.({ success: true, results });

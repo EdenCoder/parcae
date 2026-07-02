@@ -235,29 +235,31 @@ function markNew(instance: any, value: boolean): void {
   instance.__isNew = value;
 }
 
-function serializeLazyQueryArgs(args: any[]): any[] {
+export function serializeLazyQueryArgs(args: any[]): any[] {
   return args.map((arg) => {
-    if (typeof arg === "function") {
-      const nestedSteps: any[] = [];
-      const recorder: any = new Proxy(
-        {},
-        {
-          get: (_target, method: string | symbol) => {
-            if (typeof method !== "string") return undefined;
-            return (...innerArgs: any[]) => {
-              nestedSteps.push({
+    if (typeof arg !== "function") return arg;
+    const nested: any[] = [];
+    const recorder: any = new Proxy(
+      {},
+      {
+        get: (_target, method: string | symbol) =>
+          (...innerArgs: any[]) => {
+            if (typeof method === "string") {
+              nested.push({
                 method,
                 args: serializeLazyQueryArgs(innerArgs),
               });
-              return recorder;
-            };
+            }
+            return recorder;
           },
-        },
-      );
+      },
+    );
+    try {
       arg(recorder);
-      return { __nested: nestedSteps };
+    } catch {
+      return { __nested: "__opaque__" };
     }
-    return arg;
+    return { __nested: nested };
   });
 }
 
@@ -310,7 +312,7 @@ function lazyQuery<T>(
  * array-replace branch can't do its splice / index assignment, and
  * a downstream `for…of` would crash with "object is not iterable".
  */
-function isArrayIndexSegment(seg: string | undefined): boolean {
+export function isArrayIndexSegment(seg: string | undefined): boolean {
   return seg === "-" || (seg !== undefined && /^\d+$/.test(seg));
 }
 
@@ -328,7 +330,7 @@ function isArrayIndexSegment(seg: string | undefined): boolean {
  * looks like an array but throws `object is not iterable` on the
  * very next `for (const s of block.shots)`.
  */
-function ensureIntermediates(
+export function ensureIntermediates(
   doc: Record<string, any>,
   ops: readonly { path: string }[],
 ): void {
@@ -353,10 +355,8 @@ function ensureIntermediates(
  * Used by `_doFlush()` to feed `fast-json-patch.compare()` a Date-free
  * structure. Without this coercion, `compare()` walks each `Date` as a
  * string-iterable and emits ~24 char-level `add` ops per Date field
- * instead of detecting equality — DOL-412 fixed that bug by JSON-
- * round-tripping both sides; DOL-1040 swaps the round-trip for this
- * single-pass walker, dropping two string-allocation passes per
- * flush.
+ * instead of detecting equality. One recursive walk per side drops
+ * two string-allocation passes per flush.
  *
  * Semantics match `JSON.parse(JSON.stringify(value))`'s own-enumerable
  * traversal (we use `Object.keys` not `for...in` so prototype-chain
@@ -388,12 +388,33 @@ function topLevelKeys(ops: readonly PatchOp[]): Set<string> {
   for (const op of ops) {
     const top = op.path.split("/")[1];
     if (top) keys.add(top);
-    if ((op as any).from) {
-      const fromTop = String((op as any).from).split("/")[1];
+    if (op.op === "copy" || op.op === "move") {
+      const fromTop = op.from.split("/")[1];
       if (fromTop) keys.add(fromTop);
     }
   }
   return keys;
+}
+
+// ─── Ref Proxy Cache ─────────────────────────────────────────────────────────
+//
+// Module-level so the periodic sweep can clear expired entries without
+// needing access to the class internals. Entries are written on every
+// findById completion and every .expand() hydration, and evicted either
+// on the next read of the same key (lazy) or by the sweep below (bounded).
+
+const __refCache = new Map<string, { value: any; expires: number }>();
+const REF_CACHE_TTL = 30_000;
+
+if (typeof setInterval === "function") {
+  const _sweep = setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of __refCache)
+      if (v.expires < now) __refCache.delete(k);
+  }, 60_000);
+  if (typeof _sweep === "object" && _sweep !== null && "unref" in _sweep) {
+    (_sweep as any).unref();
+  }
 }
 
 // ─── Model Class ─────────────────────────────────────────────────────────────
@@ -424,7 +445,7 @@ export class Model extends EventEmitter {
   declare [SYM_PENDING_DATA]: Record<string, any> | undefined;
   declare [SYM_FLUSH_INFLIGHT]: Promise<void> | null | undefined;
   declare [SYM_FLUSH_TRAILING]: Promise<void> | null | undefined;
-  declare [SYM_VERSION]: number | undefined;
+  declare [SYM_VERSION]: number;
 
   // ── Static ─────────────────────────────────────────────────────────
 
@@ -753,7 +774,7 @@ export class Model extends EventEmitter {
       //                          object into a target-class instance
       //                          and pre-populate the ref proxy so
       //                          consumers don't trigger a Suspense
-      //                          throw on first access (DOL-1093).
+      //                          throw on first access.
       //   - String id / null   — bare raw id (or no value). Lazy load
       //                          on first access via `_createRefProxy`.
       const incoming = data[field] ?? (this as any)[field];
@@ -838,11 +859,11 @@ export class Model extends EventEmitter {
    * caller in `_apply()` also tries to install accessors BEFORE writing
    * non-ref user data, so the most common path (no subclass field
    * initializer with `= null` default) goes through one hidden-class
-   * transition per ref instead of three (DOL-1045).
-   *
-   * `prehydrated` lets the caller pre-populate the ref proxy with a
-   * fully-loaded target Model — DOL-1093's `.expand("file")` path
-   * uses it to embed the linked row inline so consumers don't
+   * transition per ref instead of three.
+ *
+ * `prehydrated` lets the caller pre-populate the ref proxy with a
+ * fully-loaded target Model — the `.expand("file")` path uses it
+ * to embed the linked row inline so consumers don't
    * Suspense-throw on first access. The pre-population mints a
    * fresh proxy (bypassing the per-id cache) so a prior lazy proxy
    * holding `loaded: null` doesn't shadow the freshly-known row.
@@ -1065,15 +1086,15 @@ export class Model extends EventEmitter {
         (this as any)[key] = snap[key];
       }
 
-      (this as any)[SYM_VERSION] = ((this as any)[SYM_VERSION] ?? 0) + 1;
+      (this as any)[SYM_VERSION] = (this as any)[SYM_VERSION] + 1;
       this.emit("change");
 
       await this[SYM_ADAPTER].patch(this, ops);
 
       // Replay ops onto the snapshot so flush() won't re-emit them.
       //
-      // We mutate the existing snapshot in place rather than cloning
-      // (DOL-1040). `SYM_SNAPSHOT` is Symbol-keyed and only exposed
+      // We mutate the existing snapshot in place rather than cloning.
+      // `SYM_SNAPSHOT` is Symbol-keyed and only exposed
       // via the `__serverSnapshot` getter that's typed `Readonly` —
       // no external consumer can hold a reference that needs the
       // pre-patch view. On a 500KB Scenecode project the old
@@ -1186,7 +1207,7 @@ export class Model extends EventEmitter {
     // walk) followed by `JSON.parse(JSON.stringify(...))` (one
     // walk + two string allocations) per side. The combined helper
     // collapses to one recursive walk per side and skips the
-    // string allocations entirely (DOL-1040).
+      // string allocations entirely.
     const stripAndDateClone = (
       data: Record<string, any>,
     ): Record<string, any> => {
@@ -1240,7 +1261,7 @@ export class Model extends EventEmitter {
       // Without this, every patch arriving over a subscription would
       // call the ref-field setter and `invalidate()` the cached
       // proxy — including the pre-hydrated proxy installed by
-      // `.expand("file")` (DOL-1093). The editor's `useAssetFile`
+      // `.expand("file")`. The editor's `useAssetFile`
       // would then snap to `null` on every status flip / job update
       // until a fresh `findById` round-tripped the linked row again.
       //
@@ -1302,7 +1323,7 @@ export class Model extends EventEmitter {
     this[SYM_SNAPSHOT] = structuredClone(serverData);
 
     if (didChange) {
-      (this as any)[SYM_VERSION] = ((this as any)[SYM_VERSION] ?? 0) + 1;
+      (this as any)[SYM_VERSION] = (this as any)[SYM_VERSION] + 1;
       // Batched — fires once per microtask flush instead of N times
       // per server-frame burst. See `scheduleChangeEmit` above.
       scheduleChangeEmit(this);
@@ -1348,7 +1369,7 @@ export class Model extends EventEmitter {
    * else's). Default implementation ignores it — it's a uniform
    * shape for everyone.
    */
-  async sanitize(_user?: { id: string }): Promise<Record<string, any>> {
+  sanitize(_user?: { id: string }): Record<string, any> {
     const ModelClass = this.constructor as typeof Model;
     const privateFields = ModelClass.privateFields;
     // `type` comes from the static — it's never been an instance
@@ -1382,12 +1403,6 @@ export class Model extends EventEmitter {
 
   // ── Reference Proxy ──────────────────────────────────────────────────
 
-  private static __refCache = new Map<
-    string,
-    { value: any; expires: number }
-  >();
-  private static REF_CACHE_TTL = 30_000; // 30 seconds
-
   /**
    * Pre-hydrated ref proxy — same shape as `_createRefProxy` but
    * `loaded` starts populated, so property access is synchronous
@@ -1413,18 +1428,18 @@ export class Model extends EventEmitter {
     loadedInstance: Model,
   ): any {
     const proxy = this._buildRefProxy(targetClass, refId, loadedInstance);
-    Model.__refCache.set(`${targetClass.type}:${refId}`, {
+    __refCache.set(`${targetClass.type}:${refId}`, {
       value: proxy,
-      expires: Date.now() + Model.REF_CACHE_TTL,
+      expires: Date.now() + REF_CACHE_TTL,
     });
     return proxy;
   }
 
   private _createRefProxy(targetClass: ModelConstructor, refId: string): any {
     const cacheKey = `${targetClass.type}:${refId}`;
-    const cached = Model.__refCache.get(cacheKey);
+    const cached = __refCache.get(cacheKey);
     if (cached && cached.expires > Date.now()) return cached.value;
-    if (cached) Model.__refCache.delete(cacheKey);
+    if (cached) __refCache.delete(cacheKey);
 
     const proxy = this._buildRefProxy(targetClass, refId, null);
     return proxy;
@@ -1437,8 +1452,8 @@ export class Model extends EventEmitter {
    * any other value short-circuits the lazy load entirely so the
    * read is synchronous.
    *
-   * The trap shape stays identical between the two cases — DOL-1045
-   * iteration safety still applies. Pre-hydration is fundamentally
+   * The trap shape stays identical between the two cases — iteration
+   * safety still applies. Pre-hydration is fundamentally
    * a "preload the cache slot" optimization, not a different proxy
    * protocol.
    */
@@ -1467,9 +1482,9 @@ export class Model extends EventEmitter {
             .findById(targetClass, refId)
             .then((result) => {
               loaded = result;
-              Model.__refCache.set(cacheKey, {
+              __refCache.set(cacheKey, {
                 value: proxy,
-                expires: Date.now() + Model.REF_CACHE_TTL,
+                expires: Date.now() + REF_CACHE_TTL,
               });
               return result;
             });
@@ -1478,7 +1493,7 @@ export class Model extends EventEmitter {
         // React Suspense integration — throw the pending promise.
         throw loading;
       },
-      // ── Iteration safety (DOL-1045) ──────────────────────────────
+      // ── Iteration safety ─────────────────────────────────────────
       //
       // Without these two traps, `Object.keys(proxy)` /
       // `JSON.stringify(walk)` / `for..in` would surface the empty

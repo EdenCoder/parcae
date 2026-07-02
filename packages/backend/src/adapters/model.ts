@@ -12,6 +12,7 @@ import { loadCachedSchemas } from "../schema/generate";
 
 import {
   CHAINABLE_METHODS,
+  isArrayIndexSegment,
   type ColumnType,
   type ModelAdapter,
   type ModelConstructor,
@@ -20,6 +21,7 @@ import {
   type SchemaDefinition,
 } from "@parcae/model";
 import { generateId, type Model } from "@parcae/model";
+import type { QuerySubscriptionManager } from "../services/subscriptions";
 import equal from "deep-equal";
 import fastJsonPatch from "fast-json-patch";
 import type { Operation as PatchOp } from "fast-json-patch";
@@ -109,18 +111,6 @@ function resolveColType(col: ColumnType): string {
   if (typeof col === "string") return col;
   if (col.kind === "ref") return "string"; // refs stored as VARCHAR ID
   return "json";
-}
-
-/**
- * RFC 6901 array-index segment: numeric string (`"0"`, `"12"`) or
- * the append marker `"-"`. When the NEXT path segment after a
- * missing intermediate is one of these, the intermediate must be a
- * JSONB array, not an object — otherwise a downstream `for…of`
- * over the JS-side hydrated value would crash with "object is not
- * iterable" when the same field is later read back.
- */
-function isArrayIndexSegment(seg: string | undefined): boolean {
-  return seg === "-" || (seg !== undefined && /^\d+$/.test(seg));
 }
 
 /**
@@ -249,7 +239,7 @@ function serialize(model: any): Record<string, any> {
 
 export class BackendAdapter implements ModelAdapter {
   private services: BackendServices;
-  public subscriptions: any | null = null;
+  public subscriptions: QuerySubscriptionManager | null = null;
 
   /** Registered model constructors, keyed by type. Set via registerModels(). */
   private _models = new Map<string, ModelConstructor>();
@@ -316,6 +306,10 @@ export class BackendAdapter implements ModelAdapter {
       this._models.set(m.type, m);
     }
     this._attachCachedSchemas(models, options.projectRoot ?? process.cwd());
+  }
+
+  get modelsByType(): Map<string, ModelConstructor> {
+    return this._models;
   }
 
   private _attachCachedSchemas(
@@ -594,7 +588,7 @@ export class BackendAdapter implements ModelAdapter {
       throw err;
     }
 
-    log.info(`model saved model=${ModelClass.type}, id=${model.id}`);
+    log.debug(`model saved model=${ModelClass.type}, id=${model.id}`);
     this._notifyChange(model, creating ? "insert" : "update");
   }
 
@@ -1492,11 +1486,10 @@ export class BackendAdapter implements ModelAdapter {
               // Array-append (`/-`) — ensure the parent path exists
               // as `[]` if missing. The append target is an array,
               // so we override the segment-derived default with the
-              // hardcoded `'[]'::jsonb` (matching the pre-DOL-675
-              // behaviour). The pre-state-aware ensure skips
-              // intermediates that already exist on the row and
-              // weren't removed earlier in this batch, preserving
-              // any prior mutations (DOL-675).
+              // hardcoded `'[]'::jsonb` as the append default.
+              // The pre-state-aware ensure skips intermediates that
+              // already exist on the row and weren't removed earlier
+              // in this batch, preserving any prior mutations.
               this._ensureIntermediates(
                 parent,
                 column,
@@ -1631,7 +1624,7 @@ export class BackendAdapter implements ModelAdapter {
    *      skip the ensure entirely. The intermediate is intact in the
    *      live SQL expression, and emitting an ensure would silently
    *      undo prior `remove` ops by re-reading from the original
-   *      column value (DOL-675).
+   *      column value.
    *
    *   2. Otherwise the ensure emits a `jsonb_set_lax` with a STATIC
    *      `'{}'::jsonb` (or `'[]'::jsonb`) default. Reading from the
@@ -1674,7 +1667,7 @@ export class BackendAdapter implements ModelAdapter {
         // previously-removed ancestor — the live SQL expression
         // still has it intact. Emitting an ensure would re-read the
         // original column at this path and overwrite any earlier
-        // remove ops in this batch (DOL-675).
+        // remove ops in this batch.
         continue;
       }
       const key = `${column}:${pathKey}`;

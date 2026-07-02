@@ -62,7 +62,7 @@ interface CachedQuery {
    * Per-query ref expansions recorded by `.expand(...)`. Drives the
    * per-emit `hydrateExpansions` pass that inlines linked rows in
    * the cached result. Empty when the subscriber didn't ask for any
-   * expansions — identical to the pre-DOL-1093 emit path.
+   * expansions — identical to the no-expand emit path.
    */
   expand: readonly ResolvedExpand[];
   /**
@@ -78,7 +78,7 @@ interface CachedQuery {
    * Whether to emit the `order` field on the wire envelope. `false`
    * when the query carries `.orderBy(false)` — consumers don't
    * care about the ordered id list and we save bytes + spare the
-   * client a `reorderByIds` pass (DOL-1101).
+    * client a `reorderByIds` pass.
    *
    * Always `true` for the first subscriber's `subscribe()` call; if
    * a later subscriber for the same hash opts out, we honour the
@@ -113,14 +113,13 @@ interface SubscriptionOptions {
    * client. Subscriptions with different expand projections live as
    * distinct cached queries (the hash includes the projection key
    * via `expandHashKey`) so emits ship the right shape per
-   * consumer. Empty → no expansions, identical to pre-DOL-1093
-   * behavior.
+   * consumer. Empty → no expansions.
    */
   expand?: readonly ResolvedExpand[];
   /**
    * Raw client-sent steps. Used to detect `.orderBy(false)` so the
    * subscriptions manager skips order envelope emission for queries
-   * whose consumers don't care about ordering (DOL-1101).
+   * whose consumers don't care about ordering.
    *
    * `undefined` means "use the default" (emit order whenever it
    * changes). Pass the original step list from `prepareClientQuery`
@@ -179,7 +178,7 @@ interface ManagerOptions {
  * loop (one `io.to(socketId).emit(...)` per subscriber, N for N
  * subscribers).
  *
- * The room-aware form (DOL-1047) also supplies `emitToRoom`,
+ * The room-aware form also supplies `emitToRoom`,
  * `joinRoom`, and `leaveRoom`. Every subscriber for a given cached
  * query joins the Socket.IO room `query:${hash}` at subscribe-time,
  * so re-eval can broadcast ONCE via `io.to(room).emit(...)` regardless
@@ -235,7 +234,7 @@ function hashFrom(
  * without a cap, every re-eval hits the DB pool in parallel and
  * either queues on `acquireTimeoutMillis` or starves concurrent
  * request handlers. With the cap, work runs at most `permits` at a
- * time and the queue drains naturally (DOL-1047).
+ * time and the queue drains naturally.
  */
 class Semaphore {
   private free: number;
@@ -345,8 +344,7 @@ export class QuerySubscriptionManager {
    * `file` (regardless of which parent type) needs a re-eval so the
    * inlined linked row stays fresh. v1 invalidation is naive: any
    * change to the target type wakes every subscriber that expanded
-   * it, regardless of projection (see DOL-1093 open questions for
-   * the field-aware follow-up).
+     * it, regardless of projection (field-aware invalidation is a follow-up).
    */
   private expandTargetIndex = new Map<string, Set<string>>();
 
@@ -578,7 +576,7 @@ export class QuerySubscriptionManager {
     // every cached query that expanded `file`, regardless of the
     // parent model type. v1 is naive — no field-aware filtering —
     // so a `File.blurhash` change re-emits even to subscribers that
-    // only projected `file.url`. Trade-off accepted in DOL-1093.
+     // only projected `file.url`. This over-notifies but stays correct.
     const viaExpand = this.expandTargetIndex.get(modelType);
     if (!viaExpand || viaExpand.size === 0) return;
     for (const hash of viaExpand) {
@@ -645,7 +643,7 @@ export class QuerySubscriptionManager {
     // Bound the parallel DB hits across the whole manager. Without
     // the semaphore, N distinct cached queries all hitting `onModelChange`
     // in the same tick launch N concurrent SELECTs and either queue
-    // on the pool or starve unrelated handlers (DOL-1047).
+     // on the pool or starve unrelated handlers.
     await this.reevalSemaphore.acquire();
     try {
       await this._reeval(cached);
@@ -709,9 +707,9 @@ export class QuerySubscriptionManager {
     // of surviving ids differs. Stable updates with stable order skip
     // it so we don't waste bytes.
     //
-    // DOL-1101: queries that opted out via `.orderBy(false)` get NO
-    // order envelope, ever. We still emit op-only frames when ops
-    // exist; we just never compute or ship the ordered id list.
+    // Queries that opted out via `.orderBy(false)` get no order
+    // envelope, ever. We still emit op-only frames when ops exist;
+    // we just never compute or ship the ordered id list.
     let includeOrder = false;
     let newOrder: string[] = [];
     if (cached.emitOrder) {

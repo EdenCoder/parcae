@@ -137,7 +137,7 @@ interface RouteModelRow {
   __data: Record<string, any>;
   save(): Promise<void>;
   remove(): Promise<void>;
-  sanitize?(user?: { id: string }): Promise<Record<string, any>>;
+  sanitize?(user?: { id: string }): Record<string, any> | Promise<Record<string, any>>;
   [field: string]: unknown;
 }
 
@@ -320,7 +320,7 @@ export function registerModelRoutes(
           // opted out via `__subscribe: false`. The pipeline (plain
           // find + sanitise + expand hydrate) is shared with the
           // socket-RPC resync handler so the two paths can't drift
-          // apart again (see DOL-1095 / DOL-1148).
+          // apart again.
           const { items, totalCount } = await runQueryStatic({
             prep,
             user: ctx.user ?? null,

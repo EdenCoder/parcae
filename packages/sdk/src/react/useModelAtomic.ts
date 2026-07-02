@@ -118,7 +118,7 @@ function flushCoalesced(): void {
  * listener wake path) share the same single rAF as parcae's atomic
  * subscribers — without this, every layer of subscribers would
  * schedule its own rAF and the editor would drown in per-subscriber
- * animation-frame callbacks (see the 1.9s tick in DOL-1101).
+ * animation-frame callbacks.
  */
 export function scheduleCoalesced(notify: () => void): void {
   coalescedNotifies.add(notify);

@@ -7,9 +7,12 @@
 
 export {
   dateSafeClone,
+  ensureIntermediates,
   flushChangeEmits,
   generateId,
+  isArrayIndexSegment,
   Model,
+  serializeLazyQueryArgs,
   SYM_SERVER_MERGE,
   SYM_VERSION,
 } from "./Model";

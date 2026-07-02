@@ -38,8 +38,7 @@
  * extra DB read cost when the two events straddle the debounce.
  *
  * Wrap critical hot paths in `withTransaction({ setRequestIdGuc:
- * true }, ...)` until DOL-895 (follow-up) ships the adapter-level
- * per-write GUC wrapping.
+ * true }, ...)` once the adapter-level per-write GUC wrapping lands.
  */
 
 import { Client } from "pg";

@@ -4,7 +4,7 @@
  * Optional — if REDIS_URL not set, jobs run in-process synchronously.
  * Extracted from Dollhouse Studio's utilities/queue.ts (172 lines).
  *
- * ── Connection sharing (DOL-1043) ────────────────────────────────
+ * ── Connection sharing ───────────────────────────────────────────
  *
  * BullMQ Queues and Workers open one ioredis client each for command
  * ops; Workers additionally duplicate the connection to get a fresh

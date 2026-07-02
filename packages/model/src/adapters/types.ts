@@ -293,7 +293,7 @@ export interface QueryChain<T> {
    *
    * The raw id ALWAYS lands in `$file` regardless — the frontend
    * accessor pair `(file, $file)` is the same shape the lazy ref
-   * proxy has used since DOL-148. `.expand()` only changes whether
+   * proxy. `.expand()` only changes whether
    * the linked row is pre-hydrated, not whether the id is present.
    *
    * Realtime: subscription invalidation is currently **naive** for
@@ -302,7 +302,7 @@ export interface QueryChain<T> {
    * which fields the subscriber projected. That over-notifies in
    * the projection case (a `blurhash` flip wakes a `file.url`
    * subscriber) but stays correct. Field-aware invalidation is a
-   * follow-up (see DOL-1093 open questions).
+   * follow-up.
    *
    * `Model.hydrate` walks the schema; ref-field objects pre-populate
    * the ref-proxy's loaded slot so `asset.file.url` is synchronous
@@ -333,12 +333,12 @@ export interface QueryChain<T> {
   decrement(column: string, amount?: number): QueryChain<T>;
 
   // Convenience
-  basic(
-    limit?: number,
-    sort?: string,
-    direction?: "asc" | "desc",
-    page?: number,
-  ): QueryChain<T>;
+  basic(opts?: {
+    limit?: number;
+    sort?: string;
+    direction?: "asc" | "desc";
+    page?: number;
+  }): QueryChain<T>;
 
   // Terminal — execute the query
   find(): Promise<T[]>;
