@@ -239,10 +239,10 @@ async function discoverAndImport(
     const name = dirent.name;
     if (!name.endsWith(".ts") && !name.endsWith(".js")) continue;
     if (name.startsWith(".") || name.startsWith("_")) continue;
-    if (dirent.path.includes("node_modules")) continue;
+    if (dirent.parentPath.includes("node_modules")) continue;
     if (name === "index.ts" || name === "index.js") continue;
 
-    const filePath = join(dirent.path, name);
+    const filePath = join(dirent.parentPath, name);
 
     if (importedFiles.has(filePath)) {
       // Already imported (probably via a side-effect chain from an
