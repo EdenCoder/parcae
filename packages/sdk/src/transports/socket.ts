@@ -62,6 +62,16 @@ export interface SocketTransportConfig {
    * PrimJS in a custom native shell without LynxWebSocketModule).
    */
   transports?: ("websocket" | "polling")[];
+  /**
+   * Extra headers attached to the socket handshake (the WebSocket
+   * upgrade / polling requests). Applied in Node and React Native;
+   * browsers cannot set custom WebSocket headers and silently
+   * ignore these. The server sees them on
+   * `socket.handshake.headers`, and the backend's socket RPC bridge
+   * spreads handshake headers onto every synthetic request, so a
+   * header set here reaches middleware like any per-request header.
+   */
+  extraHeaders?: Record<string, string>;
 }
 
 /** Wire shape for a single `resync` entry. */
@@ -115,7 +125,12 @@ export class SocketTransport extends EventEmitter implements Transport {
 
     const socketPath = config.path ?? "/ws";
     const transports = config.transports ?? ["websocket"];
-    const socketKey = `${this.url}:${socketPath}:${transports.join(",")}`;
+    const extraHeaders = config.extraHeaders;
+    // Headers are part of the pool key: two transports to the same URL
+    // with different headers must not share a handshake.
+    const socketKey =
+      `${this.url}:${socketPath}:${transports.join(",")}` +
+      (extraHeaders ? `:${JSON.stringify(extraHeaders)}` : "");
 
     if (SOCKETS.has(socketKey)) {
       this.socket = SOCKETS.get(socketKey);
@@ -124,6 +139,7 @@ export class SocketTransport extends EventEmitter implements Transport {
         path: socketPath,
         transports,
         withCredentials: true,
+        ...(extraHeaders ? { extraHeaders } : {}),
       });
       SOCKETS.set(socketKey, this.socket);
     }
