@@ -21,6 +21,14 @@ export interface ParcaeProviderProps {
    * `["polling"]` on runtimes without a WebSocket global.
    */
   transports?: ("websocket" | "polling")[];
+  /**
+   * Extra headers attached to the socket handshake. Applied in Node
+   * and React Native; browsers ignore them for WebSocket transport.
+   * Pass a stable (module-level) reference: a fresh object per
+   * render re-runs the client memo, and the client cache would pin
+   * the first-created instance anyway.
+   */
+  extraHeaders?: Record<string, string>;
   children: React.ReactNode;
   onReady?: (client: ParcaeClient) => void;
   onError?: (error: Error) => void;
@@ -34,6 +42,7 @@ export const ParcaeProvider: React.FC<ParcaeProviderProps> = ({
   auth,
   version = "v1",
   transports,
+  extraHeaders,
   children,
   onReady,
   onError,
@@ -52,8 +61,8 @@ export const ParcaeProvider: React.FC<ParcaeProviderProps> = ({
         }
       : noopToken;
 
-    return createClient({ url, version, getToken, transports });
-  }, [externalClient, url, version, auth, transports]);
+    return createClient({ url, version, getToken, transports, extraHeaders });
+  }, [externalClient, url, version, auth, transports, extraHeaders]);
 
   const onReadyRef = useRef(onReady);
   onReadyRef.current = onReady;

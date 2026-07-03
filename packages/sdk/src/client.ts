@@ -28,6 +28,14 @@ export interface ClientConfig {
    * PrimJS in a custom native shell).
    */
   transports?: ("websocket" | "polling")[];
+  /**
+   * Extra headers attached to the socket handshake. Applied in Node
+   * and React Native; browsers ignore them for WebSocket transport.
+   * Pass a stable reference. Note the client cache is keyed on
+   * `url:version` only, so the first-created client's headers win
+   * for that key (existing behaviour for all config).
+   */
+  extraHeaders?: Record<string, string>;
 }
 
 export interface ParcaeClient {
@@ -65,6 +73,7 @@ export function createClient(config: ClientConfig): ParcaeClient {
     version: config.version ?? "v1",
     getToken: config.getToken,
     transports: config.transports,
+    extraHeaders: config.extraHeaders,
   });
 
   Model.use(new FrontendAdapter(transport));
