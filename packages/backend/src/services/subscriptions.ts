@@ -96,8 +96,12 @@ interface CachedQuery {
     debounceTimer: ReturnType<typeof setTimeout> | null;
     /** Max-wait ceiling — armed on first incoming change, never reset. */
     maxWaitTimer: ReturnType<typeof setTimeout> | null;
-    /** Re-eval in flight. Follow-up changes set a `needsFollowup` flag. */
-    inFlight: boolean;
+    /**
+     * The re-eval currently in flight, `null` when idle. Follow-up
+     * changes set `needsFollowup`; the force path awaits it so a
+     * drift poll can't race a debounced re-eval on the same query.
+     */
+    inFlight: Promise<void> | null;
     needsFollowup: boolean;
     /** Override window from `Model.realtime` or manager default. */
     debounceMs: number;
@@ -435,13 +439,13 @@ export class QuerySubscriptionManager {
       // order can't actually use it anyway if the SQL is identical.
       if (orderOptedOut) cached.emitOrder = false;
       // Drift-poll path: caller asked us to re-execute the cached
-      // query against the DB and diff to every subscriber. We run
-      // _reeval inline so the LIST response that follows returns
-      // the freshly-rebuilt items and the polling client converges
-      // in one round-trip. Other subscribers receive any drift ops
+      // query against the DB and diff to every subscriber. We await
+      // the re-eval so the LIST response that follows returns the
+      // freshly-rebuilt items and the polling client converges in
+      // one round-trip. Other subscribers receive any drift ops
       // through the normal `query:{hash}` channel.
       if (extra.force) {
-        await this._reeval(cached);
+        await this._forceReeval(cached);
       }
     } else {
       const rows = await this._execQuery(query, expand);
@@ -463,7 +467,7 @@ export class QuerySubscriptionManager {
         coalesce: {
           debounceTimer: null,
           maxWaitTimer: null,
-          inFlight: false,
+          inFlight: null,
           needsFollowup: false,
           debounceMs: overrides.debounceMs ?? this.defaultDebounceMs,
           maxWaitMs: overrides.maxWaitMs ?? this.defaultMaxWaitMs,
@@ -627,7 +631,7 @@ export class QuerySubscriptionManager {
     }
   }
 
-  private async _runReeval(cached: CachedQuery): Promise<void> {
+  private _runReeval(cached: CachedQuery): Promise<void> {
     const c = cached.coalesce;
     if (c.debounceTimer) {
       clearTimeout(c.debounceTimer);
@@ -638,26 +642,51 @@ export class QuerySubscriptionManager {
       c.maxWaitTimer = null;
     }
 
-    c.inFlight = true;
     c.needsFollowup = false;
-    // Bound the parallel DB hits across the whole manager. Without
-    // the semaphore, N distinct cached queries all hitting `onModelChange`
-    // in the same tick launch N concurrent SELECTs and either queue
-     // on the pool or starve unrelated handlers.
-    await this.reevalSemaphore.acquire();
-    try {
-      await this._reeval(cached);
-    } catch (err) {
-      log.error(`subscriptions: re-eval failed for ${cached.hash}:`, err);
-    } finally {
-      this.reevalSemaphore.release();
-      c.inFlight = false;
-    }
-    if (c.needsFollowup) {
-      // A change arrived mid-re-eval. Schedule a follow-up so we
-      // converge against the latest world state.
-      this._scheduleReeval(cached);
-    }
+    const run = (async () => {
+      // Bound the parallel DB hits across the whole manager. Without
+      // the semaphore, N distinct cached queries all hitting `onModelChange`
+      // in the same tick launch N concurrent SELECTs and either queue
+      // on the pool or starve unrelated handlers.
+      await this.reevalSemaphore.acquire();
+      try {
+        await this._reeval(cached);
+      } catch (err) {
+        log.error(`subscriptions: re-eval failed for ${cached.hash}:`, err);
+      } finally {
+        this.reevalSemaphore.release();
+        c.inFlight = null;
+      }
+      if (c.needsFollowup) {
+        // A change arrived mid-re-eval. Schedule a follow-up so we
+        // converge against the latest world state.
+        this._scheduleReeval(cached);
+      }
+    })();
+    c.inFlight = run;
+    return run;
+  }
+
+  /**
+   * Force path — the client drift poll (`__forceRefresh: true`).
+   *
+   * Runs through the SAME inFlight + semaphore protocol as the
+   * debounced path. The poll is timer-driven (every client, every
+   * `poll` interval), so calling `_reeval` directly here would both
+   * bypass the `reevalConcurrency` cap the ManagerOptions contract
+   * promises AND race a debounced re-eval mid-flight on the same
+   * cached query (two concurrent `_reeval`s diff against — and swap —
+   * the same `cached.result`).
+   *
+   * If a re-eval is already in flight, wait for it to land and run a
+   * fresh one: the in-flight run's DB read may predate the drift this
+   * poll is asking about. Any timers armed by a follow-up are
+   * absorbed — `_runReeval` clears them on entry.
+   */
+  private async _forceReeval(cached: CachedQuery): Promise<void> {
+    const c = cached.coalesce;
+    while (c.inFlight) await c.inFlight;
+    await this._runReeval(cached);
   }
 
   private _teardownCoalesce(cached: CachedQuery): void {

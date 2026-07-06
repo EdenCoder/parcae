@@ -940,6 +940,137 @@ describe("QuerySubscriptionManager", () => {
       expect(refetch.items).toEqual([{ id: "p1", name: "A" }]);
       expect(emitted).toHaveLength(0);
     });
+
+    it("waits for an in-flight re-eval instead of racing it", async () => {
+      // Gated find(): pauses inside the body while the gate is
+      // closed so we can hold a re-eval mid-flight.
+      let gateOpen = true;
+      let findCalls = 0;
+      const waiters: Array<() => void> = [];
+      let results = [row("p1", { name: "A" })];
+
+      const chain: any = new Proxy(
+        {},
+        {
+          get(_t, prop: string) {
+            if (prop === "__modelType") return "project";
+            if (prop === "find") {
+              return async () => {
+                findCalls++;
+                if (!gateOpen) {
+                  await new Promise<void>((r) => waiters.push(r));
+                }
+                return results.map((r) => ({ __data: r, sanitize: () => r }));
+              };
+            }
+            if (prop === "exec") {
+              return () => ({ toSQL: () => ({ sql: "gated", bindings: [] }) });
+            }
+            if (prop === "clone") return () => chain;
+            return (..._args: any[]) => chain;
+          },
+        },
+      );
+
+      await manager.subscribe({ socketId: "s1", query: chain });
+      expect(findCalls).toBe(1);
+
+      // A write lands; the (0ms-window) re-eval starts and pauses
+      // inside the gated find().
+      gateOpen = false;
+      manager.onModelChange("project");
+      await new Promise((r) => setTimeout(r, 1));
+      expect(findCalls).toBe(2);
+
+      // The drift poll arrives mid-re-eval. It must NOT launch a
+      // concurrent find() on the same cached query — two concurrent
+      // `_reeval`s would diff against (and swap) the same cached
+      // result. It waits for the in-flight run, then runs a fresh
+      // one: the in-flight read may predate the drift being polled.
+      results = [row("p1", { name: "A-drifted" })];
+      const forcePromise = manager.subscribe(
+        { socketId: "s1", query: chain },
+        { force: true },
+      );
+      await new Promise((r) => setTimeout(r, 5));
+      expect(findCalls).toBe(2);
+
+      gateOpen = true;
+      waiters.shift()!();
+      const force = await forcePromise;
+      expect(findCalls).toBe(3);
+      expect(force.items).toEqual([{ id: "p1", name: "A-drifted" }]);
+    });
+
+    it("bounds concurrent force re-evals with the reevalConcurrency cap", async () => {
+      // Drift polls are timer-driven — every client fires one per
+      // poll interval — so unlike the request-scoped initial load
+      // they MUST honour the same semaphore as debounced re-evals.
+      let gateOpen = true;
+      let inFlight = 0;
+      let peak = 0;
+      const waiters: Array<() => void> = [];
+      const source = createQuerySource([row("p1")]);
+
+      const makeGatedQuery = (sql: string) => {
+        const chain: any = new Proxy(
+          {},
+          {
+            get(_t, prop: string) {
+              if (prop === "__modelType") return "project";
+              if (prop === "find") {
+                return async () => {
+                  inFlight++;
+                  if (inFlight > peak) peak = inFlight;
+                  if (!gateOpen) {
+                    await new Promise<void>((r) => waiters.push(r));
+                  }
+                  inFlight--;
+                  return source.query("project").find();
+                };
+              }
+              if (prop === "exec") {
+                return () => ({ toSQL: () => ({ sql, bindings: [] }) });
+              }
+              if (prop === "clone") return () => chain;
+              return (..._args: any[]) => chain;
+            },
+          },
+        );
+        return chain;
+      };
+
+      const REEVAL_CAP = 2;
+      const m = new QuerySubscriptionManager(() => {}, {
+        debounceMs: 0,
+        maxWaitMs: 0,
+        reevalConcurrency: REEVAL_CAP,
+      });
+
+      const N = 6;
+      const queries = Array.from({ length: N }, (_, i) =>
+        makeGatedQuery(`sql_${i}`),
+      );
+      for (const query of queries) {
+        await m.subscribe({ socketId: "s1", query });
+      }
+
+      gateOpen = false;
+      peak = 0;
+      const polls = queries.map((query) =>
+        m.subscribe({ socketId: "s1", query }, { force: true }),
+      );
+      await new Promise((r) => setTimeout(r, 5));
+      expect(peak).toBe(REEVAL_CAP);
+
+      while (waiters.length > 0) {
+        waiters.shift()!();
+        await new Promise((r) => setTimeout(r, 1));
+        expect(peak).toBeLessThanOrEqual(REEVAL_CAP);
+      }
+      await Promise.all(polls);
+      expect(m.reevalInFlight).toBe(0);
+    });
   });
 
   // ── Stats ──────────────────────────────────────────────────────────

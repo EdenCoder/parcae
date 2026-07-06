@@ -3,7 +3,6 @@
 import {
   ensureIntermediates,
   generateId,
-  isArrayIndexSegment,
   Model,
   serializeLazyQueryArgs,
   SYM_SERVER_MERGE,
@@ -334,18 +333,22 @@ function applyOps(
   }
 
   if (!hasRemoves && !hasAdds) {
-    // Update-only frame. The models in the array were
-    // mutated in place via `SYM_SERVER_MERGE`; the array slot
-    // identity doesn't need to flip. Consumers that care about
-    // field-level reactivity wake through parcae's per-model
-    // `change` event bus (`useModelAtomic`). Consumers reading the
-    // `items` array bail on `Object.is(prev, next)` and skip the
-    // re-render — exactly what we want for status / readAt / file
-    // patches that don't move membership.
+    // Update-only frame. The models in the array were mutated in
+    // place via `SYM_SERVER_MERGE`; the array slot identity doesn't
+    // need to flip, so memoized children keyed on item references
+    // bail out, and field-level consumers wake through parcae's
+    // per-model `change` events (`useModel` / `useModelAtomic`).
     //
-    // Returning `changed: true` keeps `entry.version++` ticking so
-    // downstream code that meters "did SOMETHING happen on this
-    // query" still sees the bump.
+    // `changed: true` still bumps `entry.version` and notifies —
+    // and because the store snapshot is the hash string (which
+    // embeds the version), every component calling `useQuery` on
+    // this entry DOES re-render; useSyncExternalStore cannot bail
+    // here. That's deliberate: consumers rendering row fields
+    // straight off `items` (`items.map(i => i.title)`) must stay
+    // live without a per-model hook. The cost is one container
+    // re-render per server re-eval window — bounded by the
+    // backend's debounce and `Model.realtime` overrides — so keep
+    // heavy row UIs in memoized children if that matters.
     return { items, changed: true };
   }
 
@@ -693,6 +696,16 @@ export function _onResyncRequired(client: ParcaeClient): void {
 // ── useQuery ───────────────────────────────────────────────────────────────
 
 function serializeStepsForKey(steps: any[] | undefined): string {
+  // Runs on every render of every `useQuery` consumer. The
+  // `serializeLazyQueryArgs` pass is SHALLOW — it only transforms
+  // function args (where-callbacks) into their recorded `__nested`
+  // step lists and returns everything else by reference — so its
+  // per-render cost is one map per step. It must stay: chain
+  // factories pre-serialize their `__steps`, but raw steps handed to
+  // `buildKey` directly (tests, custom factories) carry live
+  // callbacks, and two different predicates must not collapse into
+  // one cache key. The real per-render cost here is the
+  // `JSON.stringify`, which is the key itself.
   return JSON.stringify(
     (steps ?? []).map((s) => ({
       method: s?.method,
@@ -809,6 +822,7 @@ export function useQuery<T>(
     if (typeof setInterval !== "function") return;
 
     let timer: ReturnType<typeof setInterval> | null = null;
+    let phaseTimer: ReturnType<typeof setTimeout> | null = null;
     let stopped = false;
 
     const tick = () => {
@@ -831,13 +845,30 @@ export function useQuery<T>(
     };
 
     const start = () => {
-      if (timer) return;
-      timer = setInterval(tick, pollMs);
+      if (timer || phaseTimer) return;
+      // Random phase: first tick lands at 0.5–1.5 × pollMs, then
+      // every pollMs. Every query mounted in the same page load —
+      // multiplied by every client that loaded at the same time —
+      // would otherwise fire its forced server re-eval in one
+      // synchronized wave each interval.
+      phaseTimer = setTimeout(
+        () => {
+          phaseTimer = null;
+          tick();
+          timer = setInterval(tick, pollMs);
+        },
+        pollMs * (0.5 + Math.random()),
+      );
     };
     const stop = () => {
-      if (!timer) return;
-      clearInterval(timer);
-      timer = null;
+      if (phaseTimer) {
+        clearTimeout(phaseTimer);
+        phaseTimer = null;
+      }
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
     };
 
     start();
