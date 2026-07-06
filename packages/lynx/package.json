@@ -1,0 +1,29 @@
+{
+  "name": "@parcae/lynx",
+  "version": "0.1.0",
+  "description": "Lynx / ReactLynx bindings for Parcae — live query stores and session lifecycle over the SDK wire protocol",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./store": "./src/live-query.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@parcae/model": "workspace:*"
+  },
+  "peerDependencies": {
+    "@lynx-js/react": ">=0.111.0",
+    "@parcae/sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "@lynx-js/react": "^0.116.2",
+    "@lynx-js/types": "^3.8.0",
+    "@parcae/sdk": "workspace:*",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  }
+}

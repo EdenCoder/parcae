@@ -102,6 +102,23 @@ function normaliseSteps(rawSteps: unknown): any[] {
   }
 }
 
+/**
+ * Force `id` into every client `.select(...)` projection. Rows
+ * hydrated without their id get a FRESH generated one per read
+ * (`Model` constructor falls back to `generateId()`), so clients that
+ * later target the row by id (save / remove / patch) hit phantom ids
+ * the DB never stored. Selecting one extra column is always cheaper
+ * than that failure mode.
+ */
+function ensureIdSelected(steps: any[]): any[] {
+  return steps.map((s) => {
+    if (s?.method !== "select") return s;
+    const args = Array.isArray(s.args) ? s.args.flat() : [];
+    if (args.length === 0 || args.includes("id")) return s;
+    return { ...s, args: ["id", ...args] };
+  });
+}
+
 export function prepareClientQuery(
   opts: PrepareClientQueryOptions,
 ): PreparedClientQuery {
@@ -120,8 +137,9 @@ export function prepareClientQuery(
     ModelClass,
     modelByType,
   );
-  const steps =
-    expandResolved.length > 0 ? stripExpandSteps(normalised) : normalised;
+  const steps = ensureIdSelected(
+    expandResolved.length > 0 ? stripExpandSteps(normalised) : normalised,
+  );
 
   const query = adapter.queryFromClient(ModelClass, scopeResult, steps);
 
