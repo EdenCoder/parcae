@@ -173,11 +173,19 @@ function register(
 ): HookEntry {
   const { handler, options } = parseArgs(args);
 
+  // "First save IS a create." The adapter dispatches action "create"
+  // for new rows and "save" for full re-saves — but a hook registered
+  // for 'save' almost always means "whenever this row is written".
+  // Alias 'create' onto 'save' registrations so create-only flows
+  // (toggle rows, one-shot inserts) don't silently bypass save hooks.
+  // Register 'create' explicitly for creation-only behavior.
+  const actions: HookAction[] = action === "save" ? ["save", "create"] : [action];
+
   const entry: HookEntry = {
     modelType: modelClass.type,
     modelClass,
     timing,
-    actions: [action],
+    actions,
     async: options.async ?? false,
     priority: options.priority ?? 100,
     handler,

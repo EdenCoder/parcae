@@ -67,6 +67,11 @@ Table name, the auto-CRUD path, and the list-response collection key all derive 
 - The **backend** injects a default `.limit(25)` when a client query sends none — list views silently truncate to 25 rows. Set an explicit `.limit(N)`, or `.clearLimit()` to opt out.
 - Never call `Model.where()` with no arguments.
 - Migrations are additive-only: `ensureAllTables()` creates missing tables/columns/indexes but never drops; use `migration()` for renames, type changes, and backfills.
+- **Raw SQL: quote table identifiers.** Tables preserve the camelCase of `pluralize(type)` (`"projectAssets"`, not `project_assets`); unquoted names get lowercased by Postgres → `relation does not exist`. And `db.raw` consumes a literal `?` as a binding placeholder — use `jsonb_exists(col, key)` (and friends) instead of JSONB `?` operators.
+- **Hooks: the first save IS a create.** The adapter dispatches `create` for new rows and `save` for re-saves; `save` registrations alias `create` automatically. Register `create` for creation-only behavior; never rely on a `save` hook NOT firing on create.
+- **Defining a Model isn't registering it.** The class must be listed in `createApp({ models: [...] })` — an exported-but-unlisted model gets no table, no routes, no realtime.
+- **Never delete an applied migration file** — the `parcae_migrations` ledger still records it and Knex refuses to run any migrations while a recorded file is missing.
+- Server-maintained counters: declare the column in `static readonlyFields` (clients can't write it) and recount from an after-hook — recounts self-heal where increments drift.
 - Undeclared properties spill into a `data` JSONB overflow column; only declared properties get typed, indexable columns.
 - A scope function returning `null` denies the request (responds forbidden).
 

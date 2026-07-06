@@ -65,7 +65,9 @@ describe("hook registration", () => {
     const hooks = getHooks();
     expect(hooks.length).toBe(1);
     expect(hooks[0]!.timing).toBe("after");
-    expect(hooks[0]!.actions).toEqual(["save"]);
+    // 'save' registrations alias 'create' — the first save IS a create
+    // (see hook-save-create-alias.test.ts).
+    expect(hooks[0]!.actions).toEqual(["save", "create"]);
   });
 
   it("should register before hooks with options", () => {

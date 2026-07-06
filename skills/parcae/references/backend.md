@@ -158,6 +158,20 @@ migration("20260402000000-concurrent-idx", { transaction: false }, async ({ db }
 });
 ```
 
+- **Quote table identifiers in raw SQL.** Table names preserve the
+  camelCase of `pluralize(static type)` — `projectAssets`, not
+  `project_assets`. Unquoted identifiers get lowercased by Postgres and
+  fail with `relation "project_assets" does not exist`. Always write
+  `ALTER TABLE "projectAssets" ...`.
+- **`db.raw` eats literal `?`.** Knex treats every `?` as a binding
+  placeholder, so JSONB operators (`?`, `?|`, `?&`) break with
+  `syntax error at or near "$1"`. Use the function forms instead —
+  `jsonb_exists(col, key)`, `jsonb_exists_any`, `jsonb_exists_all` — or
+  escape as `\\?`.
+- **Never delete an applied migration file.** The ledger
+  (`parcae_migrations`) still records it, and Knex refuses to run ANY
+  migrations while a recorded file is missing ("the migration directory
+  is corrupt"). Consolidate by leaving tombstone files in place.
 - State lives in `parcae_migrations` (Knex) + `parcae_migration_meta` (Parcae); written atomically inside each migration's transaction.
 - **Checksum drift detection**: editing an already-applied migration throws `MigrationChecksumError`. Bypass with `--allow-checksum-drift` (CLI) or `PARCAE_ALLOW_CHECKSUM_DRIFT=true`.
 - Multi-replica safe — Knex's `parcae_migrations_lock` uses `SELECT ... FOR UPDATE`.
@@ -397,6 +411,18 @@ hook.after(ModelClass, action, handler, options?)
 | `action`           | `"save"`, `"create"`, `"update"`, `"patch"`, `"remove"` |
 | `options.async`    | `true` = fire-and-forget (non-blocking)                 |
 | `options.priority` | Lower runs first (default 100)                          |
+
+### Action dispatch semantics
+
+The adapter dispatches exactly one action per write: **`create`** for new
+rows (`__isNew`), **`save`** for full re-saves of existing rows, `patch`
+for JSON-patch updates, `remove` for deletes.
+
+**The first save IS a create**: registrations for `save` automatically
+alias `create`, so a save hook fires on every write of the row — new or
+existing. Register `create` when you want creation-only behavior.
+(Without the alias, create-only flows — likes, follows, any toggle row —
+would silently bypass every save hook, validation included.)
 
 ### Hook Context
 
