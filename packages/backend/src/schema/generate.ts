@@ -29,8 +29,11 @@ import { SchemaResolver } from "./resolver";
  *   1: initial
  *   2: handle `string & T` / `(string & {})` autocomplete-fallback
  *      pattern in unions (was incorrectly resolving to "json")
+ *   3: skip ambient (`declare`) and `$`-prefixed properties — a
+ *      type-only `declare $user: string` companion was resolving to
+ *      a real column whose NULL clobbered the ref accessor on hydrate
  */
-const RESOLVER_VERSION = 2;
+const RESOLVER_VERSION = 3;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 

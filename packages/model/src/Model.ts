@@ -975,7 +975,12 @@ export class Model extends EventEmitter {
     // payloads (e.g. a JSON snapshot from before the field was
     // dropped) don't accidentally write a stale type onto the
     // instance. Ref fields are skipped — their values were already
-    // consumed into the accessor closures above.
+    // consumed into the accessor closures above. `$`-prefixed keys are
+    // skipped too: that namespace belongs to the raw-id accessors
+    // installed above, so a stray `$field` key in the payload (e.g. a
+    // leaked DB column or an over-eager serializer) would otherwise
+    // write through the accessor's setter and clobber the ref id the
+    // ref loop just installed.
     for (const [key, value] of Object.entries(data)) {
       if (SYSTEM_DATA_KEYS.has(key)) continue;
       if (refTargets.has(key)) continue;

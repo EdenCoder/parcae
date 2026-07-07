@@ -227,6 +227,22 @@ export class SchemaResolver {
       // Skip methods
       if (prop.getKind() === SyntaxKind.MethodDeclaration) continue;
 
+      // Skip ambient (`declare`) properties — they describe values
+      // installed at runtime (e.g. the `$field` raw-id companion of a
+      // ref accessor), not persisted state. Treating one as a column
+      // creates a real DB column whose NULL then clobbers the runtime
+      // accessor on every hydrate.
+      if (
+        prop.isKind(SyntaxKind.PropertyDeclaration) &&
+        prop.hasDeclareKeyword()
+      )
+        continue;
+
+      // Same reasoning for `$`-prefixed names regardless of modifier:
+      // the `$` namespace is reserved for parcae's runtime accessors
+      // and must never round-trip into the schema.
+      if (name.startsWith("$")) continue;
+
       // Get the declared type
       const type = prop.getType();
       schema[name] = resolveType(type);
