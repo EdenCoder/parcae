@@ -47,6 +47,8 @@ type DiffOp =
   | { op: "remove"; id: string }
   | { op: "update"; id: string; patch: Operation[] };
 
+type SanitizerUser = { id: string } | null;
+
 /** Wire envelope sent on `query:{hash}`. */
 export interface QueryEmitEnvelope {
   ops: DiffOp[];
@@ -58,6 +60,8 @@ interface CachedQuery {
   hash: string;
   modelType: string;
   query: QueryChain<any>;
+  /** Request user used for model `sanitize(user)` during re-evals. */
+  user: SanitizerUser;
   /**
    * Per-query ref expansions recorded by `.expand(...)`. Drives the
    * per-emit `hydrateExpansions` pass that inlines linked rows in
@@ -112,6 +116,8 @@ interface CachedQuery {
 interface SubscriptionOptions {
   socketId: string;
   query: QueryChain<any>;
+  /** Request user used for model `sanitize(user)` during cache builds. */
+  user?: SanitizerUser;
   /**
    * Per-query ref expansions recorded by `.expand(...)` on the
    * client. Subscriptions with different expand projections live as
@@ -207,6 +213,7 @@ interface IoBackend {
 function hashFrom(
   toSQL: { sql: string; bindings: any[] },
   expand: readonly ResolvedExpand[],
+  user: SanitizerUser,
 ): string {
   // Expand projections are part of the cache key: a `.find()` with
   // and without `.expand("file")` returns different wire shapes and
@@ -227,6 +234,7 @@ function hashFrom(
     sql: toSQL.sql,
     bindings: toSQL.bindings,
     expand: expandKey,
+    user: user?.id ?? null,
   });
   return createHash("sha256").update(payload).digest("hex").slice(0, 16);
 }
@@ -404,13 +412,14 @@ export class QuerySubscriptionManager {
     extra: SubscribeExtraOptions = {},
   ): Promise<{ hash: string; items: Record<string, any>[] }> {
     const { socketId, query, steps } = opts;
+    const user = opts.user ? { id: opts.user.id } : null;
     const expand = opts.expand ?? EMPTY_EXPAND;
     const orderOptedOut = orderEmissionDisabled(steps);
     // `__modelType` lives on the QueryChain interface as @internal —
     // populated by every chain factory (`Model._query` → `lazyQuery`
     // server-side, the adapter's `query()` factory client-side).
     const modelType = query.__modelType;
-    const hash = hashFrom(query.exec().toSQL(), expand);
+    const hash = hashFrom(query.exec().toSQL(), expand, user);
 
     // Per-socket cap enforced BEFORE the cache lookup so a socket
     // can't unlock new subscriptions by re-requesting an already-
@@ -448,7 +457,7 @@ export class QuerySubscriptionManager {
         await this._forceReeval(cached);
       }
     } else {
-      const rows = await this._execQuery(query, expand);
+      const rows = await this._execQuery(query, expand, user);
       const result = new Map<string, Record<string, any>>();
       for (const row of rows) {
         const clean = dateSafeClone(row);
@@ -460,6 +469,7 @@ export class QuerySubscriptionManager {
         hash,
         modelType,
         query,
+        user,
         expand,
         result,
         subscribers: new Set([socketId]),
@@ -705,7 +715,11 @@ export class QuerySubscriptionManager {
   private async _reeval(cached: CachedQuery): Promise<void> {
     if (cached.subscribers.size === 0) return;
 
-    const rows = await this._execQuery(cached.query, cached.expand);
+    const rows = await this._execQuery(
+      cached.query,
+      cached.expand,
+      cached.user,
+    );
     const newResult = new Map<string, Record<string, any>>();
     for (const row of rows) {
       const clean = dateSafeClone(row);
@@ -777,6 +791,7 @@ export class QuerySubscriptionManager {
   private async _execQuery(
     query: QueryChain<any>,
     expand: readonly ResolvedExpand[],
+    user: SanitizerUser,
   ): Promise<Record<string, any>[]> {
     const models = await query.clone().find();
     // `query.find()` returns `Promise<any[]>` (the chain's generic is
@@ -786,7 +801,12 @@ export class QuerySubscriptionManager {
     // itself, so the fallback is effectively unreachable for real
     // model classes).
     const wireRows = await Promise.all(
-      models.map((m: any) => m.sanitize?.() ?? m.__data ?? m),
+      models.map(async (m: any) => {
+        if (typeof m?.sanitize === "function") {
+          return await m.sanitize(user ?? undefined);
+        }
+        return m?.__data ?? m;
+      }),
     );
 
     if (expand.length === 0) return wireRows;
@@ -806,12 +826,7 @@ export class QuerySubscriptionManager {
     const loader = new RefLoader((type, ids) =>
       adapter.batchFindByType!(type, ids),
     );
-    // No request user available outside a request scope. Privacy-
-    // sensitive refs (e.g. expanding a `user` ref with private
-    // fields) would need to opt in via subscription-time user
-    // carriage — out of scope for v1 since the only expanded ref in
-    // anger right now is `File`, which has no `privateFields`.
-    await hydrateExpansions(wireRows, expand, loader, null);
+    await hydrateExpansions(wireRows, expand, loader, user ?? undefined);
     return wireRows;
   }
 

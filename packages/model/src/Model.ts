@@ -293,6 +293,7 @@ function lazyQuery<T>(
   chain.find = async () => (await resolve()).find();
   chain.first = async () => (await resolve()).first();
   chain.count = async () => (await resolve()).count();
+  chain.sum = async (column: string) => (await resolve()).sum(column);
 
   chain.__steps = keySteps;
   chain.__modelType = modelClass.type;
@@ -691,6 +692,13 @@ export class Model extends EventEmitter {
 
   static count<T extends Model>(this: ModelConstructor<T>): Promise<number> {
     return lazyQuery(this).count();
+  }
+
+  static sum<T extends Model>(
+    this: ModelConstructor<T>,
+    column: string,
+  ): Promise<number> {
+    return lazyQuery(this).sum(column);
   }
 
   static search<T extends Model>(

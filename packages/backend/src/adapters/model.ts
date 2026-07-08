@@ -1306,6 +1306,16 @@ export class BackendAdapter implements ModelAdapter {
       return Number.parseInt(`${Object.values(result[0] || {})[0] || "0"}`, 10);
     };
 
+    chain.sum = async (column: string): Promise<number> => {
+      const clone = knexQuery.clone();
+      const result = await clone
+        .clearSelect()
+        .clearOrder()
+        .sum({ total: column });
+      const total = Number(Object.values(result[0] || {})[0] ?? 0);
+      return Number.isFinite(total) ? total : 0;
+    };
+
     chain.exec = () => knexQuery;
     chain.clone = () => this._buildQuery(modelClass, knexQuery.clone(), expand);
 

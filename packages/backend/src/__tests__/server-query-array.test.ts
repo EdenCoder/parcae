@@ -141,3 +141,43 @@ describe("BackendAdapter.query() — server-side whereIn on JSON-array columns",
     expect(whereRaw!.args[0]).toBe("1 = 0");
   });
 });
+
+describe("BackendAdapter.query() — aggregate terminals", () => {
+  it("sum() returns a numeric scalar from the scoped query", async () => {
+    const calls: Array<{ method: string; args: any[] }> = [];
+    const chain: any = {
+      where: (...args: any[]) => {
+        calls.push({ method: "where", args });
+        return chain;
+      },
+      clone: () => chain,
+      clearSelect: () => {
+        calls.push({ method: "clearSelect", args: [] });
+        return chain;
+      },
+      clearOrder: () => {
+        calls.push({ method: "clearOrder", args: [] });
+        return chain;
+      },
+      sum: async (...args: any[]) => {
+        calls.push({ method: "sum", args });
+        return [{ total: "12" }];
+      },
+    };
+    const adapter = new (BackendAdapter as any)({
+      read: () => chain,
+      write: () => chain,
+    }) as BackendAdapter;
+
+    await expect(
+      adapter.query(PostArrayModel as any).where({ name: "paid" }).sum("views"),
+    ).resolves.toBe(12);
+
+    expect(calls).toEqual([
+      { method: "where", args: [{ name: "paid" }] },
+      { method: "clearSelect", args: [] },
+      { method: "clearOrder", args: [] },
+      { method: "sum", args: [{ total: "views" }] },
+    ]);
+  });
+});

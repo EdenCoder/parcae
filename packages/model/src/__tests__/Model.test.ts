@@ -671,6 +671,19 @@ describe("Model", () => {
         JSON.stringify(second.__steps),
       );
     });
+
+    it("resolves sum as a scalar terminal", async () => {
+      const query: any = {
+        where: vi.fn(() => query),
+        sum: vi.fn(async () => 42),
+      };
+      adapter.query = vi.fn(() => query);
+
+      await expect(Post.where({ published: true }).sum("views")).resolves.toBe(42);
+
+      expect(query.where).toHaveBeenCalledWith({ published: true });
+      expect(query.sum).toHaveBeenCalledWith("views");
+    });
   });
 
   // ── Reference field accessors (DOL-1045) ──────────────────────────

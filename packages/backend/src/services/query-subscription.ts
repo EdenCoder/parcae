@@ -202,7 +202,7 @@ export async function runQuerySubscription(
 
   const [sub, totalCount] = await Promise.all([
     adapter.subscriptions.subscribe(
-      { socketId, query, expand: expandResolved, steps },
+      { socketId, query, expand: expandResolved, steps, user },
       { force },
     ),
     countQuery.count(),

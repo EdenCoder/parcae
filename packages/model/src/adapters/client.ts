@@ -254,6 +254,16 @@ export class FrontendAdapter implements ModelAdapter {
       return result?.total ?? 0;
     };
 
+    chain.sum = async (column: string): Promise<number> => {
+      const path = this.resolvePath(modelClass);
+      const result = await this.transport.get(path, {
+        __query: steps,
+        __sum: column,
+      });
+      const total = Number(result?.total ?? 0);
+      return Number.isFinite(total) ? total : 0;
+    };
+
     /**
      * Returns a sibling chain that, on `.find()`, sets the
      * `__forceRefresh: true` request flag. The backend's LIST handler

@@ -131,6 +131,7 @@ export interface ModelClass<T> extends ModelConstructor<T> {
   whereNotNull(column: string): QueryChain<T>;
   select(...columns: string[]): QueryChain<T>;
   count(): Promise<number>;
+  sum(column: string): Promise<number>;
   search(term: string): QueryChain<T>;
 }
 
@@ -324,8 +325,7 @@ export interface QueryChain<T> {
    */
   expand(...fields: string[]): QueryChain<T>;
 
-  // Chainable — aggregates (chainable versions)
-  sum(column: string): QueryChain<T>;
+  // Chainable — aggregate/mutation builders
   avg(column: string): QueryChain<T>;
   min(column: string): QueryChain<T>;
   max(column: string): QueryChain<T>;
@@ -344,6 +344,7 @@ export interface QueryChain<T> {
   find(): Promise<T[]>;
   first(): Promise<T | null>;
   count(): Promise<number>;
+  sum(column: string): Promise<number>;
 
   // Introspection — access underlying query builder
   /** @internal Return the underlying query builder (e.g. Knex QueryBuilder). */
@@ -491,7 +492,6 @@ export const CHAINABLE_METHODS = [
   "clearSelect",
   "clearLimit",
   "from",
-  "sum",
   "avg",
   "min",
   "max",

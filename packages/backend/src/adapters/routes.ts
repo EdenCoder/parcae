@@ -108,6 +108,18 @@ function readonlyFieldsFor(modelClass: ModelConstructor): ReadonlySet<string> {
   return merged;
 }
 
+function queryStringValue(value: unknown): string {
+  const raw = Array.isArray(value) ? value[0] : value;
+  return typeof raw === "string" ? raw : "";
+}
+
+function assertNumericColumn(modelClass: ModelConstructor, column: string): void {
+  const type = modelClass.__schema?.[column];
+  if (type !== "integer" && type !== "number") {
+    throw new ClientError(`Invalid numeric column "${column}"`);
+  }
+}
+
 /**
  * Strip framework-protected and model-protected fields from a client
  * body before they get mass-assigned onto a model instance. Returns
@@ -270,6 +282,13 @@ export function registerModelRoutes(
 
           if (data.__count === "true" || data.__count === true) {
             const total = await prep.query.count();
+            return json(res, 200, { result: { total }, success: true });
+          }
+
+          const sumColumn = queryStringValue(data.__sum);
+          if (sumColumn) {
+            assertNumericColumn(ModelClass, sumColumn);
+            const total = await prep.query.sum(sumColumn);
             return json(res, 200, { result: { total }, success: true });
           }
 

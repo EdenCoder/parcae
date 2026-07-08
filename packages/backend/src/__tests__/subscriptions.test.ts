@@ -57,6 +57,42 @@ function makeMockQuery(
   return chain;
 }
 
+function makePrivateUserQuery(getCredits: () => number) {
+  const chain: any = new Proxy(
+    {},
+    {
+      get(_target, prop: string) {
+        if (prop === "__modelType") return "user";
+        if (prop === "find") {
+          return async () => [
+            {
+              id: "u1",
+              credits: getCredits(),
+              sanitize: (user?: { id: string }) => {
+                if (user?.id === "u1") {
+                  return { id: "u1", credits: getCredits() };
+                }
+                return { id: "u1" };
+              },
+            },
+          ];
+        }
+        if (prop === "exec") {
+          return () => ({
+            toSQL: () => ({
+              sql: "SELECT * FROM users WHERE id = ?",
+              bindings: ["u1"],
+            }),
+          });
+        }
+        if (prop === "clone") return () => chain;
+        return (..._args: any[]) => chain;
+      },
+    },
+  );
+  return chain;
+}
+
 // ─── Helper to create queries with mutable results ───────────────────────────
 
 function createQuerySource(initialResults: Record<string, any>[] = []) {
@@ -132,6 +168,41 @@ describe("QuerySubscriptionManager", () => {
       expect(sub1.hash).toBe(sub2.hash);
       expect(manager.stats.queries).toBe(1);
       expect(manager.stats.subscribers).toBe(2);
+    });
+
+    it("should sanitize cached subscriptions and re-evals with the request user", async () => {
+      let credits = 1000;
+      const query = makePrivateUserQuery(() => credits);
+
+      const owner = await manager.subscribe({
+        socketId: "s1",
+        query,
+        user: { id: "u1" },
+      });
+      const other = await manager.subscribe({
+        socketId: "s2",
+        query,
+        user: { id: "u2" },
+      });
+
+      expect(owner.hash).not.toBe(other.hash);
+      expect(owner.items[0]).toEqual({ id: "u1", credits: 1000 });
+      expect(other.items[0]).toEqual({ id: "u1" });
+
+      credits = 750;
+      manager.onModelChange("user");
+      await tick();
+
+      expect(emitted).toHaveLength(1);
+      expect(emitted[0]!.socketId).toBe("s1");
+      expect(emitted[0]!.event).toBe(`query:${owner.hash}`);
+      expect(emitted[0]!.data.ops).toEqual([
+        {
+          op: "update",
+          id: "u1",
+          patch: [{ op: "replace", path: "/credits", value: 750 }],
+        },
+      ]);
     });
 
     it("should create separate subscriptions for different queries", async () => {
