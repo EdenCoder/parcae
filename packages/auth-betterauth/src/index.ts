@@ -36,11 +36,18 @@ import type {
 
 export interface BetterAuthConfig {
   /** Enabled auth providers. Default: ["email"] */
-  providers?: ("email" | "google" | "github")[];
+  providers?: ("email" | "google" | "github" | "apple")[];
   /** Google OAuth config. */
   google?: { clientId: string; clientSecret: string };
   /** GitHub OAuth config. */
   github?: { clientId: string; clientSecret: string };
+  /**
+   * Apple config. Native iOS sign-in only needs `appBundleIdentifier`
+   * (idToken audience = bundle id, verified against Apple's public keys);
+   * `clientId` (Services ID) + `clientSecret` (self-minted ES256 JWT) are
+   * required only for the web/Android OAuth flow.
+   */
+  apple?: { clientId?: string; clientSecret?: string; appBundleIdentifier?: string };
   /** Session config. */
   session?: { expiresIn?: number; updateAge?: number };
   /** Trusted origins for CORS (in addition to TRUSTED_ORIGINS env var). */
@@ -172,6 +179,14 @@ export function betterAuth(config: BetterAuthConfig = {}): AuthAdapter {
         socialProviders.github = {
           clientId: config.github.clientId,
           clientSecret: config.github.clientSecret,
+        };
+      }
+
+      if (providers.includes("apple") && config.apple) {
+        socialProviders.apple = {
+          clientId: config.apple.clientId ?? config.apple.appBundleIdentifier ?? "",
+          clientSecret: config.apple.clientSecret ?? "unused-for-native-idtoken",
+          appBundleIdentifier: config.apple.appBundleIdentifier,
         };
       }
 
