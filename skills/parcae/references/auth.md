@@ -12,6 +12,7 @@ Source: `packages/backend/src/auth.ts`
 ```typescript
 interface AuthAdapter {
   setup(ctx: AuthSetupContext): Promise<void>;
+  close?(): Promise<void> | void;
   resolveRequest(req): Promise<AuthSession | null>;
   resolveToken(token): Promise<AuthSession | null>;
   routes?: { basePath: string; handler: (req, res) => void } | null;
@@ -33,7 +34,8 @@ interface AuthSession {
 
 Auth adapters run during `createApp()` startup. Adapters that own schema (Better
 Auth) migrate their tables before Parcae's `ensureAllTables()` so Parcae can add
-custom columns afterwards.
+custom columns afterwards. `app.stop()` calls optional `auth.close()` before
+destroying the Knex pools. Startup failures use the same teardown path.
 
 ### Session Resolution
 
@@ -100,7 +102,9 @@ before booting an app with Better Auth.
 
 ### How It Works
 
-- Creates its own `pg.Pool` from `DATABASE_URL` (same database as Parcae).
+- Creates its own tracked `pg.Pool` from `DATABASE_URL` (same database as
+  Parcae), unless an app-owned `database` pool is supplied. `app.stop()` closes
+  an adapter-owned pool and leaves an app-owned pool open.
 - Points Better Auth's user table at `pluralize((userModel).type)` so it matches
   the table the `BackendAdapter` creates. It reads the model's **static `type`**,
   not the schema, so an irregular type lines up: `user` → `users`,
@@ -110,6 +114,9 @@ before booting an app with Better Auth.
   `emailVerified`, `image`, `createdAt`, `updatedAt`**. Parcae column types map
   to Better Auth types (`boolean`→`boolean`, `integer`/`number`→`number`,
   `datetime`→`date`, else `string`); all inferred fields are `required: false`.
+- Rejects `User.privateFields` containing any Better Auth-managed returned field:
+  `id`, `name`, `email`, `emailVerified`, `image`, `createdAt`, or `updatedAt`.
+  Better Auth cannot hide these built-ins.
 - Uses Parcae's `generateId()` as Better Auth's `advanced.database.generateId`
   for ID consistency.
 - Internal tables (created by Better Auth migrations): user table (e.g. `users`),
@@ -217,6 +224,7 @@ const app = createApp({
   auth: clerk({
     secretKey: process.env.CLERK_SECRET_KEY!,
     publishableKey: process.env.CLERK_PUBLISHABLE_KEY!,
+    authorizedParties: ["https://app.example.com"],
     webhookSecret: process.env.CLERK_WEBHOOK_SECRET, // optional
     publishClaims: ["plan", "feature_flags"], // optional
     mapUser: (clerkUser) => ({
@@ -229,18 +237,19 @@ const app = createApp({
 
 `ClerkConfig`:
 
-| Option           | Default              | Notes                                                  |
-| ---------------- | -------------------- | ------------------------------------------------------ |
-| `secretKey`      | —                    | `sk_...`. Required; used for JWT verification.         |
-| `publishableKey` | —                    | `pk_...`. Builds the Clerk API client.                 |
-| `webhookSecret`  | —                    | `whsec_...`. Enables Svix webhook sync when set.       |
-| `webhookPath`    | `"/webhooks/clerk"`  | Webhook route path.                                    |
-| `mapUser`        | `defaultMapUser`     | Maps a Clerk user to local fields.                     |
-| `publishClaims`  | `[]`                 | Extra JWT claim names to surface on `session.user`.    |
+| Option              | Default              | Notes                                                  |
+| ------------------- | -------------------- | ------------------------------------------------------ |
+| `secretKey`        | —                    | `sk_...`. Required; used for JWT verification.         |
+| `publishableKey`   | —                    | `pk_...`. Builds the Clerk API client.                 |
+| `authorizedParties`| —                    | Allowed JWT `azp` origins passed to `verifyToken`.     |
+| `webhookSecret`    | —                    | `whsec_...`. Enables Svix webhook sync when set.       |
+| `webhookPath`      | `"/webhooks/clerk"`  | Webhook mount prefix; see exact endpoint below.        |
+| `mapUser`          | `defaultMapUser`     | Maps a Clerk user to local fields.                     |
+| `publishClaims`    | `[]`                 | Extra JWT claim names to surface on `session.user`.    |
 
-Note: token verification uses **`secretKey` only** (`verifyToken(token, { secretKey })`).
-`publishableKey` is passed to `createClerkClient` to build the Clerk API client
-used for fetching users and org memberships — it is not used to verify the JWT.
+Token verification passes `secretKey` and `authorizedParties` to `verifyToken`;
+the latter validates the JWT `azp` claim when configured. `publishableKey` is
+passed to `createClerkClient` for user and org-membership API calls.
 
 `defaultMapUser` maps `name` (firstName + lastName joined), `email` (primary
 email address), and `image` (`imageUrl`). Your `mapUser` replaces it entirely.
@@ -254,6 +263,11 @@ email address), and `image` (`imageUrl`). Your `mapUser` replaces it entirely.
 - Optional webhook sync via Svix when `webhookSecret` is set, handling
   `user.created`, `user.updated`, `user.deleted` (verifies `svix-id`,
   `svix-timestamp`, `svix-signature`).
+
+The backend mounts auth handlers at `${basePath}/*`. Clerk's `webhookPath` is
+therefore a mount prefix, and the exact default webhook URL configured in Clerk
+must be `https://api.example.com/webhooks/clerk/events`; the final non-empty
+segment is required by the wildcard mount.
 
 ### Auth Flow & Session Shape
 

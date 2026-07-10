@@ -33,6 +33,7 @@ beforeEach(() => {
 
 afterEach(() => {
   delete (globalThis as Record<string, unknown>).lynx;
+  vi.useRealTimers();
 });
 
 async function flush(): Promise<void> {
@@ -62,16 +63,43 @@ describe("createEmitterAuthAdapter", () => {
     expect(seen).toEqual(["tok-1", null]);
   });
 
-  it("maps a failing getter to a null (anonymous) token", async () => {
+  it("retries a transient getter failure without emitting null", async () => {
+    vi.useFakeTimers();
+    let reads = 0;
     const adapter = createEmitterAuthAdapter({
-      getToken: () => Promise.reject(new Error("native store down")),
+      getToken: () => {
+        reads++;
+        return reads === 1
+          ? Promise.reject(new Error("native store down"))
+          : Promise.resolve("recovered-token");
+      },
     });
     const cb = vi.fn();
     adapter.onChange(cb);
 
     emitter.emit("auth.changed");
-    await flush();
-    expect(cb).toHaveBeenCalledWith(null);
+    await vi.runAllTimersAsync();
+
+    expect(reads).toBe(2);
+    expect(cb).toHaveBeenCalledOnce();
+    expect(cb).toHaveBeenCalledWith("recovered-token");
+    expect(cb).not.toHaveBeenCalledWith(null);
+  });
+
+  it("ignores a persistent getter failure after the retry budget", async () => {
+    vi.useFakeTimers();
+    const getToken = vi.fn(() =>
+      Promise.reject(new Error("native store down")),
+    );
+    const adapter = createEmitterAuthAdapter({ getToken });
+    const cb = vi.fn();
+    adapter.onChange(cb);
+
+    emitter.emit("auth.changed");
+    await vi.runAllTimersAsync();
+
+    expect(getToken).toHaveBeenCalledTimes(2);
+    expect(cb).not.toHaveBeenCalled();
   });
 
   it("honours a custom event name and unsubscribes cleanly", async () => {

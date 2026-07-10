@@ -8,23 +8,41 @@ import { useEffect, useState } from "@lynx-js/react";
 
 import type { LiveQueryStore, LiveRow, LiveSnapshot } from "./live-query";
 
+const EMPTY_SNAPSHOT: LiveSnapshot<never> = {
+  items: [],
+  status: "loading",
+  error: null,
+};
+
+interface HookState<T extends LiveRow> {
+  store: LiveQueryStore<T>;
+  snapshot: LiveSnapshot<T>;
+}
+
 /**
- * Subscribe a component to a live store. `enabled: false` renders the
- * current snapshot without retaining (no fetch is triggered) — use it
- * to keep anonymous surfaces from firing owner-scoped queries.
+ * Subscribe a component to a live store. `enabled: false` clears the
+ * visible snapshot and does not retain or fetch the store.
  */
 export function useLiveQuery<T extends LiveRow>(
   store: LiveQueryStore<T>,
   enabled = true,
 ): LiveSnapshot<T> {
-  const [snap, setSnap] = useState<LiveSnapshot<T>>(() => store.snapshot());
+  const [state, setState] = useState<HookState<T>>(() => ({
+    store,
+    snapshot: enabled ? store.snapshot() : EMPTY_SNAPSHOT,
+  }));
 
   useEffect(() => {
     "background only";
-    if (!enabled) return;
-    setSnap(store.snapshot());
-    return store.retain(() => setSnap(store.snapshot()));
+    if (!enabled) {
+      setState({ store, snapshot: EMPTY_SNAPSHOT });
+      return;
+    }
+    const update = () => setState({ store, snapshot: store.snapshot() });
+    update();
+    return store.retain(update);
   }, [store, enabled]);
 
-  return snap;
+  if (!enabled) return EMPTY_SNAPSHOT;
+  return state.store === store ? state.snapshot : store.snapshot();
 }

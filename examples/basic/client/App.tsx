@@ -8,26 +8,21 @@
  * - Suspense for lazy-loaded references (post.user)
  */
 
-import React, { Suspense } from "react";
-import { createClient } from "@parcae/sdk";
-import { ParcaeProvider, useQuery } from "@parcae/sdk/react";
-import { Post } from "../models/Post";
+import { Suspense } from 'react';
+import { createClient } from '@parcae/sdk';
+import { ParcaeProvider, useQuery } from '@parcae/sdk/react';
+import { Post } from '../models/Post';
 
 // Create the client — connects to the backend via Socket.IO
 const client = createClient({
-  url: "http://localhost:3000",
-  transport: "socket",
+  url: 'http://localhost:3000',
+  getToken: async () => null,
 });
-
-// Or use SSE (no WebSocket needed):
-// const client = createClient({
-//   url: "http://localhost:3000",
-//   transport: "sse",
-// });
+const ClientPost = client.bind(Post);
 
 function PostList() {
   const { items: posts, loading } = useQuery(
-    Post.where({ published: true }).orderBy("createdAt", "desc" as any),
+    ClientPost.where({ published: true }).orderBy('createdAt', 'desc'),
   );
 
   if (loading) return <div>Loading...</div>;
@@ -35,9 +30,9 @@ function PostList() {
   return (
     <div>
       <h1>Posts</h1>
-      {posts.map((post: any) => (
+      {posts.map((post) => (
         <article key={post.id}>
-          <h2>{post.__data.title}</h2>
+          <h2>{post.title}</h2>
           <Suspense fallback={<span>Loading author...</span>}>
             <AuthorName post={post} />
           </Suspense>
@@ -47,9 +42,9 @@ function PostList() {
   );
 }
 
-function AuthorName({ post }: { post: any }) {
+function AuthorName({ post }: { post: Post }) {
   // post.user triggers a lazy-load via Suspense
-  return <span>By {post.user?.name ?? "Anonymous"}</span>;
+  return <span>By {post.user?.name ?? 'Anonymous'}</span>;
 }
 
 export default function App() {

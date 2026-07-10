@@ -45,6 +45,14 @@ function makeSession(initialUserId: string | null): StubSession {
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
 interface FakeClient extends EventEmitter {
   session: StubSession;
   subscriptions: Array<{
@@ -144,6 +152,24 @@ describe("prefetch", () => {
     expect(first).toBe(second);
   });
 
+  it("does not hang when a subscribed result has no query hash", async () => {
+    const session = makeSession("u1");
+    session.resolve();
+    const client = makeFakeClient(session);
+    const findSpy = vi.fn();
+    const chain = makeChain({
+      results: [{ id: "p1" }],
+      queryHash: "",
+      findSpy,
+    });
+
+    await prefetch(client as unknown as ParcaeClient, chain);
+    const second = await prefetch(client as unknown as ParcaeClient, chain);
+
+    expect(second).toHaveLength(1);
+    expect(findSpy).toHaveBeenCalledOnce();
+  });
+
   it("coalesces parallel prefetches into a single wire request", async () => {
     const session = makeSession("u1");
     session.resolve();
@@ -183,7 +209,7 @@ describe("prefetch", () => {
     expect(findSpy).not.toHaveBeenCalled();
 
     const anonKey = useQueryTest.buildKey("post", null, chain.__steps);
-    expect(useQueryTest.getEntry(anonKey)).toBeUndefined();
+    expect(useQueryTest.getEntry(client as any, anonKey)).toBeUndefined();
 
     session.state.userId = "u-authsafe";
     session.resolve();
@@ -196,8 +222,8 @@ describe("prefetch", () => {
       "u-authsafe",
       chain.__steps,
     );
-    expect(useQueryTest.getEntry(userKey)).toBeDefined();
-    expect(useQueryTest.getEntry(anonKey)).toBeUndefined();
+    expect(useQueryTest.getEntry(client as any, userKey)).toBeDefined();
+    expect(useQueryTest.getEntry(client as any, anonKey)).toBeUndefined();
   });
 
   it("skips the session gate when waitForSession: false", async () => {
@@ -217,7 +243,7 @@ describe("prefetch", () => {
     expect(findSpy).toHaveBeenCalledTimes(1);
     expect(items).toHaveLength(1);
     const anonKey = useQueryTest.buildKey("post", null, chain.__steps);
-    expect(useQueryTest.getEntry(anonKey)).toBeDefined();
+    expect(useQueryTest.getEntry(client as any, anonKey)).toBeDefined();
   });
 
   it("primes the cache so a subsequent useQuery sees items without re-fetching", async () => {
@@ -235,7 +261,7 @@ describe("prefetch", () => {
     expect(findSpy).toHaveBeenCalledTimes(1);
 
     const key = useQueryTest.buildKey("post", "u1", chain.__steps);
-    const entry = useQueryTest.getEntry(key);
+    const entry = useQueryTest.getEntry(client as any, key);
     expect(entry).toBeDefined();
     expect(entry!.items).toHaveLength(2);
     expect(entry!.loading).toBe(false);
@@ -249,6 +275,81 @@ describe("prefetch", () => {
       },
     ]);
     expect((entry!.items[0] as any).title).toBe("live");
+  });
+
+  it("isolates identical query keys by client identity", async () => {
+    const sessionA = makeSession("u1");
+    const sessionB = makeSession("u1");
+    sessionA.resolve();
+    sessionB.resolve();
+    const clientA = makeFakeClient(sessionA) as unknown as ParcaeClient;
+    const clientB = makeFakeClient(sessionB) as unknown as ParcaeClient;
+    const chainA = makeChain({
+      results: [{ id: "p1", title: "client A" }],
+      queryHash: "hash-a",
+    });
+    const chainB = makeChain({
+      results: [{ id: "p1", title: "client B" }],
+      queryHash: "hash-b",
+    });
+
+    await Promise.all([prefetch(clientA, chainA), prefetch(clientB, chainB)]);
+
+    const key = useQueryTest.buildKey("post", "u1", chainA.__steps);
+    const entryA = useQueryTest.getEntry(clientA, key)!;
+    const entryB = useQueryTest.getEntry(clientB, key)!;
+    expect(entryA).not.toBe(entryB);
+    expect(entryA.items[0].title).toBe("client A");
+    expect(entryB.items[0].title).toBe("client B");
+  });
+
+  it("ignores a fetch response after its cache entry is purged and replaced", async () => {
+    const session = makeSession("u1");
+    session.resolve();
+    const client = makeFakeClient(session) as unknown as ParcaeClient;
+    const oldResult = deferred<any[]>();
+    const oldChain = makeChain({ results: [], queryHash: "old" });
+    oldChain.find = () => oldResult.promise;
+    const key = useQueryTest.buildKey("post", "u1", oldChain.__steps);
+    const releaseOld = useQueryTest.retain(client, key, () => {});
+    useQueryTest.fetch(key, oldChain, client);
+
+    const { _purgeCacheForUser } = await import("../react/useQuery");
+    _purgeCacheForUser(client, "u1");
+    const freshChain = makeChain({
+      results: [{ id: "fresh", title: "new" }],
+      queryHash: "fresh",
+    });
+    const releaseFresh = useQueryTest.retain(client, key, () => {});
+    useQueryTest.fetch(key, freshChain, client);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    oldResult.resolve([Post.hydrate({} as any, { id: "stale", title: "old" })]);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const entry = useQueryTest.getEntry(client, key)!;
+    expect(entry.items.map((item) => item.id)).toEqual(["fresh"]);
+    releaseOld();
+    releaseFresh();
+  });
+
+  it("rejects a pending prefetch when its identity cache is purged", async () => {
+    const session = makeSession("u1");
+    session.resolve();
+    const client = makeFakeClient(session) as unknown as ParcaeClient;
+    const result = deferred<any[]>();
+    const chain = makeChain({ results: [], queryHash: "pending" });
+    chain.find = () => result.promise;
+    const pending = prefetch(client, chain);
+    const rejection = expect(pending).rejects.toThrow("Query identity changed");
+    await Promise.resolve();
+
+    const { _purgeCacheForUser } = await import("../react/useQuery");
+    _purgeCacheForUser(client, "u1");
+
+    await rejection;
+    result.resolve([]);
   });
 
   it("throws if the chain has no __modelType", async () => {
@@ -281,7 +382,7 @@ describe("concurrent useQuery mounts on the same key", () => {
 
     const key = useQueryTest.buildKey("post", "u1", buildChain().__steps);
 
-    const release1 = useQueryTest.retain(key, () => {});
+    const release1 = useQueryTest.retain(client as any, key, () => {});
     useQueryTest.fetch(key, buildChain(), client as unknown as ParcaeClient);
 
     const second = prefetch(client as unknown as ParcaeClient, buildChain());
@@ -312,37 +413,40 @@ describe("_purgeCacheForUser (session-transition cache eviction)", () => {
 
     const sessionA = makeSession("userA");
     sessionA.resolve();
-    await prefetch(makeFakeClient(sessionA) as unknown as ParcaeClient, chainA);
+    const clientA = makeFakeClient(sessionA) as unknown as ParcaeClient;
+    await prefetch(clientA, chainA);
 
     const sessionB = makeSession("userB");
     sessionB.resolve();
-    await prefetch(makeFakeClient(sessionB) as unknown as ParcaeClient, chainB);
+    const clientB = makeFakeClient(sessionB) as unknown as ParcaeClient;
+    await prefetch(clientB, chainB);
 
     const keyA = useQueryTest.buildKey("post", "userA", chainA.__steps);
     const keyB = useQueryTest.buildKey("post", "userB", chainB.__steps);
-    expect(useQueryTest.getEntry(keyA)).toBeDefined();
-    expect(useQueryTest.getEntry(keyB)).toBeDefined();
+    expect(useQueryTest.getEntry(clientA, keyA)).toBeDefined();
+    expect(useQueryTest.getEntry(clientB, keyB)).toBeDefined();
 
     const { _purgeCacheForUser } = await import("../react/useQuery");
-    _purgeCacheForUser("userA");
+    _purgeCacheForUser(clientA, "userA");
 
-    expect(useQueryTest.getEntry(keyA)).toBeUndefined();
-    expect(useQueryTest.getEntry(keyB)).toBeDefined();
+    expect(useQueryTest.getEntry(clientA, keyA)).toBeUndefined();
+    expect(useQueryTest.getEntry(clientB, keyB)).toBeDefined();
   });
 
-  it("is a no-op when passed null (no prior session)", async () => {
+  it("does not drop authenticated entries when purging anonymous data", async () => {
     const session = makeSession("u1");
     session.resolve();
     const chain = makeChain({
       results: [{ id: "p1" }],
       queryHash: "h-1",
     });
-    await prefetch(makeFakeClient(session) as unknown as ParcaeClient, chain);
+    const client = makeFakeClient(session) as unknown as ParcaeClient;
+    await prefetch(client, chain);
     const key = useQueryTest.buildKey("post", "u1", chain.__steps);
 
     const { _purgeCacheForUser } = await import("../react/useQuery");
-    _purgeCacheForUser(null);
+    _purgeCacheForUser(client, null);
 
-    expect(useQueryTest.getEntry(key)).toBeDefined();
+    expect(useQueryTest.getEntry(client, key)).toBeDefined();
   });
 });

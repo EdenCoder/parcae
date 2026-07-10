@@ -35,6 +35,7 @@ import {
 import fastJsonPatch from "fast-json-patch";
 import type { Operation } from "fast-json-patch";
 import { RefLoader } from "./ref-loader";
+import { getRefLoader } from "./context";
 import {
   hydrateExpansions,
   type ResolvedExpand,
@@ -47,7 +48,7 @@ type DiffOp =
   | { op: "remove"; id: string }
   | { op: "update"; id: string; patch: Operation[] };
 
-type SanitizerUser = { id: string } | null;
+type SanitizerUser = { id: string; [key: string]: unknown } | null;
 
 /** Wire envelope sent on `query:{hash}`. */
 export interface QueryEmitEnvelope {
@@ -58,6 +59,8 @@ export interface QueryEmitEnvelope {
 
 interface CachedQuery {
   hash: string;
+  /** Invalidated before this cache identity is removed or replaced. */
+  generation: number;
   modelType: string;
   query: QueryChain<any>;
   /** Request user used for model `sanitize(user)` during re-evals. */
@@ -230,13 +233,42 @@ function hashFrom(
           })
           .sort()
           .join("|");
-  const payload = JSON.stringify({
+  const payload = stableStringify({
     sql: toSQL.sql,
     bindings: toSQL.bindings,
     expand: expandKey,
-    user: user?.id ?? null,
+    user,
   });
   return createHash("sha256").update(payload).digest("hex").slice(0, 16);
+}
+
+function stableStringify(value: unknown): string {
+  return JSON.stringify(value, (_key, current: unknown) => {
+    if (
+      !current ||
+      typeof current !== "object" ||
+      Array.isArray(current)
+    ) {
+      return current;
+    }
+    return Object.fromEntries(
+      Object.entries(current as Record<string, unknown>).sort(([a], [b]) =>
+        a.localeCompare(b),
+      ),
+    );
+  });
+}
+
+export function parsePositiveInteger(
+  value: string | number | undefined,
+  label: string,
+): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${label} must be a finite positive integer`);
+  }
+  return parsed;
 }
 
 /**
@@ -348,7 +380,10 @@ const EMPTY_EXPAND: readonly ResolvedExpand[] = Object.freeze([]);
 
 export class QuerySubscriptionManager {
   private queries = new Map<string, CachedQuery>();
+  private creating = new Map<string, Promise<CachedQuery>>();
   private socketQueries = new Map<string, Set<string>>();
+  private socketGenerations = new Map<string, number>();
+  private pendingSockets = new Map<string, number>();
   private typeIndex = new Map<string, Set<string>>();
   /**
    * Secondary index from expanded-target-type → cached query hashes.
@@ -387,12 +422,15 @@ export class QuerySubscriptionManager {
     this.defaultDebounceMs = opts.debounceMs ?? DEFAULT_DEBOUNCE_MS;
     this.defaultMaxWaitMs = opts.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
     this.reevalSemaphore = new Semaphore(
-      Math.max(1, opts.reevalConcurrency ?? DEFAULT_REEVAL_CONCURRENCY),
+      parsePositiveInteger(
+        opts.reevalConcurrency ?? DEFAULT_REEVAL_CONCURRENCY,
+        "reevalConcurrency",
+      )!,
     );
-    this.maxSubscriptionsPerSocket = Math.max(
-      1,
+    this.maxSubscriptionsPerSocket = parsePositiveInteger(
       opts.maxSubscriptionsPerSocket ?? DEFAULT_MAX_SUBSCRIPTIONS_PER_SOCKET,
-    );
+      "maxSubscriptionsPerSocket",
+    )!;
   }
 
   /** @internal — exposed for diagnostics + tests. */
@@ -412,7 +450,7 @@ export class QuerySubscriptionManager {
     extra: SubscribeExtraOptions = {},
   ): Promise<{ hash: string; items: Record<string, any>[] }> {
     const { socketId, query, steps } = opts;
-    const user = opts.user ? { id: opts.user.id } : null;
+    const user: SanitizerUser = opts.user ? dateSafeClone(opts.user) : null;
     const expand = opts.expand ?? EMPTY_EXPAND;
     const orderOptedOut = orderEmissionDisabled(steps);
     // `__modelType` lives on the QueryChain interface as @internal —
@@ -420,17 +458,18 @@ export class QuerySubscriptionManager {
     // server-side, the adapter's `query()` factory client-side).
     const modelType = query.__modelType;
     const hash = hashFrom(query.exec().toSQL(), expand, user);
+    const socketGeneration = this.socketGenerations.get(socketId) ?? 0;
 
     // Per-socket cap enforced BEFORE the cache lookup so a socket
     // can't unlock new subscriptions by re-requesting an already-
     // cached hash. The cap is on the socket's distinct-hash set
     // size, not on the cached query's total subscribers — sharing a
     // query across many sockets is fine and intentional.
-    const existing = this.socketQueries.get(socketId);
-    const alreadySubscribed = existing?.has(hash) ?? false;
+    let socketHashes = this.socketQueries.get(socketId);
+    const alreadySubscribed = socketHashes?.has(hash) ?? false;
     if (
       !alreadySubscribed &&
-      (existing?.size ?? 0) >= this.maxSubscriptionsPerSocket
+      (socketHashes?.size ?? 0) >= this.maxSubscriptionsPerSocket
     ) {
       log.warn(
         `subscriptions: socket ${socketId} hit the ${this.maxSubscriptionsPerSocket} subscription cap — refusing new query for ${modelType}`,
@@ -438,112 +477,179 @@ export class QuerySubscriptionManager {
       return { hash, items: [] };
     }
 
-    let cached = this.queries.get(hash);
-
-    if (cached) {
-      cached.subscribers.add(socketId);
-      // Honour the most-restrictive emitOrder choice across all
-      // subscribers sharing this hash: any single `orderBy(false)`
-      // opts the channel out for everyone. Subscribers that wanted
-      // order can't actually use it anyway if the SQL is identical.
-      if (orderOptedOut) cached.emitOrder = false;
-      // Drift-poll path: caller asked us to re-execute the cached
-      // query against the DB and diff to every subscriber. We await
-      // the re-eval so the LIST response that follows returns the
-      // freshly-rebuilt items and the polling client converges in
-      // one round-trip. Other subscribers receive any drift ops
-      // through the normal `query:{hash}` channel.
-      if (extra.force) {
-        await this._forceReeval(cached);
+    const reserved = !alreadySubscribed;
+    if (reserved) {
+      if (!socketHashes) {
+        socketHashes = new Set();
+        this.socketQueries.set(socketId, socketHashes);
       }
-    } else {
-      const rows = await this._execQuery(query, expand, user);
-      const result = new Map<string, Record<string, any>>();
-      for (const row of rows) {
-        const clean = dateSafeClone(row);
-        result.set(clean.id, clean);
-      }
+      socketHashes.add(hash);
+    }
+    this.pendingSockets.set(
+      socketId,
+      (this.pendingSockets.get(socketId) ?? 0) + 1,
+    );
 
-      const overrides = realtimeOverridesFor(query);
-      cached = {
-        hash,
-        modelType,
-        query,
-        user,
-        expand,
-        result,
-        subscribers: new Set([socketId]),
-        emitOrder: !orderOptedOut,
-        coalesce: {
-          debounceTimer: null,
-          maxWaitTimer: null,
-          inFlight: null,
-          needsFollowup: false,
-          debounceMs: overrides.debounceMs ?? this.defaultDebounceMs,
-          maxWaitMs: overrides.maxWaitMs ?? this.defaultMaxWaitMs,
-        },
-      };
-      this.queries.set(hash, cached);
-
-      if (!this.typeIndex.has(modelType)) {
-        this.typeIndex.set(modelType, new Set());
-      }
-      this.typeIndex.get(modelType)!.add(hash);
-
-      // Cross-type invalidation index: whenever any of this query's
-      // expanded targets is written, this hash needs a re-eval.
-      for (const exp of expand) {
-        let bucket = this.expandTargetIndex.get(exp.targetType);
-        if (!bucket) {
-          bucket = new Set();
-          this.expandTargetIndex.set(exp.targetType, bucket);
+    try {
+      let cached = this.queries.get(hash);
+      let created = false;
+      if (!cached) {
+        let creation = this.creating.get(hash);
+        if (!creation) {
+          created = true;
+          creation = this._createCached({
+            hash,
+            modelType,
+            query,
+            user,
+            expand,
+            emitOrder: !orderOptedOut,
+          });
+          this.creating.set(hash, creation);
         }
-        bucket.add(hash);
+        try {
+          cached = await creation;
+        } finally {
+          if (this.creating.get(hash) === creation) this.creating.delete(hash);
+        }
+      }
+
+      if (
+        (this.socketGenerations.get(socketId) ?? 0) !== socketGeneration ||
+        !this.socketQueries.get(socketId)?.has(hash)
+      ) {
+        this._deleteCachedIfUnused(cached);
+        return { hash, items: [] };
+      }
+
+      cached.subscribers.add(socketId);
+      // Honour the most-restrictive emitOrder choice across all subscribers
+      // sharing this hash.
+      if (orderOptedOut) cached.emitOrder = false;
+      if (extra.force && !created) await this._forceReeval(cached);
+
+      // When the IO backend supports rooms, join the socket so the
+      // `_reeval` broadcast (`io.to(room).emit`) reaches it. Skipped on
+      // re-subscribe: Socket.IO's `join` is idempotent but the call
+      // round-trips through the adapter, so guard on alreadySubscribed.
+      if (this.joinRoom && !alreadySubscribed) {
+        this.joinRoom(socketId, this._roomFor(hash));
+      }
+
+      return { hash, items: [...cached.result.values()] };
+    } catch (err) {
+      if (reserved) this._releaseReservation(socketId, hash);
+      throw err;
+    } finally {
+      const pending = (this.pendingSockets.get(socketId) ?? 1) - 1;
+      if (pending > 0) this.pendingSockets.set(socketId, pending);
+      else {
+        this.pendingSockets.delete(socketId);
+        if (!this.socketQueries.has(socketId)) {
+          this.socketGenerations.delete(socketId);
+        }
       }
     }
+  }
 
-    if (!this.socketQueries.has(socketId)) {
-      this.socketQueries.set(socketId, new Set());
+  private _releaseReservation(socketId: string, hash: string): void {
+    this.unsubscribe(socketId, hash);
+  }
+
+  private async _createCached(opts: {
+    hash: string;
+    modelType: string;
+    query: QueryChain<any>;
+    user: SanitizerUser;
+    expand: readonly ResolvedExpand[];
+    emitOrder: boolean;
+  }): Promise<CachedQuery> {
+    const { hash, modelType, query, user, expand, emitOrder } = opts;
+    // The app's query-subscription helper hydrates the returned cached row
+    // objects in place with the request RefLoader. Deferring this initial pass
+    // avoids doing the same expansion twice; background re-evals still hydrate
+    // here because they have no request context.
+    const rows = await this._execQuery(
+      query,
+      expand,
+      user,
+      getRefLoader() === null,
+    );
+    const result = new Map<string, Record<string, any>>();
+    for (const row of rows) {
+      const clean = dateSafeClone(row);
+      result.set(clean.id, clean);
     }
-    this.socketQueries.get(socketId)!.add(hash);
 
-    // When the IO backend supports rooms, join the socket so the
-    // `_reeval` broadcast (`io.to(room).emit`) reaches it. Skipped on
-    // re-subscribe: Socket.IO's `join` is idempotent but the call
-    // round-trips through the adapter, so guard on alreadySubscribed.
-    if (this.joinRoom && !alreadySubscribed) {
-      this.joinRoom(socketId, this._roomFor(hash));
+    const overrides = realtimeOverridesFor(query);
+    const cached: CachedQuery = {
+      hash,
+      generation: 0,
+      modelType,
+      query,
+      user,
+      expand,
+      result,
+      subscribers: new Set(),
+      emitOrder,
+      coalesce: {
+        debounceTimer: null,
+        maxWaitTimer: null,
+        inFlight: null,
+        needsFollowup: false,
+        debounceMs: overrides.debounceMs ?? this.defaultDebounceMs,
+        maxWaitMs: overrides.maxWaitMs ?? this.defaultMaxWaitMs,
+      },
+    };
+    this.queries.set(hash, cached);
+
+    if (!this.typeIndex.has(modelType)) {
+      this.typeIndex.set(modelType, new Set());
     }
-
-    return { hash, items: [...cached.result.values()] };
+    this.typeIndex.get(modelType)!.add(hash);
+    for (const exp of expand) {
+      let bucket = this.expandTargetIndex.get(exp.targetType);
+      if (!bucket) {
+        bucket = new Set();
+        this.expandTargetIndex.set(exp.targetType, bucket);
+      }
+      bucket.add(hash);
+    }
+    return cached;
   }
 
   // ── Unsubscribe ────────────────────────────────────────────────────
 
   unsubscribe(socketId: string, hash: string): void {
+    const hashes = this.socketQueries.get(socketId);
+    hashes?.delete(hash);
+    if (hashes?.size === 0) this.socketQueries.delete(socketId);
+
     const cached = this.queries.get(hash);
     if (!cached) return;
 
     const wasSubscribed = cached.subscribers.delete(socketId);
-    this.socketQueries.get(socketId)?.delete(hash);
 
     if (wasSubscribed && this.leaveRoom) {
       this.leaveRoom(socketId, this._roomFor(hash));
     }
 
-    if (cached.subscribers.size === 0) {
-      this._teardownCoalesce(cached);
-      this.queries.delete(hash);
-      this.typeIndex.get(cached.modelType)?.delete(hash);
-      for (const exp of cached.expand) {
-        this.expandTargetIndex.get(exp.targetType)?.delete(hash);
-      }
-    }
+    this._deleteCachedIfUnused(cached);
   }
 
   unsubscribeAll(socketId: string): void {
+    this.socketGenerations.set(
+      socketId,
+      (this.socketGenerations.get(socketId) ?? 0) + 1,
+    );
     const hashes = this.socketQueries.get(socketId);
-    if (!hashes) return;
+    if (!hashes) {
+      if (!this.pendingSockets.has(socketId)) {
+        this.socketGenerations.delete(socketId);
+      }
+      return;
+    }
+    this.socketQueries.delete(socketId);
 
     for (const hash of hashes) {
       const cached = this.queries.get(hash);
@@ -552,17 +658,27 @@ export class QuerySubscriptionManager {
       if (wasSubscribed && this.leaveRoom) {
         this.leaveRoom(socketId, this._roomFor(hash));
       }
-      if (cached.subscribers.size === 0) {
-        this._teardownCoalesce(cached);
-        this.queries.delete(hash);
-        this.typeIndex.get(cached.modelType)?.delete(hash);
-        for (const exp of cached.expand) {
-          this.expandTargetIndex.get(exp.targetType)?.delete(hash);
-        }
-      }
+      this._deleteCachedIfUnused(cached);
     }
+  }
 
-    this.socketQueries.delete(socketId);
+  private _deleteCachedIfUnused(cached: CachedQuery): void {
+    if (cached.subscribers.size > 0 || this._hasReservation(cached.hash)) return;
+    if (this.queries.get(cached.hash) !== cached) return;
+    cached.generation++;
+    this._teardownCoalesce(cached);
+    this.queries.delete(cached.hash);
+    this.typeIndex.get(cached.modelType)?.delete(cached.hash);
+    for (const exp of cached.expand) {
+      this.expandTargetIndex.get(exp.targetType)?.delete(cached.hash);
+    }
+  }
+
+  private _hasReservation(hash: string): boolean {
+    for (const hashes of this.socketQueries.values()) {
+      if (hashes.has(hash)) return true;
+    }
+    return false;
   }
 
   // ── On Model Change ────────────────────────────────────────────────
@@ -607,6 +723,7 @@ export class QuerySubscriptionManager {
   // ── Re-evaluation ──────────────────────────────────────────────────
 
   private _scheduleReeval(cached: CachedQuery): void {
+    if (this.queries.get(cached.hash) !== cached) return;
     const c = cached.coalesce;
 
     // While a re-eval is in flight, just mark a follow-up so we run
@@ -714,12 +831,20 @@ export class QuerySubscriptionManager {
 
   private async _reeval(cached: CachedQuery): Promise<void> {
     if (cached.subscribers.size === 0) return;
+    const generation = cached.generation;
 
     const rows = await this._execQuery(
       cached.query,
       cached.expand,
       cached.user,
     );
+    if (
+      cached.generation !== generation ||
+      this.queries.get(cached.hash) !== cached ||
+      cached.subscribers.size === 0
+    ) {
+      return;
+    }
     const newResult = new Map<string, Record<string, any>>();
     for (const row of rows) {
       const clean = dateSafeClone(row);
@@ -792,6 +917,7 @@ export class QuerySubscriptionManager {
     query: QueryChain<any>,
     expand: readonly ResolvedExpand[],
     user: SanitizerUser,
+    hydrateExpand = true,
   ): Promise<Record<string, any>[]> {
     const models = await query.clone().find();
     // `query.find()` returns `Promise<any[]>` (the chain's generic is
@@ -809,7 +935,7 @@ export class QuerySubscriptionManager {
       }),
     );
 
-    if (expand.length === 0) return wireRows;
+    if (expand.length === 0 || !hydrateExpand) return wireRows;
 
     // Build an ephemeral RefLoader pointed at the adapter's batch
     // entrypoint. This runs OUTSIDE a request scope (re-eval fires

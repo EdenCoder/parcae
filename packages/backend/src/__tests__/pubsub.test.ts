@@ -16,8 +16,10 @@
  * the cross-process contention re-entry pattern both rely on.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PubSub } from "../services/pubsub";
+import { log } from "../logger";
+import { _clearServices, lock } from "../services/context";
 
 describe("PubSub.lock — in-process fallback", () => {
   const unhandled: unknown[] = [];
@@ -117,5 +119,61 @@ describe("PubSub.lock — in-process fallback", () => {
     await a();
     await b();
     expect(unhandled).toHaveLength(0);
+  });
+});
+
+describe("PubSub failures", () => {
+  it("observes Redis publish rejection instead of leaking an unhandled promise", async () => {
+    const pubsub = new PubSub();
+    const failure = new Error("publish failed");
+    const publish = vi.fn().mockRejectedValue(failure);
+    (pubsub as any).redisWrite = { publish };
+    const logged = vi.spyOn(log, "error").mockImplementation(() => {});
+
+    pubsub.emit("change", { id: "x" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(logged).toHaveBeenCalledWith(
+      'PubSub publish failed for "change":',
+      failure,
+    );
+    logged.mockRestore();
+  });
+
+  it("attempts to close every Redis client when one quit fails", async () => {
+    const pubsub = new PubSub();
+    const clients = [
+      {
+        quit: vi.fn(() => {
+          throw new Error("lock failed");
+        }),
+        disconnect: vi.fn(),
+      },
+      { quit: vi.fn().mockResolvedValue(undefined), disconnect: vi.fn() },
+      { quit: vi.fn().mockResolvedValue(undefined), disconnect: vi.fn() },
+    ];
+    (pubsub as any).redisLock = clients[0];
+    (pubsub as any).redisRead = clients[1];
+    (pubsub as any).redisWrite = clients[2];
+
+    await expect(pubsub.close()).rejects.toThrow(
+      "Failed to close PubSub Redis clients",
+    );
+    for (const client of clients) {
+      expect(client.quit).toHaveBeenCalledTimes(1);
+    }
+    expect(clients[0]!.disconnect).toHaveBeenCalledTimes(1);
+    expect(clients[1]!.disconnect).not.toHaveBeenCalled();
+    expect(clients[2]!.disconnect).not.toHaveBeenCalled();
+  });
+});
+
+describe("global lock context", () => {
+  it("fails explicitly before app services are installed", async () => {
+    _clearServices();
+    await expect(lock("before-start")).rejects.toThrow(
+      "services are not initialized",
+    );
   });
 });

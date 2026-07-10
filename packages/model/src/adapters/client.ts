@@ -89,6 +89,19 @@ export interface Transport {
   reconnect?(): Promise<void>;
 }
 
+/** Transport errors may identify a missing resource without hiding other failures. */
+export interface TransportError extends Error {
+  status?: number;
+  code?: string;
+}
+
+export function isNotFoundError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  // boundary: transport implementations attach their protocol status/code.
+  const transportError = error as TransportError;
+  return transportError.status === 404 || transportError.code === "NOT_FOUND";
+}
+
 /**
  * Strip version prefix from a path if it starts with /v{number}.
  * The transport prepends the version automatically.
@@ -110,40 +123,33 @@ export class FrontendAdapter implements ModelAdapter {
     return stripVersion(modelPath);
   }
 
-  // ── createStore ──────────────────────────────────────────────────────
-  //
-  // The Model class never calls this — model reactivity flows
-  // through `EventEmitter` (`model.on("change", ...)`), not through
-  // a proxied store. The method is part of the adapter interface
-  // for symmetry with the backend adapter (which builds rows for
-  // the DB layer). Return a shallow copy to match the typeshape.
-  createStore(data: Record<string, any>): Record<string, any> {
-    return { ...data };
-  }
-
   // ── save ─────────────────────────────────────────────────────────────
 
   /**
    * Upsert the entire current state of the model.
    *
-   *  - `__isNew` → POST {full body}. If the server echoes an `id` we
-   *    adopt it (server-minted ids win when the model was created
-   *    locally without one).
+   *  - `__isNew` → POST {full body}.
    *  - otherwise → PUT {full body}. Targeted field updates use `patch`
    *    / `flush` instead; `save` is intentionally "replace the whole
    *    document".
+   *
+   * Both routes return the authoritative row at the transport result root.
+   * Model owns the single authoritative merge.
    */
-  async save(model: any): Promise<void> {
+  async save(
+    model: any,
+    data: Record<string, any>,
+  ): Promise<Record<string, any>> {
     const ModelClass = model.constructor as ModelConstructor;
     const path = this.resolvePath(ModelClass);
+    const response = model.__isNew
+      ? await this.transport.post(path, data)
+      : await this.transport.put(`${path}/${model.id}`, data);
 
-    if (model.__isNew) {
-      const result = await this.transport.post(path, model.__data);
-      if (result?.id) (model as any).id = result.id;
-      return;
+    if (!response || typeof response !== "object" || Array.isArray(response)) {
+      throw new Error("Model write returned no authoritative row");
     }
-
-    await this.transport.put(`${path}/${model.id}`, model.__data);
+    return response;
   }
 
   // ── remove ───────────────────────────────────────────────────────────
@@ -165,8 +171,9 @@ export class FrontendAdapter implements ModelAdapter {
       const data = await this.transport.get(`${path}/${id}`);
       if (!data) return null;
       return (modelClass as any).hydrate(this, data) as T;
-    } catch {
-      return null;
+    } catch (error) {
+      if (isNotFoundError(error)) return null;
+      throw error;
     }
   }
 
@@ -340,10 +347,18 @@ export class FrontendAdapter implements ModelAdapter {
 
   // ── patch ────────────────────────────────────────────────────────────
 
-  async patch(model: any, ops: PatchOp[]): Promise<void> {
+  async patch(
+    model: any,
+    ops: PatchOp[],
+    _data: Record<string, any>,
+  ): Promise<Record<string, any>> {
     const ModelClass = model.constructor as ModelConstructor;
     const path = this.resolvePath(ModelClass);
-    await this.transport.patch(`${path}/${model.id}`, { ops });
+    const response = await this.transport.patch(`${path}/${model.id}`, { ops });
+    if (!response || typeof response !== "object" || Array.isArray(response)) {
+      throw new Error("Model patch returned no authoritative row");
+    }
+    return response;
   }
 
   // ── helpers ──────────────────────────────────────────────────────────

@@ -56,7 +56,7 @@ Directory options are **not** auto-defaulted to conventional paths — every dir
 4. Connect database (Knex; Postgres pool min 2 / max 10, optional read replica via `DATABASE_READ_URL`; or SQLite via `better-sqlite3`).
 5. Connect Redis: `PubSub` and `QueueService` (queue name from `JOB_QUEUE_NAME`, default `"parcae"`). Falls back to in-process implementations when `REDIS_URL` is unset. Wired into `enqueue()` / `lock()` via `_setServices`.
 6. Create `ChangeBus` (model-change fan-out over PubSub).
-7. Create `BackendAdapter`, `registerModels`, `Model.use(adapter)`; detect engine (sqlite / postgres / alloydb).
+7. Create `BackendAdapter`, `registerModels`, bind it once as the application adapter; detect engine (sqlite / postgres / alloydb). Independent contexts use `Model.bind()` rather than replacing this binding.
 8. Set up auth (opt-in) — runs **before** `ensureAllTables` so auth-owned tables exist first; runs its own migrations when `ENSURE_SCHEMA=true`.
 9. Run user migrations (`runMigrations`) — gated on `ENSURE_SCHEMA`, before `ensureAllTables`.
 10. `ensureAllTables` — additive DDL — gated on `ENSURE_SCHEMA`.
@@ -73,7 +73,7 @@ Directory options are **not** auto-defaulted to conventional paths — every dir
 21. Socket.IO connection handling (RPC `call`, `hello`, `resync`, `route.on()` handlers, query subscribe/unsubscribe) — only when `RUN_SERVER` is true.
 22. Always bind the HTTP listener to `PORT` (even worker-only processes, so health probes work).
 
-`stop()` tears down crons, the LISTEN/NOTIFY poller, the ChangeBus subscription, the queue, pubsub, and both DB pools via `shutdownResources` (errors swallowed per-resource so a slow Redis can't block DB pool close).
+`stop()` tears down crons, the LISTEN/NOTIFY poller, the ChangeBus subscription, the queue, pubsub, the optional auth adapter, and both DB pools via `shutdownResources` (errors swallowed per-resource so a slow Redis can't block DB pool close). Startup failures use the same teardown path.
 
 ## Runtime Flags & Process Roles
 

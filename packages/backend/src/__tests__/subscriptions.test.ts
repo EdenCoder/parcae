@@ -1,5 +1,11 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { QuerySubscriptionManager } from "../services/subscriptions";
+import {
+  QuerySubscriptionManager,
+  parsePositiveInteger,
+} from "../services/subscriptions";
+import { runWithRequestContext } from "../services/context";
+import { RefLoader } from "../services/ref-loader";
+import { hydrateExpansions } from "../services/hydrate-expansions";
 
 // ─── Mock Data ───────────────────────────────────────────────────────────────
 
@@ -170,6 +176,37 @@ describe("QuerySubscriptionManager", () => {
       expect(manager.stats.subscribers).toBe(2);
     });
 
+    it("merges concurrent first subscribers through one cache creation", async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let findCalls = 0;
+      const chain: any = {
+        __modelType: "project",
+        exec: () => ({
+          toSQL: () => ({ sql: "SELECT concurrent", bindings: [] }),
+        }),
+        clone: () => chain,
+        find: async () => {
+          findCalls++;
+          await gate;
+          return [{ sanitize: () => row("p1") }];
+        },
+      };
+
+      const first = manager.subscribe({ socketId: "s1", query: chain });
+      const second = manager.subscribe({ socketId: "s2", query: chain });
+      await Promise.resolve();
+      expect(findCalls).toBe(1);
+
+      release();
+      const [a, b] = await Promise.all([first, second]);
+      expect(a.hash).toBe(b.hash);
+      expect(a.items).toEqual([row("p1")]);
+      expect(manager.stats).toEqual({ queries: 1, subscribers: 2, sockets: 2 });
+    });
+
     it("should sanitize cached subscriptions and re-evals with the request user", async () => {
       let credits = 1000;
       const query = makePrivateUserQuery(() => credits);
@@ -203,6 +240,92 @@ describe("QuerySubscriptionManager", () => {
           patch: [{ op: "replace", path: "/credits", value: 750 }],
         },
       ]);
+    });
+
+    it("includes all auth claims in sanitization and cache identity", async () => {
+      const chain: any = {
+        __modelType: "document",
+        exec: () => ({
+          toSQL: () => ({ sql: "SELECT claim_guarded", bindings: [] }),
+        }),
+        clone: () => chain,
+        find: async () => [
+          {
+            sanitize: (user?: { id: string; role?: string }) => ({
+              id: "d1",
+              ...(user?.role === "admin" ? { secret: "classified" } : {}),
+            }),
+          },
+        ],
+      };
+
+      const admin = await manager.subscribe({
+        socketId: "admin",
+        query: chain,
+        user: { id: "u1", role: "admin" },
+      });
+      const member = await manager.subscribe({
+        socketId: "member",
+        query: chain,
+        user: { id: "u1", role: "member" },
+      });
+
+      expect(admin.hash).not.toBe(member.hash);
+      expect(admin.items).toEqual([{ id: "d1", secret: "classified" }]);
+      expect(member.items).toEqual([{ id: "d1" }]);
+    });
+
+    it("defers initial expansion to the request path instead of hydrating twice", async () => {
+      const backgroundBatch = vi.fn(async () => new Map());
+      const requestBatch = vi.fn(async () =>
+        new Map([
+          [
+            "f1",
+            {
+              sanitize: () => ({ id: "f1", type: "file", url: "/one" }),
+            },
+          ],
+        ]),
+      );
+      const query: any = {
+        __modelType: "asset",
+        __adapter: { batchFindByType: backgroundBatch },
+        exec: () => ({
+          toSQL: () => ({ sql: "SELECT expanded", bindings: [] }),
+        }),
+        clone: () => query,
+        find: async () => [
+          { sanitize: () => ({ id: "a1", file: "f1" }) },
+        ],
+      };
+      const expand: any = [
+        {
+          refField: "file",
+          targetType: "file",
+          targetClass: class File {},
+          projection: null,
+        },
+      ];
+      const loader = new RefLoader(requestBatch);
+
+      await runWithRequestContext({ user: null, refLoader: loader }, async () => {
+        const sub = await manager.subscribe({
+          socketId: "s1",
+          query,
+          expand,
+        });
+        await hydrateExpansions(sub.items, expand, loader, null);
+        expect(sub.items).toEqual([
+          {
+            id: "a1",
+            file: { id: "f1", type: "file", url: "/one" },
+            $file: "f1",
+          },
+        ]);
+      });
+
+      expect(backgroundBatch).not.toHaveBeenCalled();
+      expect(requestBatch).toHaveBeenCalledTimes(1);
     });
 
     it("should create separate subscriptions for different queries", async () => {
@@ -273,6 +396,76 @@ describe("QuerySubscriptionManager", () => {
         query: source.query("project", `bucket_overflow`),
       });
       expect(otherSocket.items).toHaveLength(1);
+    });
+
+    it("atomically caps concurrent distinct subscriptions on one socket", async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let findCalls = 0;
+      const makeQuery = (sql: string) => {
+        const chain: any = {
+          __modelType: "project",
+          exec: () => ({ toSQL: () => ({ sql, bindings: [] }) }),
+          clone: () => chain,
+          find: async () => {
+            findCalls++;
+            await gate;
+            return [{ sanitize: () => row(sql) }];
+          },
+        };
+        return chain;
+      };
+      const cappedManager = new QuerySubscriptionManager(() => {}, {
+        maxSubscriptionsPerSocket: 2,
+      });
+
+      const attempts = Array.from({ length: 4 }, (_, index) =>
+        cappedManager.subscribe({
+          socketId: "resync-socket",
+          query: makeQuery(`query_${index}`),
+        }),
+      );
+      await Promise.resolve();
+
+      expect(findCalls).toBe(2);
+      await expect(attempts[2]).resolves.toMatchObject({ items: [] });
+      await expect(attempts[3]).resolves.toMatchObject({ items: [] });
+      release();
+      const accepted = await Promise.all(attempts.slice(0, 2));
+      expect(accepted.every((result) => result.items.length === 1)).toBe(true);
+      expect(cappedManager.stats).toEqual({
+        queries: 2,
+        subscribers: 2,
+        sockets: 1,
+      });
+    });
+
+    it("releases a reserved subscription slot when creation fails", async () => {
+      const cappedManager = new QuerySubscriptionManager(() => {}, {
+        maxSubscriptionsPerSocket: 1,
+      });
+      const failed: any = {
+        __modelType: "project",
+        exec: () => ({
+          toSQL: () => ({ sql: "failed-query", bindings: [] }),
+        }),
+        clone: () => failed,
+        find: async () => {
+          throw new Error("query failed");
+        },
+      };
+
+      await expect(
+        cappedManager.subscribe({ socketId: "s1", query: failed }),
+      ).rejects.toThrow("query failed");
+      const retry = await cappedManager.subscribe({
+        socketId: "s1",
+        query: source.query("project", "retry"),
+      });
+      expect(retry.items).toBeDefined();
+      expect(cappedManager.stats.sockets).toBe(1);
     });
 
     it("re-subscribing to a cached hash on the same socket doesn't count against the cap", async () => {
@@ -351,6 +544,109 @@ describe("QuerySubscriptionManager", () => {
       expect(manager.stats.queries).toBe(0);
       expect(manager.stats.sockets).toBe(0);
     });
+
+    it("cancels a pending reservation before cache creation completes", async () => {
+      const probe = new QuerySubscriptionManager(() => {});
+      const queryIdentity = "pending-cancel";
+      const hash = (
+        await probe.subscribe({
+          socketId: "probe",
+          query: source.query("project", queryIdentity),
+        })
+      ).hash;
+      probe.unsubscribeAll("probe");
+
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const query: any = {
+        __modelType: "project",
+        exec: () => ({
+          toSQL: () => ({
+            sql: `SELECT * FROM projects WHERE ${queryIdentity}`,
+            bindings: [],
+          }),
+        }),
+        clone: () => query,
+        find: async () => {
+          await gate;
+          return [{ sanitize: () => row("p1") }];
+        },
+      };
+
+      const pending = manager.subscribe({ socketId: "s1", query });
+      await Promise.resolve();
+      manager.unsubscribe("s1", hash);
+      release();
+
+      await expect(pending).resolves.toEqual({ hash, items: [] });
+      expect(manager.stats).toEqual({ queries: 0, subscribers: 0, sockets: 0 });
+    });
+
+    it("does not re-add a disconnected socket after late creation", async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const query: any = {
+        __modelType: "project",
+        exec: () => ({
+          toSQL: () => ({ sql: "SELECT disconnect-race", bindings: [] }),
+        }),
+        clone: () => query,
+        find: async () => {
+          await gate;
+          return [{ sanitize: () => row("p1") }];
+        },
+      };
+
+      const pending = manager.subscribe({ socketId: "gone", query });
+      await Promise.resolve();
+      manager.unsubscribeAll("gone");
+      release();
+      await pending;
+
+      expect(manager.stats).toEqual({ queries: 0, subscribers: 0, sockets: 0 });
+    });
+
+    it("invalidates an in-flight re-eval before recreating the same hash", async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let calls = 0;
+      const query: any = {
+        __modelType: "project",
+        exec: () => ({
+          toSQL: () => ({ sql: "SELECT cache-generation", bindings: [] }),
+        }),
+        clone: () => query,
+        find: async () => {
+          calls++;
+          if (calls === 2) {
+            await gate;
+            return [{ sanitize: () => row("stale") }];
+          }
+          const id = calls === 1 ? "old" : "fresh";
+          return [{ sanitize: () => row(id) }];
+        },
+      };
+
+      const first = await manager.subscribe({ socketId: "s1", query });
+      manager.onModelChange("project");
+      await Promise.resolve();
+      expect(calls).toBe(2);
+
+      manager.unsubscribe("s1", first.hash);
+      const recreated = await manager.subscribe({ socketId: "s2", query });
+      expect(recreated.items).toEqual([row("fresh")]);
+
+      release();
+      await tick();
+      expect(emitted).toHaveLength(0);
+      expect(manager.stats).toEqual({ queries: 1, subscribers: 1, sockets: 1 });
+    });
   });
 
   // ── onModelChange — the core diff engine ───────────────────────────
@@ -373,14 +669,17 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("should emit 'add' op when a new item appears in results", async () => {
-      source.setResults([row("p1", { name: "A" })]);
+      source.setResults([row("p1", { name: "A" }), row("p3", { name: "C" })]);
       await manager.subscribe({
         socketId: "s1",
         query: source.query("project"),
       });
 
-      // New item appears
-      source.setResults([row("p1", { name: "A" }), row("p2", { name: "B" })]);
+      source.setResults([
+        row("p1", { name: "A" }),
+        row("p2", { name: "B" }),
+        row("p3", { name: "C" }),
+      ]);
       manager.onModelChange("project");
       await tick();
 
@@ -393,7 +692,7 @@ describe("QuerySubscriptionManager", () => {
         data: { id: "p2", name: "B" },
       });
       // Membership changed → order envelope present.
-      expect(emitted[0]!.data.order).toEqual(["p1", "p2"]);
+      expect(emitted[0]!.data.order).toEqual(["p1", "p2", "p3"]);
     });
 
     it("should emit 'remove' op when an item disappears from results", async () => {
@@ -749,31 +1048,6 @@ describe("QuerySubscriptionManager", () => {
   // ── Ordered-id emission ────────────────────────────────────────────
 
   describe("order envelope", () => {
-    it("emits order array on add when membership changes", async () => {
-      source.setResults([row("p1", { name: "A" }), row("p3", { name: "C" })]);
-      await manager.subscribe({
-        socketId: "s1",
-        query: source.query("project"),
-      });
-
-      // p2 inserted between p1 and p3 — client needs the new order to
-      // place it correctly rather than appending to the end.
-      source.setResults([
-        row("p1", { name: "A" }),
-        row("p2", { name: "B" }),
-        row("p3", { name: "C" }),
-      ]);
-      manager.onModelChange("project");
-      await tick();
-
-      expect(emitted).toHaveLength(1);
-      const envelope = emitted[0]!.data;
-      expect(envelope.ops).toHaveLength(1);
-      expect(envelope.ops[0].op).toBe("add");
-      expect(envelope.ops[0].id).toBe("p2");
-      expect(envelope.order).toEqual(["p1", "p2", "p3"]);
-    });
-
     it("emits order array when only ordering changes (no membership change)", async () => {
       source.setResults([
         row("p1", { name: "A" }),
@@ -1178,6 +1452,22 @@ describe("QuerySubscriptionManager", () => {
       });
     });
   });
+});
+
+describe("parsePositiveInteger", () => {
+  it("accepts finite positive integers", () => {
+    expect(parsePositiveInteger("8", "limit")).toBe(8);
+    expect(parsePositiveInteger(12, "limit")).toBe(12);
+  });
+
+  it.each(["NaN", "Infinity", "1.5", "0", "-1"])(
+    "rejects invalid safeguard value %s",
+    (value) => {
+      expect(() => parsePositiveInteger(value, "limit")).toThrow(
+        "limit must be a finite positive integer",
+      );
+    },
+  );
 });
 
 // ─── DOL-1047: concurrency cap + Socket.IO rooms ────────────────────────────

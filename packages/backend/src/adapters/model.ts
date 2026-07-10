@@ -39,8 +39,12 @@ import {
 } from "../services/context";
 import type { ChangeBus, ChangeOp } from "../services/changeBus";
 import {
+  activeTransactionHandle,
   bufferChangeIfActive,
   getActiveTransactionFrame,
+  runAfterCommitIfActive,
+  runAfterRollbackIfActive,
+  withTransaction,
 } from "../services/transactionContext";
 import { ensureChangeTriggers } from "../services/changeTriggers";
 
@@ -104,6 +108,35 @@ const PARCAE_OWNED_COLUMNS: ReadonlySet<string> = new Set([
 
 function tableName(modelClass: ModelConstructor): string {
   return pluralize(modelClass.type);
+}
+
+function parsePatchPath(path: string): string[] {
+  if (!path.startsWith("/")) {
+    throw new ClientError(`patch: invalid path "${path}"`);
+  }
+  return path
+    .slice(1)
+    .split("/")
+    .map((segment) => segment.replace(/~1/g, "/").replace(/~0/g, "~"));
+}
+
+function assertSupportedPatchOps(ops: readonly PatchOp[]): void {
+  for (const op of ops) {
+    if (op.op === "copy" || op.op === "move") {
+      throw new ClientError(`patch: unsupported op "${op.op}"`);
+    }
+    if (
+      op.op !== "add" &&
+      op.op !== "replace" &&
+      op.op !== "remove" &&
+      op.op !== "test"
+    ) {
+      throw new ClientError(
+        `patch: unsupported op "${String((op as { op?: unknown }).op)}"`,
+      );
+    }
+    parsePatchPath(op.path);
+  }
 }
 
 /** Resolve a ColumnType to a primitive string type. */
@@ -195,11 +228,13 @@ function hydrate<T>(
  * Serialize model data for DB insert/update.
  * Splits into declared columns + overflow `data` JSONB blob.
  */
-function serialize(model: any): Record<string, any> {
+function serialize(
+  model: any,
+  raw: Record<string, any> = model.__data,
+): Record<string, any> {
   const ModelClass = model.constructor as typeof Model;
   const schema =
     (ModelClass.__schema as SchemaDefinition | undefined) ?? {};
-  const raw = model.__data;
 
   if (!model.id) {
     (model as any).id = generateId();
@@ -254,10 +289,10 @@ export class BackendAdapter implements ModelAdapter {
   private _embeddingReady = new Set<string>();
 
   get read() {
-    return this.services.read;
+    return activeTransactionHandle() ?? this.services.read;
   }
   get write() {
-    return this.services.write;
+    return activeTransactionHandle() ?? this.services.write;
   }
   get pubsub() {
     return this.services.pubsub;
@@ -432,13 +467,23 @@ export class BackendAdapter implements ModelAdapter {
    */
   private _notifyChange(model: any, op: ChangeOp): void {
     const ModelClass = model.constructor as typeof Model;
+    this._notifyChangeById(
+      ModelClass as unknown as ModelConstructor,
+      model.id,
+      op,
+    );
+  }
+
+  private _notifyChangeById(
+    ModelClass: ModelConstructor,
+    id: string | undefined,
+    op: ChangeOp,
+  ): void {
     const table = tableName(ModelClass as unknown as ModelConstructor);
-    const id: string | undefined = (model as any).id;
 
     if (!this.changeBus) {
-      // Legacy single-process path. No bus, no dedup, no transaction
-      // buffer — just fire the local manager.
-      this.subscriptions?.onModelChange(ModelClass.type);
+      const notify = () => this.subscriptions?.onModelChange(ModelClass.type);
+      if (!runAfterCommitIfActive(notify)) notify();
       return;
     }
 
@@ -463,6 +508,17 @@ export class BackendAdapter implements ModelAdapter {
 
     if (bufferChangeIfActive(change)) return;
     this.changeBus.emit(change);
+  }
+
+  private _withTransaction<T>(fn: () => Promise<T>): Promise<T> {
+    return withTransaction(
+      {
+        knex: this.services.write,
+        changeBus: this.changeBus,
+        setRequestIdGuc: !this.isSqlite && Boolean(this.changeBus),
+      },
+      fn,
+    );
   }
 
   // ── Search Query ────────────────────────────────────────────────────
@@ -546,12 +602,6 @@ export class BackendAdapter implements ModelAdapter {
       .orderByRaw("_rank DESC");
   }
 
-  // ── createStore ──────────────────────────────────────────────────────
-
-  createStore(data: Record<string, any>): Record<string, any> {
-    return data; // Plain object on backend — no proxy wrapping
-  }
-
   // ── save ─────────────────────────────────────────────────────────────
 
   /**
@@ -563,33 +613,46 @@ export class BackendAdapter implements ModelAdapter {
    * Targeted RFC 6902 updates go through `.patch()` instead; this path
    * is intentionally "replace the whole row".
    */
-  async save(model: any): Promise<void> {
+  async save(
+    model: any,
+    data: Record<string, any> = model.__data,
+  ): Promise<Record<string, any>> {
     const ModelClass = model.constructor as typeof Model;
     const table = tableName(ModelClass as unknown as ModelConstructor);
     const creating = Boolean((model as any).__isNew);
-
     const action = creating ? "create" : "save";
     const cleanups: Array<() => Promise<void> | void> = [];
+    const operationModel = this._captureSaveModel(model, data, creating);
+    let persistedData: Record<string, any>;
 
     try {
-      await this.runHooks(model, action, "before", { cleanups });
+      persistedData = await this._withTransaction(async () => {
+        await this.runHooks(operationModel, action, "before", { cleanups });
 
-      (model as any).updatedAt = new Date();
-      if (creating && !(model as any).createdAt) {
-        (model as any).createdAt = new Date();
-      }
+        (operationModel as any).updatedAt = new Date();
+        if (creating && !(operationModel as any).createdAt) {
+          (operationModel as any).createdAt = new Date();
+        }
 
-      const row = serialize(model);
-      await this.write(table).insert(row).onConflict("id").merge();
+        const writeData = structuredClone(operationModel.__data);
+        const row = serialize(operationModel, writeData);
+        await this.write(table).insert(row).onConflict("id").merge();
 
-      await this.runHooks(model, action, "after", { cleanups });
+        await this.runHooks(operationModel, action, "after", { cleanups });
+        this._notifyChange(operationModel, creating ? "insert" : "update");
+        return writeData;
+      });
     } catch (err) {
       await this._runCleanups(cleanups, `${ModelClass.type}:${action}`);
       throw err;
     }
 
+    this._retainCleanupsForOuterRollback(
+      cleanups,
+      `${ModelClass.type}:${action}`,
+    );
     log.debug(`model saved model=${ModelClass.type}, id=${model.id}`);
-    this._notifyChange(model, creating ? "insert" : "update");
+    return persistedData;
   }
 
   // ── remove ───────────────────────────────────────────────────────────
@@ -600,16 +663,26 @@ export class BackendAdapter implements ModelAdapter {
     const cleanups: Array<() => Promise<void> | void> = [];
 
     try {
-      await this.runHooks(model, "remove", "before", { cleanups });
-      await this.write(table).where("id", model.id).del();
-      await this.runHooks(model, "remove", "after", { cleanups });
+      await this._withTransaction(async () => {
+        await this.runHooks(model, "remove", "before", { cleanups });
+        await this.write(table).where("id", model.id).del();
+        await this.runHooks(model, "remove", "after", { cleanups });
+        runAfterCommitIfActive(() =>
+          this.pubsub?.emit?.(
+            `delete+${ModelClass.type}:${model.id}`,
+            model.__data,
+          ),
+        );
+        this._notifyChange(model, "delete");
+      });
     } catch (err) {
       await this._runCleanups(cleanups, `${ModelClass.type}:remove`);
       throw err;
     }
-
-    this.pubsub?.emit?.(`delete+${ModelClass.type}:${model.id}`, model.__data);
-    this._notifyChange(model, "delete");
+    this._retainCleanupsForOuterRollback(
+      cleanups,
+      `${ModelClass.type}:remove`,
+    );
   }
 
   // ── findById ─────────────────────────────────────────────────────────
@@ -728,6 +801,18 @@ export class BackendAdapter implements ModelAdapter {
     "whereNotNull",
     "whereBetween",
     "orderBy",
+  ]);
+
+  private static CLIENT_PREDICATE_METHODS = new Set([
+    "where",
+    "andWhere",
+    "orWhere",
+    "whereIn",
+    "whereNot",
+    "whereNotIn",
+    "whereNull",
+    "whereNotNull",
+    "whereBetween",
   ]);
 
   /** Operators safe for 3-arg where clauses. */
@@ -898,8 +983,55 @@ export class BackendAdapter implements ModelAdapter {
       }
     }
 
+    const predicates: Array<{ step: QueryStep; args: any[] }> = [];
+    for (const step of steps) {
+      if (!BackendAdapter.CLIENT_PREDICATE_METHODS.has(step.method)) continue;
+      const args = this._sanitizeStepArgs(
+        step,
+        validColumns,
+        modelClass.type,
+        schema,
+      );
+      if (args.length > 0) predicates.push({ step, args });
+    }
+
+    let groupedPredicates = false;
+
     for (const step of steps) {
       if (!BackendAdapter.SAFE_CLIENT_METHODS.has(step.method)) continue;
+
+      if (BackendAdapter.CLIENT_PREDICATE_METHODS.has(step.method)) {
+        if (!groupedPredicates && predicates.length > 0) {
+          chain = chain.where((builder: any) => {
+            for (const predicate of predicates) {
+              const { args } = predicate;
+              if (
+                typeof args[0] === "string" &&
+                args[0].startsWith("__rewrite:")
+              ) {
+                const method = args[0].slice("__rewrite:".length);
+                builder = builder[method](args[1], args[2]);
+                continue;
+              }
+              if (
+                (predicate.step.method === "whereIn" ||
+                  predicate.step.method === "orWhereIn") &&
+                this._isJsonArrayColumn(modelClass, args[0], schema)
+              ) {
+                builder = this._applyJsonArrayWhereIn(
+                  builder,
+                  args[0] as string,
+                  args[1] as any[],
+                );
+                continue;
+              }
+              builder = builder[predicate.step.method](...args);
+            }
+          });
+          groupedPredicates = true;
+        }
+        continue;
+      }
 
       // clearLimit — bypass default limit, cap at 10,000 as safety net
       if (step.method === "clearLimit") {
@@ -927,13 +1059,6 @@ export class BackendAdapter implements ModelAdapter {
       // Skip empty where({}) — sanitizer returns [] to signal "no-op"
       if (args.length === 0 && step.method !== "limit") continue;
 
-      // Handle rewritten ref subqueries: ["__rewrite:whereIn", refKey, subquery]
-      if (typeof args[0] === "string" && args[0].startsWith("__rewrite:")) {
-        const rewriteMethod = args[0].slice("__rewrite:".length);
-        chain = (chain as any)[rewriteMethod](args[1], args[2]);
-        continue;
-      }
-
       // Sanitize limit — coerce to a positive integer, fall back to
       // DEFAULT_LIMIT on parse failure. No upper clamp; clients that
       // need an unusually large window pass it explicitly. Skipped
@@ -947,24 +1072,6 @@ export class BackendAdapter implements ModelAdapter {
             1,
           );
         }
-      }
-
-      // ── whereIn on a JSON-array column → "array contains any of" ─────
-      // Stock `WHERE col IN (?, ?)` compares the whole jsonb value to
-      // each binding as a string, which never matches when the column
-      // stores an array. Detect that case and emit dialect-appropriate
-      // containment SQL instead so callers can write the natural
-      // `Scene.whereIn("tags", [tagId])` and have it Just Work.
-      if (
-        (step.method === "whereIn" || step.method === "orWhereIn") &&
-        this._isJsonArrayColumn(modelClass, args[0], schema)
-      ) {
-        chain = this._applyJsonArrayWhereIn(
-          chain,
-          args[0] as string,
-          args[1] as any[],
-        );
-        continue;
       }
 
       chain = (chain as any)[step.method](...args);
@@ -1302,6 +1409,8 @@ export class BackendAdapter implements ModelAdapter {
       const result = await clone
         .clearSelect()
         .clearOrder()
+        .clear("limit")
+        .clear("offset")
         .count(column || "*");
       return Number.parseInt(`${Object.values(result[0] || {})[0] || "0"}`, 10);
     };
@@ -1311,6 +1420,8 @@ export class BackendAdapter implements ModelAdapter {
       const result = await clone
         .clearSelect()
         .clearOrder()
+        .clear("limit")
+        .clear("offset")
         .sum({ total: column });
       const total = Number(Object.values(result[0] || {})[0] ?? 0);
       return Number.isFinite(total) ? total : 0;
@@ -1333,29 +1444,40 @@ export class BackendAdapter implements ModelAdapter {
 
   // ── patch (atomic JSONB SQL) ─────────────────────────────────────────
 
-  async patch(model: any, ops: PatchOp[]): Promise<void> {
+  async patch(
+    model: any,
+    ops: PatchOp[],
+    _data: Record<string, any> = model.__data,
+  ): Promise<Record<string, any> | void> {
     if (!ops.length) return;
+    assertSupportedPatchOps(ops);
 
     const ModelClass = model.constructor as typeof Model;
     const table = tableName(ModelClass as unknown as ModelConstructor);
     const schema = (ModelClass.__schema as SchemaDefinition) ?? {};
 
-    // ── SQLite: read-modify-write (no native JSONB operators) ──────
-    if (this.isSqlite) {
-      await this._patchSqlite(model, ops, table, schema);
-      return;
-    }
-
     const cleanups: Array<() => Promise<void> | void> = [];
 
     try {
-      await this._patchPostgres(model, ops, table, schema, cleanups);
+      const persistedData = await this._withTransaction(async () => {
+        if (this.isSqlite) {
+          const row = await this._patchSqlite(model, ops, table, schema, cleanups);
+          this._notifyChange(model, "update");
+          return row;
+        }
+        const row = await this._patchPostgres(model, ops, table, schema, cleanups);
+        this._notifyChange(model, "update");
+        return row;
+      });
+      this._retainCleanupsForOuterRollback(
+        cleanups,
+        `${ModelClass.type}:patch`,
+      );
+      return persistedData;
     } catch (err) {
       await this._runCleanups(cleanups, `${ModelClass.type}:patch`);
       throw err;
     }
-
-    this._notifyChange(model, "update");
   }
 
   private async _patchPostgres(
@@ -1364,12 +1486,29 @@ export class BackendAdapter implements ModelAdapter {
     table: string,
     schema: SchemaDefinition,
     cleanups: Array<() => Promise<void> | void>,
-  ): Promise<void> {
+  ): Promise<Record<string, any>> {
     const ModelClass = model.constructor as typeof Model;
     await this.runHooks(model, "patch", "before", {
       data: { ops },
       cleanups,
     });
+
+    let patchState = model.__serverSnapshot ?? model.__data;
+    if (ops.some((op) => op.op === "test")) {
+      const currentRow = await this.write(table)
+        .where("id", model.id)
+        .forUpdate()
+        .first();
+      if (!currentRow) {
+        throw new ClientError(`patch: row not found id=${model.id}`);
+      }
+      patchState = (hydrate(
+        ModelClass as unknown as ModelConstructor,
+        this,
+        currentRow,
+      ) as any).__data;
+    }
+    this._validatePatchTests(patchState, ops);
 
     type ParsedOp = {
       op: PatchOp;
@@ -1382,7 +1521,7 @@ export class BackendAdapter implements ModelAdapter {
     const VALID_COLUMN_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
     for (const o of ops) {
-      const segments = o.path.slice(1).split("/");
+      const segments = parsePatchPath(o.path);
       const column = segments[0]!;
       const innerSegments = segments.slice(1);
 
@@ -1403,20 +1542,6 @@ export class BackendAdapter implements ModelAdapter {
         );
       }
 
-      if (o.op === "test") {
-        const current =
-          colType === "json"
-            ? model.__data[column] || {}
-            : model.__data[column];
-        const actual = innerSegments.length
-          ? current?.[innerSegments[0]!]
-          : current;
-        // TypeScript narrows `o` to TestOperation<any> via the
-        // discriminant check above; `.value` is typed.
-        if (!equal(actual, o.value)) {
-          throw new ClientError(`patch test failed at ${o.path}`);
-        }
-      }
       parsed.push({ op: o, column, colType, innerSegments });
     }
 
@@ -1455,8 +1580,8 @@ export class BackendAdapter implements ModelAdapter {
       }
 
       // JSON columns: atomic JSONB SQL
-      let sql = `COALESCE(${column}, '{}'::jsonb)`;
-      const bindings: any[] = [];
+      let sql = `COALESCE(??, '{}'::jsonb)`;
+      const bindings: any[] = [column];
       const ensured = new Set<string>();
 
       // Pre-batch in-memory state for the column. The optimistic
@@ -1471,8 +1596,7 @@ export class BackendAdapter implements ModelAdapter {
       // constructed model that hasn't been hydrated), fall back to
       // empty so every depth gets an ensure (safe but adds a tiny
       // overhead).
-      const preState: any =
-        (model as any).__serverSnapshot?.[column] ?? null;
+      const preState: any = patchState[column] ?? null;
       // Tracks paths whose subtree was removed earlier in THIS batch.
       // Subsequent ensures targeting these paths must still emit so
       // the leaf set has a parent to land on. The "" sentinel marks
@@ -1483,7 +1607,9 @@ export class BackendAdapter implements ModelAdapter {
       const ancestorOrSelfRemoved = (segments: string[]): boolean => {
         if (removedPaths.has("")) return true;
         for (let d = 1; d <= segments.length; d++) {
-          if (removedPaths.has(segments.slice(0, d).join(","))) return true;
+          if (removedPaths.has(JSON.stringify(segments.slice(0, d)))) {
+            return true;
+          }
         }
         return false;
       };
@@ -1513,17 +1639,32 @@ export class BackendAdapter implements ModelAdapter {
               );
               sql = `jsonb_insert(${sql}, ?::text[], ?::jsonb, true)`;
               bindings.push(
-                `{${[...parent, "-1"].join(",")}}`,
+                [...parent, "-1"],
                 JSON.stringify(o.value),
               );
             } else if (innerSegments.length === 0) {
               sql = "?::jsonb";
+              bindings.length = 0;
               bindings.push(JSON.stringify(o.value));
               // Root replace — every future path starts from this
               // new value. Treat it like a root-wipe for ensure
               // tracking; pre-state is irrelevant.
               removedPaths.clear();
               removedPaths.add("");
+            } else if (/^(0|[1-9]\d*)$/.test(innerSegments.at(-1) ?? "")) {
+              this._ensureIntermediates(
+                innerSegments,
+                column,
+                ensured,
+                preState,
+                ancestorOrSelfRemoved,
+                (pgPath, defaultJson) => {
+                  sql = `jsonb_set_lax(${sql}, ?::text[], ${defaultJson}, true, 'use_json_null')`;
+                  bindings.push(pgPath);
+                },
+              );
+              sql = `jsonb_insert(${sql}, ?::text[], ?::jsonb, false)`;
+              bindings.push(innerSegments, JSON.stringify(o.value));
             } else {
               this._ensureIntermediates(
                 innerSegments,
@@ -1538,7 +1679,7 @@ export class BackendAdapter implements ModelAdapter {
               );
               sql = `jsonb_set_lax(${sql}, ?::text[], ?::jsonb, true, 'use_json_null')`;
               bindings.push(
-                `{${innerSegments.join(",")}}`,
+                innerSegments,
                 JSON.stringify(o.value),
               );
             }
@@ -1548,6 +1689,7 @@ export class BackendAdapter implements ModelAdapter {
             // `case "replace"` narrows `o` to ReplaceOperation<any>.
             if (innerSegments.length === 0) {
               sql = "?::jsonb";
+              bindings.length = 0;
               bindings.push(JSON.stringify(o.value));
               // Root replace — every future path starts from this
               // new value. Treat it like a root-wipe for ensure
@@ -1568,7 +1710,7 @@ export class BackendAdapter implements ModelAdapter {
               );
               sql = `jsonb_set_lax(${sql}, ?::text[], ?::jsonb, true, 'use_json_null')`;
               bindings.push(
-                `{${innerSegments.join(",")}}`,
+                innerSegments,
                 JSON.stringify(o.value),
               );
             }
@@ -1577,12 +1719,13 @@ export class BackendAdapter implements ModelAdapter {
           case "remove": {
             if (innerSegments.length === 0) {
               sql = `'{}'::jsonb`;
+              bindings.length = 0;
               removedPaths.clear();
               removedPaths.add("");
             } else {
               sql = `(${sql} #- ?::text[])`;
-              bindings.push(`{${innerSegments.join(",")}}`);
-              removedPaths.add(innerSegments.join(","));
+              bindings.push(innerSegments);
+              removedPaths.add(JSON.stringify(innerSegments));
             }
             break;
           }
@@ -1612,16 +1755,26 @@ export class BackendAdapter implements ModelAdapter {
       // row where it's null. `- text[]` removes the listed top-level
       // keys (PostgreSQL ≥ 10).
       updateFields.data = this.write.raw(
-        `COALESCE(data, '{}'::jsonb) - ?::text[]`,
-        [`{${staleKeys.join(",")}}`],
+        `COALESCE(??, '{}'::jsonb) - ?::text[]`,
+        ["data", staleKeys],
       );
     }
 
-    await this.write(table).where("id", model.id).update(updateFields);
+    const updated = await this.write(table)
+      .where("id", model.id)
+      .update(updateFields)
+      .returning("*");
+    const updatedRow = Array.isArray(updated) ? updated[0] : updated;
+    if (!updatedRow) throw new ClientError(`patch: row not found id=${model.id}`);
     await this.runHooks(model, "patch", "after", {
       data: { ops },
       cleanups,
     });
+    return (hydrate(
+      ModelClass as unknown as ModelConstructor,
+      this,
+      updatedRow,
+    ) as any).__data;
   }
 
   /**
@@ -1664,11 +1817,11 @@ export class BackendAdapter implements ModelAdapter {
     ensured: Set<string>,
     preState: any,
     ancestorOrSelfRemoved: (segments: string[]) => boolean,
-    emit: (pgPath: string, defaultJson: string) => void,
+    emit: (pgPath: string[], defaultJson: string) => void,
   ): void {
     for (let depth = 1; depth < segments.length; depth++) {
       const path = segments.slice(0, depth);
-      const pathKey = path.join(",");
+      const pathKey = JSON.stringify(path);
       if (
         BackendAdapter._pathExistsInData(preState, path) &&
         !ancestorOrSelfRemoved(path)
@@ -1686,7 +1839,7 @@ export class BackendAdapter implements ModelAdapter {
         const defaultJson = isArrayIndexSegment(segments[depth])
           ? "'[]'::jsonb"
           : "'{}'::jsonb";
-        emit(`{${pathKey}}`, defaultJson);
+        emit(path, defaultJson);
       }
     }
   }
@@ -1717,26 +1870,51 @@ export class BackendAdapter implements ModelAdapter {
     ops: PatchOp[],
     table: string,
     schema: SchemaDefinition,
-  ): Promise<void> {
-    const ModelClass = model.constructor as typeof Model;
-    const cleanups: Array<() => Promise<void> | void> = [];
+    cleanups: Array<() => Promise<void> | void>,
+  ): Promise<Record<string, any>> {
+    await this.runHooks(model, "patch", "before", {
+      data: { ops },
+      cleanups,
+    });
+    const updatedRow = await this._patchSqliteBody(model, ops, table, schema);
+    await this.runHooks(model, "patch", "after", {
+      data: { ops },
+      cleanups,
+    });
+    return (hydrate(
+      model.constructor as ModelConstructor,
+      this,
+      updatedRow,
+    ) as any).__data;
+  }
 
-    try {
-      await this.runHooks(model, "patch", "before", {
-        data: { ops },
-        cleanups,
-      });
-      await this._patchSqliteBody(model, ops, table, schema);
-      await this.runHooks(model, "patch", "after", {
-        data: { ops },
-        cleanups,
-      });
-    } catch (err) {
-      await this._runCleanups(cleanups, `${ModelClass.type}:patch`);
-      throw err;
+  private _validatePatchTests(data: Record<string, any>, ops: PatchOp[]): void {
+    const state = structuredClone(data);
+    for (const op of ops) {
+      if (op.op === "test") {
+        let actual: any = state;
+        for (const segment of parsePatchPath(op.path)) {
+          actual = actual?.[segment];
+        }
+        if (!equal(actual, op.value)) {
+          throw new ClientError(`patch test failed at ${op.path}`);
+        }
+        continue;
+      }
+      if (op.op !== "add" && op.op !== "replace" && op.op !== "remove") {
+        continue;
+      }
+      const segments = parsePatchPath(op.path);
+      let parent = state;
+      for (let i = 0; i < segments.length - 1; i++) {
+        const segment = segments[i]!;
+        if (parent[segment] == null || typeof parent[segment] !== "object") {
+          parent[segment] = isArrayIndexSegment(segments[i + 1]) ? [] : {};
+        }
+        parent = parent[segment];
+      }
+      applyPatch(state, [op], false, true);
     }
-
-    this._notifyChange(model, "update");
   }
 
   private async _patchSqliteBody(
@@ -1744,17 +1922,25 @@ export class BackendAdapter implements ModelAdapter {
     ops: PatchOp[],
     table: string,
     schema: SchemaDefinition,
-  ): Promise<void> {
+  ): Promise<Record<string, any>> {
     // Read current row
     const row = await this.write(table).where("id", model.id).first();
     if (!row) throw new ClientError(`patch: row not found id=${model.id}`);
+    if (ops.some((op) => op.op === "test")) {
+      const currentData = (hydrate(
+        model.constructor as ModelConstructor,
+        this,
+        row,
+      ) as any).__data;
+      this._validatePatchTests(currentData, ops);
+    }
 
     const updateFields: Record<string, any> = { updatedAt: new Date() };
 
     // Group ops by top-level column
     const byColumn = new Map<string, PatchOp[]>();
     for (const op of ops) {
-      const column = op.path.slice(1).split("/")[0]!;
+      const column = parsePatchPath(op.path)[0]!;
       if (!byColumn.has(column)) byColumn.set(column, []);
       byColumn.get(column)!.push(op);
     }
@@ -1797,10 +1983,13 @@ export class BackendAdapter implements ModelAdapter {
       if (current == null) current = {};
 
       // Wrap column ops as a proper JSON Patch document (paths relative to column root)
-      const subOps: PatchOp[] = columnOps.map((op) => ({
-        ...op,
-        path: op.path.slice(1 + column.length), // strip /<column> prefix
-      }));
+      const subOps: PatchOp[] = columnOps.map((op) => {
+        const nextSlash = op.path.indexOf("/", 1);
+        return {
+          ...op,
+          path: nextSlash < 0 ? "" : op.path.slice(nextSlash),
+        };
+      });
 
       const result = applyPatch(current, subOps, true, false);
       updateFields[column] = JSON.stringify(result.newDocument);
@@ -1839,6 +2028,9 @@ export class BackendAdapter implements ModelAdapter {
     }
 
     await this.write(table).where("id", model.id).update(updateFields);
+    const updatedRow = await this.write(table).where("id", model.id).first();
+    if (!updatedRow) throw new ClientError(`patch: row not found id=${model.id}`);
+    return updatedRow;
   }
 
   // ── Increment/Decrement ──────────────────────────────────────────────
@@ -1846,23 +2038,29 @@ export class BackendAdapter implements ModelAdapter {
   async increment(model: any, field: string, amount = 1): Promise<void> {
     const ModelClass = model.constructor as typeof Model;
     const table = tableName(ModelClass as unknown as ModelConstructor);
-    await this.write(table).where("id", model.id).increment(field, amount);
-    const row = await this.write(table)
-      .where("id", model.id)
-      .select(field)
-      .first();
-    if (row) (model as any)[field] = row[field];
+    await this._withTransaction(async () => {
+      await this.write(table).where("id", model.id).increment(field, amount);
+      const row = await this.write(table)
+        .where("id", model.id)
+        .select(field)
+        .first();
+      if (row) (model as any)[field] = row[field];
+      this._notifyChange(model, "update");
+    });
   }
 
   async decrement(model: any, field: string, amount = 1): Promise<void> {
     const ModelClass = model.constructor as typeof Model;
     const table = tableName(ModelClass as unknown as ModelConstructor);
-    await this.write(table).where("id", model.id).decrement(field, amount);
-    const row = await this.write(table)
-      .where("id", model.id)
-      .select(field)
-      .first();
-    if (row) (model as any)[field] = row[field];
+    await this._withTransaction(async () => {
+      await this.write(table).where("id", model.id).decrement(field, amount);
+      const row = await this.write(table)
+        .where("id", model.id)
+        .select(field)
+        .first();
+      if (row) (model as any)[field] = row[field];
+      this._notifyChange(model, "update");
+    });
   }
 
   /**
@@ -1891,28 +2089,23 @@ export class BackendAdapter implements ModelAdapter {
   ): Promise<void> {
     if (amount === 0 || ids.length === 0) return;
     const table = tableName(modelClass);
-    await this.write(table).whereIn("id", ids).increment(field, amount);
+    await this._withTransaction(async () => {
+      await this.write(table).whereIn("id", ids).increment(field, amount);
+      this._notifyChangeById(modelClass, ids[0], "update");
+    });
   }
 
   /**
    * Run `fn` inside a Knex transaction. Returns whatever `fn` returns,
    * or rolls back on any thrown error.
    *
-   * Caveat: parcae model operations issued inside `fn` do NOT
-   * automatically participate in the transaction — they go through the
-   * adapter's default knex handle, which is the outer connection.
-   * Callers that need a fully-transactional model operation should
-   * still drop down to raw SQL via the `trx` argument until parcae
-   * grows transaction-threading at the model layer.
-   *
-   * The primary use case today is grouping a few raw `UPDATE`/`DELETE`
-   * statements (e.g. delete-scene's joint-table cleanup) so a crash
-   * mid-way doesn't leave half the rows scrubbed.
+   * Model operations and raw statements both use the same active handle;
+   * model-change events flush only after the outermost commit succeeds.
    */
   async runInTransaction<T>(
     fn: (trx: any) => Promise<T>,
   ): Promise<T> {
-    return this.write.transaction(async (trx: any) => fn(trx));
+    return this._withTransaction(() => fn(this.write));
   }
 
   /** Raw access to the write Knex handle. Use sparingly — prefer model
@@ -1981,12 +2174,17 @@ export class BackendAdapter implements ModelAdapter {
       };
 
       if (isAsync) {
-        Promise.resolve(hookEntry.handler(ctx)).catch((err) => {
-          log.error(
-            `[hook] Async error in ${hookEntry.modelType}:${action}:`,
-            err,
-          );
-        });
+        const dispatch = () => {
+          void Promise.resolve()
+            .then(() => hookEntry.handler(ctx))
+            .catch((err) => {
+              log.error(
+                `[hook] Async error in ${hookEntry.modelType}:${action}:`,
+                err,
+              );
+            });
+        };
+        if (!runAfterCommitIfActive(dispatch)) dispatch();
       } else {
         await hookEntry.handler(ctx as any);
       }
@@ -2009,6 +2207,61 @@ export class BackendAdapter implements ModelAdapter {
         log.error(`[parcae/onError] cleanup failed for ${label}:`, cleanupErr);
       }
     }
+  }
+
+  private _retainCleanupsForOuterRollback(
+    cleanups: Array<() => Promise<void> | void>,
+    label: string,
+  ): void {
+    if (cleanups.length === 0) return;
+    let isPending = true;
+    runAfterRollbackIfActive(async () => {
+      if (!isPending) return;
+      isPending = false;
+      await this._runCleanups(cleanups, label);
+    });
+  }
+
+  private _captureSaveModel(
+    model: any,
+    data: Record<string, any>,
+    creating: boolean,
+  ): any {
+    const ModelClass = model.constructor as typeof Model;
+    if (typeof (ModelClass as any).hydrate === "function") {
+      const captured = (ModelClass as any).hydrate(
+        this,
+        structuredClone(data),
+      );
+      captured.__isNew = creating;
+      return captured;
+    }
+
+    const state = structuredClone(data);
+    const target = Object.assign(
+      Object.create(Object.getPrototypeOf(model)),
+      model,
+      state,
+    );
+    Object.defineProperty(target, "__data", {
+      configurable: true,
+      get: () => state,
+    });
+    target.__isNew = creating;
+    return new Proxy(target, {
+      set(object, property, value) {
+        Reflect.set(object, property, value);
+        if (typeof property === "string" && !property.startsWith("__")) {
+          state[property] = value;
+        }
+        return true;
+      },
+      deleteProperty(object, property) {
+        Reflect.deleteProperty(object, property);
+        if (typeof property === "string") delete state[property];
+        return true;
+      },
+    });
   }
 
   // ── Schema Management ────────────────────────────────────────────────

@@ -51,6 +51,10 @@ describe("@parcae/i18n backend routes", () => {
 
     expect(response.status()).toBe(200);
     expect(response.header("Content-Language")).toBe("fr");
+    expect(response.header("Vary")).toBeUndefined();
+    expect(response.header("Cache-Control")).toBe(
+      "public, max-age=300, stale-while-revalidate=86400",
+    );
     expect(response.json()).toEqual({ greeting: "Bonjour" });
   });
 
@@ -68,6 +72,24 @@ describe("@parcae/i18n backend routes", () => {
 
     expect(response.status()).toBe(200);
     expect(response.header("Content-Language")).toBe("fr");
+    expect(response.header("Cache-Control")).toBe("private, no-store");
+    expect(response.header("Vary")).toBe(
+      "x-locale, accept-language, cookie",
+    );
+    expect(response.json()).toEqual({ greeting: "Bonjour" });
+  });
+
+  it("does not publicly cache an unkeyed request locale", async () => {
+    registerI18nRoutes(config);
+    const route = getRoutes().find(
+      (entry) => entry.path === DEFAULT_I18N_ROUTE_PATH,
+    );
+    const response = createResponse();
+
+    await route?.handler({ locale: "fr", headers: {} }, response.res);
+
+    expect(response.header("Content-Language")).toBe("fr");
+    expect(response.header("Cache-Control")).toBe("private, no-store");
     expect(response.json()).toEqual({ greeting: "Bonjour" });
   });
 });

@@ -4,6 +4,7 @@
  */
 
 import knexFactory from "knex";
+import { Model } from "@parcae/model";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BackendAdapter } from "../adapters/model";
 import type { HookContext } from "../routing/hook";
@@ -20,6 +21,13 @@ const TestModel: TestModelClass = {
   type: "testitem",
   __schema: { name: "string" },
 };
+
+class CapturedModel extends Model {
+  static override type = "testitem";
+  static override __schema = { name: "string" as const };
+
+  name = "";
+}
 
 function makeModel(data: Record<string, unknown> = {}): any {
   return {
@@ -131,11 +139,7 @@ describe("ctx.onError — compensating actions", () => {
     expect(rows.length).toBe(0);
   });
 
-  it("fires cleanups when a sync after-hook throws (note: DB row is NOT rolled back)", async () => {
-    // Semantics: onError is for compensating external side effects, not for
-    // DB atomicity. When an after-hook throws, the INSERT has already
-    // committed, but cleanup handlers still fire so hooks can undo their own
-    // external work (Clerk calls, S3 uploads, etc.).
+  it("fires cleanups and rolls back when a sync after-hook throws", async () => {
     const cleanup = vi.fn();
 
     hook.before(TestModel as any, "create", ({ onError }: HookContext) => {
@@ -154,9 +158,9 @@ describe("ctx.onError — compensating actions", () => {
 
     expect(cleanup).toHaveBeenCalledTimes(1);
 
-    // Row WAS inserted — onError does not provide DB rollback
+    // The synchronous before/write/after pipeline is one transaction.
     const rows = await (adapter as any).__knex("testitems").where("id", "rb");
-    expect(rows.length).toBe(1);
+    expect(rows.length).toBe(0);
   });
 
   it("runs cleanups in LIFO order across multiple registrations", async () => {
@@ -237,6 +241,83 @@ describe("ctx.onError — compensating actions", () => {
     expect(cleanup).not.toHaveBeenCalled();
   });
 
+  it("runs successful nested-operation cleanups exactly once on outer rollback", async () => {
+    const cleanup = vi.fn();
+    hook.before(TestModel as any, "create", ({ onError }: HookContext) => {
+      onError(cleanup);
+    });
+
+    await expect(
+      adapter.runInTransaction(async () => {
+        await adapter.save(makeModel({ id: "outer-rb", name: "pending" }));
+        throw new Error("outer rollback");
+      }),
+    ).rejects.toThrow("outer rollback");
+
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    const rows = await (adapter as any)
+      .__knex("testitems")
+      .where("id", "outer-rb");
+    expect(rows).toHaveLength(0);
+  });
+
+  it("discards nested-operation cleanups after outer commit", async () => {
+    const cleanup = vi.fn();
+    hook.before(TestModel as any, "create", ({ onError }: HookContext) => {
+      onError(cleanup);
+    });
+
+    await adapter.runInTransaction(async () => {
+      await adapter.save(makeModel({ id: "outer-ok", name: "committed" }));
+    });
+
+    expect(cleanup).not.toHaveBeenCalled();
+  });
+
+  it("validates and persists each queued save's captured state", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered!: () => void;
+    const firstHook = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const seen: string[] = [];
+
+    hook.before(CapturedModel, "save", async ({ model }) => {
+      seen.push(model.name);
+      if (seen.length === 1) {
+        entered();
+        await gate;
+      }
+      model.name = `${model.name}-hook`;
+    });
+
+    const model = CapturedModel.hydrate(adapter, {
+      id: "captured-save",
+      name: "first",
+    });
+    model.__isNew = true;
+    const first = model.save();
+    await firstHook;
+
+    model.name = "second";
+    const second = model.save();
+    model.name = "newer-local-edit";
+    release();
+    await Promise.all([first, second]);
+
+    expect(seen).toEqual(["first", "second"]);
+    const row = await (adapter as any)
+      .__knex("testitems")
+      .where("id", "captured-save")
+      .first();
+    expect(row.name).toBe("second-hook");
+    expect(model.name).toBe("newer-local-edit");
+    expect(model.__serverSnapshot.name).toBe("second-hook");
+  });
+
   it("onError is a no-op when called inside an async-option hook", async () => {
     const cleanup = vi.fn();
     const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -308,11 +389,11 @@ describe("ctx.onError — compensating actions", () => {
 
     expect(cleanup).toHaveBeenCalledTimes(1);
 
-    // Row IS present — onError does not roll back DB state
+    // The after-hook failure rolls the insert back before cleanup runs.
     const rows = await (adapter as any)
       .__knex("testitems")
       .where("id", "mixed");
-    expect(rows.length).toBe(1);
+    expect(rows.length).toBe(0);
   });
 
   it("fires cleanups for patch() when an after-hook throws", async () => {
@@ -339,12 +420,11 @@ describe("ctx.onError — compensating actions", () => {
     ).rejects.toThrow("patch after failed");
 
     expect(cleanup).toHaveBeenCalledTimes(1);
-    // Patch UPDATE committed before the after-hook threw — name is "after".
-    // onError is not about DB rollback; it's about external-side-effect compensation.
+    // The patch UPDATE and synchronous after-hook share one transaction.
     const row = await (adapter as any)
       .__knex("testitems")
       .where("id", "patch1")
       .first();
-    expect(row.name).toBe("after");
+    expect(row.name).toBe("before");
   });
 });

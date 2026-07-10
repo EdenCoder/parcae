@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { decompress } from "compress-json";
+import pako from "pako";
 import { createSocketFakeRes } from "../socket-fake-res";
 
 function makeSocket() {
@@ -26,6 +28,23 @@ describe("createSocketFakeRes", () => {
     res.writeHead(403, { "Content-Type": "application/json" });
     expect(res.statusCode).toBe(403);
     expect(res.writableEnded).toBe(false);
+  });
+
+  it("includes HTTP status in socket error envelopes", () => {
+    const socket = makeSocket();
+    const res = createSocketFakeRes(socket, "req-1");
+    res.writeHead(404);
+    res.end(JSON.stringify({ success: false, error: "Not found" }));
+
+    const frame = socket.emit.mock.calls[0]![1];
+    const payload = decompress(
+      JSON.parse(pako.ungzip(frame, { to: "string" })),
+    );
+    expect(payload).toMatchObject({
+      success: false,
+      error: "Not found",
+      status: 404,
+    });
   });
 
   // The load-bearing contract for the step-up gate: once a hook calls

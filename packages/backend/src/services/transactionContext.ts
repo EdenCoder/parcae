@@ -34,10 +34,16 @@ import type { Change, ChangeBus } from "./changeBus";
 export interface TransactionFrame {
   /** Knex transaction handle (`db.transaction()` provides it). */
   trx: any;
+  /** Closed frames may remain visible to detached ALS work but are unusable. */
+  state: "active" | "closed";
   /** Buffered changes awaiting commit. */
   buffer: Change[];
   /** Shared request-id for every write inside the frame. */
   requestId: string;
+  /** Side effects that may run only after Knex confirms commit. */
+  afterCommit: Array<() => Promise<void> | void>;
+  /** Compensations that run if the outermost transaction fails. */
+  afterRollback: Array<() => Promise<void> | void>;
   /** Depth — non-zero inside nested `withTransaction(…)` calls. */
   depth: number;
 }
@@ -48,7 +54,13 @@ const storage = new AsyncLocalStorage<TransactionFrame>();
 
 /** Get the active transaction frame, if any. */
 export function getActiveTransactionFrame(): TransactionFrame | null {
-  return storage.getStore() ?? null;
+  const frame = storage.getStore();
+  return frame?.state === "active" ? frame : null;
+}
+
+/** Get the active Knex transaction handle, if any. */
+export function activeTransactionHandle(): any | null {
+  return getActiveTransactionFrame()?.trx ?? null;
 }
 
 /**
@@ -57,9 +69,29 @@ export function getActiveTransactionFrame(): TransactionFrame | null {
  * emit immediately.
  */
 export function bufferChangeIfActive(change: Change): boolean {
-  const frame = storage.getStore();
+  const frame = getActiveTransactionFrame();
   if (!frame) return false;
   frame.buffer.push(change);
+  return true;
+}
+
+/** Queue a side effect until commit. Returns false outside a transaction. */
+export function runAfterCommitIfActive(
+  callback: () => Promise<void> | void,
+): boolean {
+  const frame = getActiveTransactionFrame();
+  if (!frame) return false;
+  frame.afterCommit.push(callback);
+  return true;
+}
+
+/** Queue a compensation for outermost rollback. Returns false outside a transaction. */
+export function runAfterRollbackIfActive(
+  callback: () => Promise<void> | void,
+): boolean {
+  const frame = getActiveTransactionFrame();
+  if (!frame) return false;
+  frame.afterRollback.push(callback);
   return true;
 }
 
@@ -102,7 +134,7 @@ export async function withTransaction<T>(
   deps: WithTransactionDeps,
   fn: (trx: any) => Promise<T>,
 ): Promise<T> {
-  const existing = storage.getStore();
+  const existing = getActiveTransactionFrame();
   if (existing) {
     // Nested call. Re-enter with depth+1 on the same frame — the inner
     // body still receives the existing trx so all writes flow to the
@@ -119,43 +151,58 @@ export async function withTransaction<T>(
   const requestId =
     deps.requestId ?? deps.changeBus?.newRequestId() ?? fallbackRequestId();
 
-  // We use a plain Promise wrapper around knex.transaction so we can
-  // distinguish "fn returned successfully → trx will commit" from
-  // "fn threw → trx will roll back" before knex's own commit fires.
-  // Buffer flushing happens AFTER knex confirms commit.
-  return await deps.knex.transaction(async (trx: any) => {
-    if (deps.setRequestIdGuc) {
-      await trx.raw("SELECT set_config('parcae.request_id', ?, true)", [
-        requestId,
-      ]);
-    }
-    const frame: TransactionFrame = {
-      trx,
-      buffer: [],
-      requestId,
-      depth: 1,
-    };
-    return storage.run(frame, async () => {
-      let result: T;
-      try {
-        result = await fn(trx);
-      } catch (err) {
-        // knex will roll back; the buffer is intentionally discarded
-        // (never flushed). Re-throw so knex sees the failure.
-        throw err;
+  const transaction: { frame: TransactionFrame | null } = { frame: null };
+  let result: T;
+  try {
+    result = await deps.knex.transaction(async (trx: any) => {
+      if (deps.setRequestIdGuc) {
+        await trx.raw("SELECT set_config('parcae.request_id', ?, true)", [
+          requestId,
+        ]);
       }
-      // fn resolved → knex is about to commit. We flush right before
-      // returning so the actual commit happens after the buffer is
-      // already on its way to the bus. If the commit itself later
-      // fails (very rare for a single-statement trx, possible for
-      // larger ones), we accept a small window of false-positive
-      // events — better than the alternative of holding the bus
-      // emit until AFTER `transaction()` resolves, where a thrown
-      // post-commit handler can lose them entirely.
-      flush(frame.buffer, deps.changeBus);
-      return result;
+      transaction.frame = {
+        trx,
+        state: "active",
+        buffer: [],
+        requestId,
+        afterCommit: [],
+        afterRollback: [],
+        depth: 1,
+      };
+      const value = await storage.run(transaction.frame, () => fn(trx));
+      // Reserve only rows that have corresponding hook changes. Raw-only
+      // writes must remain visible through LISTEN, including raw writes in a
+      // mixed transaction that target a different table/id.
+      if (deps.changeBus) {
+        for (const change of transaction.frame.buffer) {
+          deps.changeBus.reserve(change);
+        }
+      }
+      return value;
     });
-  });
+  } catch (err) {
+    const frame = transaction.frame;
+    if (frame) {
+      frame.state = "closed";
+      await runAfterRollback(frame.afterRollback);
+      frame.afterRollback.length = 0;
+      frame.afterCommit.length = 0;
+      frame.buffer.length = 0;
+    }
+    throw err;
+  }
+
+  // Knex resolves transaction() only after COMMIT succeeds. A callback
+  // error or commit failure skips this block and discards both queues.
+  const frame = transaction.frame;
+  if (!frame) throw new Error("transactionContext: transaction frame missing");
+  frame.state = "closed";
+  flush(frame.buffer, deps.changeBus);
+  await runAfterCommit(frame.afterCommit);
+  frame.buffer.length = 0;
+  frame.afterCommit.length = 0;
+  frame.afterRollback.length = 0;
+  return result;
 }
 
 function flush(buffer: Change[], changeBus: ChangeBus | null): void {
@@ -165,6 +212,34 @@ function flush(buffer: Change[], changeBus: ChangeBus | null): void {
       changeBus.emit(change);
     } catch (err) {
       log.warn(`transactionContext: bus.emit threw: ${String(err)}`);
+    }
+  }
+}
+
+async function runAfterCommit(
+  callbacks: Array<() => Promise<void> | void>,
+): Promise<void> {
+  for (const callback of callbacks) {
+    try {
+      await callback();
+    } catch (err) {
+      log.warn(
+        `transactionContext: after-commit callback threw: ${String(err)}`,
+      );
+    }
+  }
+}
+
+async function runAfterRollback(
+  callbacks: Array<() => Promise<void> | void>,
+): Promise<void> {
+  for (let i = callbacks.length - 1; i >= 0; i--) {
+    try {
+      await callbacks[i]!();
+    } catch (err) {
+      log.warn(
+        `transactionContext: rollback callback threw: ${String(err)}`,
+      );
     }
   }
 }

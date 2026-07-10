@@ -64,7 +64,7 @@ The reference proxy throws a Promise on first property access for React Suspense
 
 ## Static Query Methods
 
-All query methods go through the global adapter set via `Model.use()`.
+Static query methods use the adapter bound to that model constructor. `Model.use()` installs a default exactly once; `Model.bind(adapter)` returns an independent adapter-bound constructor without mutating the source class.
 
 ```typescript
 // Find by ID
@@ -147,26 +147,39 @@ The `ModelAdapter` interface decouples the Model from persistence:
 
 ```typescript
 interface ModelAdapter {
-  createStore(data): Record<string, any>;
-  save(model, changes): Promise<void>;
+  save(model, data): Promise<Record<string, any> | void>;
   remove(model): Promise<void>;
   findById(modelClass, id): Promise<T | null>;
   query(modelClass): QueryChain<T>;
-  patch(model, ops): Promise<void>;
+  patch(model, ops, data): Promise<Record<string, any> | void>;
 }
 ```
 
+Write adapters return the authoritative row for `Model` to merge. A backend
+adapter may return `void` only when it has already applied authoritative hook
+and persistence mutations to the model instance itself.
+
 | Adapter           | Store                   | Persistence                     |
 | ----------------- | ----------------------- | ------------------------------- |
-| `FrontendAdapter` | Plain object (EventEmitter) | Transport RPC (Socket.IO / SSE) |
+| `FrontendAdapter` | Plain object (EventEmitter) | Transport RPC (Socket.IO)       |
 | `BackendAdapter`  | Plain object            | Knex + PostgreSQL               |
 
-Set the adapter once at startup:
+Set the application default once at startup:
 
 ```typescript
 import { Model } from "@parcae/model";
 
 Model.use(adapter);
+```
+
+For multiple application or client contexts, bind instead of replacing the default:
+
+```typescript
+const PublicPost = Post.bind(publicAdapter);
+const AdminPost = Post.bind(adminAdapter);
+
+await PublicPost.where({ published: true }).find();
+await AdminPost.where({}).find();
 ```
 
 ## FrontendAdapter
@@ -177,8 +190,10 @@ Included in this package. Wraps a `Transport` to handle client-side persistence.
 import { FrontendAdapter } from "@parcae/model";
 
 const adapter = new FrontendAdapter(transport);
-Model.use(adapter);
+const ClientPost = Post.bind(adapter);
 ```
+
+`@parcae/sdk` exposes the same operation as `client.bind(Post)`, which is the preferred client API because it keeps the transport and adapter lifecycle together.
 
 The `Transport` interface is protocol-agnostic:
 

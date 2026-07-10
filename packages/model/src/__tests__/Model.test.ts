@@ -1,6 +1,21 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { Model, SYM_SERVER_MERGE, generateId } from "../Model";
+import {
+  Model,
+  SYM_SERVER_MERGE,
+  SYM_SERVER_PATCH,
+  generateId,
+} from "../Model";
 import type { ModelAdapter, QueryChain } from "../adapters/types";
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 // ─── Mock Adapter ────────────────────────────────────────────────────────────
 
@@ -13,17 +28,22 @@ function createMockAdapter(): ModelAdapter & {
     saved: [] as any[],
     removed: [] as any[],
     patched: [] as any[],
-    createStore: (data: Record<string, any>) => ({ ...data }),
-    save: async (model: any) => {
-      adapter.saved.push({ model, data: { ...model.__data } });
+    save: async (model: any, data: Record<string, any>) => {
+      adapter.saved.push({ model, data: structuredClone(data) });
+      return structuredClone(data);
     },
     remove: async (model: any) => {
       adapter.removed.push(model);
     },
     findById: async () => null,
     query: () => ({}) as QueryChain<any>,
-    patch: async (model: any, ops: any[]) => {
-      adapter.patched.push({ model, ops: [...ops] });
+    patch: async (
+      model: any,
+      ops: any[],
+      _data: Record<string, any>,
+    ) => {
+      adapter.patched.push({ model, ops: structuredClone(ops) });
+      return structuredClone(_data);
     },
   };
   return adapter;
@@ -39,19 +59,15 @@ class Post extends Model {
   views: number = 0;
 }
 
-class Comment extends Model {
-  static type = "comment" as const;
-  text: string = "";
-  author: string = "";
-}
-
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 describe("Model", () => {
-  let adapter: ReturnType<typeof createMockAdapter>;
+  const adapter = createMockAdapter();
 
   beforeEach(() => {
-    adapter = createMockAdapter();
+    adapter.saved.length = 0;
+    adapter.removed.length = 0;
+    adapter.patched.length = 0;
     Model.use(adapter);
   });
 
@@ -188,6 +204,62 @@ describe("Model", () => {
       await post.flush();
       expect(adapter.patched.length).toBe(0);
     });
+
+    it("keeps edits made during save dirty for the next flush", async () => {
+      const originalSave = adapter.save;
+      const gate = deferred<void>();
+      adapter.save = async (model, data) => {
+        adapter.saved.push({ model, data: structuredClone(data) });
+        await gate.promise;
+        return structuredClone(data);
+      };
+
+      try {
+        const post = Post.create({ title: "sent" });
+        const saving = post.save();
+        post.title = "edited while saving";
+        gate.resolve();
+        await saving;
+
+        expect(post.__serverSnapshot.title).toBe("sent");
+        expect(post.title).toBe("edited while saving");
+
+        await post.flush();
+        expect(adapter.patched).toHaveLength(1);
+        expect(adapter.patched[0].ops).toContainEqual({
+          op: "replace",
+          path: "/title",
+          value: "edited while saving",
+        });
+      } finally {
+        adapter.save = originalSave;
+      }
+    });
+
+    it("advances a void save snapshot only to the submitted payload", async () => {
+      const originalSave = adapter.save;
+      adapter.save = async (model, data) => {
+        adapter.saved.push({ model, data: structuredClone(data) });
+        model.title = "after hook";
+      };
+
+      try {
+        const post = Post.create({ title: "before hook" });
+        await post.save();
+
+        expect(post.title).toBe("after hook");
+        expect(post.__serverSnapshot.title).toBe("before hook");
+        await post.flush();
+        expect(adapter.patched).toHaveLength(1);
+        expect(adapter.patched[0].ops).toContainEqual({
+          op: "replace",
+          path: "/title",
+          value: "after hook",
+        });
+      } finally {
+        adapter.save = originalSave;
+      }
+    });
   });
 
   describe("flush", () => {
@@ -270,9 +342,13 @@ describe("Model", () => {
       // Slow down the adapter's patch so the leading flush is
       // genuinely still in-flight when the follow-ups fire.
       const originalPatch = adapter.patch;
-      adapter.patch = async (model: any, ops: any[]) => {
+      adapter.patch = async (
+        model: any,
+        ops: any[],
+        data: Record<string, any>,
+      ) => {
         await new Promise((r) => setTimeout(r, 10));
-        return originalPatch(model, ops);
+        return originalPatch(model, ops, data);
       };
 
       // Burst of flushes with new state each time. Streaming call
@@ -309,9 +385,13 @@ describe("Model", () => {
       adapter.patched.length = 0;
 
       const originalPatch = adapter.patch;
-      adapter.patch = async (model: any, ops: any[]) => {
+      adapter.patch = async (
+        model: any,
+        ops: any[],
+        data: Record<string, any>,
+      ) => {
         await new Promise((r) => setTimeout(r, 10));
-        return originalPatch(model, ops);
+        return originalPatch(model, ops, data);
       };
 
       post.title = "1";
@@ -325,6 +405,37 @@ describe("Model", () => {
 
       expect(adapter.patched.length).toBe(2);
       adapter.patch = originalPatch;
+    });
+
+    it("does not duplicate a create across concurrent new-model flushes", async () => {
+      const originalSave = adapter.save;
+      const gate = deferred<void>();
+      adapter.save = async (model, data) => {
+        adapter.saved.push({ model, data: structuredClone(data) });
+        await gate.promise;
+        return structuredClone(data);
+      };
+
+      try {
+        const post = Post.create({ title: "first" });
+        const first = post.flush();
+        post.title = "second";
+        const second = post.flush();
+
+        expect(adapter.saved).toHaveLength(1);
+        gate.resolve();
+        await Promise.all([first, second]);
+
+        expect(adapter.saved).toHaveLength(1);
+        expect(adapter.patched).toHaveLength(1);
+        expect(adapter.patched[0].ops).toContainEqual({
+          op: "replace",
+          path: "/title",
+          value: "second",
+        });
+      } finally {
+        adapter.save = originalSave;
+      }
     });
   });
 
@@ -457,19 +568,18 @@ describe("Model", () => {
     it("vivifies multi-digit numeric segments as arrays (regression — the regex must accept '12', not just '1')", async () => {
       const post = Post.create({ title: "x" });
       await post.save();
-      // Direct sparse-index add — fast-json-patch's array path
-      // accepts numeric strings of any length.
       await post.patch([
-        { op: "add", path: "/items/0", value: "first" },
-        { op: "add", path: "/items/1", value: "second" },
+        {
+          op: "add",
+          path: "/items/12/name",
+          value: "thirteenth",
+        },
       ]);
-      // After the two adds, `items` is a real array of length 2.
-      // The regression guard here is the regex that decides
-      // numeric-vs-string: a literal-`/^\d$/` would only match
-      // single-digit indices and fall through to `{}` for `"12"`.
       const items = (post as any).items;
       expect(Array.isArray(items)).toBe(true);
-      expect(items).toEqual(["first", "second"]);
+      expect(items).toHaveLength(13);
+      expect(items[0]).toBeUndefined();
+      expect(items[12]).toEqual({ name: "thirteenth" });
     });
 
     it("does not coerce a string segment that merely contains digits to array (e.g. 'b1')", async () => {
@@ -513,6 +623,172 @@ describe("Model", () => {
         { text: "a", role: "primary" },
         { text: "b" },
       ]);
+    });
+
+    it("deletes a top-level property locally", async () => {
+      const post = Post.create({ obsolete: "remove me" });
+      await post.save();
+
+      await post.patch([{ op: "remove", path: "/obsolete" }]);
+
+      expect(Object.prototype.hasOwnProperty.call(post, "obsolete")).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(post.__data, "obsolete")).toBe(
+        false,
+      );
+    });
+
+    it("decodes RFC 6901 escaped segments when copying patched keys locally", async () => {
+      const post = Post.create({
+        "a/b": { "til~de": "before" },
+      });
+      await post.save();
+
+      await post.patch([
+        {
+          op: "replace",
+          path: "/a~1b/til~0de",
+          value: "after",
+        },
+      ]);
+
+      expect((post as any)["a/b"]["til~de"]).toBe("after");
+    });
+
+    it("keeps overlapping patch paths pending until every write settles", async () => {
+      const originalPatch = adapter.patch;
+      const firstGate = deferred<void>();
+      const secondGate = deferred<void>();
+      let call = 0;
+      adapter.patch = async (model, ops, data) => {
+        adapter.patched.push({
+          model,
+          ops: structuredClone(ops),
+          data: structuredClone(data),
+        });
+        await (call++ === 0 ? firstGate.promise : secondGate.promise);
+      };
+
+      try {
+        const post = Post.create({ title: "start" });
+        await post.save();
+
+        const first = post.patch([
+          { op: "replace", path: "/title", value: "first" },
+        ]);
+        const second = post.patch([
+          { op: "replace", path: "/title", value: "second" },
+        ]);
+
+        expect(post.__patchingPaths.has("/title")).toBe(true);
+        firstGate.resolve();
+        await first;
+        expect(post.__patchingPaths.has("/title")).toBe(true);
+
+        secondGate.resolve();
+        await second;
+        expect(post.__patchingPaths.has("/title")).toBe(false);
+      } finally {
+        adapter.patch = originalPatch;
+      }
+    });
+
+    it("three-way merges authoritative nested siblings with edits made during the write", async () => {
+      const originalPatch = adapter.patch;
+      const response = deferred<Record<string, any>>();
+      adapter.patch = async () => response.promise;
+
+      try {
+        const post = Post.hydrate(adapter, {
+          id: "p1",
+          profile: { name: "before", theme: "light", rank: 1 },
+        });
+        const writing = post.patch([
+          { op: "replace", path: "/profile/name", value: "client" },
+        ]);
+        (post as any).profile.theme = "local while writing";
+
+        response.resolve({
+          ...post.__data,
+          profile: {
+            name: "SERVER CANONICAL",
+            theme: "light",
+            rank: 2,
+          },
+        });
+        await writing;
+
+        expect((post as any).profile).toEqual({
+          name: "SERVER CANONICAL",
+          theme: "local while writing",
+          rank: 2,
+        });
+        expect(post.__serverSnapshot.profile).toEqual({
+          name: "SERVER CANONICAL",
+          theme: "light",
+          rank: 2,
+        });
+
+        adapter.patch = originalPatch;
+        adapter.patched.length = 0;
+        await post.flush();
+        expect(adapter.patched[0].ops).toContainEqual({
+          op: "replace",
+          path: "/profile/theme",
+          value: "local while writing",
+        });
+      } finally {
+        adapter.patch = originalPatch;
+      }
+    });
+
+    it("does not snapshot a later queued patch when a void patch completes", async () => {
+      const originalPatch = adapter.patch;
+      const firstGate = deferred<void>();
+      const secondGate = deferred<void>();
+      let call = 0;
+      adapter.patch = async () => {
+        if (call++ === 0) {
+          await firstGate.promise;
+          return;
+        }
+        await secondGate.promise;
+        throw new Error("second patch failed");
+      };
+
+      try {
+        const post = Post.hydrate(adapter, {
+          id: "p1",
+          profile: { name: "before", theme: "light" },
+        });
+        const first = post.patch([
+          { op: "replace", path: "/profile/name", value: "first" },
+        ]);
+        const second = post.patch([
+          { op: "replace", path: "/profile/theme", value: "second" },
+        ]);
+
+        firstGate.resolve();
+        await first;
+        secondGate.resolve();
+        await expect(second).rejects.toThrow("second patch failed");
+
+        expect(post.__serverSnapshot.profile).toEqual({
+          name: "first",
+          theme: "light",
+        });
+        expect((post as any).profile.theme).toBe("second");
+
+        adapter.patch = originalPatch;
+        adapter.patched.length = 0;
+        await post.flush();
+        expect(adapter.patched[0].ops).toContainEqual({
+          op: "replace",
+          path: "/profile/theme",
+          value: "second",
+        });
+      } finally {
+        adapter.patch = originalPatch;
+      }
     });
   });
 
@@ -626,14 +902,71 @@ describe("Model", () => {
     it("hasAdapter should return true after use()", () => {
       expect(Model.hasAdapter()).toBe(true);
     });
+
+    it("refuses to silently replace an application adapter", () => {
+      expect(() => Model.use(createMockAdapter())).toThrow(
+        /Adapter already set/,
+      );
+      expect(Model.getAdapter()).toBe(adapter);
+    });
+
+    it("binds independent static model contexts to separate adapters", async () => {
+      const firstAdapter = createMockAdapter();
+      const secondAdapter = createMockAdapter();
+      firstAdapter.findById = vi.fn(async () => null);
+      secondAdapter.findById = vi.fn(async () => null);
+      const FirstPost = Post.bind(firstAdapter);
+      const SecondPost = Post.bind(secondAdapter);
+
+      await FirstPost.create({ title: "first" }).save();
+      await SecondPost.create({ title: "second" }).save();
+      await FirstPost.findById("first-id");
+      await SecondPost.findById("second-id");
+
+      expect(firstAdapter.saved.map((entry) => entry.data.title)).toEqual([
+        "first",
+      ]);
+      expect(secondAdapter.saved.map((entry) => entry.data.title)).toEqual([
+        "second",
+      ]);
+      expect(FirstPost.where({ published: true }).__adapter).toBe(firstAdapter);
+      expect(SecondPost.where({ published: true }).__adapter).toBe(
+        secondAdapter,
+      );
+      expect(firstAdapter.findById).toHaveBeenCalledWith(
+        FirstPost,
+        "first-id",
+      );
+      expect(secondAdapter.findById).toHaveBeenCalledWith(
+        SecondPost,
+        "second-id",
+      );
+    });
+
+    it("binds after a constructor has its own adapter", () => {
+      class OwnPost extends Model {
+        static type = "own-post" as const;
+        static path = "/v1/own-posts";
+      }
+      const ownAdapter = createMockAdapter();
+      const boundAdapter = createMockAdapter();
+      OwnPost.use(ownAdapter);
+
+      const BoundPost = OwnPost.bind(boundAdapter);
+      const post = BoundPost.create();
+
+      expect(OwnPost.getAdapter()).toBe(ownAdapter);
+      expect(BoundPost.getAdapter()).toBe(boundAdapter);
+      expect(BoundPost.type).toBe(OwnPost.type);
+      expect(BoundPost.path).toBe(OwnPost.path);
+      expect(post.constructor).toBe(BoundPost);
+      expect(post).toBeInstanceOf(OwnPost);
+    });
+
   });
 
   describe("lazy query chains", () => {
     it("should build without adapter", () => {
-      // Temporarily clear adapter
-      const saved = (Model as any).__adapter;
-      (Model as any).__adapter = null;
-
       // These should NOT throw — they build lazy chains
       const chain = Post.where({ published: true });
       expect(chain.__steps).toBeDefined();
@@ -641,9 +974,6 @@ describe("Model", () => {
 
       const chain2 = Post.select("id", "title").orderBy("createdAt", "desc");
       expect(chain2.__steps?.length).toBe(2);
-
-      // Restore
-      (Model as any).__adapter = saved;
     });
 
     it("serializes callback query steps for stable cache keys", () => {
@@ -795,6 +1125,96 @@ describe("Model", () => {
       expect((article as any).$author).toBeNull();
     });
 
+    it("loads refs through the owning instance adapter without cross-session reuse", async () => {
+      const firstAdapter = createMockAdapter();
+      const secondAdapter = createMockAdapter();
+      firstAdapter.findById = vi.fn(async (modelClass, id) =>
+        (modelClass as any).hydrate(firstAdapter, {
+          id,
+          name: "first session",
+        }),
+      );
+      secondAdapter.findById = vi.fn(async (modelClass, id) =>
+        (modelClass as any).hydrate(secondAdapter, {
+          id,
+          name: "second session",
+        }),
+      );
+      const first = Article.hydrate(firstAdapter, { author: "shared" });
+      const second = Article.hydrate(secondAdapter, { author: "shared" });
+
+      let firstLoad: Promise<unknown> | null = null;
+      let secondLoad: Promise<unknown> | null = null;
+      try {
+        void (first.author as any).name;
+      } catch (error) {
+        firstLoad = error as Promise<unknown>;
+      }
+      try {
+        void (second.author as any).name;
+      } catch (error) {
+        secondLoad = error as Promise<unknown>;
+      }
+      await Promise.all([firstLoad, secondLoad]);
+
+      expect((first.author as any).name).toBe("first session");
+      expect((second.author as any).name).toBe("second session");
+      expect(firstAdapter.findById).toHaveBeenCalledTimes(1);
+      expect(secondAdapter.findById).toHaveBeenCalledTimes(1);
+    });
+
+    it("settles a missing ref as loaded null instead of throwing forever", async () => {
+      const refAdapter = createMockAdapter();
+      refAdapter.findById = vi.fn(async () => null);
+      const article = Article.hydrate(refAdapter, { author: "missing" });
+
+      let load: Promise<unknown> | null = null;
+      try {
+        void (article.author as any).name;
+      } catch (error) {
+        load = error as Promise<unknown>;
+      }
+      expect(load).not.toBeNull();
+      await load;
+
+      expect((article.author as any).name).toBeUndefined();
+      expect(refAdapter.findById).toHaveBeenCalledTimes(1);
+    });
+
+    it("propagates a ref load error and retries on the next read", async () => {
+      const refAdapter = createMockAdapter();
+      const failure = new Error("temporary failure");
+      refAdapter.findById = vi
+        .fn()
+        .mockRejectedValueOnce(failure)
+        .mockImplementationOnce(async (modelClass, id) =>
+          (modelClass as any).hydrate(refAdapter, {
+            id,
+            name: "recovered",
+          }),
+        );
+      const article = Article.hydrate(refAdapter, { author: "a1" });
+
+      let failedLoad: Promise<unknown> | null = null;
+      try {
+        void (article.author as any).name;
+      } catch (error) {
+        failedLoad = error as Promise<unknown>;
+      }
+      await expect(failedLoad).rejects.toBe(failure);
+
+      let retry: Promise<unknown> | null = null;
+      try {
+        void (article.author as any).name;
+      } catch (error) {
+        retry = error as Promise<unknown>;
+      }
+      await retry;
+
+      expect((article.author as any).name).toBe("recovered");
+      expect(refAdapter.findById).toHaveBeenCalledTimes(2);
+    });
+
     // ── Pre-hydrated ref proxy (DOL-1093 `.expand("file")` payload) ─────────
     //
     // When the wire payload includes a nested object on a ref field
@@ -857,10 +1277,8 @@ describe("Model", () => {
           expect((article.author as any).name).toBe("Alice");
           expect(findByIdSpy).not.toHaveBeenCalled();
           // Reassign to a different id — must shed the pre-hydrated
-          // proxy. The Model __refCache is module-scoped and keyed
-          // by `${type}:${id}`; even if a prior test cached "a2",
-          // the reassignment invalidates the instance-level cache
-          // and a new read mints a fresh lazy proxy.
+          // proxy. Refs are cached only on the owning instance, so
+          // reassignment always mints a fresh lazy proxy.
           article.author = "a2" as any;
           // Reading a non-whitelisted field now throws the lazy
           // load Promise (Suspense integration). Catch it so we
@@ -994,6 +1412,40 @@ describe("Model", () => {
         article[SYM_SERVER_MERGE]({ title: "y" } as any);
         expect(article.title).toBe("y");
         expect(article.author === before).toBe(true);
+      });
+
+      it("applies a nested ref patch to the loaded instance without replacing the raw id", () => {
+        const article = Article.hydrate(adapter, {
+          id: "article-1",
+          author: { id: "a1", name: "Alice" },
+        });
+        const before = article.author;
+
+        article[SYM_SERVER_PATCH]([
+          { op: "replace", path: "/author/name", value: "Alicia" },
+        ]);
+
+        expect((article as any).$author).toBe("a1");
+        expect(article.author === before).toBe(true);
+        expect((article.author as any).name).toBe("Alicia");
+      });
+
+      it("refreshes a same-id loaded ref from a fresh expanded model", () => {
+        const article = Article.hydrate(adapter, {
+          id: "article-1",
+          author: { id: "a1", name: "stale" },
+        });
+        const before = article.author;
+        const fresh = Article.hydrate(adapter, {
+          id: "article-1",
+          author: { id: "a1", name: "fresh" },
+        });
+
+        article[SYM_SERVER_MERGE](fresh);
+
+        expect((article as any).$author).toBe("a1");
+        expect(article.author === before).toBe(true);
+        expect((article.author as any).name).toBe("fresh");
       });
     });
   });

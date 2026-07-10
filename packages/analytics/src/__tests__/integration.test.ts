@@ -31,7 +31,9 @@ import {
   type ProjectionContext,
   ANALYTICS_EVENT_TABLE,
   ANALYTICS_SNAPSHOT_TABLE,
+  ANALYTICS_STATE_CHANGE_TABLE,
   STORY_TABLE,
+  ensureAnalyticsTables,
   installAnalytics,
   defineMatview,
   ensureAllMatviews,
@@ -50,13 +52,12 @@ import {
 
 const DB_URL = process.env.ANALYTICS_TEST_DB;
 const skip = !DB_URL;
-const describeIfDb = skip ? describe.skip : describe;
-
-if (skip) {
-  console.info(
-    "[integration.test.ts] skipping — set ANALYTICS_TEST_DB=postgres://… to run",
+if (process.env.CI && skip) {
+  throw new Error(
+    "ANALYTICS_TEST_DB is required in CI for the analytics PostgreSQL integration test",
   );
 }
+const describeIfDb = skip ? describe.skip : describe;
 
 let db: Knex;
 
@@ -69,6 +70,7 @@ beforeAll(async () => {
   });
   // Best-effort cleanup of artifacts from prior runs.
   await db.raw(`DROP TABLE IF EXISTS ${STORY_TABLE} CASCADE`);
+  await db.raw(`DROP TABLE IF EXISTS ${ANALYTICS_STATE_CHANGE_TABLE} CASCADE`);
   await db.raw(`DROP TABLE IF EXISTS ${ANALYTICS_SNAPSHOT_TABLE} CASCADE`);
   await db.raw(`DROP TABLE IF EXISTS ${ANALYTICS_EVENT_TABLE} CASCADE`);
   await db.raw(`DROP MATERIALIZED VIEW IF EXISTS analytics_event_recent CASCADE`);
@@ -184,7 +186,7 @@ describeIfDb("@parcae/analytics integration", () => {
     // Projection: a fake detector that fires once, a mock composer.
     class FakeDetector extends Detector {
       readonly key = "fake";
-      async detect(c: DetectorContext): Promise<Finding[]> {
+      async detect(_ctx: DetectorContext): Promise<Finding[]> {
         return [
           {
             key: "fake.cohort_alive",
@@ -210,6 +212,7 @@ describeIfDb("@parcae/analytics integration", () => {
 
     const projection: ProjectionContext = {
       org,
+      locale: "en",
       period,
       db,
       now,
@@ -221,7 +224,7 @@ describeIfDb("@parcae/analytics integration", () => {
     expect(stories[0]?.title).toBe("All four logged this week");
     expect(stories[0]?.subjects).toEqual(subjects);
 
-    // Reruns replace cleanly — same (org, periodEnd) → no drift.
+    // Reruns replace cleanly — same (org, locale, periodEnd) → no drift.
     const rerun = await runProjection(projection);
     expect(rerun).toHaveLength(1);
     const totalRows = await db(STORY_TABLE)
@@ -249,8 +252,10 @@ describeIfDb("@parcae/analytics integration", () => {
       }
     }
 
-    await runMetric(new FixedMetric(11), { org, period, db, now });
-    await runMetric(new FixedMetric(22), { org, period, db, now });
+    const [first] = await runMetric(new FixedMetric(11), { org, period, db, now });
+    const [second] = await runMetric(new FixedMetric(22), { org, period, db, now });
+
+    expect(second?.id).toBe(first?.id);
 
     const rows = await db(ANALYTICS_SNAPSHOT_TABLE)
       .where({ org, metricKey: "test.fixed" });
@@ -261,5 +266,33 @@ describeIfDb("@parcae/analytics integration", () => {
         ? JSON.parse(rows[0].metadata)
         : rows[0]?.metadata;
     expect(meta).toEqual({ run: 22 });
+  });
+
+  it("rejects existing tables whose conflict targets are not unique", async () => {
+    await db.raw("DROP INDEX analytics_snapshot_unique_idx");
+    try {
+      await expect(ensureAnalyticsTables(db)).rejects.toThrow(
+        "analytics_snapshot lacks a valid unique index or constraint",
+      );
+    } finally {
+      await db.raw(
+        `CREATE UNIQUE INDEX analytics_snapshot_unique_idx
+           ON ${ANALYTICS_SNAPSHOT_TABLE}
+           (org, "metricKey", grain, "periodStart", dimensions)`,
+      );
+    }
+
+    await db.raw("DROP INDEX analytics_state_change_idempotent_idx");
+    try {
+      await expect(ensureAnalyticsTables(db)).rejects.toThrow(
+        "analytics_state_change lacks a valid unique index or constraint",
+      );
+    } finally {
+      await db.raw(
+        `CREATE UNIQUE INDEX analytics_state_change_idempotent_idx
+           ON ${ANALYTICS_STATE_CHANGE_TABLE}
+           (org, subject, cohort, "sourceSnapshotId", transition)`,
+      );
+    }
   });
 });

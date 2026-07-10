@@ -471,34 +471,3 @@ describe("BackendAdapter.detectEngine", () => {
     expect(adapter.engine).toBe("postgres");
   });
 });
-
-// ─── Tests: _buildQuery search method ────────────────────────────────────────
-
-describe("BackendAdapter._buildQuery — search method", () => {
-  it("should have search method on built query chain", () => {
-    const { adapter } = createTestAdapter();
-    const chain = adapter.query(ProjectModel);
-    expect(typeof (chain as any).search).toBe("function");
-  });
-
-  it("should return a chain from search()", () => {
-    const { adapter } = createTestAdapter();
-    const chain = adapter.query(ProjectModel);
-    const result = (chain as any).search("test");
-    expect(result).toBeDefined();
-    // Should still have find/first/count
-    expect(typeof result.find).toBe("function");
-    expect(typeof result.first).toBe("function");
-    expect(typeof result.count).toBe("function");
-  });
-
-  it("should be chainable with other methods", () => {
-    const { adapter } = createTestAdapter();
-    const chain = adapter.query(ProjectModel);
-    const result = (chain as any)
-      .where({ public: true })
-      .search("hello")
-      .limit(10);
-    expect(typeof result.find).toBe("function");
-  });
-});

@@ -39,6 +39,7 @@ export interface QueryChain<T> {
   // boundary; hydrate is cast back on at the single call site.
   __modelClass?: unknown;
   __adapter?: unknown;
+  __steps?: Array<{ method: string; args: unknown[] }>;
 }
 
 interface HydratingClass<T> {
@@ -53,6 +54,7 @@ type QueryOp =
 export interface LiveRow {
   id?: string;
   tmp?: string;
+  __data?: Record<string, unknown>;
   [SYM_SERVER_MERGE]?: (data: Record<string, unknown>) => unknown;
 }
 
@@ -67,21 +69,26 @@ export interface LiveQueryStore<T> {
 }
 
 interface StoreInternal {
-  reset(): void;
+  reset(refetchActive: boolean): void;
   refetchIfActive(): void;
 }
 
 const registry = new Set<StoreInternal>();
+let isSuspended = false;
+let identityEpoch = 0;
 
 /** Drop all store state (identity changed — rows belong to another user). */
-export function resetLiveQueries(): void {
+export function resetLiveQueries(refetchActive = true): void {
   "background only";
-  for (const s of registry) s.reset();
+  identityEpoch++;
+  isSuspended = !refetchActive;
+  for (const s of registry) s.reset(refetchActive);
 }
 
 /** Re-run every active store's query (reconnect re-established the session). */
 export function refetchLiveQueries(): void {
   "background only";
+  if (isSuspended) return;
   for (const s of registry) s.refetchIfActive();
 }
 
@@ -98,10 +105,13 @@ export function createLiveQuery<T extends LiveRow>(
   let snap: LiveSnapshot<T> | null = null;
 
   let refs = 0;
+  let storeIdentityEpoch = identityEpoch;
+  let generation = 0;
   let fetching = false;
   let fetchQueued = false;
   let started = false;
   let disposeOps: (() => void) | null = null;
+  let queryHash: string | null = null;
   let updateTimer: ReturnType<typeof setTimeout> | null = null;
   const listeners = new Set<() => void>();
 
@@ -132,15 +142,91 @@ export function createLiveQuery<T extends LiveRow>(
     );
   };
 
+  const reconcile = (next: T[]): T[] => {
+    if (items.length === 0 && optimistic.length === 0) return next;
+
+    const byId = new Map(
+      items.filter((item) => item.id).map((item) => [item.id, item]),
+    );
+    const optimisticById = new Map(
+      optimistic.filter((item) => item.id).map((item) => [item.id, item]),
+    );
+    const optimisticByTmp = new Map(
+      optimistic.filter((item) => item.tmp).map((item) => [item.tmp, item]),
+    );
+    let membershipChanged = items.length !== next.length;
+    const result = next.map((fresh, index) => {
+      const existing =
+        (fresh.id && (byId.get(fresh.id) ?? optimisticById.get(fresh.id))) ||
+        (fresh.tmp && optimisticByTmp.get(fresh.tmp));
+      if (!existing) {
+        membershipChanged = true;
+        return fresh;
+      }
+
+      const serverData =
+        fresh instanceof Model
+          ? fresh
+          : (fresh.__data ?? Object.fromEntries(Object.entries(fresh)));
+      const mergeFn = existing[SYM_SERVER_MERGE];
+      if (typeof mergeFn === "function") {
+        mergeFn.call(existing, serverData as Record<string, unknown>);
+      } else {
+        Object.assign(existing, serverData);
+      }
+
+      if (items[index] !== existing) membershipChanged = true;
+      return existing;
+    });
+
+    return membershipChanged ? result : items;
+  };
+
   const hydrate = (
     chain: QueryChain<T>,
     data: Record<string, unknown>,
   ): T | null => {
     const ModelClass = chain.__modelClass as HydratingClass<T> | undefined;
     if (!ModelClass || typeof ModelClass.hydrate !== "function") return null;
+    const client = requireClient();
     const adapter =
-      chain.__adapter ?? (Model.hasAdapter() ? Model.getAdapter() : null);
-    return ModelClass.hydrate(adapter, data);
+      client.adapter ??
+      chain.__adapter ??
+      (Model.hasAdapter() ? Model.getAdapter() : null);
+    const BoundModel =
+      client.adapter && typeof client.bind === "function"
+        ? client.bind(ModelClass as unknown as typeof Model)
+        : ModelClass;
+    return (BoundModel as unknown as HydratingClass<T>).hydrate(adapter, data);
+  };
+
+  const releaseSubscription = () => {
+    const hash = queryHash;
+    disposeOps?.();
+    disposeOps = null;
+    queryHash = null;
+    const client = requireClient();
+    if (hash && typeof client.send === "function") {
+      client.send("unsubscribe:query", hash);
+    }
+  };
+
+  const bindChain = (chain: QueryChain<T>): QueryChain<T> => {
+    const client = requireClient();
+    const ModelClass = chain.__modelClass as typeof Model | undefined;
+    if (!client.adapter || !ModelClass || typeof client.bind !== "function") {
+      return chain;
+    }
+    const BoundModel = client.bind(ModelClass);
+    if (chain.__adapter === client.adapter && ModelClass === BoundModel) return chain;
+    let rebound = client.adapter.query(BoundModel) as unknown as QueryChain<T>;
+    for (const step of chain.__steps ?? []) {
+      const method = (rebound as any)[step.method];
+      if (typeof method === "function") {
+        rebound = method(...step.args) as QueryChain<T>;
+      }
+    }
+    return rebound;
   };
 
   const applyOps = (chain: QueryChain<T>, ops: QueryOp[], order?: string[]) => {
@@ -211,26 +297,31 @@ export function createLiveQuery<T extends LiveRow>(
 
   const doFetch = () => {
     "background only";
+    if (refs === 0 || isSuspended) return;
     if (fetching) {
       fetchQueued = true;
       return;
     }
     fetching = true;
-    const chain = chainFactory();
+    const fetchGeneration = generation;
+    const chain = bindChain(chainFactory());
     chain
       .find()
       .then((result) => {
-        items = result;
+        if (fetchGeneration !== generation) return;
+        items = reconcile(result);
         status = "ready";
         error = null;
         drainOptimistic();
 
         const hash = (result as { __queryHash?: string }).__queryHash;
-        if (hash) {
-          disposeOps?.();
+        if (hash && hash !== queryHash) {
+          releaseSubscription();
+          queryHash = hash;
           disposeOps = requireClient().subscribe(
             `query:${hash}`,
             (payload: unknown) => {
+              if (fetchGeneration !== generation) return;
               const p = payload as
                 | { ops?: QueryOp[]; order?: string[] }
                 | QueryOp[];
@@ -239,15 +330,19 @@ export function createLiveQuery<T extends LiveRow>(
               if (ops.length || order) applyOps(chain, ops, order);
             },
           );
+        } else if (!hash && queryHash) {
+          releaseSubscription();
         }
         notify();
       })
       .catch((err: Error) => {
+        if (fetchGeneration !== generation) return;
         error = err;
         status = items.length ? "ready" : "error";
         notify();
       })
       .finally(() => {
+        if (fetchGeneration !== generation) return;
         fetching = false;
         if (fetchQueued) {
           fetchQueued = false;
@@ -256,48 +351,74 @@ export function createLiveQuery<T extends LiveRow>(
       });
   };
 
+  const stop = () => {
+    generation++;
+    fetching = false;
+    fetchQueued = false;
+    started = false;
+    releaseSubscription();
+    if (updateTimer) clearTimeout(updateTimer);
+    updateTimer = null;
+  };
+
+  const invalidateIdentity = () => {
+    if (storeIdentityEpoch === identityEpoch) return;
+    stop();
+    storeIdentityEpoch = identityEpoch;
+    items = [];
+    optimistic = [];
+    status = "loading";
+    error = null;
+    notify();
+  };
+
   const internal: StoreInternal = {
-    reset() {
-      disposeOps?.();
-      disposeOps = null;
-      items = [];
-      optimistic = [];
-      status = "loading";
-      error = null;
-      started = false;
-      notify();
-      if (refs > 0) {
+    reset(refetchActive) {
+      invalidateIdentity();
+      if (refs > 0 && refetchActive) {
         started = true;
         doFetch();
       }
     },
     refetchIfActive() {
-      if (refs > 0) doFetch();
+      if (refs > 0 && !isSuspended) {
+        started = true;
+        doFetch();
+      }
     },
   };
-  registry.add(internal);
 
   return {
     snapshot() {
+      invalidateIdentity();
       if (!snap) snap = { items: merged(), status, error };
       return snap;
     },
     retain(onChange: () => void) {
       "background only";
+      invalidateIdentity();
       listeners.add(onChange);
       refs++;
-      if (!started) {
+      registry.add(internal);
+      if (!started && !isSuspended) {
         started = true;
         doFetch();
       }
+      let released = false;
       return () => {
+        if (released) return;
+        released = true;
         listeners.delete(onChange);
         refs--;
+        if (refs === 0) {
+          stop();
+          registry.delete(internal);
+        }
       };
     },
     refetch() {
       "background only";
-      doFetch();
+      if (refs > 0 && !isSuspended) doFetch();
     },
     addOptimistic(item: T) {
       optimistic = [...optimistic, item];

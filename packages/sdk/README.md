@@ -19,7 +19,15 @@ const client = createClient({
 });
 ```
 
-`createClient()` also calls `Model.use(new FrontendAdapter(transport))` automatically, so `Model.where()`, `Model.findById()`, and other static methods work immediately.
+`createClient()` creates an independent Socket.IO transport, session machine, connection machine, and `FrontendAdapter`. It does not mutate the default model adapter. Use `client.bind(ModelClass)` for imperative model operations; `useQuery` automatically runs model chains through its provider client.
+
+```typescript
+const ClientPost = client.bind(Post);
+const posts = await ClientPost.where({ published: true }).find();
+
+const adminClient = createClient({ url, getToken: getAdminToken });
+const AdminPost = adminClient.bind(Post); // independent from ClientPost
+```
 
 ### ClientConfig
 
@@ -47,6 +55,7 @@ interface ClientConfig {
 ```typescript
 interface ParcaeClient {
   transport: Transport;
+  adapter: FrontendAdapter;
   session: SessionMachine; // authenticated identity state
   connection: ConnectionMachine; // transport connection state
 
@@ -69,6 +78,10 @@ interface ParcaeClient {
   disconnect(): void;
   reconnect(): Promise<void>;
 
+  // Explicit model context and permanent teardown
+  bind<T extends typeof Model>(model: T): T;
+  dispose(): void;
+
   // Session lifecycle
   refreshSession(): Promise<{ userId: string | null }>;
   terminateSession(): Promise<void>;
@@ -76,7 +89,7 @@ interface ParcaeClient {
 }
 ```
 
-The client is cached on `globalThis` per `url:version` so cross-package callers share the same socket pool.
+Each `createClient()` call owns its own transport and authentication context. Reuse a client deliberately when callers should share identity and connection state; create and bind a separate client when they should not.
 
 ## Transport
 
@@ -85,15 +98,17 @@ The client is cached on `globalThis` per `url:version` so cross-package callers 
 The only built-in transport. Socket.IO over WebSocket.
 
 - Bidirectional communication
-- Connection pooling (shared socket per `url:version` via global `SOCKETS` Map)
+- One socket owned by each client
 - Hello/resync handshake — server confirms `userId` on every connect/reconnect
 - Request/response via `"call"` event with short unique request IDs
 - gzip + `compress-json` response encoding (`pako.ungzip` → `JSON.parse` → `compress-json.decompress`)
 - GET request deduplication (in-flight coalescing)
-- 30s timeout for pending requests
+- 120s default timeout for pending requests, overridable per request
 - Token rotation triggers `refreshSession()`; explicit sign-out triggers `terminateSession()`
 
 Pass `transports: ["polling"]` in `ClientConfig` for runtimes without a WebSocket global (e.g. some React Native shells).
+
+The session and wire lifecycles are deliberately separate. A disconnect changes `ConnectionMachine` state but keeps the confirmed identity. Reconnect resolves the latest token, sends a fresh `hello`, then emits `resync-required` so live queries can restore their subscriptions. `refreshSession()` handles login/token rotation, `terminateSession()` handles explicit sign-out, and `dispose()` permanently removes listeners and closes the socket.
 
 ## React
 
@@ -224,7 +239,7 @@ import { useConnection } from "@parcae/sdk/react";
 
 function StatusBadge() {
   const { isConnected, status, lastError } = useConnection();
-  // status: "connecting" | "connected" | "reconnecting" | "disconnected"
+  // status: "idle" | "connecting" | "connected" | "disconnected"
   return <span>{isConnected ? "Online" : "Offline"}</span>;
 }
 ```

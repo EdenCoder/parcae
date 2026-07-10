@@ -56,7 +56,7 @@ Table name, the auto-CRUD path, and the list-response collection key all derive 
 ## Key Patterns
 
 - **Class IS the schema** — ts-morph resolves TypeScript property types into Postgres columns at startup; no decorators or schema files.
-- **Adapter pattern** — `Model.use(adapter)` swaps `BackendAdapter` (Knex/Postgres) for `FrontendAdapter` (transport); identical query code runs everywhere.
+- **Adapter pattern** — `Model.use(adapter)` installs one application default; `Model.bind(adapter)` or `client.bind(ModelClass)` creates independent contexts without mutable global swapping.
 - **Explicit writes** — instance is the data store (no Proxy); persist via `save()`, `patch(ops)`, or `flush()`.
 - **Scopes are row-level security** — composable functions returning a query modifier, a defaults object, or `null` (deny).
 - **Self-registration** — files in `controllers/`, `hooks/`, `jobs/`, `crons/`, `migrations/` register via `route.*`, `hook.before/after`, `job()`, `cron()`, `migration()` at import time.
@@ -74,6 +74,7 @@ Table name, the auto-CRUD path, and the list-response collection key all derive 
 - Server-maintained counters: declare the column in `static readonlyFields` (clients can't write it) and recount from an after-hook — recounts self-heal where increments drift.
 - Undeclared properties spill into a `data` JSONB overflow column; only declared properties get typed, indexable columns.
 - A scope function returning `null` denies the request (responds forbidden).
+- `createClient({ url, getToken })` requires `getToken`; return `null` for anonymous. It has no transport selector: Socket.IO uses `hello` on connect/reconnect, then resyncs live queries.
 
 ## Reference Files
 

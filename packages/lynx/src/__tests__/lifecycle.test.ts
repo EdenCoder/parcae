@@ -4,7 +4,7 @@
  * change, store resets on identity transitions, refetch on resync.
  */
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { __resetLifecycleForTests, startLifecycle } from "../lifecycle";
 import { createLiveQuery, type QueryChain } from "../live-query";
@@ -14,10 +14,19 @@ interface Row {
   tmp?: string;
 }
 
-function makeFakeClient(initialUserId: string | null = null) {
+type SessionStatus =
+  | "pending"
+  | "anonymous"
+  | "authenticated"
+  | "terminated";
+
+function makeFakeClient(
+  initialStatus: SessionStatus = "anonymous",
+  initialUserId: string | null = null,
+) {
   const sessionListeners = new Set<() => void>();
   const events = new Map<string, Set<() => void>>();
-  const state = { userId: initialUserId, status: "pending", version: 0 };
+  const state = { userId: initialUserId, status: initialStatus, version: 0 };
   return {
     refreshSession: vi.fn().mockResolvedValue({ userId: "u1" }),
     terminateSession: vi.fn().mockResolvedValue(undefined),
@@ -33,13 +42,24 @@ function makeFakeClient(initialUserId: string | null = null) {
       if (!events.has(event)) events.set(event, new Set());
       events.get(event)!.add(cb);
     },
+    off(event: string, cb: () => void) {
+      events.get(event)?.delete(cb);
+    },
     // Test drivers:
-    setUserId(userId: string | null) {
+    setSession(status: SessionStatus, userId: string | null) {
+      state.status = status;
       state.userId = userId;
+      state.version++;
       for (const cb of sessionListeners) cb();
     },
     fire(event: string) {
       for (const cb of events.get(event) ?? []) cb();
+    },
+    sessionListenerCount() {
+      return sessionListeners.size;
+    },
+    eventListenerCount(event: string) {
+      return events.get(event)?.size ?? 0;
     },
   };
 }
@@ -60,6 +80,9 @@ function makeAdapter() {
     changeToken(token: string | null) {
       handler?.(token);
     },
+    listenerCount() {
+      return handler ? 1 : 0;
+    },
   };
 }
 
@@ -69,19 +92,55 @@ async function flush(): Promise<void> {
 
 let client: ReturnType<typeof makeFakeClient>;
 let auth: ReturnType<typeof makeAdapter>;
+let dispose: () => void;
 
 beforeEach(() => {
   __resetLifecycleForTests();
   client = makeFakeClient();
   auth = makeAdapter();
-  startLifecycle(() => client as never, auth.adapter);
+  dispose = startLifecycle(() => client as never, auth.adapter);
+});
+
+afterEach(() => {
+  __resetLifecycleForTests();
 });
 
 describe("startLifecycle", () => {
   it("is idempotent", () => {
     const second = makeAdapter();
-    startLifecycle(() => client as never, second.adapter);
+    expect(startLifecycle(() => client as never, second.adapter)).toBe(dispose);
     second.changeToken("tok");
+    expect(client.refreshSession).not.toHaveBeenCalled();
+  });
+
+  it("disposes every listener and __resetLifecycleForTests tears down", () => {
+    expect(auth.listenerCount()).toBe(1);
+    expect(client.sessionListenerCount()).toBe(1);
+    expect(client.eventListenerCount("resync-required")).toBe(1);
+
+    __resetLifecycleForTests();
+    expect(auth.listenerCount()).toBe(0);
+    expect(client.sessionListenerCount()).toBe(0);
+    expect(client.eventListenerCount("resync-required")).toBe(0);
+
+    auth.changeToken("ignored");
+    client.fire("resync-required");
+    expect(client.refreshSession).not.toHaveBeenCalled();
+  });
+
+  it("allows a new client and adapter after disposal", () => {
+    dispose();
+    const replacementClient = makeFakeClient();
+    const replacementAuth = makeAdapter();
+    const replacementDispose = startLifecycle(
+      () => replacementClient as never,
+      replacementAuth.adapter,
+    );
+
+    replacementAuth.changeToken("new-token");
+    auth.changeToken("old-token");
+    expect(replacementDispose).not.toBe(dispose);
+    expect(replacementClient.refreshSession).toHaveBeenCalledOnce();
     expect(client.refreshSession).not.toHaveBeenCalled();
   });
 
@@ -107,18 +166,50 @@ describe("startLifecycle", () => {
     await flush();
     expect(calls).toBe(1);
 
-    client.setUserId("u1"); // anonymous → signed in
+    client.setSession("authenticated", "u1");
     await flush();
     expect(calls).toBe(2);
 
-    client.setUserId("u1"); // no identity change — no reset
+    client.setSession("authenticated", "u1");
     await flush();
     expect(calls).toBe(2);
 
-    client.setUserId(null); // sign-out
+    client.setSession("anonymous", null);
     await flush();
     expect(calls).toBe(3);
 
+    release();
+  });
+
+  it("clears terminated sessions without refetching until identity resolves", async () => {
+    let calls = 0;
+    const store = createLiveQuery<Row>(() => ({
+      find: async () => {
+        calls++;
+        return [{ id: `row-${calls}` }];
+      },
+    }));
+    const release = store.retain(() => {});
+    await flush();
+    expect(calls).toBe(1);
+
+    client.setSession("terminated", null);
+    await flush();
+    expect(calls).toBe(1);
+    expect(store.snapshot()).toMatchObject({ status: "loading", items: [] });
+
+    client.fire("resync-required");
+    await flush();
+    expect(calls).toBe(1);
+
+    client.setSession("pending", null);
+    await flush();
+    expect(calls).toBe(1);
+
+    client.setSession("authenticated", "u2");
+    await flush();
+    expect(calls).toBe(2);
+    expect(store.snapshot().items[0]?.id).toBe("row-2");
     release();
   });
 
@@ -138,6 +229,26 @@ describe("startLifecycle", () => {
     await flush();
     expect(calls).toBe(2);
 
+    release();
+  });
+
+  it("coalesces an identity reset with the immediate resync from one hello", async () => {
+    let calls = 0;
+    const store = createLiveQuery<Row>(() => ({
+      find: async () => {
+        calls++;
+        return [];
+      },
+    }));
+    const release = store.retain(() => {});
+    await flush();
+    expect(calls).toBe(1);
+
+    client.setSession("authenticated", "u1");
+    client.fire("resync-required");
+    await flush();
+
+    expect(calls).toBe(2);
     release();
   });
 });

@@ -58,7 +58,7 @@ Controllers, hooks, and jobs self-register on import — just put files in the d
 3. Generate `.parcae/` type metadata (ts-morph schema resolver)
 4. Connect Postgres (Knex, optional read replica)
 5. Connect Redis (PubSub + Queue, optional — falls back to in-process)
-6. Create `BackendAdapter`, call `Model.use()`
+6. Create `BackendAdapter`, bind it once as the process's application adapter
 7. Ensure tables exist (additive DDL migration)
 8. Create HTTP server (Polka) + WebSocket server (Socket.IO)
 9. Set up `QuerySubscriptionManager` for realtime
@@ -310,7 +310,7 @@ const adapter = new BackendAdapter({
   pubsub, // PubSub instance (optional)
 });
 
-Model.use(adapter);
+Model.use(adapter); // one-time application binding; use Model.bind() for other contexts
 ```
 
 ### Key Features
@@ -410,7 +410,7 @@ const app = createApp({
 The `User` Model is always a real, managed Parcae Model. Auth adapters resolve identity and sync user data into it.
 
 - `req.session.user` available in route handlers and scopes
-- Socket.IO auth via `authenticate` event
+- Socket.IO auth via one `hello` token handshake per connection/reconnect
 - Implement `AuthAdapter` to bring your own provider
 
 ## Schema Generation

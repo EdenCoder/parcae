@@ -26,8 +26,8 @@
  * `SYM_SERVER_MERGE` on server-initiated updates, and reapplied after
  * save() / patch() acks.
  *
- * `"change"` fires from exactly three sites: patch(), flush() (via its
- * inner patch() call), and SYM_SERVER_MERGE. Direct field writes do NOT
+ * `"change"` fires from exactly three sites: patch(), flush(), and
+ * SYM_SERVER_MERGE. Direct field writes do NOT
  * emit — callers who want to signal UI re-render call flush() (or patch()
  * with explicit ops). `useModel` / `useModelAtomic` subscribe to
  * `"change"`; reference identity across merges is trivially stable
@@ -70,10 +70,24 @@ const SYM_PATCHING = Symbol("parcae:patching");
 const SYM_SNAPSHOT = Symbol("parcae:serverSnapshot");
 /** Temporary staging for constructor-provided data until subclass field initializers finish running. Consumed and deleted by the static factories via _apply(). */
 const SYM_PENDING_DATA = Symbol("parcae:pendingData");
-/** The currently executing flush() promise, if any. Used to serialize concurrent flush() calls. */
-const SYM_FLUSH_INFLIGHT = Symbol("parcae:flushInflight");
-/** A queued trailing flush() promise that will run after the current in-flight finishes. Multiple concurrent callers during an in-flight share this one. */
-const SYM_FLUSH_TRAILING = Symbol("parcae:flushTrailing");
+/** Tail of the instance's single save/patch/flush write lane. */
+const SYM_WRITE_LANE = Symbol("parcae:writeLane");
+/** Per-field raw id, proxy, and loaded expanded instance. */
+const SYM_REFS = Symbol("parcae:refs");
+
+const classAdapters = new WeakMap<ModelConstructor, ModelAdapter>();
+const boundSources = new WeakMap<ModelConstructor, ModelConstructor>();
+const adapterBindings = new WeakMap<
+  ModelAdapter,
+  WeakMap<ModelConstructor, ModelConstructor>
+>();
+const adapterWaiters = new Map<
+  ModelConstructor,
+  {
+    promise: Promise<ModelAdapter>;
+    resolve: (adapter: ModelAdapter) => void;
+  }
+>();
 
 /**
  * Atomically merge server-authoritative data onto this instance.
@@ -91,6 +105,9 @@ const SYM_FLUSH_TRAILING = Symbol("parcae:flushTrailing");
  * need for the old get-trap closure indirection.
  */
 export const SYM_SERVER_MERGE = Symbol("parcae:serverMerge");
+
+/** Apply server-authored RFC 6902 ops, including paths below expanded refs. */
+export const SYM_SERVER_PATCH = Symbol("parcae:serverPatch");
 
 /**
  * Monotonic version counter bumped on every `"change"` emit. Exported so
@@ -136,15 +153,15 @@ function flushPendingChangeEmits(): void {
   // the next microtask, not this one.
   const drain = Array.from(pendingChangeEmits);
   pendingChangeEmits.clear();
+  let firstError: unknown;
   for (const model of drain) {
     try {
       model.emit("change");
     } catch (err) {
-      // Listeners must not break sibling listeners. Surface but
-      // keep draining.
-      console.error("[parcae] change listener threw", err);
+      firstError ??= err;
     }
   }
+  if (firstError !== undefined) throw firstError;
 }
 
 /**
@@ -226,13 +243,72 @@ const SYSTEM_DATA_KEYS = new Set([
  * `instance as any` cast lives in exactly one place rather than every
  * static factory.
  */
-function applyInstance(instance: any): void {
+function applyInstance(instance: Model): void {
   instance._apply();
 }
 
 /** Stamp the `__isNew` flag. Same centralisation rationale. */
 function markNew(instance: any, value: boolean): void {
   instance.__isNew = value;
+}
+
+function getBoundAdapter(
+  modelClass: ModelConstructor,
+): ModelAdapter | null {
+  let current: object | null = modelClass;
+  while (current && current !== Function.prototype) {
+    const adapter = classAdapters.get(current as ModelConstructor);
+    if (adapter) return adapter;
+    current = Object.getPrototypeOf(current);
+  }
+  return null;
+}
+
+function resolveAdapterWaiters(): void {
+  for (const [modelClass, waiter] of adapterWaiters) {
+    const adapter = getBoundAdapter(modelClass);
+    if (!adapter) continue;
+    adapterWaiters.delete(modelClass);
+    waiter.resolve(adapter);
+  }
+}
+
+function waitForClassAdapter(modelClass: ModelConstructor): Promise<ModelAdapter> {
+  const adapter = getBoundAdapter(modelClass);
+  if (adapter) return Promise.resolve(adapter);
+  let waiter = adapterWaiters.get(modelClass);
+  if (!waiter) {
+    let resolve!: (adapter: ModelAdapter) => void;
+    const promise = new Promise<ModelAdapter>((done) => {
+      resolve = done;
+    });
+    waiter = { promise, resolve };
+    adapterWaiters.set(modelClass, waiter);
+  }
+  return waiter.promise;
+}
+
+function bindModelClass<T extends ModelConstructor>(
+  modelClass: T,
+  adapter: ModelAdapter,
+): T {
+  if (getBoundAdapter(modelClass) === adapter && classAdapters.has(modelClass)) {
+    return modelClass;
+  }
+  const source = boundSources.get(modelClass) ?? modelClass;
+  let bindings = adapterBindings.get(adapter);
+  if (!bindings) {
+    bindings = new WeakMap();
+    adapterBindings.set(adapter, bindings);
+  }
+  const existing = bindings.get(source);
+  if (existing) return existing as T;
+  const BoundModel = class extends (source as typeof Model) {};
+  classAdapters.set(BoundModel, adapter);
+  boundSources.set(BoundModel, source);
+  bindings.set(source, BoundModel);
+  resolveAdapterWaiters();
+  return BoundModel as unknown as T;
 }
 
 export function serializeLazyQueryArgs(args: any[]): any[] {
@@ -267,6 +343,7 @@ function lazyQuery<T>(
   modelClass: ModelConstructor<T>,
   steps: any[] = [],
   keySteps: any[] = [],
+  capturedAdapter: ModelAdapter | null = getBoundAdapter(modelClass),
 ): QueryChain<T> {
   const chain: any = {};
 
@@ -276,13 +353,15 @@ function lazyQuery<T>(
         modelClass,
         [...steps, { method, args }],
         [...keySteps, { method, args: serializeLazyQueryArgs(args) }],
+        capturedAdapter,
       );
   }
 
   const resolve = async (): Promise<QueryChain<T>> => {
-    const adapter = Model.hasAdapter()
-      ? Model.getAdapter()
-      : await Model.waitForAdapter();
+    const adapter =
+      capturedAdapter ??
+      getBoundAdapter(modelClass) ??
+      (await waitForClassAdapter(modelClass));
     let q = adapter.query(modelClass);
     for (const step of steps) {
       q = (q as any)[step.method](...step.args);
@@ -298,7 +377,7 @@ function lazyQuery<T>(
   chain.__steps = keySteps;
   chain.__modelType = modelClass.type;
   chain.__modelClass = modelClass;
-  chain.__adapter = null;
+  chain.__adapter = capturedAdapter;
 
   return chain as QueryChain<T>;
 }
@@ -315,6 +394,16 @@ function lazyQuery<T>(
  */
 export function isArrayIndexSegment(seg: string | undefined): boolean {
   return seg === "-" || (seg !== undefined && /^\d+$/.test(seg));
+}
+
+/** Decode one RFC 6901 JSON Pointer segment. */
+function decodePointerSegment(segment: string): string {
+  return segment.replace(/~1/g, "/").replace(/~0/g, "~");
+}
+
+function pointerSegments(path: string): string[] {
+  if (!path.startsWith("/")) return [];
+  return path.slice(1).split("/").map(decodePointerSegment);
 }
 
 /**
@@ -336,7 +425,7 @@ export function ensureIntermediates(
   ops: readonly { path: string }[],
 ): void {
   for (const { path } of ops) {
-    const segments = path.split("/").filter(Boolean);
+    const segments = pointerSegments(path);
     let cursor: any = doc;
     for (let i = 0; i < segments.length - 1; i++) {
       const seg = segments[i]!;
@@ -383,39 +472,62 @@ export function dateSafeClone(value: any): any {
   return value;
 }
 
+function dataValuesEqual(left: any, right: any): boolean {
+  if (Object.is(left, right)) return true;
+  if (
+    left === null ||
+    right === null ||
+    left === undefined ||
+    right === undefined ||
+    typeof left !== "object" ||
+    typeof right !== "object"
+  ) {
+    return false;
+  }
+  return compare(dateSafeClone(left), dateSafeClone(right)).length === 0;
+}
+
+function mergeServerWithLocalChanges(
+  serverData: Record<string, any>,
+  baselineData: Record<string, any>,
+  currentData: Record<string, any>,
+): Record<string, any> {
+  const localOps = compare(
+    dateSafeClone(baselineData),
+    dateSafeClone(currentData),
+  ) as unknown as PatchOp[];
+  if (localOps.length === 0) return structuredClone(serverData);
+  const merged = structuredClone(serverData);
+  ensureIntermediates(merged, localOps);
+  applyPatch(merged, localOps, false, true);
+  return merged;
+}
+
 /** Return the set of top-level keys touched by a batch of ops. */
 function topLevelKeys(ops: readonly PatchOp[]): Set<string> {
   const keys = new Set<string>();
   for (const op of ops) {
-    const top = op.path.split("/")[1];
-    if (top) keys.add(top);
+    const top = pointerSegments(op.path)[0];
+    if (top !== undefined) keys.add(top);
     if (op.op === "copy" || op.op === "move") {
-      const fromTop = op.from.split("/")[1];
-      if (fromTop) keys.add(fromTop);
+      const fromTop = pointerSegments(op.from)[0];
+      if (fromTop !== undefined) keys.add(fromTop);
     }
   }
   return keys;
 }
 
-// ─── Ref Proxy Cache ─────────────────────────────────────────────────────────
-//
-// Module-level so the periodic sweep can clear expired entries without
-// needing access to the class internals. Entries are written on every
-// findById completion and every .expand() hydration, and evicted either
-// on the next read of the same key (lazy) or by the sweep below (bounded).
+interface RefControl {
+  refId: string;
+  loaded: Model | null | undefined;
+  loading: Promise<Model | null> | null;
+}
 
-const __refCache = new Map<string, { value: any; expires: number }>();
-const REF_CACHE_TTL = 30_000;
-
-if (typeof setInterval === "function") {
-  const _sweep = setInterval(() => {
-    const now = Date.now();
-    for (const [k, v] of __refCache)
-      if (v.expires < now) __refCache.delete(k);
-  }, 60_000);
-  if (typeof _sweep === "object" && _sweep !== null && "unref" in _sweep) {
-    (_sweep as any).unref();
-  }
+interface RefState {
+  targetClass: ModelConstructor;
+  raw: string | null;
+  proxy: any | null;
+  control: RefControl | null;
 }
 
 // ─── Model Class ─────────────────────────────────────────────────────────────
@@ -441,11 +553,11 @@ export class Model extends EventEmitter {
   // augmentation does not propagate when the consumer resolves the module
   // under a different specifier (e.g. `@parcae/model`).
   declare [SYM_ADAPTER]: ModelAdapter;
-  declare [SYM_PATCHING]: Set<string>;
+  declare [SYM_PATCHING]: Map<string, number>;
   declare [SYM_SNAPSHOT]: Record<string, any>;
   declare [SYM_PENDING_DATA]: Record<string, any> | undefined;
-  declare [SYM_FLUSH_INFLIGHT]: Promise<void> | null | undefined;
-  declare [SYM_FLUSH_TRAILING]: Promise<void> | null | undefined;
+  declare [SYM_WRITE_LANE]: Promise<void> | null | undefined;
+  declare [SYM_REFS]: Map<string, RefState>;
   declare [SYM_VERSION]: number;
 
   // ── Static ─────────────────────────────────────────────────────────
@@ -518,61 +630,48 @@ export class Model extends EventEmitter {
   /** @internal */
   static __schema?: SchemaDefinition;
 
-  // Adapter lives on globalThis so it works across multiple copies of @parcae/model
-  // (pnpm can install multiple versions — they all need to share the same adapter)
-  private static get __adapter(): ModelAdapter | null {
-    return (globalThis as any).__parcae_adapter ?? null;
-  }
-  private static set __adapter(v: ModelAdapter | null) {
-    (globalThis as any).__parcae_adapter = v;
-  }
-  private static get __pendingAdapter(): Promise<ModelAdapter> | null {
-    return (globalThis as any).__parcae_pending ?? null;
-  }
-  private static set __pendingAdapter(v: Promise<ModelAdapter> | null) {
-    (globalThis as any).__parcae_pending = v;
-  }
-  private static get __resolveAdapter():
-    | ((adapter: ModelAdapter) => void)
-    | null {
-    return (globalThis as any).__parcae_resolve ?? null;
-  }
-  private static set __resolveAdapter(
-    v: ((adapter: ModelAdapter) => void) | null,
-  ) {
-    (globalThis as any).__parcae_resolve = v;
+  /**
+   * Bind the default adapter for this constructor exactly once.
+   * Independent applications should use bind() instead of replacing it.
+   */
+  static use(adapter: ModelAdapter): void {
+    const modelClass = this as unknown as ModelConstructor;
+    const ownAdapter = classAdapters.get(modelClass);
+    if (ownAdapter && ownAdapter !== adapter) {
+      throw new Error(
+        "Adapter already set for this model context. Use Model.bind(adapter) for an independent context.",
+      );
+    }
+    if (!ownAdapter) classAdapters.set(modelClass, adapter);
+    resolveAdapterWaiters();
   }
 
-  static use(adapter: ModelAdapter): void {
-    Model.__adapter = adapter;
-    if (Model.__resolveAdapter) {
-      Model.__resolveAdapter(adapter);
-      Model.__resolveAdapter = null;
-      Model.__pendingAdapter = null;
-    }
+  /**
+   * Return an adapter-bound constructor without mutating the source class.
+   * Static metadata is inherited and instances remain instanceof the source.
+   */
+  static bind<T extends typeof Model>(this: T, adapter: ModelAdapter): T {
+    return bindModelClass(this as unknown as ModelConstructor, adapter) as T;
   }
 
   static getAdapter(): ModelAdapter {
-    if (!Model.__adapter) {
+    const adapter = getBoundAdapter(
+      this as unknown as ModelConstructor,
+    );
+    if (!adapter) {
       throw new Error(
-        "No adapter set. Call Model.use(adapter) before using models.",
+        "No adapter bound. Call Model.use(adapter) once or use ModelClass.bind(adapter).",
       );
     }
-    return Model.__adapter;
+    return adapter;
   }
 
   static hasAdapter(): boolean {
-    return Model.__adapter !== null;
+    return getBoundAdapter(this as unknown as ModelConstructor) !== null;
   }
 
   static waitForAdapter(): Promise<ModelAdapter> {
-    if (Model.__adapter) return Promise.resolve(Model.__adapter);
-    if (!Model.__pendingAdapter) {
-      Model.__pendingAdapter = new Promise<ModelAdapter>((resolve) => {
-        Model.__resolveAdapter = resolve;
-      });
-    }
-    return Model.__pendingAdapter;
+    return waitForClassAdapter(this as unknown as ModelConstructor);
   }
 
   // ── Static Query Methods ───────────────────────────────────────────
@@ -595,7 +694,10 @@ export class Model extends EventEmitter {
     this: ModelConstructor<T>,
     data?: Record<string, any>,
   ): WithRefs<T> {
-    const instance = new this(Model.getAdapter(), data);
+    const instance = new this(
+      Model.getAdapter.call(this as unknown as typeof Model),
+      data,
+    );
     applyInstance(instance);
     markNew(instance, true);
     return instance as WithRefs<T>;
@@ -624,14 +726,18 @@ export class Model extends EventEmitter {
     this: ModelConstructor<T>,
     id: string,
   ): Promise<WithRefs<T> | null> {
-    return Model.getAdapter().findById(this, id) as Promise<WithRefs<T> | null>;
+    return Model.getAdapter
+      .call(this as unknown as typeof Model)
+      .findById(this, id) as Promise<WithRefs<T> | null>;
   }
 
   static where<T extends Model>(
     this: ModelConstructor<T>,
     ...args: any[]
   ): QueryChain<WithRefs<T>> {
-    return lazyQuery(this).where(...args) as QueryChain<WithRefs<T>>;
+    return lazyQuery(this, [], [], getBoundAdapter(this)).where(
+      ...args
+    ) as QueryChain<WithRefs<T>>;
   }
 
   static whereRaw<T extends Model>(
@@ -639,9 +745,10 @@ export class Model extends EventEmitter {
     query: string,
     ...bindings: any[]
   ): QueryChain<WithRefs<T>> {
-    return lazyQuery(this).whereRaw(query, ...bindings) as QueryChain<
-      WithRefs<T>
-    >;
+    return lazyQuery(this, [], [], getBoundAdapter(this)).whereRaw(
+      query,
+      ...bindings
+    ) as QueryChain<WithRefs<T>>;
   }
 
   static whereIn<T extends Model>(
@@ -649,14 +756,19 @@ export class Model extends EventEmitter {
     column: string,
     values: any[],
   ): QueryChain<WithRefs<T>> {
-    return lazyQuery(this).whereIn(column, values) as QueryChain<WithRefs<T>>;
+    return lazyQuery(this, [], [], getBoundAdapter(this)).whereIn(
+      column,
+      values,
+    ) as QueryChain<WithRefs<T>>;
   }
 
   static whereNot<T extends Model>(
     this: ModelConstructor<T>,
     ...args: any[]
   ): QueryChain<WithRefs<T>> {
-    return lazyQuery(this).whereNot(...args) as QueryChain<WithRefs<T>>;
+    return lazyQuery(this, [], [], getBoundAdapter(this)).whereNot(
+      ...args
+    ) as QueryChain<WithRefs<T>>;
   }
 
   static whereNotIn<T extends Model>(
@@ -664,48 +776,57 @@ export class Model extends EventEmitter {
     column: string,
     values: any[],
   ): QueryChain<WithRefs<T>> {
-    return lazyQuery(this).whereNotIn(column, values) as QueryChain<
-      WithRefs<T>
-    >;
+    return lazyQuery(this, [], [], getBoundAdapter(this)).whereNotIn(
+      column,
+      values,
+    ) as QueryChain<WithRefs<T>>;
   }
 
   static whereNull<T extends Model>(
     this: ModelConstructor<T>,
     column: string,
   ): QueryChain<WithRefs<T>> {
-    return lazyQuery(this).whereNull(column) as QueryChain<WithRefs<T>>;
+    return lazyQuery(this, [], [], getBoundAdapter(this)).whereNull(
+      column,
+    ) as QueryChain<WithRefs<T>>;
   }
 
   static whereNotNull<T extends Model>(
     this: ModelConstructor<T>,
     column: string,
   ): QueryChain<WithRefs<T>> {
-    return lazyQuery(this).whereNotNull(column) as QueryChain<WithRefs<T>>;
+    return lazyQuery(this, [], [], getBoundAdapter(this)).whereNotNull(
+      column,
+    ) as QueryChain<WithRefs<T>>;
   }
 
   static select<T extends Model>(
     this: ModelConstructor<T>,
     ...columns: string[]
   ): QueryChain<WithRefs<T>> {
-    return lazyQuery(this).select(...columns) as QueryChain<WithRefs<T>>;
+    return lazyQuery(this, [], [], getBoundAdapter(this)).select(
+      ...columns
+    ) as QueryChain<WithRefs<T>>;
   }
 
   static count<T extends Model>(this: ModelConstructor<T>): Promise<number> {
-    return lazyQuery(this).count();
+    return lazyQuery(this, [], [], getBoundAdapter(this)).count();
   }
 
   static sum<T extends Model>(
     this: ModelConstructor<T>,
     column: string,
   ): Promise<number> {
-    return lazyQuery(this).sum(column);
+    return lazyQuery(this, [], [], getBoundAdapter(this)).sum(column);
   }
 
   static search<T extends Model>(
     this: ModelConstructor<T>,
     term: string,
   ): QueryChain<WithRefs<T>> {
-    return lazyQuery(this).search(term) as QueryChain<WithRefs<T>>;
+    return lazyQuery(this, [], [], getBoundAdapter(this)).search(
+      term,
+    ) as QueryChain<WithRefs<T>>;
   }
 
   // ── Constructor ────────────────────────────────────────────────────
@@ -723,8 +844,9 @@ export class Model extends EventEmitter {
   constructor(adapter: ModelAdapter, data?: Record<string, any>) {
     super();
     this[SYM_ADAPTER] = adapter;
-    this[SYM_PATCHING] = new Set<string>();
+    this[SYM_PATCHING] = new Map<string, number>();
     this[SYM_SNAPSHOT] = {};
+    this[SYM_REFS] = new Map();
     (this as any)[SYM_VERSION] = 0;
     if (data) this[SYM_PENDING_DATA] = data;
   }
@@ -734,7 +856,8 @@ export class Model extends EventEmitter {
    * defaults, install ref-field accessors from the schema, and seed
    * `__serverSnapshot`. Called exactly once by the static factories.
    */
-  private _apply(): void {
+  /** @internal */
+  _apply(): void {
     const data = this[SYM_PENDING_DATA] ?? {};
     delete this[SYM_PENDING_DATA];
 
@@ -766,9 +889,13 @@ export class Model extends EventEmitter {
           typeof col === "object" &&
           col !== null &&
           "kind" in col &&
-          col.kind === "ref"
+          col.kind === "ref" &&
+          typeof col.target === "function"
         ) {
-          refTargets.set(field, col.target);
+          refTargets.set(
+            field,
+            bindModelClass(col.target, this[SYM_ADAPTER]),
+          );
         }
       }
     }
@@ -784,12 +911,13 @@ export class Model extends EventEmitter {
       //                          consumers don't trigger a Suspense
       //                          throw on first access.
       //   - String id / null   — bare raw id (or no value). Lazy load
-      //                          on first access via `_createRefProxy`.
+      //                          on first access via `_buildRefProxy`.
       const incoming = data[field] ?? (this as any)[field];
       let raw: string | null;
       let prehydrated: Model | null = null;
       if (incoming instanceof Model) {
         raw = (incoming as any).id ?? null;
+        prehydrated = incoming;
       } else if (
         incoming &&
         typeof incoming === "object" &&
@@ -856,7 +984,7 @@ export class Model extends EventEmitter {
    * Replace the plain `post.author` / `post.$author` pair with an
    * accessor pair driven by a closed-over `raw` id slot.
    *
-   *   post.author            → lazy-loading Model proxy (memoized per raw id)
+   *   post.author            → lazy-loading Model proxy (memoized on this field)
    *   post.author = user     → stores user.id, invalidates cached proxy
    *   post.author = "u_abc"  → stores "u_abc", invalidates cached proxy
    *   post.$author           → "u_abc" (raw id, no load)
@@ -869,12 +997,11 @@ export class Model extends EventEmitter {
    * initializer with `= null` default) goes through one hidden-class
    * transition per ref instead of three.
  *
- * `prehydrated` lets the caller pre-populate the ref proxy with a
- * fully-loaded target Model — the `.expand("file")` path uses it
- * to embed the linked row inline so consumers don't
-   * Suspense-throw on first access. The pre-population mints a
-   * fresh proxy (bypassing the per-id cache) so a prior lazy proxy
-   * holding `loaded: null` doesn't shadow the freshly-known row.
+   * `prehydrated` lets the caller pre-populate the ref proxy with a
+   * fully-loaded target Model — the `.expand("file")` path uses it
+   * to embed the linked row inline so consumers don't
+   * Suspense-throw on first access. The pre-population mints a fresh
+   * field-local proxy, so no other instance or adapter can shadow it.
    * On any subsequent reassignment the cached proxy is cleared and
    * the lazy path resumes (correct: the new ref id may not have
    * been expanded).
@@ -885,37 +1012,53 @@ export class Model extends EventEmitter {
     initialRaw: string | null,
     prehydrated: Model | null = null,
   ): void {
-    let raw: string | null = initialRaw;
-    // Per-instance proxy memoization. The same `raw` id returns the
-    // same Proxy reference across reads, so `<UserCard user={post.author}>`
-    // rendered at 60 fps doesn't allocate a fresh Proxy per frame.
-    let cachedProxy: any =
-      prehydrated && raw
-        ? this._createPrehydratedRefProxy(targetClass, raw, prehydrated)
-        : null;
-    let cachedRaw: string | null = cachedProxy ? raw : null;
+    const state: RefState = {
+      targetClass,
+      raw: initialRaw,
+      proxy: null,
+      control:
+        prehydrated && initialRaw
+          ? {
+              refId: initialRaw,
+              loaded: prehydrated,
+              loading: null,
+            }
+          : null,
+    };
+    if (state.control) state.proxy = this._buildRefProxy(targetClass, state.control);
+    this[SYM_REFS].set(field, state);
     const self = this;
 
-    const invalidate = (): void => {
-      if (raw !== cachedRaw) cachedProxy = null;
+    const setRaw = (raw: string | null): void => {
+      if (raw === state.raw) return;
+      state.raw = raw;
+      state.proxy = null;
+      state.control = null;
     };
 
     Object.defineProperty(this, field, {
       configurable: true,
       enumerable: true,
       get() {
-        if (!raw) return null;
-        if (cachedProxy && cachedRaw === raw) return cachedProxy;
-        cachedProxy = self._createRefProxy(targetClass, raw);
-        cachedRaw = raw;
-        return cachedProxy;
+        if (!state.raw) return null;
+        if (!state.control || state.control.refId !== state.raw) {
+          state.control = {
+            refId: state.raw,
+            loaded: undefined,
+            loading: null,
+          };
+        }
+        if (!state.proxy) {
+          state.proxy = self._buildRefProxy(targetClass, state.control);
+        }
+        return state.proxy;
       },
       set(value: Model | string | null | undefined) {
-        raw =
+        setRaw(
           value instanceof Model
             ? ((value as any).id ?? null)
-            : (value ?? null);
-        invalidate();
+            : (value ?? null),
+        );
       },
     });
 
@@ -926,11 +1069,10 @@ export class Model extends EventEmitter {
       // `__data` getter's schema lookup.
       enumerable: false,
       get() {
-        return raw;
+        return state.raw;
       },
       set(v: string | null | undefined) {
-        raw = v ?? null;
-        invalidate();
+        setRaw(v ?? null);
       },
     });
   }
@@ -975,7 +1117,7 @@ export class Model extends EventEmitter {
 
   /** @internal — full RFC 6902 paths currently in-flight via patch() */
   get __patchingPaths(): ReadonlySet<string> {
-    return this[SYM_PATCHING];
+    return new Set(this[SYM_PATCHING].keys());
   }
 
   /** @internal — last server-authoritative view; what flush() diffs against */
@@ -1030,28 +1172,16 @@ export class Model extends EventEmitter {
 
   /**
    * Upsert the entire current document to the server. No diffing, no
-   * dirty-tracking — the adapter receives the whole model and writes
-   * it.
+   * dirty-tracking — the adapter receives an immutable snapshot of the
+   * document captured when save() was called.
    *
    * Runs the adapter's "save" pipeline (on the backend: "create" /
    * "save" hooks, full INSERT ... ON CONFLICT MERGE).
    */
-  async save(): Promise<void> {
+  save(): Promise<void> {
     (this as any).updatedAt = new Date().toISOString();
-    this.__savingCount++;
-    this.emit("saving", this);
-    this.emit("__saving", this.__savingCount);
-    try {
-      await this[SYM_ADAPTER].save(this);
-      this.__isNew = false;
-      // The server now holds what we just sent. Refresh the snapshot
-      // from the post-write local state so flush() starts from zero.
-      this[SYM_SNAPSHOT] = structuredClone(this.__data);
-      this.emit("saved", this);
-    } finally {
-      this.__savingCount = Math.max(0, this.__savingCount - 1);
-      this.emit("__saving", this.__savingCount);
-    }
+    const data = structuredClone(this.__data);
+    return this._enqueueWrite(() => this._writeSave(data));
   }
 
   /**
@@ -1063,60 +1193,129 @@ export class Model extends EventEmitter {
    * subscription layer can skip echoes of its own writes for the
    * specific sub-paths still in flight.
    */
-  async patch(rawOps: PatchOp[]): Promise<void> {
-    if (rawOps.length === 0) return;
+  patch(rawOps: PatchOp[]): Promise<void> {
+    if (rawOps.length === 0) return Promise.resolve();
     // Normalize: drop ops whose path lives UNDER another `remove`
     // op in the same batch. Without this, fast-json-patch crashes
     // on the sub-path op when its parent has just been removed.
     // Callers can freely compose helpers — the framework keeps the
     // batch consistent. See `patch.ts:dedupOps` for the contract.
-    const ops = dedupOps(rawOps);
-    if (ops.length === 0) return;
+    const ops = structuredClone(dedupOps(rawOps)) as PatchOp[];
+    if (ops.length === 0) return Promise.resolve();
 
-    const paths = new Set<string>();
-    for (const op of ops) paths.add(op.path);
-    for (const p of paths) this[SYM_PATCHING].add(p);
+    // Apply locally on a plain-object snapshot (fast-json-patch
+    // mutates in place), then copy the touched top-level keys back
+    // onto `this`. We avoid applyPatch'ing `this` directly because
+    // the instance carries methods / ref accessors / EE internals
+    // that would confuse the walker.
+    const snap = this.__data;
+    ensureIntermediates(snap, ops);
+    applyPatch(snap, ops, false, true);
+    this._copyPatchedTopLevels(snap, ops);
 
+    (this as any)[SYM_VERSION] = (this as any)[SYM_VERSION] + 1;
+    this.emit("change");
+
+    const expectedData = structuredClone(this.__data);
+    const paths = this._beginPatch(ops);
+    return this._enqueueWrite(() =>
+      this._writePatch(ops, expectedData, paths),
+    );
+  }
+
+  private _enqueueWrite(write: () => Promise<void>): Promise<void> {
+    const previous = this[SYM_WRITE_LANE];
+    const current = previous
+      ? previous.then(write, write)
+      : write();
+    this[SYM_WRITE_LANE] = current;
+    const clear = (): void => {
+      if (this[SYM_WRITE_LANE] === current) this[SYM_WRITE_LANE] = null;
+    };
+    void current.then(clear, clear);
+    return current;
+  }
+
+  private async _writeSave(data: Record<string, any>): Promise<void> {
+    this.__savingCount++;
+    this.emit("saving", this);
+    this.emit("__saving", this.__savingCount);
+    try {
+      const serverData = await this[SYM_ADAPTER].save(this, data);
+      if (serverData) {
+        this[SYM_SERVER_MERGE](serverData, data);
+      } else {
+        this._replaceServerSnapshot(data);
+      }
+      this.__isNew = false;
+      this.emit("saved", this);
+    } finally {
+      this.__savingCount = Math.max(0, this.__savingCount - 1);
+      this.emit("__saving", this.__savingCount);
+    }
+  }
+
+  private _beginPatch(ops: readonly PatchOp[]): Set<string> {
+    const paths = new Set(ops.map((op) => op.path));
+    for (const path of paths) {
+      this[SYM_PATCHING].set(path, (this[SYM_PATCHING].get(path) ?? 0) + 1);
+    }
     this.__savingCount++;
     this.emit("patching", this);
     this.emit("__saving", this.__savingCount);
+    return paths;
+  }
 
+  private _endPatch(paths: ReadonlySet<string>): void {
+    for (const path of paths) {
+      const count = this[SYM_PATCHING].get(path) ?? 0;
+      if (count <= 1) this[SYM_PATCHING].delete(path);
+      else this[SYM_PATCHING].set(path, count - 1);
+    }
+    this.__savingCount = Math.max(0, this.__savingCount - 1);
+    this.emit("__saving", this.__savingCount);
+  }
+
+  private async _writePatch(
+    ops: PatchOp[],
+    expectedData: Record<string, any>,
+    paths: ReadonlySet<string>,
+  ): Promise<void> {
     try {
-      // Apply locally on a plain-object snapshot (fast-json-patch
-      // mutates in place), then copy the touched top-level keys back
-      // onto `this`. We avoid applyPatch'ing `this` directly because
-      // the instance carries methods / ref accessors / EE internals
-      // that would confuse the walker.
-      const snap = this.__data;
-      ensureIntermediates(snap, ops);
-      applyPatch(snap, ops, false, true);
-      for (const key of topLevelKeys(ops)) {
-        (this as any)[key] = snap[key];
+      const serverData = await this[SYM_ADAPTER].patch(
+        this,
+        ops,
+        expectedData,
+      );
+      if (serverData) {
+        this[SYM_SERVER_MERGE](serverData, expectedData);
+      } else {
+        this._replaceServerSnapshot(expectedData);
       }
-
-      (this as any)[SYM_VERSION] = (this as any)[SYM_VERSION] + 1;
-      this.emit("change");
-
-      await this[SYM_ADAPTER].patch(this, ops);
-
-      // Replay ops onto the snapshot so flush() won't re-emit them.
-      //
-      // We mutate the existing snapshot in place rather than cloning.
-      // `SYM_SNAPSHOT` is Symbol-keyed and only exposed
-      // via the `__serverSnapshot` getter that's typed `Readonly` —
-      // no external consumer can hold a reference that needs the
-      // pre-patch view. On a 500KB Scenecode project the old
-      // structuredClone was 3–5 ms of main-thread CPU per patch;
-      // mutating in place reclaims that.
-      const snapshot = this[SYM_SNAPSHOT];
-      ensureIntermediates(snapshot, ops);
-      applyPatch(snapshot, ops, false, true);
-
       this.emit("patched", this);
     } finally {
-      for (const p of paths) this[SYM_PATCHING].delete(p);
-      this.__savingCount = Math.max(0, this.__savingCount - 1);
-      this.emit("__saving", this.__savingCount);
+      this._endPatch(paths);
+    }
+  }
+
+  private _copyPatchedTopLevels(
+    snapshot: Record<string, any>,
+    ops: readonly PatchOp[],
+  ): void {
+    for (const key of topLevelKeys(ops)) {
+      if (Object.prototype.hasOwnProperty.call(snapshot, key)) {
+        (this as any)[key] = snapshot[key];
+      } else {
+        delete (this as any)[key];
+      }
+    }
+  }
+
+  private _replaceServerSnapshot(data: Record<string, any>): void {
+    const snapshot = this[SYM_SNAPSHOT];
+    for (const key of Object.keys(snapshot)) delete snapshot[key];
+    for (const [key, value] of Object.entries(data)) {
+      snapshot[key] = structuredClone(value);
     }
   }
 
@@ -1131,21 +1330,9 @@ export class Model extends EventEmitter {
    *
    * No-op when the diff is empty.
    *
-   * ## Self-serializing
-   *
-   * Concurrent `flush()` calls coalesce into at most two round-trips
-   * per burst:
-   *
-   *   - The first call starts immediately (leading edge).
-   *   - Further calls while the first is in-flight return a shared
-   *     "trailing" promise that chains after the in-flight finishes
-   *     and captures any changes made during that window. All
-   *     trailing callers resolve when the trailing flush completes.
-   *
-   * This lets streaming call sites fire `msg.flush()` per delta
-   * (push the promise into an array, `await Promise.all(...)` at the
-   * end) without hand-rolling their own debounce / throttle. N rapid
-   * flushes → at most 2 actual patches.
+   * All flushes share the same write lane as save() and patch(). A queued
+   * flush computes its diff only after prior writes acknowledge, so it
+   * captures edits made while those writes were awaiting the adapter.
    *
    * ## Pre-processing before diff
    *
@@ -1163,59 +1350,25 @@ export class Model extends EventEmitter {
    *      iterable and produces 24 character-level `add` ops per Date
    *      field instead of equality.
    */
-  async flush(): Promise<void> {
-    if (this.__isNew) {
-      return this.save();
-    }
-
-    // Trailing-coalesce: an existing in-flight flush captured an
-    // earlier state; our caller's changes need a follow-up flush.
-    // All trailing callers share the same promise so only one extra
-    // round-trip runs regardless of how many deltas arrived.
-    const inflight = this[SYM_FLUSH_INFLIGHT];
-    if (inflight) {
-      let trailing = this[SYM_FLUSH_TRAILING];
-      if (!trailing) {
-        trailing = (async () => {
-          // Wait for the in-flight to finish. Swallow its error here —
-          // it already rejected its own caller; a failed earlier
-          // flush shouldn't block a later retry from running.
-          try {
-            await inflight;
-          } catch {
-            /* noop */
-          }
-          this[SYM_FLUSH_TRAILING] = null;
-          // Recurse: the lane is now clear, this call will become
-          // the next leading-edge flush.
-          return this.flush();
-        })();
-        this[SYM_FLUSH_TRAILING] = trailing;
-      }
-      return trailing;
-    }
-
-    // Leading edge — no flush in-flight. Start one.
-    const p = this._doFlush();
-    this[SYM_FLUSH_INFLIGHT] = p;
-    try {
-      await p;
-    } finally {
-      this[SYM_FLUSH_INFLIGHT] = null;
-    }
+  flush(): Promise<void> {
+    return this._enqueueWrite(() => this._doFlush());
   }
 
   /** @internal — one-shot body of `flush()`. Computes the diff and
-   * delegates to `patch()`. Callers must ensure serialization via
-   * `flush()`'s `SYM_FLUSH_INFLIGHT` guard. */
+   * delegates directly to the active write lane. */
   private async _doFlush(): Promise<void> {
+    if (this.__isNew) {
+      (this as any).updatedAt = new Date().toISOString();
+      return this._writeSave(structuredClone(this.__data));
+    }
+
     // Strip framework-managed columns AND coerce Date instances to
     // ISO strings in one pass — see the file-level `dateSafeClone`
     // for the why. Previously this was a separate `strip()` (one
     // walk) followed by `JSON.parse(JSON.stringify(...))` (one
     // walk + two string allocations) per side. The combined helper
     // collapses to one recursive walk per side and skips the
-      // string allocations entirely.
+    // string allocations entirely.
     const stripAndDateClone = (
       data: Record<string, any>,
     ): Record<string, any> => {
@@ -1230,60 +1383,128 @@ export class Model extends EventEmitter {
     const current = stripAndDateClone(this.__data);
     const ops = compare(snap, current) as unknown as PatchOp[];
     if (ops.length === 0) return;
-    return this.patch(ops);
+    const expectedData = structuredClone(this.__data);
+    const paths = this._beginPatch(ops);
+    (this as any)[SYM_VERSION] = (this as any)[SYM_VERSION] + 1;
+    this.emit("change");
+    return this._writePatch(ops, expectedData, paths);
+  }
+
+  private _mergeRefField(
+    field: string,
+    nextRaw: string | null,
+    expanded?: Model | Record<string, any>,
+  ): boolean {
+    const state = this[SYM_REFS].get(field);
+    if (!state) return false;
+
+    let incomingLoaded: Model | undefined;
+    if (expanded instanceof Model) {
+      incomingLoaded = expanded;
+    } else if (expanded && typeof expanded.id === "string") {
+      incomingLoaded = (state.targetClass as any).hydrate(
+        this[SYM_ADAPTER],
+        expanded,
+      ) as Model;
+    }
+
+    if (state.raw !== nextRaw) {
+      state.raw = nextRaw;
+      state.proxy = null;
+      state.control =
+        nextRaw && incomingLoaded
+          ? { refId: nextRaw, loaded: incomingLoaded, loading: null }
+          : null;
+      return true;
+    }
+    if (!nextRaw || !incomingLoaded) return false;
+
+    if (!state.control || state.control.refId !== nextRaw) {
+      state.control = {
+        refId: nextRaw,
+        loaded: incomingLoaded,
+        loading: null,
+      };
+      return true;
+    }
+
+    const loaded = state.control.loaded;
+    state.control.loading = null;
+    if (loaded instanceof Model) {
+      if (loaded === incomingLoaded) return false;
+      const previousVersion = loaded[SYM_VERSION];
+      loaded[SYM_SERVER_MERGE](incomingLoaded);
+      return loaded[SYM_VERSION] !== previousVersion;
+    }
+    state.control.loaded = incomingLoaded;
+    return true;
   }
 
   /**
-   * Atomically overwrite this instance with server-authoritative data.
-   *
-   * Skips any keys with pending in-flight writes (their paths live in
-   * `__patchingPaths`), deletes keys the server no longer has, refreshes
-   * `__serverSnapshot` to mirror what the server actually holds, and
-   * emits `"change"` exactly when something changed.
+   * Atomically merge a server row while replaying local edits made after the
+   * supplied baseline. Write acknowledgements use their outbound payload as
+   * that baseline; fetches and subscriptions use the prior server snapshot.
    */
-  [SYM_SERVER_MERGE](serverData: Record<string, any>): this {
-    const pending = this[SYM_PATCHING];
-    const serverKeys = new Set(Object.keys(serverData));
+  [SYM_SERVER_MERGE](
+    serverValue: Record<string, any> | Model,
+    expectedData?: Record<string, any>,
+  ): this {
+    const sourceModel = serverValue instanceof Model ? serverValue : null;
+    const incomingData: Record<string, any> = sourceModel
+      ? sourceModel.__data
+      : (serverValue as Record<string, any>);
     const schema = (this.constructor as typeof Model).__schema;
+    const authoritativeData: Record<string, any> = {};
+
+    for (const [key, value] of Object.entries(incomingData)) {
+      const col = schema?.[key];
+      if (
+        col &&
+        typeof col === "object" &&
+        "kind" in col &&
+        col.kind === "ref"
+      ) {
+        authoritativeData[key] =
+          value instanceof Model
+            ? value.id
+            : value && typeof value === "object"
+              ? (value as Record<string, any>).id ?? null
+              : value;
+      } else {
+        authoritativeData[key] = value;
+      }
+    }
+
+    const currentData = this.__data;
+    const mergedData = mergeServerWithLocalChanges(
+      authoritativeData,
+      expectedData ?? this[SYM_SNAPSHOT],
+      currentData,
+    );
+    const mergedKeys = new Set(Object.keys(mergedData));
+    const serverKeys = new Set(Object.keys(authoritativeData));
     let didChange = false;
 
-    const keyHasPending = (key: string): boolean => {
-      const prefix = `/${key}`;
-      for (const p of pending) {
-        if (p === prefix || p.startsWith(prefix + "/")) return true;
-      }
-      return false;
-    };
-
-    // Write new / changed values.
-    for (const key of serverKeys) {
-      if (keyHasPending(key)) continue;
-      const nextVal = serverData[key];
-
-      // Ref-field shortcut: incoming server data carries the raw id
-      // (see `__data` getter — refs serialize via the `$field`
-      // accessor). Compare against the raw-id slot, NOT against the
-      // public getter (which returns the proxy / Model instance and
-      // never equals the incoming string).
-      //
-      // Without this, every patch arriving over a subscription would
-      // call the ref-field setter and `invalidate()` the cached
-      // proxy — including the pre-hydrated proxy installed by
-      // `.expand("file")`. The editor's `useAssetFile`
-      // would then snap to `null` on every status flip / job update
-      // until a fresh `findById` round-tripped the linked row again.
-      //
-      // When the raw id IS unchanged, skip the assignment so the
-      // existing proxy survives. When it changed (reshoot, swap),
-      // fall through to the setter so the stale proxy is correctly
-      // invalidated.
+    for (const [key, nextVal] of Object.entries(mergedData)) {
+      if (key === "type") continue;
       const col = schema?.[key];
       const isRef =
         col && typeof col === "object" && "kind" in col && col.kind === "ref";
       if (isRef) {
-        if (Object.is((this as any)[`$${key}`], nextVal)) continue;
-        (this as any)[key] = nextVal;
-        didChange = true;
+        let expanded: Model | Record<string, any> | undefined;
+        if (dataValuesEqual(nextVal, authoritativeData[key])) {
+          if (sourceModel) {
+            const sourceState = sourceModel[SYM_REFS].get(key);
+            const loaded = sourceState?.control?.loaded;
+            if (loaded instanceof Model) expanded = loaded;
+          } else {
+            const incoming = incomingData[key];
+            if (incoming instanceof Model || (incoming && typeof incoming === "object")) {
+              expanded = incoming as Model | Record<string, any>;
+            }
+          }
+        }
+        didChange = this._mergeRefField(key, nextVal ?? null, expanded) || didChange;
         continue;
       }
 
@@ -1293,26 +1514,12 @@ export class Model extends EventEmitter {
       }
     }
 
-    // Delete keys the server no longer has. Same filter as __data so
-    // we don't accidentally prune methods, EE internals, ref accessor
-    // storage, or private state.
-    //
-    // Ref fields are also skipped — they're not regular data
-    // properties, they're getter/setter pairs installed by
-    // `_installRefField`. Deleting them tears out the accessor and
-    // leaves `instance.fieldName` as `undefined` instead of the lazy
-    // / pre-hydrated proxy. A payload that omits the ref key is
-    // either a partial update (live diff) or a bug; either way we
-    // leave the accessor alone. Real "ref cleared" goes through the
-    // `serverData[key] = null` path in the loop above, which writes
-    // through the setter correctly.
     for (const key of Object.keys(this)) {
       if (SYSTEM_DATA_KEYS.has(key)) continue;
       if (INSTANCE_METHODS.has(key)) continue;
       if (EVENTEMITTER_KEYS.has(key)) continue;
       if (key.startsWith("_") || key.startsWith("$")) continue;
-      if (serverKeys.has(key)) continue;
-      if (keyHasPending(key)) continue;
+      if (mergedKeys.has(key)) continue;
       const col = schema?.[key];
       if (
         col &&
@@ -1326,17 +1533,68 @@ export class Model extends EventEmitter {
       didChange = true;
     }
 
-    // Snapshot always refreshes — it represents what the server holds,
-    // independent of local pending writes.
-    this[SYM_SNAPSHOT] = structuredClone(serverData);
+    const snapshot = this[SYM_SNAPSHOT];
+    for (const key of Object.keys(snapshot)) {
+      if (!serverKeys.has(key)) delete snapshot[key];
+    }
+    for (const [key, value] of Object.entries(authoritativeData)) {
+      snapshot[key] = structuredClone(value);
+    }
 
     if (didChange) {
       (this as any)[SYM_VERSION] = (this as any)[SYM_VERSION] + 1;
-      // Batched — fires once per microtask flush instead of N times
-      // per server-frame burst. See `scheduleChangeEmit` above.
       scheduleChangeEmit(this);
     }
 
+    return this;
+  }
+
+  [SYM_SERVER_PATCH](ops: readonly PatchOp[]): this {
+    const outerOps: PatchOp[] = [];
+    const refOps = new Map<string, PatchOp[]>();
+
+    for (const op of ops) {
+      const segments = pointerSegments(op.path);
+      const state = segments.length > 1 ? this[SYM_REFS].get(segments[0]!) : null;
+      const from = op.op === "copy" || op.op === "move" ? op.from : null;
+      const fromSegments = from ? pointerSegments(from) : null;
+      if (!state || (fromSegments && fromSegments[0] !== segments[0])) {
+        outerOps.push(op);
+        continue;
+      }
+      const pathStart = op.path.indexOf("/", 1);
+      const relative = {
+        ...op,
+        path: op.path.slice(pathStart),
+        ...(from
+          ? { from: from.slice(from.indexOf("/", 1)) }
+          : {}),
+      } as PatchOp;
+      const grouped = refOps.get(segments[0]!);
+      if (grouped) grouped.push(relative);
+      else refOps.set(segments[0]!, [relative]);
+    }
+
+    let didRefChange = false;
+    for (const [field, patches] of refOps) {
+      const loaded = this[SYM_REFS].get(field)?.control?.loaded;
+      if (!(loaded instanceof Model)) continue;
+      const previousVersion = loaded[SYM_VERSION];
+      loaded[SYM_SERVER_PATCH](patches);
+      if (loaded[SYM_VERSION] !== previousVersion) didRefChange = true;
+    }
+
+    const previousVersion = this[SYM_VERSION];
+    if (outerOps.length > 0) {
+      const snapshot = structuredClone(this[SYM_SNAPSHOT]);
+      ensureIntermediates(snapshot, outerOps);
+      applyPatch(snapshot, outerOps, false, true);
+      this[SYM_SERVER_MERGE](snapshot);
+    }
+    if (didRefChange && this[SYM_VERSION] === previousVersion) {
+      (this as any)[SYM_VERSION] = previousVersion + 1;
+      scheduleChangeEmit(this);
+    }
     return this;
   }
 
@@ -1412,67 +1670,20 @@ export class Model extends EventEmitter {
   // ── Reference Proxy ──────────────────────────────────────────────────
 
   /**
-   * Pre-hydrated ref proxy — same shape as `_createRefProxy` but
-   * `loaded` starts populated, so property access is synchronous
-   * and never fires `findById` / throws Suspense.
-   *
-   * Used by `_apply` when the wire payload included a `.expand(...)`
-   * inline object for this ref field. The cache slot for
-   * `${type}:${id}` is overwritten so a sibling read of the same
-   * ref id elsewhere on the same instance (or across instances
-   * within the 30s TTL) reuses this same hydrated proxy rather
-   * than a stale lazy one.
-   *
-   * Field-projection note: `.expand("file.url")` builds an inline
-   * row with only `{ id, type, url }`. Reading
-   * `asset.file.blurhash` after a projected expand returns
-   * `undefined` rather than triggering a lazy load — the caller
-   * opted out of the other columns by projecting. If the caller
-   * needs them, they ask for the whole row (`.expand("file")`).
-   */
-  private _createPrehydratedRefProxy(
-    targetClass: ModelConstructor,
-    refId: string,
-    loadedInstance: Model,
-  ): any {
-    const proxy = this._buildRefProxy(targetClass, refId, loadedInstance);
-    __refCache.set(`${targetClass.type}:${refId}`, {
-      value: proxy,
-      expires: Date.now() + REF_CACHE_TTL,
-    });
-    return proxy;
-  }
-
-  private _createRefProxy(targetClass: ModelConstructor, refId: string): any {
-    const cacheKey = `${targetClass.type}:${refId}`;
-    const cached = __refCache.get(cacheKey);
-    if (cached && cached.expires > Date.now()) return cached.value;
-    if (cached) __refCache.delete(cacheKey);
-
-    const proxy = this._buildRefProxy(targetClass, refId, null);
-    return proxy;
-  }
-
-  /**
-   * Shared proxy factory for `_createRefProxy` (lazy) and
-   * `_createPrehydratedRefProxy` (eager). `initialLoaded === null`
-   * routes the first non-whitelisted read through `findById`;
-   * any other value short-circuits the lazy load entirely so the
-   * read is synchronous.
+   * Shared proxy factory for lazy and expanded refs. The mutable control is
+   * retained by the owning field so subscription patches and full fetches can
+   * refresh a loaded instance without replacing either proxy or raw id.
    *
    * The trap shape stays identical between the two cases — iteration
-   * safety still applies. Pre-hydration is fundamentally
-   * a "preload the cache slot" optimization, not a different proxy
-   * protocol.
+   * safety still applies. Pre-hydration seeds the same field-local
+   * proxy protocol used by lazy refs.
    */
   private _buildRefProxy(
     targetClass: ModelConstructor,
-    refId: string,
-    initialLoaded: Model | null,
+    control: RefControl,
   ): any {
-    let loaded: any = initialLoaded;
-    let loading: Promise<any> | null = null;
-    const cacheKey = `${targetClass.type}:${refId}`;
+    const adapter = this[SYM_ADAPTER];
+    const refId = control.refId;
 
     const proxy = new Proxy({} as any, {
       get(_target, prop) {
@@ -1483,23 +1694,34 @@ export class Model extends EventEmitter {
           return () => ({ id: refId, type: targetClass.type });
         if (prop === Symbol.toPrimitive) return () => refId;
 
-        if (loaded) return (loaded as any)[prop];
+        if (control.loaded !== undefined) {
+          return control.loaded === null
+            ? undefined
+            : (control.loaded as any)[prop];
+        }
 
-        if (!loading) {
-          loading = Model.getAdapter()
-            .findById(targetClass, refId)
-            .then((result) => {
-              loaded = result;
-              __refCache.set(cacheKey, {
-                value: proxy,
-                expires: Date.now() + REF_CACHE_TTL,
-              });
-              return result;
-            });
+        if (!control.loading) {
+          let request!: Promise<Model | null>;
+          request = adapter.findById(targetClass, refId).then(
+            (result) => {
+              if (control.loading === request) {
+                control.loaded = result as Model | null;
+                control.loading = null;
+              }
+              return result as Model | null;
+            },
+            (error: unknown) => {
+              // Explicit retry policy: reject this Suspense read, then
+              // let the next property read start a fresh adapter call.
+              if (control.loading === request) control.loading = null;
+              throw error;
+            },
+          );
+          control.loading = request;
         }
 
         // React Suspense integration — throw the pending promise.
-        throw loading;
+        throw control.loading;
       },
       // ── Iteration safety ─────────────────────────────────────────
       //

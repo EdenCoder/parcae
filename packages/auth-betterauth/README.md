@@ -38,6 +38,7 @@ import { Model } from "@parcae/model";
 
 class User extends Model {
   static type = "user" as const;
+  static readonly privateFields = ["passwordHash"];
 
   // Auth-synced fields (written by Better Auth)
   name: string = "";
@@ -49,6 +50,7 @@ class User extends Model {
   bio: string = "";
   role: "user" | "admin" = "user";
   plan: "free" | "pro" = "free";
+  passwordHash: string = "";
 }
 ```
 
@@ -86,8 +88,37 @@ betterAuth({
 
   // Base URL for OAuth callbacks. Auto-detected from PORT if not set.
   baseURL: "https://api.myapp.com",
+
+  // Custom fields are neither writable nor returned by default.
+  userFields: {
+    input: ["bio"],
+    returned: ["bio", "plan"],
+  },
 });
 ```
+
+Custom `static privateFields` always remain excluded from Better Auth responses,
+even if accidentally included in `userFields.returned`. Better Auth always
+returns its built-in `id`, `name`, `email`, `emailVerified`, `image`, `createdAt`,
+and `updatedAt` fields; Better Auth cannot hide them. Setup therefore fails with
+a clear error if the User model lists any of them in `privateFields`.
+
+Better Auth accepts a `pg.Pool`, not Parcae's Knex pool. The adapter therefore
+owns a dedicated pool unless `database` is supplied. `app.stop()` calls the
+adapter's idempotent `close()` automatically:
+
+```typescript
+const auth = betterAuth({ providers: ["email"] });
+const app = createApp({ models: [User], auth });
+
+await app.start();
+// On shutdown:
+await app.stop();
+```
+
+When `database` is supplied, automatic teardown clears adapter state but leaves
+the app-owned pool open. Startup failures also run auth teardown before
+`app.start()` rejects, including Better Auth migration failures.
 
 ## Environment Variables
 

@@ -23,6 +23,7 @@ import { betterAuth as createBetterAuth } from "better-auth";
 import { log } from "@parcae/backend";
 import { bearer } from "better-auth/plugins/bearer";
 import pg from "pg";
+import type { Pool } from "pg";
 import pluralize from "pluralize";
 import { generateId } from "@parcae/model";
 import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
@@ -67,38 +68,74 @@ export interface BetterAuthConfig {
       verify?: (data: { hash: string; password: string }) => Promise<boolean>;
     };
   };
+  /**
+   * Explicit allowlists for custom User fields. Inferred fields are private
+   * to Better Auth by default: they cannot be written through auth endpoints
+   * or returned in auth profiles unless listed here. Custom Model
+   * `privateFields` always remain non-returned.
+   */
+  userFields?: {
+    input?: readonly string[];
+    returned?: readonly string[];
+  };
+  /**
+   * Optional app-owned pg Pool. Better Auth cannot consume Parcae's Knex
+   * pool directly; when omitted, this adapter owns a dedicated tracked pool.
+   */
+  database?: Pool;
+}
+
+export interface BetterAuthAdapter extends AuthAdapter {
+  /** Close the adapter-owned database pool. App-owned pools are untouched. */
+  close(): Promise<void>;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+const BETTER_AUTH_MANAGED_FIELDS = [
+  "id",
+  "name",
+  "email",
+  "emailVerified",
+  "image",
+  "createdAt",
+  "updatedAt",
+] as const;
 
 /**
  * Infer Better Auth `additionalFields` from the User model's schema.
  * Fields that Better Auth already manages (name, email, emailVerified, image,
  * createdAt, updatedAt, id) are excluded.
  */
-function inferAdditionalFields(
+export function inferAdditionalFields(
   userModel: ModelConstructor,
+  allowlists: BetterAuthConfig["userFields"] = {},
 ): Record<
   string,
-  { type: "string" | "number" | "boolean" | "date"; required: boolean }
+  {
+    type: "string" | "number" | "boolean" | "date";
+    required: boolean;
+    input: boolean;
+    returned: boolean;
+  }
 > {
   const schema = (userModel as any).__schema as SchemaDefinition | undefined;
   if (!schema) return {};
 
-  const betterAuthFields = new Set([
-    "id",
-    "name",
-    "email",
-    "emailVerified",
-    "image",
-    "createdAt",
-    "updatedAt",
-  ]);
+  const betterAuthFields = new Set<string>(BETTER_AUTH_MANAGED_FIELDS);
 
   const fields: Record<
     string,
-    { type: "string" | "number" | "boolean" | "date"; required: boolean }
+    {
+      type: "string" | "number" | "boolean" | "date";
+      required: boolean;
+      input: boolean;
+      returned: boolean;
+    }
   > = {};
+  const inputFields = new Set(allowlists.input ?? []);
+  const returnedFields = new Set(allowlists.returned ?? []);
+  const privateFields = new Set(userModel.privateFields ?? []);
 
   for (const [key, colDef] of Object.entries(schema)) {
     if (betterAuthFields.has(key)) continue;
@@ -122,7 +159,13 @@ function inferAdditionalFields(
         break;
     }
 
-    fields[key] = { type: baType, required: false };
+    const isPrivate = privateFields.has(key);
+    fields[key] = {
+      type: baType,
+      required: false,
+      input: !isPrivate && inputFields.has(key),
+      returned: !isPrivate && returnedFields.has(key),
+    };
   }
 
   return fields;
@@ -140,16 +183,36 @@ function inferAdditionalFields(
  * Sessions, accounts, and verifications are internal Better Auth tables —
  * created automatically by this adapter.
  */
-export function betterAuth(config: BetterAuthConfig = {}): AuthAdapter {
+export function betterAuth(config: BetterAuthConfig = {}): BetterAuthAdapter {
   const basePath = config.basePath ?? "/v1/auth";
 
   let auth: any = null;
+  let database: Pool | null = null;
+  let ownsDatabase = false;
 
-  return {
+  const adapter: BetterAuthAdapter = {
     routes: null, // populated in setup()
 
+    async close() {
+      auth = null;
+      adapter.routes = null;
+      const pool = database;
+      database = null;
+      if (pool && ownsDatabase) await pool.end();
+      ownsDatabase = false;
+    },
+
     async setup(ctx: AuthSetupContext) {
-      const { userModel, config: envConfig, db, ensureSchema } = ctx;
+      const { userModel, config: envConfig, ensureSchema } = ctx;
+
+      const managedPrivateFields = BETTER_AUTH_MANAGED_FIELDS.filter((field) =>
+        userModel?.privateFields?.includes(field),
+      );
+      if (managedPrivateFields.length > 0) {
+        throw new Error(
+          `[parcae/auth-betterauth] User.privateFields cannot include Better Auth-managed returned fields: ${managedPrivateFields.join(", ")}. These built-in fields cannot be hidden from Better Auth responses.`,
+        );
+      }
 
       const secret = envConfig.AUTH_SECRET;
       if (!secret) {
@@ -206,19 +269,22 @@ export function betterAuth(config: BetterAuthConfig = {}): AuthAdapter {
 
       // Infer additional fields from the User model schema
       const additionalFields = userModel
-        ? inferAdditionalFields(userModel)
+        ? inferAdditionalFields(userModel, config.userFields)
         : {};
 
-      // Create Better Auth instance — shares Parcae's Postgres connection
+      database = config.database ?? new pg.Pool({
+        connectionString: envConfig.DATABASE_URL,
+      });
+      ownsDatabase = !config.database;
+
+      // Better Auth accepts pg.Pool but not Knex's internal Tarn pool. The
+      // dedicated fallback is tracked by close() rather than leaked.
       auth = createBetterAuth({
         basePath,
         baseURL,
         secret,
 
-        // Use Parcae's database connection
-        database: new pg.Pool({
-          connectionString: envConfig.DATABASE_URL,
-        }),
+        database,
 
         // Point Better Auth at the Parcae User model's table
         user: {
@@ -266,20 +332,20 @@ export function betterAuth(config: BetterAuthConfig = {}): AuthAdapter {
       // for Parcae to add custom columns to.
       if (ensureSchema) {
         try {
-          const ctx = await auth.$context;
-          await ctx.runMigrations();
+          const authContext = await auth.$context;
+          await authContext.runMigrations();
           log.info(
             "[parcae/auth-betterauth] Auth tables migrated (users, sessions, accounts, verifications)",
           );
-        } catch (err: any) {
-          log.warn(
-            `[parcae/auth-betterauth] Migration warning: ${err.message}`,
-          );
+        } catch (err) {
+          log.error("[parcae/auth-betterauth] Auth migration failed:", err);
+          await adapter.close();
+          throw err;
         }
       }
 
       // Populate routes for the framework to mount
-      (this as any).routes = {
+      adapter.routes = {
         basePath,
         handler: async (req: any, res: any) => {
           // Convert Polka/Node request to Web Fetch Request for Better Auth
@@ -361,4 +427,6 @@ export function betterAuth(config: BetterAuthConfig = {}): AuthAdapter {
       }
     },
   };
+
+  return adapter;
 }

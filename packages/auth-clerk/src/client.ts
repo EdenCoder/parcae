@@ -12,7 +12,9 @@
  *
  * function App() {
  *   const { getToken } = useAuth();
- *   const auth = useMemo(() => createClerkAuthAdapter(getToken), [getToken]);
+ *   const auth = useMemo(() => createClerkAuthAdapter(getToken, {
+ *     subscribe: clerk.addListener,
+ *   }), [getToken, clerk]);
  *
  *   return (
  *     <ParcaeProvider url="..." auth={auth}>
@@ -34,6 +36,10 @@ type TokenChangeCallback = (token: string | null) => void;
 export interface ClerkClientAdapterOptions {
   /** Clerk organization ID to scope tokens. */
   organizationId?: string | null;
+  /** Subscribe to Clerk session changes. Required so onChange is live. */
+  subscribe: (onSessionChange: () => void) => () => void;
+  /** Receives asynchronous subscription refresh failures. */
+  onError?: (error: unknown) => void;
 }
 
 /**
@@ -44,59 +50,45 @@ export interface ClerkClientAdapterOptions {
  * `AuthClientAdapter` and can be handed straight to `<ParcaeProvider auth={…}>`.
  */
 
-/** WeakMap to associate adapters with their internal listener sets. */
-const adapterListeners = new WeakMap<
-  AuthClientAdapter,
-  Set<TokenChangeCallback>
->();
-
 export function createClerkAuthAdapter(
   getToken: GetTokenFn,
-  options: ClerkClientAdapterOptions = {},
+  options: ClerkClientAdapterOptions,
 ): AuthClientAdapter {
-  const listeners = new Set<TokenChangeCallback>();
-
   const adapter: AuthClientAdapter = {
     init() {
       // No initialization needed — Clerk manages sessions externally.
     },
 
     async getToken() {
-      try {
-        const token = await getToken({
-          organizationId: options.organizationId ?? undefined,
-        });
-        return token ?? null;
-      } catch {
-        return null;
-      }
+      const token = await getToken({
+        organizationId: options.organizationId ?? undefined,
+      });
+      return token ?? null;
     },
 
     onChange(callback: TokenChangeCallback) {
-      listeners.add(callback);
+      let active = true;
+      let generation = 0;
+      const unsubscribe = options.subscribe(() => {
+        const currentGeneration = ++generation;
+        void adapter.getToken().then(
+          (token) => {
+            if (active && currentGeneration === generation) callback(token);
+          },
+          (error) => {
+            if (active && currentGeneration === generation) {
+              options.onError?.(error);
+            }
+          },
+        );
+      });
       return () => {
-        listeners.delete(callback);
+        active = false;
+        generation++;
+        unsubscribe();
       };
     },
   };
 
-  adapterListeners.set(adapter, listeners);
   return adapter;
-}
-
-/**
- * Notify all `onChange` subscribers that the session changed.
- * Useful when Clerk fires a sign-out or token refresh outside React.
- */
-export function notifyClerkTokenChange(
-  adapter: AuthClientAdapter,
-  token: string | null,
-) {
-  const listeners = adapterListeners.get(adapter);
-
-  if (listeners) {
-    for (const cb of listeners) {
-      cb(token);
-    }
-  }
 }

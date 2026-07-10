@@ -1,16 +1,21 @@
 /**
  * @parcae/analytics — Auto-DDL + default Knex emitter
  *
- * Two tables, additive-only DDL. Both are owned by this package, not
- * the consuming app, so consumers never need to write a migration to
- * use the framework. `ensureAnalyticsTables()` is called from
- * `installAnalytics()`.
+ * Two package-owned tables. Fresh installs get the complete schema;
+ * existing installs only receive safe non-key additions. Missing
+ * identity or conflict columns fail loudly for a versioned migration.
+ * `ensureAnalyticsTables()` is called from `installAnalytics()`.
  */
 
 import type { Knex } from "knex";
-import type { AnalyticsEvent, EventEmitter } from "./event.js";
+import type { EventEmitter } from "./event.js";
 import { setEventEmitter } from "./event.js";
 import { generateId } from "./id.js";
+import {
+  assertUniqueConflictTarget,
+  assertStructuralColumns,
+  ensureAdditiveColumn,
+} from "./schema-upgrade.js";
 import { ensureStateChangeTable } from "./state-change.js";
 
 export const ANALYTICS_EVENT_TABLE = "analytics_event";
@@ -35,21 +40,31 @@ async function ensureEventTable(db: Knex): Promise<void> {
       t.jsonb("dimensions").notNullable().defaultTo("{}");
       t.timestamp("createdAt", { useTz: true }).notNullable().defaultTo(db.fn.now());
     });
-    await db.raw(
-      `CREATE INDEX IF NOT EXISTS analytics_event_org_key_occurred_idx
-         ON ${ANALYTICS_EVENT_TABLE} (org, key, "occurredAt" DESC)`,
+  } else {
+    await assertStructuralColumns(db, ANALYTICS_EVENT_TABLE, [
+      "id",
+      "org",
+      "subject",
+      "key",
+      "occurredAt",
+    ]);
+    await ensureAdditiveColumn(db, ANALYTICS_EVENT_TABLE, "source", (t) =>
+      t.string("source", 16).notNullable().defaultTo("system"),
     );
-    await db.raw(
-      `CREATE INDEX IF NOT EXISTS analytics_event_org_subject_occurred_idx
-         ON ${ANALYTICS_EVENT_TABLE} (org, subject, "occurredAt" DESC)`,
+    await ensureAdditiveColumn(db, ANALYTICS_EVENT_TABLE, "dimensions", (t) =>
+      t.jsonb("dimensions").notNullable().defaultTo("{}"),
     );
-    return;
+    await ensureAdditiveColumn(db, ANALYTICS_EVENT_TABLE, "createdAt", (t) =>
+      t.timestamp("createdAt", { useTz: true }).notNullable().defaultTo(db.fn.now()),
+    );
   }
-  await ensureColumn(db, ANALYTICS_EVENT_TABLE, "source", (t) =>
-    t.string("source", 16).notNullable().defaultTo("system"),
+  await db.raw(
+    `CREATE INDEX IF NOT EXISTS analytics_event_org_key_occurred_idx
+       ON ${ANALYTICS_EVENT_TABLE} (org, key, "occurredAt" DESC)`,
   );
-  await ensureColumn(db, ANALYTICS_EVENT_TABLE, "dimensions", (t) =>
-    t.jsonb("dimensions").notNullable().defaultTo("{}"),
+  await db.raw(
+    `CREATE INDEX IF NOT EXISTS analytics_event_org_subject_occurred_idx
+       ON ${ANALYTICS_EVENT_TABLE} (org, subject, "occurredAt" DESC)`,
   );
 }
 
@@ -73,28 +88,42 @@ async function ensureSnapshotTable(db: Knex): Promise<void> {
     // through `canonicalDimensions()` so `{a:1,b:2}` and `{b:2,a:1}`
     // hash to the same row instead of two.
     await db.raw(
-      `CREATE UNIQUE INDEX IF NOT EXISTS analytics_snapshot_unique_idx
+      `CREATE UNIQUE INDEX analytics_snapshot_unique_idx
          ON ${ANALYTICS_SNAPSHOT_TABLE}
          (org, "metricKey", grain, "periodStart", dimensions)`,
     );
-    await db.raw(
-      `CREATE INDEX IF NOT EXISTS analytics_snapshot_lookup_idx
-         ON ${ANALYTICS_SNAPSHOT_TABLE} (org, "metricKey", grain, "periodStart" DESC)`,
+  } else {
+    await assertStructuralColumns(db, ANALYTICS_SNAPSHOT_TABLE, [
+      "id",
+      "org",
+      "metricKey",
+      "grain",
+      "periodStart",
+      "periodEnd",
+      "value",
+      "dimensions",
+    ]);
+    await assertUniqueConflictTarget(db, ANALYTICS_SNAPSHOT_TABLE, [
+      "org",
+      "metricKey",
+      "grain",
+      "periodStart",
+      "dimensions",
+    ]);
+    await ensureAdditiveColumn(db, ANALYTICS_SNAPSHOT_TABLE, "metadata", (t) =>
+      t.jsonb("metadata").notNullable().defaultTo("{}"),
     );
-    return;
+    await ensureAdditiveColumn(db, ANALYTICS_SNAPSHOT_TABLE, "metricVersion", (t) =>
+      t.integer("metricVersion").notNullable().defaultTo(1),
+    );
+    await ensureAdditiveColumn(db, ANALYTICS_SNAPSHOT_TABLE, "computedAt", (t) =>
+      t.timestamp("computedAt", { useTz: true }).notNullable().defaultTo(db.fn.now()),
+    );
   }
-}
-
-async function ensureColumn(
-  db: Knex,
-  table: string,
-  column: string,
-  add: (t: Knex.AlterTableBuilder) => void,
-): Promise<void> {
-  const has = await db.schema.hasColumn(table, column);
-  if (!has) {
-    await db.schema.alterTable(table, add);
-  }
+  await db.raw(
+    `CREATE INDEX IF NOT EXISTS analytics_snapshot_lookup_idx
+       ON ${ANALYTICS_SNAPSHOT_TABLE} (org, "metricKey", grain, "periodStart" DESC)`,
+  );
 }
 
 /**

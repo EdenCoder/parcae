@@ -11,6 +11,7 @@ import { resolve, join } from "node:path";
 import { readdirSync, existsSync } from "node:fs";
 import pako from "pako";
 import { compress } from "compress-json";
+import equal from "deep-equal";
 import pluralize from "pluralize";
 import { createSocketFakeRes } from "./socket-fake-res";
 import { Model } from "@parcae/model";
@@ -25,12 +26,13 @@ import {
   resolveRuntimeFlags,
 } from "./config";
 import type { Config, RuntimeFlags } from "./config";
-import { createServer_ } from "./server";
+import { createServer_, listenServer } from "./server";
 import type { ServerContext } from "./server";
 import {
   getRoutes,
   getSocketHandlers,
   runSocketChain,
+  wrapHttpHandler,
   type Middleware,
   type SocketContext,
 } from "./routing/route";
@@ -39,7 +41,10 @@ import { registerModelRoutes } from "./adapters/routes";
 import { PubSub } from "./services/pubsub";
 import { QueueService } from "./services/queue";
 import { RefLoader } from "./services/ref-loader";
-import { QuerySubscriptionManager } from "./services/subscriptions";
+import {
+  QuerySubscriptionManager,
+  parsePositiveInteger,
+} from "./services/subscriptions";
 import { ChangeBus } from "./services/changeBus";
 import { ListenNotifyPoller } from "./services/listenNotifyPoller";
 import {
@@ -47,6 +52,7 @@ import {
   _setIo,
   _setChangeBus,
   _setRuntimeFlags,
+  _clearServices,
   runWithRequestContext,
 } from "./services/context";
 import {
@@ -65,6 +71,7 @@ import { discoverMigrations } from "./adapters/migration-discovery";
 import type { AuthAdapter, AuthSession } from "./auth";
 import knex from "knex";
 import { shutdownResources } from "./shutdown";
+import type { ShutdownResources } from "./shutdown";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -208,6 +215,29 @@ async function discoverModels(dir: string): Promise<ModelConstructor[]> {
   return models;
 }
 
+/** Dedupe re-exported constructors and reject ambiguous model type ownership. */
+export function normalizeModels(
+  discovered: readonly ModelConstructor[],
+): ModelConstructor[] {
+  const constructors = new Set<ModelConstructor>();
+  const byType = new Map<string, ModelConstructor>();
+  const models: ModelConstructor[] = [];
+
+  for (const model of discovered) {
+    if (constructors.has(model)) continue;
+    const existing = byType.get(model.type);
+    if (existing && existing !== model) {
+      throw new Error(
+        `Distinct model constructors declare the same type "${model.type}"`,
+      );
+    }
+    constructors.add(model);
+    byType.set(model.type, model);
+    models.push(model);
+  }
+  return models;
+}
+
 // ─── Auto-discovery ──────────────────────────────────────────────────────────
 
 /**
@@ -334,57 +364,195 @@ function startCron(entry: CronEntry, pubsub: PubSub): Cron {
 
 // ─── Socket helpers ──────────────────────────────────────────────────────────
 
-async function resyncQueries(
+interface ResyncEntry {
+  key: string;
+  modelType: string;
+  steps: unknown[];
+  queryHash?: string | null;
+  subscribe?: boolean;
+}
+
+interface ResyncOptions {
+  maxEntries?: number;
+  concurrency?: number;
+}
+
+const DEFAULT_MAX_RESYNC_QUERIES = 100;
+const DEFAULT_RESYNC_CONCURRENCY = 8;
+
+interface SocketSessionSubscriptions {
+  unsubscribeAll(socketId: string): void;
+}
+
+export function createSocketSessionController(
+  socketId: string,
+  authAdapter: AuthAdapter | null,
+  subscriptions: SocketSessionSubscriptions,
+) {
+  let session: AuthSession | null = null;
+  let generation = 0;
+
+  return {
+    get session(): AuthSession | null {
+      return session;
+    },
+    async hello(
+      payload: { token?: string | null } | null | undefined,
+      callback?: (result: { userId: string | null }) => void,
+    ): Promise<void> {
+      const acceptedGeneration = ++generation;
+      const token = payload?.token ?? null;
+      let nextSession: AuthSession | null = null;
+      if (authAdapter && token) {
+        try {
+          nextSession = await authAdapter.resolveToken(token);
+        } catch {
+          nextSession = null;
+        }
+      }
+
+      if (acceptedGeneration !== generation) {
+        callback?.({ userId: session?.user?.id ?? null });
+        return;
+      }
+      if (!equal(session, nextSession, { strict: true })) {
+        subscriptions.unsubscribeAll(socketId);
+        session = nextSession;
+      }
+      callback?.({ userId: session?.user?.id ?? null });
+    },
+  };
+}
+
+export function mountAuthRoutes(
+  app: { all(path: string, handler: Middleware): unknown },
+  routes: NonNullable<AuthAdapter["routes"]>,
+): void {
+  const basePath = routes.basePath.replace(/\/+$/, "") || "/";
+  const handler = wrapHttpHandler(routes.handler);
+  app.all(basePath, handler);
+  app.all(basePath === "/" ? "/*" : `${basePath}/*`, handler);
+}
+
+export async function resyncQueries(
   socketId: string,
   socketSession: AuthSession | null,
-  entries: Array<{
-    key: string;
-    modelType: string;
-    steps: unknown[];
-    queryHash?: string | null;
-    subscribe?: boolean;
-  }>,
+  entries: ResyncEntry[],
   adapter: BackendAdapter,
+  options: ResyncOptions = {},
 ): Promise<Array<{ key: string; hash: string | null; items: any[]; totalCount: number }>> {
-  const results: Array<{ key: string; hash: string | null; items: any[]; totalCount: number }> = [];
-  const user = socketSession?.user ?? null;
-  for (const entry of entries) {
-    const ModelClass = adapter.modelsByType.get(entry.modelType);
-    if (!ModelClass) continue;
-    const scope = (ModelClass as any).scope;
-    if (!scope?.read) continue;
-
-    const scopeResult = scope.read({ user, params: {}, data: {} } as any);
-    if (!scopeResult) continue;
-
-    const prep = prepareClientQuery({
-      ModelClass,
-      scopeResult,
-      rawSteps: entry.steps,
-      modelByType: adapter.modelsByType,
-      adapter,
-    });
-
-    if (entry.subscribe === false) {
-      const { items, totalCount } = await runQueryStatic({ prep, user, adapter });
-      results.push({ key: entry.key, hash: null, items, totalCount });
-      continue;
-    }
-
-    if (!adapter.subscriptions) continue;
-
-    const { items, hash, totalCount } = await runQuerySubscription({
-      prep,
-      socketId,
-      user,
-      adapter,
-    });
-    results.push({ key: entry.key, hash, items, totalCount });
+  const maxEntries = parsePositiveInteger(
+    options.maxEntries ?? DEFAULT_MAX_RESYNC_QUERIES,
+    "maxEntries",
+  )!;
+  const concurrency = parsePositiveInteger(
+    options.concurrency ?? DEFAULT_RESYNC_CONCURRENCY,
+    "concurrency",
+  )!;
+  if (entries.length > maxEntries) {
+    throw new ClientError(
+      `Resync query limit exceeded (${entries.length}/${maxEntries})`,
+      400,
+    );
   }
+
+  const results: Array<{
+    key: string;
+    hash: string | null;
+    items: any[];
+    totalCount: number;
+  }> = entries.map((entry) => ({
+    key: entry.key,
+    hash: null,
+    items: [],
+    totalCount: 0,
+  }));
+  const user = socketSession?.user ?? null;
+  let nextIndex = 0;
+
+  const run = async () => {
+    while (true) {
+      const index = nextIndex++;
+      if (index >= entries.length) return;
+      const entry = entries[index]!;
+      const refLoader = new RefLoader((type, ids) =>
+        adapter.batchFindByType(type, ids),
+      );
+      results[index] = await runWithRequestContext(
+        { user, refLoader },
+        async () => {
+          const ModelClass = adapter.modelsByType.get(entry.modelType);
+          if (!ModelClass) return results[index]!;
+          const scope = (ModelClass as any).scope;
+          if (!scope?.read) return results[index]!;
+
+          const scopeResult = scope.read({ user, params: {}, data: {} } as any);
+          if (!scopeResult) return results[index]!;
+
+          const prep = prepareClientQuery({
+            ModelClass,
+            scopeResult,
+            rawSteps: entry.steps,
+            modelByType: adapter.modelsByType,
+            adapter,
+          });
+
+          if (entry.subscribe === false) {
+            const { items, totalCount } = await runQueryStatic({
+              prep,
+              user,
+              adapter,
+            });
+            return { key: entry.key, hash: null, items, totalCount };
+          }
+
+          if (!adapter.subscriptions) return results[index]!;
+          const { items, hash, totalCount } = await runQuerySubscription({
+            prep,
+            socketId,
+            user,
+            adapter,
+          });
+          return { key: entry.key, hash, items, totalCount };
+        },
+      );
+    }
+  };
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(concurrency, entries.length) },
+      () => run(),
+    ),
+  );
   return results;
 }
 
 // ─── createApp ───────────────────────────────────────────────────────────────
+
+type AppState =
+  | "idle"
+  | "starting"
+  | "started"
+  | "stopping"
+  | "stopped"
+  | "failed";
+
+const APP_START_CLAIM = Symbol.for("@parcae/backend/app-start-claimed");
+
+function claimApplication(): void {
+  const globals = globalThis as typeof globalThis & Record<PropertyKey, unknown>;
+  if (globals[APP_START_CLAIM]) {
+    throw new Error(
+      "A Parcae application has already started in this process; app startup is one-shot",
+    );
+  }
+  globals[APP_START_CLAIM] = true;
+}
+
+function clearApplicationContext(): void {
+  _clearServices();
+}
 
 export function createApp(config: AppConfig): ParcaeApp {
   const version = config.version ?? "v1";
@@ -395,7 +563,15 @@ export function createApp(config: AppConfig): ParcaeApp {
   let server: ServerContext | null = null;
   let envConfig: Config | null = null;
   let flags: RuntimeFlags | null = null;
-  let teardown: Parameters<typeof shutdownResources>[0] | null = null;
+  let teardown: ShutdownResources | null = null;
+  let state: AppState = "idle";
+  let transition = Promise.resolve();
+
+  const serialize = (operation: () => Promise<void>): Promise<void> => {
+    const run = transition.then(operation, operation);
+    transition = run.catch(() => {});
+    return run;
+  };
 
   return {
     get schemas() {
@@ -406,6 +582,18 @@ export function createApp(config: AppConfig): ParcaeApp {
     },
 
     async start(options = {}) {
+      return serialize(async () => {
+        if (state !== "idle") {
+          throw new Error(
+            `Cannot start Parcae app while lifecycle state is "${state}"`,
+          );
+        }
+        claimApplication();
+        state = "starting";
+        const resources: ShutdownResources = {};
+        teardown = resources;
+
+        try {
       // ── Step 0: Parse & validate config ────────────────────────────
       envConfig = parseConfig(process.env, projectRoot);
       const port = options.port ?? envConfig.PORT;
@@ -431,9 +619,9 @@ export function createApp(config: AppConfig): ParcaeApp {
 
       // ── Step 1: Discover models ────────────────────────────────────
       if (Array.isArray(config.models)) {
-        models = config.models;
+        models = normalizeModels(config.models);
       } else {
-        models = await discoverModels(config.models);
+        models = normalizeModels(await discoverModels(config.models));
       }
       log.info(
         `Found ${models.length} model(s): ${models.map((m) => m.type).join(", ")}`,
@@ -485,7 +673,9 @@ export function createApp(config: AppConfig): ParcaeApp {
           connection: { filename },
           useNullAsDefault: true,
         });
+        resources.writeDb = writeDb;
         readDb = writeDb; // SQLite has no read replica
+        resources.readDb = readDb;
         log.info(`SQLite database: ${filename}`);
       } else {
         writeDb = knex({
@@ -493,13 +683,17 @@ export function createApp(config: AppConfig): ParcaeApp {
           connection: envConfig.DATABASE_URL,
           pool: { min: 2, max: dbPoolMax },
         });
-        readDb = envConfig.DATABASE_READ_URL
-          ? knex({
-              client: "pg",
-              connection: envConfig.DATABASE_READ_URL,
-              pool: { min: 2, max: dbPoolMax },
-            })
-          : writeDb;
+        resources.writeDb = writeDb;
+        if (envConfig.DATABASE_READ_URL) {
+          readDb = knex({
+            client: "pg",
+            connection: envConfig.DATABASE_READ_URL,
+            pool: { min: 2, max: dbPoolMax },
+          });
+        } else {
+          readDb = writeDb;
+        }
+        resources.readDb = readDb;
       }
 
       log.info("Database connected");
@@ -507,11 +701,16 @@ export function createApp(config: AppConfig): ParcaeApp {
       // ── Step 4: Connect Redis (PubSub + Queue) ─────────────────────
       log.info("Connecting PubSub...");
       const pubsub = new PubSub({ url: envConfig.REDIS_URL });
+      resources.pubsub = pubsub;
       await pubsub.building;
       log.info("PubSub ready");
 
       log.info("Connecting Queue...");
-      const queue = new QueueService({ url: envConfig.REDIS_URL, name: envConfig.JOB_QUEUE_NAME || "parcae" });
+      const queue = new QueueService({
+        url: envConfig.REDIS_URL,
+        name: envConfig.JOB_QUEUE_NAME || "parcae",
+      });
+      resources.queue = queue;
       await queue.building;
       log.info("Queue ready");
 
@@ -529,6 +728,7 @@ export function createApp(config: AppConfig): ParcaeApp {
       // adapter publishes here; QuerySubscriptionManager listens
       // (wired below). One bus per app; close()'d at shutdown.
       const changeBus = new ChangeBus({ pubsub });
+      resources.changeBus = changeBus;
       _setChangeBus(changeBus);
 
       // ── Step 5: Set up BackendAdapter + Model.use() ────────────────
@@ -555,6 +755,7 @@ export function createApp(config: AppConfig): ParcaeApp {
       const ensureSchema = process.env.ENSURE_SCHEMA === "true";
 
       if (authAdapter) {
+        resources.auth = authAdapter;
         const userModel = models.find((m) => m.type === "user") ?? null;
 
         await authAdapter.setup({
@@ -596,6 +797,8 @@ export function createApp(config: AppConfig): ParcaeApp {
 
       // ── Step 8: Create server ──────────────────────────────────────
       server = createServer_({ config: envConfig, version });
+      resources.io = server.io;
+      resources.httpServer = server.httpServer;
       _setIo(server.io);
 
       // ── Step 9: Set up QuerySubscriptionManager ────────────────────
@@ -606,16 +809,23 @@ export function createApp(config: AppConfig): ParcaeApp {
       // `emitToSocket` is still provided as a fallback for any path
       // that doesn't have a room (e.g. force-refresh on a query the
       // socket hasn't joined yet).
-      const reevalConcurrency = process.env.PARCAE_REEVAL_CONCURRENCY
-        ? Math.max(1, Number(process.env.PARCAE_REEVAL_CONCURRENCY))
-        : undefined;
-      const maxSubscriptionsPerSocket = process.env
-        .PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET
-        ? Math.max(
-            1,
-            Number(process.env.PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET),
-          )
-        : config.maxSubscriptionsPerSocket;
+      const reevalConcurrency = parsePositiveInteger(
+        process.env.PARCAE_REEVAL_CONCURRENCY,
+        "PARCAE_REEVAL_CONCURRENCY",
+      );
+      const maxSubscriptionsPerSocket = parsePositiveInteger(
+        process.env.PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET ??
+          config.maxSubscriptionsPerSocket,
+        "PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET",
+      );
+      const maxResyncQueries = parsePositiveInteger(
+        process.env.PARCAE_MAX_RESYNC_QUERIES,
+        "PARCAE_MAX_RESYNC_QUERIES",
+      ) ?? DEFAULT_MAX_RESYNC_QUERIES;
+      const resyncConcurrency = parsePositiveInteger(
+        process.env.PARCAE_RESYNC_CONCURRENCY,
+        "PARCAE_RESYNC_CONCURRENCY",
+      ) ?? DEFAULT_RESYNC_CONCURRENCY;
       const subscriptions = new QuerySubscriptionManager(
         {
           emitToSocket: (socketId, event, data) => {
@@ -660,6 +870,7 @@ export function createApp(config: AppConfig): ParcaeApp {
         const modelType = pluralize.singular(change.table);
         subscriptions.onModelChange(modelType);
       });
+      resources.offChange = offChange;
 
       // ── Step 9.5: LISTEN/NOTIFY poller (Postgres only) ─────────────
       // Captures external writes that bypass Parcae's adapter (raw
@@ -676,6 +887,7 @@ export function createApp(config: AppConfig): ParcaeApp {
           url: envConfig.DATABASE_URL,
           changeBus,
         });
+        resources.listenNotify = listenNotify;
         try {
           await listenNotify.start();
           log.info("LISTEN/NOTIFY poller started");
@@ -685,30 +897,17 @@ export function createApp(config: AppConfig): ParcaeApp {
               (err as Error).message
             }`,
           );
+          await listenNotify.stop();
           listenNotify = null;
+          resources.listenNotify = null;
         }
       }
-
-      teardown = {
-        io: server.io,
-        httpServer: server.httpServer,
-        changeBus,
-        offChange,
-        listenNotify,
-        pubsub,
-        queue,
-        writeDb,
-        readDb,
-        crons: null,
-      };
+      resources.crons = [];
 
       // ── Step 10: Mount auth routes + middleware ─────────────────────
       if (authAdapter) {
         if (authAdapter.routes) {
-          server.polka.all(
-            `${authAdapter.routes.basePath}/*`,
-            authAdapter.routes.handler,
-          );
+          mountAuthRoutes(server.polka, authAdapter.routes);
         }
 
         // Middleware: resolve every request to req.session
@@ -735,7 +934,7 @@ export function createApp(config: AppConfig): ParcaeApp {
       // this scope (background jobs, hooks fired from non-HTTP code
       // paths, tests) `findById` falls through to the direct
       // per-id query. See `services/ref-loader.ts` for the contract.
-      server.polka.use((req: any, res: any, next: any) => {
+      server.polka.use((req: any, _res: any, next: any) => {
         const user = req.session?.user ?? null;
         const refLoader = new RefLoader((type, ids) =>
           adapter.batchFindByType(type, ids),
@@ -747,7 +946,7 @@ export function createApp(config: AppConfig): ParcaeApp {
 
       if (config.middleware?.length) {
         for (const middleware of config.middleware) {
-          server.polka.use(middleware);
+          server.polka.use(wrapHttpHandler(middleware));
         }
       }
 
@@ -1019,6 +1218,7 @@ export function createApp(config: AppConfig): ParcaeApp {
         }
 
         const startedCrons: Cron[] = [];
+        resources.crons = startedCrons;
         const scheduled: string[] = [];
         const skipped: string[] = [];
         for (const entry of registeredCrons) {
@@ -1029,7 +1229,6 @@ export function createApp(config: AppConfig): ParcaeApp {
           startedCrons.push(startCron(entry, pubsub));
           scheduled.push(`${entry.name}@"${entry.pattern}"`);
         }
-        if (teardown) teardown.crons = startedCrons;
         if (scheduled.length > 0) {
           log.info(`Scheduled ${scheduled.length} cron(s): ${scheduled.join(", ")}`);
         }
@@ -1050,7 +1249,11 @@ export function createApp(config: AppConfig): ParcaeApp {
       // expects it), but on worker-only processes it sits idle — no
       // clients should be hitting the worker URL anyway.
       if (flags.server) server.io.on("connection", (socket) => {
-        let socketSession: any = null;
+        const socketSession = createSocketSessionController(
+          socket.id,
+          authAdapter,
+          subscriptions,
+        );
 
         // ── RPC: pipe socket calls through Polka's HTTP handler ─────
         socket.on(
@@ -1095,7 +1298,7 @@ export function createApp(config: AppConfig): ParcaeApp {
                 query: mergedQuery,
                 _socketQuery: mergedQuery,
                 params: {},
-                session: socketSession,
+                session: socketSession.session,
                 _socketRpc: true, // marker: skip auth middleware resolution
                 _socketId: socket.id,
                 _parsedUrl: { pathname, query: qs || "", _raw: path },
@@ -1120,6 +1323,7 @@ export function createApp(config: AppConfig): ParcaeApp {
                   compress({
                     result: null,
                     success: false,
+                    status: err instanceof ClientError ? err.status : 500,
                     error:
                       err instanceof ClientError
                         ? err.message
@@ -1145,19 +1349,8 @@ export function createApp(config: AppConfig): ParcaeApp {
         // id. One round trip restores N queries.
         socket.on(
           "hello",
-          async (payload: { token?: string | null }, callback: any) => {
-            const token = payload?.token ?? null;
-            if (authAdapter && token) {
-              try {
-                socketSession = await authAdapter.resolveToken(token);
-              } catch {
-                socketSession = null;
-              }
-            } else {
-              socketSession = null;
-            }
-            callback?.({ userId: socketSession?.user?.id ?? null });
-          },
+          (payload: { token?: string | null }, callback: any) =>
+            socketSession.hello(payload, callback),
         );
 
         socket.on(
@@ -1180,31 +1373,21 @@ export function createApp(config: AppConfig): ParcaeApp {
             },
             callback: any,
           ) => {
-            const entries = payload?.queries ?? [];
+            const entries = Array.isArray(payload?.queries) ? payload.queries : [];
             if (entries.length === 0) {
               callback?.({ success: true, results: [] });
               return;
             }
-            // Install a request-scoped context so `runQuerySubscription`
-            // → `hydrateExpansions` → `getRefLoader()` finds a loader.
-            // Without this, `.expand("file")` projections silently
-            // no-op on every reconnect and the editor's pre-hydrated
-            // ref proxies snap to null. Mirrors the Polka middleware
-            // at server.polka.use(...) that wraps every HTTP request.
-            const user = socketSession?.user ?? null;
-            const refLoader = new RefLoader((type, ids) =>
-              adapter.batchFindByType(type, ids),
-            );
             try {
-              const results = await runWithRequestContext(
-                { user, refLoader },
-                () =>
-                  resyncQueries(
-                    socket.id,
-                    socketSession,
-                    entries,
-                    adapter,
-                  ),
+              const results = await resyncQueries(
+                socket.id,
+                socketSession.session,
+                entries,
+                adapter,
+                {
+                  maxEntries: maxResyncQueries,
+                  concurrency: resyncConcurrency,
+                },
               );
               callback?.({ success: true, results });
             } catch (err: any) {
@@ -1228,7 +1411,7 @@ export function createApp(config: AppConfig): ParcaeApp {
               socket,
               io: server!.io,
               data,
-              session: socketSession,
+              session: socketSession.session,
               socketId: socket.id,
               emit: (event: string, ...args: any[]) =>
                 socket.emit(event, ...args),
@@ -1239,6 +1422,7 @@ export function createApp(config: AppConfig): ParcaeApp {
               log.error(`[socket] ${entry.event} error:`, err);
               socket.emit("error", {
                 event: entry.event,
+                status: err instanceof ClientError ? err.status : 500,
                 message:
                   err instanceof ClientError
                     ? err.message
@@ -1249,8 +1433,8 @@ export function createApp(config: AppConfig): ParcaeApp {
         }
 
         // Query subscriptions
-        socket.on("unsubscribe:query", (data: any) => {
-          subscriptions.unsubscribe(socket.id, data.hash);
+        socket.on("unsubscribe:query", (hash: string) => {
+          subscriptions.unsubscribe(socket.id, hash);
         });
 
         socket.on("disconnect", () => {
@@ -1263,9 +1447,7 @@ export function createApp(config: AppConfig): ParcaeApp {
       // Cloud Run / k8s health probes need *something* to talk to, and the
       // `/{version}/health` endpoint registered in Step 11 is the cheapest
       // signal of liveness we have.
-      await new Promise<void>((resolveStart) => {
-        server!.httpServer.listen(port, () => resolveStart());
-      });
+      await listenServer(server.httpServer, port);
 
       const exposedRoutes = flags.server ? routes.length + crudCount : 0;
       log.success(
@@ -1277,17 +1459,32 @@ export function createApp(config: AppConfig): ParcaeApp {
           `${getJobs().length} jobs, ` +
           `${getCrons().length} crons`,
       );
+          state = "started";
+        } catch (err) {
+          await shutdownResources(resources);
+          clearApplicationContext();
+          server = null;
+          teardown = null;
+          state = "failed";
+          throw err;
+        }
+      });
     },
 
     async stop() {
-      if (!server) return;
-      log.info("Shutting down...");
-
-      await shutdownResources(teardown ?? {});
-
-      server = null;
-      teardown = null;
-      log.info("Shutdown complete");
+      return serialize(async () => {
+        if (state === "idle" || state === "stopped" || state === "failed") {
+          return;
+        }
+        state = "stopping";
+        log.info("Shutting down...");
+        await shutdownResources(teardown ?? {});
+        clearApplicationContext();
+        server = null;
+        teardown = null;
+        state = "stopped";
+        log.info("Shutdown complete");
+      });
     },
   };
 }

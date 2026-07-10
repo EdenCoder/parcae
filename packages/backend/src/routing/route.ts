@@ -35,8 +35,9 @@
 
 // ─── HTTP Types ──────────────────────────────────────────────────────────────
 
-export type RouteHandler = (req: any, res: any, next?: () => void) => any;
-export type Middleware = (req: any, res: any, next: () => void) => any;
+export type Next = (error?: unknown) => unknown;
+export type RouteHandler = (req: any, res: any, next?: Next) => any;
+export type Middleware = (req: any, res: any, next: Next) => any;
 
 export interface RouteOptions {
   /** Route priority (lower = higher priority). Default: 100. */
@@ -118,6 +119,30 @@ export function clearSocketHandlers(): void {
 }
 
 /**
+ * Polka does not observe returned promises. Bridge sync throws and async
+ * rejections into its existing `next(error)` responder without auto-advancing
+ * successful middleware that intentionally omits `next()`.
+ */
+export function wrapHttpHandler<T extends (...args: any[]) => any>(handler: T): T {
+  return ((req: any, res: any, next?: Next) => {
+    const reject = (error: unknown): unknown => {
+      if (next) return next(error);
+      throw error;
+    };
+
+    try {
+      const result = handler(req, res, next);
+      if (result && typeof result.then === "function") {
+        return Promise.resolve(result).catch(reject);
+      }
+      return result;
+    } catch (error) {
+      return reject(error);
+    }
+  }) as T;
+}
+
+/**
  * Run a socket middleware chain then the handler.
  * Middleware calls next() to proceed; throwing or not calling next() aborts.
  */
@@ -182,8 +207,8 @@ function registerRoute(method: string, path: string, ...args: any[]): void {
   registeredRoutes.push({
     method: method.toUpperCase(),
     path,
-    middlewares,
-    handler,
+    middlewares: middlewares.map((middleware) => wrapHttpHandler(middleware)),
+    handler: wrapHttpHandler(handler),
     priority: options.priority ?? 100,
   });
 }

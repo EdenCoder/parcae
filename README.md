@@ -118,7 +118,7 @@ GET    /v1/health         status, uptime, model count
 | ------------------------------------------------------- | ------------------------------------------------------------------- |
 | [`@parcae/model`](./packages/model)                     | Model base class, Proxy system, query builder, adapter interface    |
 | [`@parcae/backend`](./packages/backend)                 | createApp, auto-CRUD, hooks, jobs, PubSub, queue, schema resolution |
-| [`@parcae/sdk`](./packages/sdk)                         | Client SDK — Socket.IO and SSE transports, React hooks              |
+| [`@parcae/sdk`](./packages/sdk)                         | Client SDK — Socket.IO transport, session lifecycle, React hooks    |
 | [`@parcae/auth-betterauth`](./packages/auth-betterauth) | Better Auth adapter — self-hosted, same Postgres                    |
 | [`@parcae/auth-clerk`](./packages/auth-clerk)           | Clerk adapter — external auth proxied to your User model            |
 | [`@parcae/i18n`](./packages/i18n)                       | Lingui-powered locale negotiation, backend middleware, React helper |
@@ -266,24 +266,30 @@ const app = createApp({
   auth: clerk({
     secretKey: process.env.CLERK_SECRET_KEY!,
     publishableKey: process.env.CLERK_PUBLISHABLE_KEY!,
+    authorizedParties: ["https://app.example.com"],
   }),
 });
 ```
 
-`req.session.user` is available in every route handler and scope. Socket.IO authenticates via the `authenticate` event. Implement the `AuthAdapter` interface to bring whatever you want.
+`req.session.user` is available in every route handler and scope. On every Socket.IO connection, the client sends one `hello` with its current bearer token; the server resolves it and acknowledges the user ID before RPC calls proceed. Implement the `AuthAdapter` interface to bring whatever you want.
 
 ## Client SDK
 
-Two transports, same API. Socket.IO for bidirectional realtime, SSE for simpler infrastructure.
+The SDK uses Socket.IO for RPC and realtime updates. `getToken` is required and runs before the initial `hello` and again on reconnect; return `null` for an anonymous client.
 
 ```typescript
 import { createClient } from "@parcae/sdk";
 
-const client = createClient({ url: "http://localhost:3000" });
-// or: createClient({ url: "...", transport: "sse" })
+const client = createClient({
+  url: "http://localhost:3000",
+  getToken: async () => localStorage.getItem("token"),
+});
+
+const ClientPost = client.bind(Post);
+const posts = await ClientPost.where({ published: true }).find();
 ```
 
-The client wires up `Model.use()` automatically — `Post.where(...)` just works on the frontend.
+`createClient()` owns an independent transport, session machine, connection machine, and frontend adapter. The first client can install the process's one-time default model adapter when none exists, but code with multiple clients or server and client contexts must use `client.bind(ModelClass)`. Binding returns an adapter-bound constructor without mutating the original model or another client. Call `client.dispose()` when that client is permanently retired; temporary wire loss only changes connection state, and reconnect performs a fresh `hello` followed by query resync without signing the session out.
 
 ## React
 

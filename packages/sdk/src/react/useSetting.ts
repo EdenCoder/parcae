@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParcae } from "./context";
 import { useSession } from "./useSession";
 
@@ -9,32 +9,44 @@ export function useSetting<T = string>(
   defaultValue: T,
 ): [T, (value: T) => Promise<void>, { isLoading: boolean }] {
   const client = useParcae();
-  const { status } = useSession();
+  const { status, userId } = useSession();
 
   const [value, setValue] = useState<T>(defaultValue);
   const [isLoading, setIsLoading] = useState(true);
+  const requestGeneration = useRef(0);
+  const defaultValueRef = useRef(defaultValue);
+  defaultValueRef.current = defaultValue;
 
   useEffect(() => {
+    const generation = ++requestGeneration.current;
+    setValue(defaultValueRef.current);
+    setIsLoading(status === "pending" || status === "authenticated");
+
     if (status === "pending") return;
     if (status !== "authenticated") {
-      setIsLoading(false);
       return;
     }
 
-    let cancelled = false;
     client
       .get(`/settings/${encodeURIComponent(key)}`)
       .then((result: any) => {
-        if (!cancelled && result?.value !== undefined) setValue(result.value);
+        if (
+          requestGeneration.current === generation &&
+          result?.value !== undefined
+        ) {
+          setValue(result.value);
+        }
       })
       .catch(() => {})
       .finally(() => {
-        if (!cancelled) setIsLoading(false);
+        if (requestGeneration.current === generation) setIsLoading(false);
       });
     return () => {
-      cancelled = true;
+      if (requestGeneration.current === generation) {
+        requestGeneration.current++;
+      }
     };
-  }, [key, client, status]);
+  }, [key, client, status, userId]);
 
   const update = useCallback(
     async (newValue: T) => {
@@ -43,7 +55,7 @@ export function useSetting<T = string>(
         value: newValue,
       });
     },
-    [key, client],
+    [key, client, userId],
   );
 
   return [value, update, { isLoading }];

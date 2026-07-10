@@ -56,6 +56,7 @@ export {
   type ContractRequest,
   type ContractResponse,
   type ContractGuard,
+  type ContractOrgAuthorizer,
   type MountOptions,
 } from "./contract.js";
 

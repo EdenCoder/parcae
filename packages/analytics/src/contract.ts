@@ -26,6 +26,7 @@
  */
 
 import type { Knex } from "knex";
+import { log } from "@parcae/backend";
 import type { Period } from "./period.js";
 
 /**
@@ -73,6 +74,11 @@ export type ContractGuard = (
   req: ContractRequest,
 ) => string | { error: string; status?: number };
 
+export type ContractOrgAuthorizer = (
+  req: ContractRequest,
+  requestedOrg: string,
+) => boolean | Promise<boolean>;
+
 export abstract class Contract<T = unknown> {
   abstract readonly path: string;
   /**
@@ -96,7 +102,9 @@ export abstract class Contract<T = unknown> {
     db: Knex,
     parsePeriod: (spec: string) => Period,
   ): Promise<ContractContext> {
-    const org = pickString(req.query.org) ?? req.session?.orgId;
+    const sessionOrg = req.session?.orgId ?? req.session?.user?.orgId;
+    const requestedOrg = pickString(req.query.org);
+    const org = requestedOrg ?? sessionOrg;
     if (!org) {
       throw new ContractError(400, "missing org");
     }
@@ -144,6 +152,10 @@ export interface MountOptions {
   parsePeriod: (spec: string) => Period;
   /** Optional auth gate — return user-facing error string to deny. */
   guard?: ContractGuard;
+  /** Required to authorize a query org that differs from the session org. */
+  authorizeOrg?: ContractOrgAuthorizer;
+  /** Optional logger override. Defaults to @parcae/backend's logger. */
+  logger?: { error(message: string, error: unknown): void };
 }
 
 /**
@@ -191,6 +203,7 @@ export function mountContract<T>(
         opts.db,
         opts.parsePeriod,
       );
+      await authorizeContext(reqShape, ctx.org, opts.authorizeOrg);
       const [data, freshness] = await Promise.all([
         contract.data(ctx),
         contract.freshness(ctx),
@@ -200,11 +213,25 @@ export function mountContract<T>(
       if (err instanceof ContractError) {
         return respond(res, err.status, { error: err.message });
       }
-      const message =
-        err instanceof Error ? err.message : "internal error";
-      respond(res, 500, { error: message });
+      if (opts.logger) {
+        opts.logger.error(`[analytics] ${contract.path} failed`, err);
+      } else {
+        log.error(`[analytics] ${contract.path} failed:`, err);
+      }
+      respond(res, 500, { error: "internal error" });
     }
   });
+}
+
+async function authorizeContext(
+  req: ContractRequest,
+  org: string,
+  authorizeOrg?: ContractOrgAuthorizer,
+): Promise<void> {
+  const sessionOrg = req.session?.orgId ?? req.session?.user?.orgId;
+  if (org !== sessionOrg && (!authorizeOrg || !(await authorizeOrg(req, org)))) {
+    throw new ContractError(403, "forbidden org");
+  }
 }
 
 function pickString(v: string | string[] | undefined): string | undefined {

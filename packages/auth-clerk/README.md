@@ -23,6 +23,7 @@ const app = createApp({
   auth: clerk({
     secretKey: process.env.CLERK_SECRET_KEY!,
     publishableKey: process.env.CLERK_PUBLISHABLE_KEY!,
+    authorizedParties: ["https://app.example.com"],
     webhookSecret: process.env.CLERK_WEBHOOK_SECRET, // optional
   }),
 });
@@ -73,6 +74,17 @@ If `webhookSecret` is provided, the adapter mounts a webhook endpoint that handl
 - `user.deleted` — removes the local User record
 
 Webhooks are verified using Svix (Clerk's webhook delivery system).
+Verification requires the exact `req.rawBody` bytes captured by Parcae's JSON
+middleware; parsed or re-serialized request bodies are rejected.
+
+Parcae mounts auth handlers at `${webhookPath}/*`. With the default prefix,
+configure Clerk's exact webhook endpoint as
+`https://api.example.com/webhooks/clerk/events`. The final non-empty path
+segment is required by the backend wildcard mount.
+
+Provisioning and webhook changes are serialized per Clerk user. Deletions also
+write a persistent tombstone under a PostgreSQL advisory transaction lock, so
+another process cannot recreate a deleted local user from an in-flight request.
 
 ### Custom user mapping
 
@@ -99,15 +111,31 @@ clerk({
   secretKey: process.env.CLERK_SECRET_KEY!,
   publishableKey: process.env.CLERK_PUBLISHABLE_KEY!,
 
+  // Validates the JWT azp claim against your frontend origins
+  authorizedParties: ["https://app.example.com"],
+
   // Optional — enables webhook sync
   webhookSecret: process.env.CLERK_WEBHOOK_SECRET,
 
-  // Webhook route path. Default: "/webhooks/clerk"
+  // Webhook mount prefix. Exact default endpoint: "/webhooks/clerk/events".
   webhookPath: "/webhooks/clerk",
 
   // Custom Clerk → User mapping
   mapUser: (clerkUser) => ({ ... }),
 })
+```
+
+## Client adapter
+
+The client requires a real Clerk session subscription. Token read failures are
+propagated by `getToken()` and are not converted into sign-out events.
+
+```typescript
+const auth = createClerkAuthAdapter(getToken, {
+  organizationId,
+  subscribe: (onSessionChange) => clerk.addListener(onSessionChange),
+  onError: reportError,
+});
 ```
 
 ## Environment Variables

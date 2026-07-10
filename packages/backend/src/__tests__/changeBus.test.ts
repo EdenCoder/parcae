@@ -69,6 +69,25 @@ describe("ChangeBus", () => {
     expect(received[0]!.source).toBe("hook");
   });
 
+  it("reserves a request id without dispatch and drops an early LISTEN echo", async () => {
+    const received: Change[] = [];
+    bus.on((c) => received.push(c));
+
+    bus.reserve(makeChange({ requestId: "req_reserved" }));
+    expect(received).toHaveLength(0);
+    bus.emit(
+      makeChange({ requestId: "req_reserved", source: "listen" }),
+    );
+    bus.emit(
+      makeChange({ requestId: "req_reserved", source: "hook" }),
+    );
+
+    await Promise.resolve();
+    expect(received).toEqual([
+      expect.objectContaining({ requestId: "req_reserved", source: "hook" }),
+    ]);
+  });
+
   it("delivers a LISTEN emit with no matching hook requestId", async () => {
     const received: Change[] = [];
     bus.on((c) => received.push(c));
@@ -87,6 +106,25 @@ describe("ChangeBus", () => {
       id: "p1",
       source: "listen",
     });
+  });
+
+  it("does not suppress a different row from the same request", async () => {
+    const received: Change[] = [];
+    bus.on((change) => received.push(change));
+
+    bus.emit(makeChange({ requestId: "req_mixed", id: "hook-row" }));
+    bus.emit(
+      makeChange({
+        requestId: "req_mixed",
+        id: "raw-row",
+        source: "listen",
+      }),
+    );
+
+    expect(received.map((change) => change.id)).toEqual([
+      "hook-row",
+      "raw-row",
+    ]);
   });
 
   it("delivers two LISTEN events for unrelated requestIds", async () => {

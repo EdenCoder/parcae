@@ -101,6 +101,7 @@ const mocks = vi.hoisted(() => {
       IORedis.mockClear();
       Queue.mockClear();
       Worker.mockClear();
+      Job.fromId.mockReset();
     },
   };
 });
@@ -117,7 +118,7 @@ vi.mock("bullmq", () => ({
 }));
 
 // Late import so the mocks above are in place.
-import { QueueService } from "../services/queue";
+import { QueueService, addJobIfNotExists } from "../services/queue";
 
 describe("QueueService — shared ioredis", () => {
   beforeEach(() => {
@@ -233,6 +234,21 @@ describe("QueueService — shared ioredis", () => {
     expect(mocks.IORedis).not.toHaveBeenCalled();
   });
 
+  it("forceClose aborts workers and disconnects Redis without awaiting drain", async () => {
+    const svc = new QueueService({ url: "redis://localhost:6379" });
+    await svc.building;
+    const redis = mocks.ioredisInstances[0];
+    svc.get("queue-a");
+    svc.createWorker("queue-a", async () => {});
+
+    svc.forceClose();
+
+    expect(mocks.workerInstances[0]!.close).toHaveBeenCalledWith(true);
+    expect(mocks.queueInstances[0]!.close).toHaveBeenCalledTimes(1);
+    expect(redis.disconnect).toHaveBeenCalledWith(false);
+    expect(svc.get()).toBeNull();
+  });
+
   it("handles TLS rediss:// URLs (passes tls option through to ioredis)", async () => {
     const svc = new QueueService({
       url: "rediss://user:pass@my-host:6380",
@@ -248,5 +264,46 @@ describe("QueueService — shared ioredis", () => {
     expect(opts?.username).toBe("user");
     expect(opts?.password).toBe("pass");
     expect(opts?.tls).toBeDefined();
+  });
+});
+
+describe("addJobIfNotExists", () => {
+  beforeEach(() => {
+    mocks.Job.fromId.mockReset().mockResolvedValue(null);
+  });
+
+  it("keys the recent cache by queue and job id", async () => {
+    const queueA = {
+      name: "queue-a",
+      add: vi.fn(async () => ({ id: "same" })),
+    };
+    const queueB = {
+      name: "queue-b",
+      add: vi.fn(async () => ({ id: "same" })),
+    };
+
+    await addJobIfNotExists(queueA as any, "build", {}, { jobId: "same" });
+    await addJobIfNotExists(queueB as any, "build", {}, { jobId: "same" });
+
+    expect(queueA.add).toHaveBeenCalledTimes(1);
+    expect(queueB.add).toHaveBeenCalledTimes(1);
+  });
+
+  it("only records the recent cache after enqueue succeeds", async () => {
+    const queue = {
+      name: "queue-retry",
+      add: vi
+        .fn()
+        .mockRejectedValueOnce(new Error("redis unavailable"))
+        .mockResolvedValueOnce({ id: "retry" }),
+    };
+
+    await expect(
+      addJobIfNotExists(queue as any, "build", {}, { jobId: "retry" }),
+    ).rejects.toThrow("redis unavailable");
+    await expect(
+      addJobIfNotExists(queue as any, "build", {}, { jobId: "retry" }),
+    ).resolves.toEqual({ id: "retry" });
+    expect(queue.add).toHaveBeenCalledTimes(2);
   });
 });

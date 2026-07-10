@@ -51,12 +51,11 @@ export async function addJobIfNotExists(
 ): Promise<Job | null> {
   const { jobId } = options;
 
-  const recentTime = recentlyQueued.get(jobId);
+  const cacheKey = `${queue.name}\0${jobId}`;
+  const recentTime = recentlyQueued.get(cacheKey);
   if (recentTime && Date.now() - recentTime < RECENT_QUEUE_TTL_MS) {
     return null;
   }
-
-  recentlyQueued.set(jobId, Date.now());
 
   if (recentlyQueued.size > 1000) {
     const now = Date.now();
@@ -75,11 +74,13 @@ export async function addJobIfNotExists(
     } catch {}
   }
 
-  return queue.add(name, data, {
+  const added = await queue.add(name, data, {
     jobId,
     removeOnComplete: options.removeOnComplete ?? 100,
     removeOnFail: options.removeOnFail ?? 50,
   });
+  recentlyQueued.set(cacheKey, Date.now());
+  return added;
 }
 
 // ─── QueueService ────────────────────────────────────────────────────────────
@@ -120,18 +121,19 @@ export class QueueService {
    * and let third-party consumers pick up specific jobs without colliding
    * with each other.
    *
-   * BullMQ v5 rejects colons in queue names, so any colons (from the
-   * namespace separator OR from a colon-style job name like `post:index`)
-   * are collapsed to dashes. Job names themselves keep their original
-   * shape — only the derived queue name is sanitised.
+   * BullMQ v5 rejects colons in queue names. Percent-escaping both `%` and
+   * `:` keeps the mapping injective (`post:index` cannot collide with
+   * `post-index` or the literal `post%3Aindex`).
    *
    * @example
    * queueNameFor("panel")                    → "parcae-panel"
    * queueNameFor("project-asset.image")      → "parcae-project-asset.image"
-   * queueNameFor("post:index")               → "parcae-post-index"
+   * queueNameFor("post:index")               → "parcae-post%3Aindex"
    */
   queueNameFor(jobName: string): string {
-    return `${this.defaultName}:${jobName}`.split(":").join("-");
+    const escape = (value: string) =>
+      value.replace(/%/g, "%25").replace(/:/g, "%3A");
+    return `${escape(this.defaultName)}-${escape(jobName)}`;
   }
 
   private async build(url: string): Promise<void> {
@@ -226,5 +228,23 @@ export class QueueService {
       }
       this.sharedRedis = null;
     }
+  }
+
+  /** Abort graceful draining and synchronously sever every Redis connection. */
+  forceClose(): void {
+    const queues = [...this.queues.values()];
+    const workers = [...this.workers.values()];
+    const redis = this.sharedRedis;
+    this.queues.clear();
+    this.workers.clear();
+    this.sharedRedis = null;
+
+    for (const worker of workers) {
+      void worker.close(true).catch(() => {});
+    }
+    for (const queue of queues) {
+      void queue.close().catch(() => {});
+    }
+    redis?.disconnect(false);
   }
 }

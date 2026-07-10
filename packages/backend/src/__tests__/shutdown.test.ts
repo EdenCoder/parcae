@@ -57,10 +57,18 @@ function makeFakes() {
     close: vi.fn(async () => {
       note("queue.close");
     }),
+    forceClose: vi.fn(() => {
+      note("queue.forceClose");
+    }),
   };
   const pubsub = {
     close: vi.fn(async () => {
       note("pubsub.close");
+    }),
+  };
+  const auth = {
+    close: vi.fn(async () => {
+      note("auth.close");
     }),
   };
   const writeDb = {
@@ -85,6 +93,7 @@ function makeFakes() {
     changeBus,
     queue,
     pubsub,
+    auth,
     writeDb,
     readDb,
   };
@@ -114,6 +123,7 @@ describe("shutdownResources", () => {
       changeBus: f.changeBus as any,
       queue: f.queue as any,
       pubsub: f.pubsub as any,
+      auth: f.auth as any,
       writeDb: f.writeDb as any,
       readDb: f.readDb as any,
     });
@@ -126,7 +136,9 @@ describe("shutdownResources", () => {
     expect(f.offChange).toHaveBeenCalledTimes(1);
     expect(f.changeBus.close).toHaveBeenCalledTimes(1);
     expect(f.queue.close).toHaveBeenCalledTimes(1);
+    expect(f.queue.forceClose).not.toHaveBeenCalled();
     expect(f.pubsub.close).toHaveBeenCalledTimes(1);
+    expect(f.auth.close).toHaveBeenCalledTimes(1);
     expect(f.writeDb.destroy).toHaveBeenCalledTimes(1);
     expect(f.readDb.destroy).toHaveBeenCalledTimes(1);
   });
@@ -154,6 +166,7 @@ describe("shutdownResources", () => {
       changeBus: f.changeBus as any,
       queue: f.queue as any,
       pubsub: f.pubsub as any,
+      auth: f.auth as any,
       writeDb: f.writeDb as any,
       readDb: f.readDb as any,
     });
@@ -169,6 +182,8 @@ describe("shutdownResources", () => {
     expect(ix("offChange")).toBeLessThan(ix("queue.close"));
     expect(ix("changeBus.close")).toBeLessThan(ix("queue.close"));
     expect(ix("queue.close")).toBeLessThan(ix("pubsub.close"));
+    expect(ix("pubsub.close")).toBeLessThan(ix("auth.close"));
+    expect(ix("auth.close")).toBeLessThan(ix("writeDb.destroy"));
     expect(ix("pubsub.close")).toBeLessThan(ix("writeDb.destroy"));
     expect(ix("pubsub.close")).toBeLessThan(ix("readDb.destroy"));
   });
@@ -220,6 +235,7 @@ describe("shutdownResources", () => {
     const elapsed = Date.now() - start;
 
     expect(elapsed).toBeLessThan(250); // generous: should be ~50ms
+    expect(f.queue.forceClose).toHaveBeenCalledTimes(1);
     // Subsequent resources still ran even after the queue timed out.
     expect(f.pubsub.close).toHaveBeenCalledTimes(1);
   });

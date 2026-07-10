@@ -11,7 +11,7 @@ import { I18nProvider } from "@lingui/react";
 import { setupI18n } from "@lingui/core";
 import type { I18n, Messages } from "@lingui/core";
 import {
-  activateLocale,
+  activateLocaleIfCurrent,
   getFormatLocales,
   resolveLocale,
   type LocaleResolution,
@@ -70,6 +70,7 @@ export function ParcaeI18nProvider<TLocale extends string = string>({
 
   const activeLocaleRef = useRef(firstResolution.locale);
   const readyRef = useRef(Boolean(initialMessages));
+  const activationGenerationRef = useRef(0);
 
   const [i18n] = useState(() => {
     const instance = setupI18n({ missing: config.missing });
@@ -91,8 +92,11 @@ export function ParcaeI18nProvider<TLocale extends string = string>({
     async (requestedLocale: string): Promise<LocaleResolution<TLocale>> => {
       const currentConfig = configRef.current;
       const nextResolution = resolveLocale(requestedLocale, currentConfig);
+      const generation = ++activationGenerationRef.current;
 
       if (readyRef.current && activeLocaleRef.current === nextResolution.locale) {
+        setLoading(false);
+        setError(null);
         setResolution(nextResolution);
         return nextResolution;
       }
@@ -101,19 +105,30 @@ export function ParcaeI18nProvider<TLocale extends string = string>({
       setError(null);
 
       try {
-        await activateLocale(i18n, currentConfig, nextResolution.locale);
+        const activated = await activateLocaleIfCurrent(
+          i18n,
+          currentConfig,
+          nextResolution.locale,
+          () => generation === activationGenerationRef.current,
+        );
+        if (!activated) return nextResolution;
         activeLocaleRef.current = nextResolution.locale;
         readyRef.current = true;
         setResolution(nextResolution);
         onLocaleChange?.(nextResolution);
         return nextResolution;
       } catch (err) {
+        if (generation !== activationGenerationRef.current) {
+          return nextResolution;
+        }
         const error = err instanceof Error ? err : new Error(String(err));
         setError(error);
         onError?.(error);
         throw error;
       } finally {
-        setLoading(false);
+        if (generation === activationGenerationRef.current) {
+          setLoading(false);
+        }
       }
     },
     [i18n, onError, onLocaleChange],
@@ -131,6 +146,7 @@ export function ParcaeI18nProvider<TLocale extends string = string>({
     });
     return () => {
       cancelled = true;
+      activationGenerationRef.current++;
     };
   }, [requestedLocale, setLocale]);
 

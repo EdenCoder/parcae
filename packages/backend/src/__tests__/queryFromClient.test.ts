@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
+import knexFactory from "knex";
 import { BackendAdapter } from "../adapters/model";
 import type { QueryStep, SchemaDefinition } from "@parcae/model";
 
@@ -20,7 +21,7 @@ function createMockModel(type: string, schema: SchemaDefinition): any {
 function createTestAdapter() {
   const calls: Array<{ method: string; args: any[] }> = [];
 
-  function makeChain(): any {
+  function makeChain(isRoot = true): any {
     return new Proxy(
       {},
       {
@@ -31,8 +32,16 @@ function createTestAdapter() {
           if (prop === "exec") return () => ({});
           if (prop === "clone") return () => makeChain();
           return (...args: any[]) => {
+            if (
+              isRoot &&
+              prop === "where" &&
+              typeof args[0] === "function"
+            ) {
+              args[0](makeChain(false));
+              return makeChain();
+            }
             calls[calls.length] = { method: prop, args };
-            return makeChain();
+            return makeChain(isRoot);
           };
         },
       },
@@ -433,8 +442,8 @@ describe("BackendAdapter.queryFromClient", () => {
         {},
         {
           get:
-            (_t, method: string) =>
-            (...args: any[]) =>
+            (_t, _method: string) =>
+            (..._args: any[]) =>
               mockBuilder,
         },
       );
@@ -716,6 +725,38 @@ describe("BackendAdapter.queryFromClient", () => {
       // Both wheres are ANDed by Knex — scope is never overridden
     });
 
+    it("keeps a tenant scope ANDed with a top-level client OR in generated SQL", async () => {
+      const knex = knexFactory({ client: "pg" });
+      const sqlAdapter = new BackendAdapter({ read: knex, write: knex });
+
+      try {
+        const query = sqlAdapter.queryFromClient(
+          ProjectModel,
+          { userId: "tenant-user" },
+          [
+            { method: "where", args: ["status", "active"] },
+            { method: "orWhere", args: ["userId", "attacker-user"] },
+            { method: "orderBy", args: ["createdAt", "desc"] },
+            { method: "limit", args: [10] },
+          ],
+        );
+        const compiled = (query as any).exec().toSQL();
+
+        expect(compiled.sql).toContain(
+          'where "userId" = ? and ("status" = ? or "userId" = ?)',
+        );
+        expect(compiled.sql).toContain('order by "createdAt" desc limit ?');
+        expect(compiled.bindings).toEqual([
+          "tenant-user",
+          "active",
+          "attacker-user",
+          10,
+        ]);
+      } finally {
+        await knex.destroy();
+      }
+    });
+
     it("should not allow client to remove scope via clearSelect/clearOrder", () => {
       const steps: QueryStep[] = [
         { method: "clearSelect", args: [] },
@@ -826,8 +867,8 @@ describe("BackendAdapter.queryFromClient", () => {
         {},
         {
           get:
-            (_t: any, method: string) =>
-            (...args: any[]) =>
+            (_t: any, _method: string) =>
+            (..._args: any[]) =>
               mockBuilder,
         },
       );
@@ -858,8 +899,8 @@ describe("BackendAdapter.queryFromClient", () => {
         {},
         {
           get:
-            (_t: any, method: string) =>
-            (...args: any[]) =>
+            (_t: any, _method: string) =>
+            (..._args: any[]) =>
               mockBuilder,
         },
       );

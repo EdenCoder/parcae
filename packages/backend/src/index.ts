@@ -54,6 +54,7 @@ export {
 export {
   withTransaction,
   getActiveTransactionFrame,
+  activeTransactionHandle,
 } from "./services/transactionContext";
 export type {
   TransactionFrame,

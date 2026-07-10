@@ -148,6 +148,7 @@ export async function runMetrics(
 }
 
 export interface PersistedSnapshot {
+  id: string;
   org: string;
   metricKey: string;
   grain: Grain;
@@ -195,15 +196,36 @@ async function persistSnapshots(
   // Upsert via the canonical unique key. On conflict, refresh value +
   // metadata + version + computedAt so subsequent reads always see the
   // freshest row for that bucket.
-  await ctx.db(ANALYTICS_SNAPSHOT_TABLE)
+  const persistedRows = await ctx.db(ANALYTICS_SNAPSHOT_TABLE)
     .insert(rows)
     .onConflict(["org", "metricKey", "grain", "periodStart", "dimensions"])
-    .merge(["value", "metadata", "metricVersion", "computedAt", "periodEnd"]);
+    .merge(["value", "metadata", "metricVersion", "computedAt", "periodEnd"])
+    .returning<Array<{
+      id: string;
+      dimensions: string | Record<string, unknown>;
+    }>>(["id", "dimensions"]);
 
-  return rows.map((r) => ({
-    ...r,
-    dimensions: JSON.parse(r.dimensions) as Record<string, unknown>,
+  if (persistedRows.length !== rows.length) {
+    throw new Error("analytics_snapshot upsert returned an unexpected row count");
+  }
+  const idsByDimensions = new Map(persistedRows.map((row) => {
+    const dimensions = typeof row.dimensions === "string"
+      ? JSON.parse(row.dimensions) as Record<string, unknown>
+      : row.dimensions;
+    return [canonicalDimensions(dimensions), row.id];
   }));
+
+  return rows.map((r) => {
+    const id = idsByDimensions.get(r.dimensions);
+    if (!id) {
+      throw new Error("analytics_snapshot upsert did not return a persisted id");
+    }
+    return {
+      ...r,
+      id,
+      dimensions: JSON.parse(r.dimensions) as Record<string, unknown>,
+    };
+  });
 }
 
 function byteLength(obj: unknown): number {

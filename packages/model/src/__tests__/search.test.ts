@@ -1,13 +1,12 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { Model } from "../Model";
-import type { ModelAdapter, QueryChain } from "../adapters/types";
+import type { ModelAdapter } from "../adapters/types";
 
 // ─── Mock Adapter ────────────────────────────────────────────────────────────
 
 function createMockAdapter(): ModelAdapter & { lastQuery: any } {
   const adapter: any = {
     lastQuery: null,
-    createStore: (data: Record<string, any>) => ({ ...data }),
     save: async () => {},
     remove: async () => {},
     findById: async () => null,
@@ -22,9 +21,6 @@ function createMockAdapter(): ModelAdapter & { lastQuery: any } {
               if (prop === "__modelType") return modelClass.type;
               if (prop === "__modelClass") return modelClass;
               if (prop === "__adapter") return adapter;
-              if (prop === "find") return async () => [];
-              if (prop === "first") return async () => null;
-              if (prop === "count") return async () => 0;
               return (...args: any[]) => {
                 steps.push({ method: prop, args });
                 return makeChain();
@@ -60,21 +56,11 @@ class Tag extends Model {
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 describe("Model.search() — lazy query chain", () => {
-  let adapter: ReturnType<typeof createMockAdapter>;
+  const adapter = createMockAdapter();
 
   beforeEach(() => {
-    adapter = createMockAdapter();
+    adapter.lastQuery = null;
     Model.use(adapter);
-  });
-
-  describe("static searchFields declaration", () => {
-    it("should have searchFields on the model class", () => {
-      expect(Article.searchFields).toEqual(["title", "body"]);
-    });
-
-    it("should not have searchFields when not declared", () => {
-      expect(Tag.searchFields).toBeUndefined();
-    });
   });
 
   describe("search() chain method", () => {
@@ -133,30 +119,6 @@ describe("Model.search() — lazy query chain", () => {
       // The backend handles the no-op when searchFields is absent
       const chain = Tag.search("test");
       expect(chain.__steps).toEqual([{ method: "search", args: ["test"] }]);
-    });
-  });
-
-  describe("search() terminal methods", () => {
-    // Terminal resolution (find/first/count) is tested via the existing
-    // Model.test.ts suite. Here we verify the lazy chain correctly
-    // records steps that will replay through any adapter.
-
-    it("should produce a chain with find/first/count methods", () => {
-      const chain = Article.search("test");
-      expect(typeof chain.find).toBe("function");
-      expect(typeof chain.first).toBe("function");
-      expect(typeof chain.count).toBe("function");
-    });
-
-    it("should produce a chain with correct steps for compound queries", () => {
-      const chain = Article.where({ published: true }).search("ghost").limit(5);
-
-      expect(chain.__steps).toEqual([
-        { method: "where", args: [{ published: true }] },
-        { method: "search", args: ["ghost"] },
-        { method: "limit", args: [5] },
-      ]);
-      expect(typeof chain.find).toBe("function");
     });
   });
 

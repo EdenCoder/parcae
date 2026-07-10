@@ -7,7 +7,7 @@
  * behaviour on identity changes and reconnects.
  */
 
-import { SYM_SERVER_MERGE } from "@parcae/model";
+import { Model, SYM_SERVER_MERGE } from "@parcae/model";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { provideClient } from "../client-registry";
@@ -26,12 +26,26 @@ interface Row {
   [SYM_SERVER_MERGE]?: (data: Record<string, unknown>) => unknown;
 }
 
+class Author extends Model {
+  static type = "author" as const;
+  name = "";
+}
+
+class Article extends Model {
+  static type = "article" as const;
+  static __schema = {
+    author: { kind: "ref", target: Author },
+  } as any;
+  declare author: Author;
+}
+
 // ── Fakes ──────────────────────────────────────────────────────────
 
 type OpsHandler = (payload: unknown) => void;
 
 function makeFakeClient() {
   const subs = new Map<string, Set<OpsHandler>>();
+  const sent: Array<{ event: string; args: unknown[] }> = [];
   const client = {
     subscribe(event: string, handler: OpsHandler) {
       if (!subs.has(event)) subs.set(event, new Set());
@@ -43,6 +57,14 @@ function makeFakeClient() {
     },
     subscriberCount(event: string) {
       return subs.get(event)?.size ?? 0;
+    },
+    send(event: string, ...args: unknown[]) {
+      sent.push({ event, args });
+    },
+    sentCount(event: string, value: unknown) {
+      return sent.filter(
+        (entry) => entry.event === event && entry.args[0] === value,
+      ).length;
     },
   };
   return client;
@@ -73,6 +95,14 @@ function makeChain(
     __adapter: {},
   };
   return { chain, calls: () => call };
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
 
 async function flush(): Promise<void> {
@@ -153,6 +183,108 @@ describe("fetch", () => {
     await flush();
 
     expect(store.snapshot().status).toBe("error");
+  });
+
+  it("reconciles server fields into existing rows and array identity", async () => {
+    const merge = vi.fn(function (
+      this: Row,
+      data: Record<string, unknown>,
+    ) {
+      Object.assign(this, data);
+      return this;
+    });
+    const { chain } = makeChain([
+      [{ id: "a", project: "old", [SYM_SERVER_MERGE]: merge }],
+      [{ id: "a", project: "new" }],
+    ]);
+    const store = createLiveQuery<Row>(() => chain);
+    const retainedStore = retainTracked(store);
+    await flush();
+    const before = store.snapshot();
+
+    store.refetch();
+    await flush();
+    const after = store.snapshot();
+
+    expect(after.items).toBe(before.items);
+    expect(after.items[0]).toBe(before.items[0]);
+    expect(after.items[0]?.project).toBe("new");
+    expect(merge).toHaveBeenCalledOnce();
+    expect(retainedStore.changes()).toBe(2);
+  });
+
+  it("preserves matching rows when refetch membership changes", async () => {
+    const merge = function (this: Row, data: Record<string, unknown>) {
+      Object.assign(this, data);
+      return this;
+    };
+    const { chain } = makeChain([
+      [
+        { id: "a", [SYM_SERVER_MERGE]: merge },
+        { id: "b", project: "old", [SYM_SERVER_MERGE]: merge },
+      ],
+      [
+        { id: "b", project: "new" },
+        { id: "c" },
+      ],
+    ]);
+    const store = createLiveQuery<Row>(() => chain);
+    retainTracked(store);
+    await flush();
+    const before = store.snapshot();
+    const rowB = before.items[1];
+
+    store.refetch();
+    await flush();
+    const after = store.snapshot();
+
+    expect(after.items).not.toBe(before.items);
+    expect(after.items[0]).toBe(rowB);
+    expect(after.items[0]?.project).toBe("new");
+  });
+
+  it("refreshes a same-id expanded ref in place on a subscription refetch", async () => {
+    vi.useFakeTimers();
+    const adapter = {} as any;
+    let call = 0;
+    const chain: QueryChain<Article> = {
+      find: async () => {
+        const rows = [
+          Article.hydrate(adapter, {
+            id: "article-1",
+            author: {
+              id: "author-1",
+              name: call++ === 0 ? "stale" : "fresh",
+            },
+          }),
+        ];
+        Object.defineProperty(rows, "__queryHash", { value: "expanded" });
+        return rows;
+      },
+      __modelClass: Article,
+      __adapter: adapter,
+    };
+    const store = createLiveQuery<Article>(() => chain);
+    const release = store.retain(() => {});
+    await vi.advanceTimersByTimeAsync(0);
+    const article = store.snapshot().items[0]!;
+    const author = article.author;
+
+    fakeClient.emit("query:expanded", [
+      {
+        op: "update",
+        id: "article-1",
+        patch: [
+          { op: "replace", path: "/author/name", value: "fresh" },
+        ],
+      },
+    ]);
+    await vi.advanceTimersByTimeAsync(250);
+
+    expect((article as any).$author).toBe("author-1");
+    expect(article.author).toBe(author);
+    expect(article.author.name).toBe("fresh");
+    release();
   });
 });
 
@@ -256,7 +388,14 @@ describe("optimistic", () => {
     retainTracked(store);
     await flush();
 
-    store.addOptimistic({ id: "x" });
+    const local: Row = {
+      id: "x",
+      [SYM_SERVER_MERGE](data) {
+        Object.assign(this, data);
+        return this;
+      },
+    };
+    store.addOptimistic(local);
     expect(store.snapshot().items.map((i) => i.id)).toEqual(["x"]);
 
     store.refetch();
@@ -264,6 +403,7 @@ describe("optimistic", () => {
 
     // Server row replaced the optimistic one — no duplicate.
     expect(store.snapshot().items.map((i) => i.id)).toEqual(["x"]);
+    expect(store.snapshot().items[0]).toBe(local);
   });
 
   it("removeOptimistic drops rows from both arrays", async () => {
@@ -291,10 +431,122 @@ describe("registry", () => {
 
     resetLiveQueries();
     expect(store.snapshot().status).toBe("loading");
+    expect(fakeClient.sentCount("unsubscribe:query", "H1")).toBe(1);
     await flush();
 
     expect(calls()).toBe(2);
     expect(store.snapshot().items.map((i) => i.id)).toEqual(["b"]);
+  });
+
+  it("ignores an old identity response after reset", async () => {
+    const oldIdentity = deferred<Row[]>();
+    const currentIdentity = deferred<Row[]>();
+    const queuedRefetch = deferred<Row[]>();
+    const requests = [oldIdentity, currentIdentity, queuedRefetch];
+    let calls = 0;
+    const store = createLiveQuery<Row>(() => ({
+      find: () => requests[calls++]!.promise,
+    }));
+    retainTracked(store);
+    expect(calls).toBe(1);
+
+    resetLiveQueries();
+    expect(calls).toBe(2);
+    store.refetch();
+    expect(calls).toBe(2);
+
+    oldIdentity.resolve([{ id: "old-account" }]);
+    await flush();
+    expect(calls).toBe(2);
+    expect(store.snapshot()).toMatchObject({ status: "loading", items: [] });
+
+    currentIdentity.resolve([{ id: "current-account" }]);
+    await flush();
+    expect(calls).toBe(3);
+    expect(store.snapshot().items.map((i) => i.id)).toEqual([
+      "current-account",
+    ]);
+
+    queuedRefetch.resolve([{ id: "current-account" }]);
+    await flush();
+  });
+
+  it("disposes only after the last retainer releases", async () => {
+    const { chain } = makeChain([[]]);
+    const store = createLiveQuery<Row>(() => chain);
+    const first = retained(store);
+    const second = retained(store);
+    await flush();
+    expect(fakeClient.subscriberCount("query:H1")).toBe(1);
+
+    first.release();
+    expect(fakeClient.subscriberCount("query:H1")).toBe(1);
+    second.release();
+    second.release();
+    expect(fakeClient.subscriberCount("query:H1")).toBe(0);
+    expect(fakeClient.sentCount("unsubscribe:query", "H1")).toBe(1);
+  });
+
+  it("clears pending update timers on the last release", async () => {
+    vi.useFakeTimers();
+    const { chain, calls } = makeChain([[{ id: "a" }], [{ id: "a" }]]);
+    const store = createLiveQuery<Row>(() => chain);
+    const active = retained(store);
+    await vi.runAllTimersAsync();
+
+    fakeClient.emit("query:H1", [{ op: "update", id: "a" }]);
+    expect(vi.getTimerCount()).toBe(1);
+    active.release();
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.runAllTimersAsync();
+    expect(calls()).toBe(1);
+  });
+
+  it("ignores a released fetch and safely restarts on retain", async () => {
+    const releasedFetch = deferred<Row[]>();
+    const restartedFetch = deferred<Row[]>();
+    let calls = 0;
+    const store = createLiveQuery<Row>(() => ({
+      find: () => [releasedFetch, restartedFetch][calls++]!.promise,
+    }));
+    const first = retained(store);
+    first.release();
+    const second = retained(store);
+    expect(calls).toBe(2);
+
+    releasedFetch.resolve([{ id: "released" }]);
+    await flush();
+    expect(store.snapshot()).toMatchObject({ status: "loading", items: [] });
+
+    restartedFetch.resolve([{ id: "current" }]);
+    await flush();
+    expect(store.snapshot().items.map((item) => item.id)).toEqual(["current"]);
+    second.release();
+  });
+
+  it("invalidates inactive stores across identity resets before retaining again", async () => {
+    const { chain, calls } = makeChain([
+      [{ id: "a" }],
+      [{ id: "b" }],
+      [{ id: "c" }],
+    ]);
+    const store = createLiveQuery<Row>(() => chain);
+    const first = retained(store);
+    await flush();
+    first.release();
+
+    resetLiveQueries();
+    expect(store.snapshot()).toMatchObject({ status: "loading", items: [] });
+    expect(calls()).toBe(1);
+
+    const second = retained(store);
+    await flush();
+    expect(store.snapshot().items.map((item) => item.id)).toEqual(["b"]);
+    resetLiveQueries();
+    await flush();
+    expect(calls()).toBe(3);
+    expect(store.snapshot().items.map((item) => item.id)).toEqual(["c"]);
+    second.release();
   });
 
   it("refetchLiveQueries skips stores with no retainers", async () => {

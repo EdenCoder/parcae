@@ -53,6 +53,14 @@ export function createSocketFakeRes(
           responseBody = body;
         }
       }
+      if (
+        this.statusCode >= 400 &&
+        responseBody &&
+        typeof responseBody === "object" &&
+        !Array.isArray(responseBody)
+      ) {
+        responseBody = { ...responseBody, status: this.statusCode };
+      }
       const compressed = pako.gzip(
         JSON.stringify(compress(responseBody ?? { result: null, success: true })),
       );

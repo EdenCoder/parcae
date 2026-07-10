@@ -176,21 +176,22 @@ describe("useQuery — { subscribe: false }", () => {
     await Promise.resolve();
 
     expect(client.countSubs("query:h-stale")).toBe(0);
-    const entry = useQueryTest.getEntry(key);
+    const entry = useQueryTest.getEntry(client, key);
     expect(entry?.queryHash).toBeNull();
   });
 
   it("getOrCreate captures `subscribe` on first arrival; subsequent retains don't override", () => {
     const key = useQueryTest.buildKey("post", null, [], false);
-    const release = useQueryTest.retain(key, () => {}, false);
-    expect(useQueryTest.getEntry(key)?.subscribe).toBe(false);
+    const client = new FakeClient() as any;
+    const release = useQueryTest.retain(client, key, () => {}, false);
+    expect(useQueryTest.getEntry(client, key)?.subscribe).toBe(false);
 
     // A second retain with subscribe:true must not flip the entry's
     // mode. Cache key includes the subscribe suffix anyway, so a
     // genuine dynamic mount would land on a different key — this
     // test guards the contract for direct `retain` callers.
-    const release2 = useQueryTest.retain(key, () => {}, true);
-    expect(useQueryTest.getEntry(key)?.subscribe).toBe(false);
+    const release2 = useQueryTest.retain(client, key, () => {}, true);
+    expect(useQueryTest.getEntry(client, key)?.subscribe).toBe(false);
 
     release2();
     release();
@@ -213,8 +214,8 @@ describe("useQuery — { subscribe: false }", () => {
     await Promise.resolve();
 
     // Retain both so they have refs > 0 (resync skips refs<=0).
-    const r1 = useQueryTest.retain(staticKey, () => {}, false);
-    const r2 = useQueryTest.retain(dynamicKey, () => {});
+    const r1 = useQueryTest.retain(client, staticKey, () => {}, false);
+    const r2 = useQueryTest.retain(client, dynamicKey, () => {});
 
     useQueryTest.onResyncRequired(client);
 
@@ -235,6 +236,65 @@ describe("useQuery — { subscribe: false }", () => {
 
     r1();
     r2();
+  });
+
+  it("resync only includes entries owned by the requested client", async () => {
+    const clientA = new FakeClient() as any;
+    const clientB = new FakeClient() as any;
+    const chainA = makeChain({ results: [{ id: "a" }], queryHash: "ha" });
+    const chainB = makeChain({ results: [{ id: "b" }], queryHash: "hb" });
+    const key = useQueryTest.buildKey("post", null, chainA.__steps);
+
+    useQueryTest.fetch(key, chainA, clientA);
+    useQueryTest.fetch(key, chainB, clientB);
+    await Promise.resolve();
+    await Promise.resolve();
+    const releaseA = useQueryTest.retain(clientA, key, () => {});
+    const releaseB = useQueryTest.retain(clientB, key, () => {});
+
+    useQueryTest.onResyncRequired(clientA);
+
+    expect(clientA.resync).toHaveBeenCalledOnce();
+    expect(clientB.resync).not.toHaveBeenCalled();
+    expect(clientA.resync.mock.calls[0]![0]).toHaveLength(1);
+    releaseA();
+    releaseB();
+  });
+
+  it("notifies when resync changes scalar data without changing ids or order", async () => {
+    const client = new FakeClient() as any;
+    const chain = makeChain({
+      results: [{ id: "p1", title: "before" }],
+      queryHash: "h-scalar-resync",
+    });
+    const key = useQueryTest.buildKey("post", null, chain.__steps);
+    const onChange = vi.fn();
+    const release = useQueryTest.retain(client, key, onChange);
+    useQueryTest.fetch(key, chain, client);
+    await Promise.resolve();
+    await Promise.resolve();
+    const entry = useQueryTest.getEntry(client, key)!;
+    const items = entry.items;
+    const version = entry.version;
+    onChange.mockClear();
+    client.resync.mockResolvedValueOnce([
+      {
+        key,
+        hash: "h-scalar-resync",
+        items: [{ id: "p1", title: "after" }],
+        totalCount: 1,
+      },
+    ]);
+
+    useQueryTest.onResyncRequired(client);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(entry.items).toBe(items);
+    expect(entry.items[0].title).toBe("after");
+    expect(entry.version).toBeGreaterThan(version);
+    expect(onChange).toHaveBeenCalled();
+    release();
   });
 
   it("prefetch({ subscribe: false }) hits the static fast-path without requiring a queryHash", async () => {

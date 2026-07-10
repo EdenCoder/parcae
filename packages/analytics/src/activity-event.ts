@@ -53,18 +53,12 @@ export abstract class ActivityEvent<
     this.createdAt = row.createdAt;
   }
 
-  /**
-   * Subclass hook for vocabulary validation. Return `false` to reject a
-   * row whose `key` doesn't belong to this subclass. Default accepts.
-   */
-  static accepts(_key: string): boolean {
-    return true;
-  }
+  /** Closed event vocabulary. Empty means all keys are accepted. */
+  static readonly keys: readonly string[] = [];
 
   /**
    * Walk `analytics_event`, returning instances of the calling
-   * subclass. Subclasses with closed key vocabularies can override
-   * `accepts()` to filter at the query level.
+   * subclass. `keys` is applied in SQL before ordering and limiting.
    */
   static async query<E extends ActivityEvent>(
     this: new (row: AnalyticsEvent) => E,
@@ -83,6 +77,12 @@ export abstract class ActivityEvent<
         ? query.whereIn("key", q.key)
         : query.where("key", q.key);
     }
+    const acceptedKeys = (
+      this as unknown as { keys?: readonly string[] }
+    ).keys;
+    if (acceptedKeys?.length) {
+      query = query.whereIn("key", acceptedKeys);
+    }
     if (q.since) query = query.where("occurredAt", ">=", q.since);
     if (q.until) query = query.where("occurredAt", "<", q.until);
     query = query.orderBy("occurredAt", "desc");
@@ -90,12 +90,7 @@ export abstract class ActivityEvent<
 
     const rows = await query;
     const ctor = this;
-    const accepts =
-      (ctor as unknown as { accepts?: (k: string) => boolean }).accepts ??
-      (() => true);
-    return rows
-      .filter((r) => accepts(r.key))
-      .map((r) => {
+    return rows.map((r) => {
         const dimensions =
           typeof r.dimensions === "string"
             ? JSON.parse(r.dimensions)

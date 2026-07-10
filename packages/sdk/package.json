@@ -24,6 +24,7 @@
   "scripts": {
     "build": "tsup",
     "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit",
     "clean": "rm -rf dist",
     "test": "vitest run",
     "test:watch": "vitest"
@@ -42,7 +43,9 @@
     "@types/node": "^25.9.3",
     "@types/pako": "^2.0.4",
     "@types/react": "^19.2.17",
+    "@types/react-test-renderer": "^19.1.0",
     "react": "^19.2.7",
+    "react-test-renderer": "^19.2.7",
     "tsup": "^8.5.1",
     "typescript": "^6.0.3",
     "vitest": "^4.1.9"

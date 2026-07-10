@@ -28,7 +28,6 @@ what your frontend already uses.
 import { defineI18n } from "@parcae/i18n";
 
 export const i18nConfig = defineI18n({
-  sourceLocale: "en",
   defaultLocale: "en",
   locales: ["en", "fr", "ja"] as const,
   loadMessages: async (locale) => {
@@ -79,6 +78,10 @@ GET /v1/locale/:locale
 
 Pass `{ path: "/api/messages" }` only when an app needs a non-standard
 endpoint.
+
+The negotiated `/v1/locale` response is `private, no-store` because middleware
+may supply an unkeyed request locale. The explicit `/v1/locale/:locale` response
+is publicly cacheable and includes `Content-Language`.
 
 For route-local usage without middleware:
 

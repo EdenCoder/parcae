@@ -120,11 +120,15 @@ export function betterAuth(opts: BetterAuthOptions = {}): AuthClientAdapter {
       // cross-tab path without extra infrastructure.
 
       let lastToken: string | null | undefined = undefined;
+      let active = true;
+      let generation = 0;
 
       const readAndNotify = async () => {
         if (!client) return;
+        const currentGeneration = ++generation;
         try {
           const session = await client.getSession();
+          if (!active || currentGeneration !== generation) return;
           const token = session?.data?.session?.token ?? null;
           if (token === lastToken) return;
           lastToken = token;
@@ -171,6 +175,8 @@ export function betterAuth(opts: BetterAuthOptions = {}): AuthClientAdapter {
       }
 
       return () => {
+        active = false;
+        generation++;
         unsubscribeSignal?.();
         if (typeof document !== "undefined") {
           document.removeEventListener("visibilitychange", visibilityHandler);

@@ -7,21 +7,21 @@
  * to re-render when the count changes.
  */
 
-import { useState, useEffect } from "react";
+import { useCallback, useSyncExternalStore } from "react";
 
 export function useSaving(model: any): boolean {
-  const [saving, setSaving] = useState(false);
+  const subscribe = useCallback(
+    (onChange: () => void) => {
+      if (!model) return () => {};
+      model.on("__saving", onChange);
+      return () => model.off("__saving", onChange);
+    },
+    [model],
+  );
+  const getSnapshot = useCallback(
+    () => Boolean(model?.__savingCount),
+    [model],
+  );
 
-  // effect
-  useEffect(() => {
-    // check on
-    if (!model) return;
-    setSaving(model?.__savingCount);
-    model.on("__saving", setSaving);
-    return () => {
-      model.off("__saving", setSaving);
-    };
-  }, [model]);
-
-  return saving;
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }

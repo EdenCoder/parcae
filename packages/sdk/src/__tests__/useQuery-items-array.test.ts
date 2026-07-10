@@ -38,8 +38,8 @@
  * before and after.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { Model } from "@parcae/model";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Model, SYM_SERVER_MERGE } from "@parcae/model";
 import { EventEmitter } from "eventemitter3";
 
 import { __test as useQueryTest } from "../react/useQuery";
@@ -50,6 +50,20 @@ class Post extends Model {
   static type = "post" as const;
   title = "";
   body = "";
+  profile: Record<string, any> = {};
+}
+
+class Author extends Model {
+  static type = "author" as const;
+  name = "";
+}
+
+class Article extends Model {
+  static type = "article" as const;
+  static __schema = {
+    author: { kind: "ref", target: Author },
+  } as any;
+  declare author: Author;
 }
 
 // ─── FakeClient — minimal ParcaeClient surface useQuery touches ─────────────
@@ -61,6 +75,7 @@ interface SubscriptionRegistration {
 
 class FakeClient extends EventEmitter {
   public subscriptions: SubscriptionRegistration[] = [];
+  public send = vi.fn();
 
   subscribe(event: string, handler: (...args: any[]) => void): () => void {
     const entry = { event, handler };
@@ -96,7 +111,12 @@ class FakeClient extends EventEmitter {
 // ─── chain factory ──────────────────────────────────────────────────────────
 
 function makeChain(opts: {
-  results: Array<{ id: string; title?: string; body?: string }>;
+  results: Array<{
+    id: string;
+    title?: string;
+    body?: string;
+    profile?: Record<string, any>;
+  }>;
   queryHash: string;
 }): any {
   const chain: any = {
@@ -127,14 +147,19 @@ function makeChain(opts: {
 async function primeCache(
   client: FakeClient,
   hash: string,
-  results: Array<{ id: string; title?: string; body?: string }>,
+  results: Array<{
+    id: string;
+    title?: string;
+    body?: string;
+    profile?: Record<string, any>;
+  }>,
 ) {
   const chain = makeChain({ results, queryHash: hash });
   const key = useQueryTest.buildKey("post", "u1", chain.__steps);
-  const release = useQueryTest.retain(key, () => {});
+  const release = useQueryTest.retain(client as any, key, () => {});
   useQueryTest.fetch(key, chain, client as any);
   await new Promise((r) => setImmediate(r));
-  const entry = useQueryTest.getEntry(key)!;
+  const entry = useQueryTest.getEntry(client as any, key)!;
   return { entry, release };
 }
 
@@ -232,6 +257,202 @@ describe("useQuery — items-array reference contract", () => {
     expect(entry.items[1].title).toBe("second");
     expect(entry.items[2].title).toBe("C");
 
+    release();
+  });
+
+  it("filters parent patches while a nested optimistic child write is pending", async () => {
+    const client = new FakeClient();
+    const { entry, release } = await primeCache(client, "h-nested-child", [
+      { id: "p1", profile: { name: "server", theme: "light" } },
+    ]);
+    const post = entry.items[0];
+    post.profile = { name: "optimistic", theme: "light" };
+    Object.defineProperty(post, "__patchingPaths", {
+      configurable: true,
+      get: () => new Set(["/profile/name"]),
+    });
+    const originalMerge = post[SYM_SERVER_MERGE].bind(post);
+    const merge = vi.fn(originalMerge);
+    post[SYM_SERVER_MERGE] = merge;
+
+    client.emitQueryOps("h-nested-child", [
+      {
+        op: "update",
+        id: "p1",
+        patch: [
+          {
+            op: "replace",
+            path: "/profile",
+            value: { name: "stale", theme: "dark" },
+          },
+        ],
+      },
+    ]);
+
+    expect(post.profile.name).toBe("optimistic");
+    expect(merge).not.toHaveBeenCalled();
+    release();
+  });
+
+  it("filters nested patches while an optimistic parent write is pending", async () => {
+    const client = new FakeClient();
+    const { entry, release } = await primeCache(client, "h-nested-parent", [
+      { id: "p1", profile: { name: "server" } },
+    ]);
+    const post = entry.items[0];
+    post.profile = { name: "optimistic" };
+    Object.defineProperty(post, "__patchingPaths", {
+      configurable: true,
+      get: () => new Set(["/profile"]),
+    });
+    const originalMerge = post[SYM_SERVER_MERGE].bind(post);
+    const merge = vi.fn(originalMerge);
+    post[SYM_SERVER_MERGE] = merge;
+
+    client.emitQueryOps("h-nested-parent", [
+      {
+        op: "update",
+        id: "p1",
+        patch: [{ op: "replace", path: "/profile/name", value: "stale" }],
+      },
+    ]);
+
+    expect(post.profile.name).toBe("optimistic");
+    expect(merge).not.toHaveBeenCalled();
+    release();
+  });
+
+  it("merges one authoritative clone for multiple nested patches", async () => {
+    const client = new FakeClient();
+    const { entry, release } = await primeCache(client, "h-nested-batch", [
+      { id: "p1", profile: { name: "before", theme: "light" } },
+    ]);
+    const post = entry.items[0];
+    const originalMerge = post[SYM_SERVER_MERGE].bind(post);
+    const merge = vi.fn(originalMerge);
+    post[SYM_SERVER_MERGE] = merge;
+
+    client.emitQueryOps("h-nested-batch", [
+      {
+        op: "update",
+        id: "p1",
+        patch: [{ op: "replace", path: "/profile/name", value: "after" }],
+      },
+      {
+        op: "update",
+        id: "p1",
+        patch: [{ op: "replace", path: "/profile/theme", value: "dark" }],
+      },
+    ]);
+
+    expect(merge).toHaveBeenCalledOnce();
+    expect(post.profile).toEqual({ name: "after", theme: "dark" });
+    release();
+  });
+
+  it("merges subscription patches below an expanded ref without replacing its raw id", async () => {
+    const client = new FakeClient();
+    const adapter = {} as any;
+    const chain: any = {
+      __modelType: "article",
+      __modelClass: Article,
+      __steps: [],
+      __adapter: adapter,
+      find: async () => {
+        const rows = [
+          Article.hydrate(adapter, {
+            id: "article-1",
+            author: { id: "author-1", name: "Alice" },
+          }),
+        ];
+        Object.defineProperty(rows, "__queryHash", { value: "expanded" });
+        return rows;
+      },
+    };
+    const key = useQueryTest.buildKey("article", "u1", []);
+    const release = useQueryTest.retain(client as any, key, () => {});
+    useQueryTest.fetch(key, chain, client as any);
+    await new Promise((resolve) => setImmediate(resolve));
+    const entry = useQueryTest.getEntry(client as any, key)!;
+    const article = entry.items[0];
+    const author = article.author;
+
+    client.emitQueryOps("expanded", [
+      {
+        op: "update",
+        id: "article-1",
+        patch: [
+          { op: "replace", path: "/author/name", value: "Alicia" },
+        ],
+      },
+    ]);
+
+    expect(article.$author).toBe("author-1");
+    expect(article.author).toBe(author);
+    expect(article.author.name).toBe("Alicia");
+    release();
+  });
+
+  it("refreshes a same-id expanded ref while preserving both model identities", async () => {
+    const client = new FakeClient();
+    const adapter = {} as any;
+    const makeArticleChain = (name: string): any => ({
+      __modelType: "article",
+      __modelClass: Article,
+      __steps: [],
+      __adapter: adapter,
+      find: async () => [
+        Article.hydrate(adapter, {
+          id: "article-1",
+          author: { id: "author-1", name },
+        }),
+      ],
+    });
+    const key = useQueryTest.buildKey("article", "u1", []);
+    const release = useQueryTest.retain(client as any, key, () => {});
+    useQueryTest.fetch(key, makeArticleChain("stale"), client as any);
+    await new Promise((resolve) => setImmediate(resolve));
+    const entry = useQueryTest.getEntry(client as any, key)!;
+    const article = entry.items[0];
+    const author = article.author;
+
+    useQueryTest.fetch(key, makeArticleChain("fresh"), client as any);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(entry.items[0]).toBe(article);
+    expect(article.author).toBe(author);
+    expect(article.$author).toBe("author-1");
+    expect(article.author.name).toBe("fresh");
+    release();
+  });
+
+  it("reconciles a full fetch into an optimistic id/tmp match", async () => {
+    const client = new FakeClient();
+    const { entry, release } = await primeCache(client, "optimistic-fetch", []);
+    const local = Post.hydrate({} as any, {
+      id: "temporary-id",
+      tmp: "tmp-1",
+      title: "optimistic",
+    });
+    entry.optimistic.push(local);
+    const chain = makeChain({
+      results: [{ id: "server-id", title: "canonical" }],
+      queryHash: "optimistic-fetch",
+    });
+    const originalFind = chain.find;
+    chain.find = async () => {
+      const rows = await originalFind();
+      rows[0].tmp = "tmp-1";
+      return rows;
+    };
+
+    useQueryTest.fetch(entry.key, chain, client as any);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(entry.items[0]).toBe(local);
+    expect(local.id).toBe("server-id");
+    expect(local.title).toBe("canonical");
+    expect(entry.optimistic).toEqual([]);
     release();
   });
 

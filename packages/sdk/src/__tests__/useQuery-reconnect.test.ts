@@ -1,7 +1,7 @@
 /**
  * useQuery — disconnect / reconnect behaviour.
  *
- * Drives the module-level cache directly via the `__test` surface so
+ * Drives a client's cache directly via the `__test` surface so
  * we don't need React DOM. The cache is the contract: a subscriber
  * holds a ref, `doFetch` populates it, the client's `"connected"`
  * event triggers a refetch on the next reconnect, and the retry
@@ -21,7 +21,10 @@ import { Model } from "@parcae/model";
 import { EventEmitter } from "eventemitter3";
 
 // eslint-disable-next-line import/first
-import { __test as useQueryTest } from "../react/useQuery";
+import {
+  _purgeCacheForUser,
+  __test as useQueryTest,
+} from "../react/useQuery";
 
 // ─── Fake Model class for the tests ─────────────────────────────────────────
 
@@ -41,6 +44,8 @@ interface SubscriptionRegistration {
 class FakeClient extends EventEmitter {
   /** Map of event → set of handlers. Mirrors `transport.subscribe`. */
   public subscriptions: SubscriptionRegistration[] = [];
+  public resync = vi.fn(async () => [] as any[]);
+  public send = vi.fn();
 
   subscribe(event: string, handler: (...args: any[]) => void): () => void {
     const entry = { event, handler };
@@ -113,6 +118,14 @@ function makeChain(opts: FakeChainOptions = {}): any {
   return chain;
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
@@ -138,14 +151,14 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     });
     const key = useQueryTest.buildKey("post", "u1", chain.__steps);
     const onChange = vi.fn();
-    const release = useQueryTest.retain(key, onChange);
+    const release = useQueryTest.retain(client as any, key, onChange);
 
     useQueryTest.fetch(key, chain, client as any);
 
     // Tick the microtask queue so chain.find() resolves.
     await new Promise((r) => setImmediate(r));
 
-    const entry = useQueryTest.getEntry(key)!;
+    const entry = useQueryTest.getEntry(client as any, key)!;
     expect(entry.loading).toBe(false);
     expect(entry.items.length).toBe(2);
     expect(entry.items[0].id).toBe("p1");
@@ -167,12 +180,12 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
       queryHash: "h-update",
     });
     const key = useQueryTest.buildKey("post", "u1", chain.__steps);
-    const release = useQueryTest.retain(key, () => {});
+    const release = useQueryTest.retain(client as any, key, () => {});
 
     useQueryTest.fetch(key, chain, client as any);
     await new Promise((r) => setImmediate(r));
 
-    const entry = useQueryTest.getEntry(key)!;
+    const entry = useQueryTest.getEntry(client as any, key)!;
     const firstInstance = entry.items[0];
     expect(firstInstance.title).toBe("first");
 
@@ -201,12 +214,12 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     // swap its `find` after the failure to simulate a recovered server.
     const chain = makeChain({ reject: new Error("network down") });
     const key = useQueryTest.buildKey("post", "u1", chain.__steps);
-    const release = useQueryTest.retain(key, () => {});
+    const release = useQueryTest.retain(client as any, key, () => {});
 
     useQueryTest.fetch(key, chain, client as any);
     await vi.advanceTimersByTimeAsync(0);
 
-    let entry = useQueryTest.getEntry(key)!;
+    let entry = useQueryTest.getEntry(client as any, key)!;
     expect(entry.error?.message).toContain("network down");
     expect(entry.retryTimer).not.toBeNull();
 
@@ -223,7 +236,7 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    entry = useQueryTest.getEntry(key)!;
+    entry = useQueryTest.getEntry(client as any, key)!;
     expect(entry.error).toBeNull();
     expect(entry.items.length).toBe(1);
     expect(entry.items[0].title).toBe("recovered");
@@ -237,11 +250,11 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     const chain = makeChain({ reject: new Error("network down") });
     const key = useQueryTest.buildKey("post", "u1", chain.__steps);
 
-    const release = useQueryTest.retain(key, () => {});
+    const release = useQueryTest.retain(client as any, key, () => {});
     useQueryTest.fetch(key, chain, client as any);
     await vi.advanceTimersByTimeAsync(0);
 
-    const entry = useQueryTest.getEntry(key)!;
+    const entry = useQueryTest.getEntry(client as any, key)!;
     expect(entry.retryTimer).not.toBeNull();
 
     // Unmount before the retry fires. The retry timer was stored on
@@ -269,12 +282,12 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
       queryHash: "h-recon-1",
     });
     const key = useQueryTest.buildKey("post", "u1", chain.__steps);
-    const release = useQueryTest.retain(key, () => {});
+    const release = useQueryTest.retain(client as any, key, () => {});
 
     useQueryTest.fetch(key, chain, client as any);
     await new Promise((r) => setImmediate(r));
 
-    const entry = useQueryTest.getEntry(key)!;
+    const entry = useQueryTest.getEntry(client as any, key)!;
     expect(entry.items[0].title).toBe("v1");
     expect(chain.findCalls).toBe(1);
 
@@ -282,7 +295,7 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     // attach `client.on("connected", onReconnect)` and have it call
     // `doFetch` again. We test the cache reaction.
     const onReconnect = () => {
-      const ent = useQueryTest.getEntry(key);
+      const ent = useQueryTest.getEntry(client as any, key);
       if (!ent || !ent.chain || !ent.client) return;
       ent.retryCount = 0;
       if (ent.retryTimer) {
@@ -306,7 +319,7 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     client.emit("connected");
     await new Promise((r) => setImmediate(r));
 
-    const after = useQueryTest.getEntry(key)!;
+    const after = useQueryTest.getEntry(client as any, key)!;
     expect(after.items.length).toBe(2);
     expect(after.items[1].title).toBe("fresh-after-reconnect");
     // The new __queryHash replaces the old one — the previous
@@ -314,6 +327,7 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     expect(after.queryHash).toBe("h-recon-2");
     expect(client.countSubs("query:h-recon-1")).toBe(0);
     expect(client.countSubs("query:h-recon-2")).toBe(1);
+    expect(client.send).toHaveBeenCalledWith("unsubscribe:query", "h-recon-1");
 
     release();
   });
@@ -326,12 +340,12 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
       results: [{ id: "p1", title: "before-disconnect" }],
     });
     const key = useQueryTest.buildKey("post", "u1", chain.__steps);
-    const release = useQueryTest.retain(key, () => {});
+    const release = useQueryTest.retain(client as any, key, () => {});
 
     useQueryTest.fetch(key, chain, client as any);
     await new Promise((r) => setImmediate(r));
 
-    const entry = useQueryTest.getEntry(key)!;
+    const entry = useQueryTest.getEntry(client as any, key)!;
     expect(entry.items[0].title).toBe("before-disconnect");
 
     // During a disconnect, `useQuery`'s `liveKey` becomes null (auth
@@ -357,7 +371,7 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
       queryHash: "h-stable",
     });
     const key = useQueryTest.buildKey("post", "u1", chain.__steps);
-    const release = useQueryTest.retain(key, () => {});
+    const release = useQueryTest.retain(client as any, key, () => {});
 
     useQueryTest.fetch(key, chain, client as any);
     await new Promise((r) => setImmediate(r));
@@ -365,7 +379,7 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
 
     // Second fetch with the same hash — the existing subscription
     // should be preserved.
-    const entry = useQueryTest.getEntry(key)!;
+    const entry = useQueryTest.getEntry(client as any, key)!;
     const same = makeChain({
       results: [{ id: "p1", title: "refreshed" }],
       queryHash: "h-stable", // same!
@@ -380,6 +394,226 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     release();
   });
 
+  it("notifies when a same-id, same-order fetch changes only scalar data", async () => {
+    const client = new FakeClient();
+    const first = makeChain({
+      results: [{ id: "p1", title: "before" }],
+      queryHash: "h-scalar",
+    });
+    const key = useQueryTest.buildKey("post", "u1", first.__steps);
+    const onChange = vi.fn();
+    const release = useQueryTest.retain(client as any, key, onChange);
+    useQueryTest.fetch(key, first, client as any);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const entry = useQueryTest.getEntry(client as any, key)!;
+    const items = entry.items;
+    const version = entry.version;
+    onChange.mockClear();
+    useQueryTest.fetch(
+      key,
+      makeChain({
+        results: [{ id: "p1", title: "after" }],
+        queryHash: "h-scalar",
+      }),
+      client as any,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(entry.items).toBe(items);
+    expect(entry.items[0].title).toBe("after");
+    expect(entry.version).toBeGreaterThan(version);
+    expect(onChange).toHaveBeenCalled();
+    release();
+  });
+
+  it("does not let a pre-resync fetch overwrite the resync result", async () => {
+    const client = new FakeClient();
+    const staleFetch = deferred<any[]>();
+    const resync = deferred<any[]>();
+    client.resync.mockReturnValueOnce(resync.promise);
+    const chain = makeChain();
+    chain.find = () => staleFetch.promise;
+    const key = useQueryTest.buildKey("post", "u1", chain.__steps);
+    const release = useQueryTest.retain(client as any, key, () => {});
+    useQueryTest.fetch(key, chain, client as any);
+
+    useQueryTest.onResyncRequired(client as any);
+    resync.resolve([
+      {
+        key,
+        hash: "fresh-hash",
+        items: [{ id: "fresh", title: "resynced" }],
+        totalCount: 1,
+      },
+    ]);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const entry = useQueryTest.getEntry(client as any, key)!;
+    expect(entry.items.map((item: any) => item.id)).toEqual(["fresh"]);
+
+    staleFetch.resolve([Post.hydrate({} as any, { id: "stale" })]);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(entry.items.map((item: any) => item.id)).toEqual(["fresh"]);
+    release();
+  });
+
+  it("does not let a stale resync overwrite a newer fetch", async () => {
+    const client = new FakeClient();
+    const first = makeChain({ results: [{ id: "first" }] });
+    const key = useQueryTest.buildKey("post", "u1", first.__steps);
+    const release = useQueryTest.retain(client as any, key, () => {});
+    useQueryTest.fetch(key, first, client as any);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const resync = deferred<any[]>();
+    client.resync.mockReturnValueOnce(resync.promise);
+    useQueryTest.onResyncRequired(client as any);
+    const newer = makeChain({ results: [{ id: "newer" }] });
+    useQueryTest.fetch(key, newer, client as any);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const entry = useQueryTest.getEntry(client as any, key)!;
+    expect(entry.items.map((item: any) => item.id)).toEqual(["newer"]);
+
+    resync.resolve([
+      {
+        key,
+        hash: "stale-hash",
+        items: [{ id: "stale-resync" }],
+        totalCount: 1,
+      },
+    ]);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(entry.items.map((item: any) => item.id)).toEqual(["newer"]);
+    release();
+  });
+
+  it("clears and retries an entry omitted from a resync batch", async () => {
+    vi.useFakeTimers();
+    const client = new FakeClient();
+    const chain = makeChain({
+      results: [{ id: "stale" }],
+      queryHash: "old-hash",
+    });
+    const key = useQueryTest.buildKey("post", "u1", chain.__steps);
+    const release = useQueryTest.retain(client as any, key, () => {});
+    useQueryTest.fetch(key, chain, client as any);
+    await vi.advanceTimersByTimeAsync(0);
+    client.resync.mockResolvedValueOnce([]);
+
+    useQueryTest.onResyncRequired(client as any);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const entry = useQueryTest.getEntry(client as any, key)!;
+    expect(entry.items).toEqual([]);
+    expect(entry.loading).toBe(true);
+    expect(entry.queryHash).toBeNull();
+    expect(entry.retryTimer).not.toBeNull();
+    expect(client.countSubs("query:old-hash")).toBe(0);
+    expect(client.send).toHaveBeenCalledWith("unsubscribe:query", "old-hash");
+    release();
+  });
+
+  it("clears and retries an incomplete resync entry", async () => {
+    vi.useFakeTimers();
+    const client = new FakeClient();
+    const chain = makeChain({
+      results: [{ id: "stale" }],
+      queryHash: "incomplete-hash",
+    });
+    const key = useQueryTest.buildKey("post", "u1", chain.__steps);
+    const release = useQueryTest.retain(client as any, key, () => {});
+    useQueryTest.fetch(key, chain, client as any);
+    await vi.advanceTimersByTimeAsync(0);
+    client.resync.mockResolvedValueOnce([{ key, items: [] }]);
+
+    useQueryTest.onResyncRequired(client as any);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const entry = useQueryTest.getEntry(client as any, key)!;
+    expect(entry.items).toEqual([]);
+    expect(entry.loading).toBe(true);
+    expect(entry.retryTimer).not.toBeNull();
+    expect(client.send).toHaveBeenCalledWith(
+      "unsubscribe:query",
+      "incomplete-hash",
+    );
+    release();
+  });
+
+  it("removes stale subscriptions for an explicit empty denied result", async () => {
+    const client = new FakeClient();
+    const chain = makeChain({
+      results: [{ id: "stale" }],
+      queryHash: "denied-hash",
+    });
+    const key = useQueryTest.buildKey("post", "u1", chain.__steps);
+    const release = useQueryTest.retain(client as any, key, () => {});
+    useQueryTest.fetch(key, chain, client as any);
+    await new Promise((resolve) => setImmediate(resolve));
+    client.resync.mockResolvedValueOnce([
+      { key, hash: null, items: [], totalCount: 0 },
+    ]);
+
+    useQueryTest.onResyncRequired(client as any);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const entry = useQueryTest.getEntry(client as any, key)!;
+    expect(entry.items).toEqual([]);
+    expect(entry.queryHash).toBeNull();
+    expect(client.countSubs("query:denied-hash")).toBe(0);
+    expect(client.send).toHaveBeenCalledWith("unsubscribe:query", "denied-hash");
+    release();
+  });
+
+  it("schedules recovery after a failed resync batch even without polling", async () => {
+    vi.useFakeTimers();
+    const client = new FakeClient();
+    const chain = makeChain({
+      results: [{ id: "stale" }],
+      queryHash: "failed-hash",
+    });
+    const key = useQueryTest.buildKey("post", "u1", chain.__steps);
+    const release = useQueryTest.retain(client as any, key, () => {});
+    useQueryTest.fetch(key, chain, client as any);
+    await vi.advanceTimersByTimeAsync(0);
+    client.resync.mockRejectedValueOnce(new Error("batch failed"));
+
+    useQueryTest.onResyncRequired(client as any);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const entry = useQueryTest.getEntry(client as any, key)!;
+    expect(entry.error?.message).toBe("batch failed");
+    expect(entry.retryTimer).not.toBeNull();
+    expect(entry.queryHash).toBeNull();
+    expect(client.send).toHaveBeenCalledWith("unsubscribe:query", "failed-hash");
+    release();
+  });
+
+  it("unsubscribes every query hash purged on an identity change", async () => {
+    const client = new FakeClient();
+    const first = makeChain({ results: [{ id: "a" }], queryHash: "hash-a" });
+    const second = makeChain({ results: [{ id: "b" }], queryHash: "hash-b" });
+    second.__steps = [{ method: "where", args: [{ kind: "second" }] }];
+    const firstKey = useQueryTest.buildKey("post", "u1", first.__steps);
+    const secondKey = useQueryTest.buildKey("post", "u1", second.__steps);
+    const releaseFirst = useQueryTest.retain(client as any, firstKey, () => {});
+    const releaseSecond = useQueryTest.retain(client as any, secondKey, () => {});
+    useQueryTest.fetch(firstKey, first, client as any);
+    useQueryTest.fetch(secondKey, second, client as any);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    _purgeCacheForUser(client as any, "u1");
+
+    expect(client.send).toHaveBeenCalledWith("unsubscribe:query", "hash-a");
+    expect(client.send).toHaveBeenCalledWith("unsubscribe:query", "hash-b");
+    expect(useQueryTest.getEntry(client as any, firstKey)).toBeUndefined();
+    expect(useQueryTest.getEntry(client as any, secondKey)).toBeUndefined();
+    releaseFirst();
+    releaseSecond();
+  });
+
   // ── Subscription cleanup on release ─────────────────────────────────
 
   it("releasing all refs disposes the query:<hash> subscription via the GC timer", async () => {
@@ -391,7 +625,7 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     });
     const key = useQueryTest.buildKey("post", "u1", chain.__steps);
 
-    const release = useQueryTest.retain(key, () => {});
+    const release = useQueryTest.retain(client as any, key, () => {});
     useQueryTest.fetch(key, chain, client as any);
     await vi.advanceTimersByTimeAsync(0);
     expect(client.countSubs("query:h-gc")).toBe(1);
@@ -404,7 +638,7 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     // here by calling dispose + setting refs=0 explicitly the way
     // the hook does.
     release();
-    const entry = useQueryTest.getEntry(key)!;
+    const entry = useQueryTest.getEntry(client as any, key)!;
     entry.dispose?.();
     expect(client.countSubs("query:h-gc")).toBe(0);
   });

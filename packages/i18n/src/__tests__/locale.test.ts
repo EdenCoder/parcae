@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { setupI18n } from "@lingui/core";
 import {
+  activateLocaleIfCurrent,
   createI18nSync,
   defineI18n,
   detectLocale,
@@ -14,6 +16,46 @@ const config = defineI18n({
     greeting: locale === "fr" ? "Bonjour" : "Hello",
   }),
 });
+
+describe("React locale activation", () => {
+  it("does not let a stale catalog load win", async () => {
+    const en = deferred<Record<string, string>>();
+    const fr = deferred<Record<string, string>>();
+    const controlledConfig = defineI18n({
+      locales: ["en", "fr"] as const,
+      defaultLocale: "en",
+      loadMessages: (locale) => locale === "en" ? en.promise : fr.promise,
+    });
+    const i18n = setupI18n();
+    let generation = 0;
+    const activate = (locale: "en" | "fr") => {
+      const current = ++generation;
+      return activateLocaleIfCurrent(
+        i18n,
+        controlledConfig,
+        locale,
+        () => current === generation,
+      );
+    };
+
+    const stale = activate("en");
+    const current = activate("fr");
+    fr.resolve({ greeting: "Bonjour" });
+    await current;
+    en.resolve({ greeting: "Hello" });
+    await stale;
+
+    expect(i18n.locale).toBe("fr");
+  });
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
+}
 
 describe("@parcae/i18n locale negotiation", () => {
   it("sorts Accept-Language candidates by q value", () => {

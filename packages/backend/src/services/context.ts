@@ -109,6 +109,20 @@ export function _setRuntimeFlags(flags: RuntimeFlags): void {
   _flags = flags;
 }
 
+/** @internal — clears app-owned globals after failed startup or shutdown. */
+export function _clearServices(): void {
+  _queue = null;
+  _pubsub = null;
+  _changeBus = null;
+  _io = null;
+  _flags = {
+    server: true,
+    hooks: true,
+    jobs: false,
+    crons: false,
+  };
+}
+
 /**
  * Read the resolved per-process runtime flags.
  *
@@ -206,7 +220,9 @@ export async function lock(
   ttl: number = 120000,
 ): Promise<() => Promise<void>> {
   if (!_pubsub) {
-    return async () => {};
+    throw new Error(
+      `[parcae] lock("${key}"): services are not initialized; call app.start() first`,
+    );
   }
 
   return _pubsub.lock(key, ttl);

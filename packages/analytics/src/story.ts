@@ -5,16 +5,21 @@
  * detectors produce findings, composer turns each finding into prose,
  * the projection ranks / merges / persists `Story` rows.
  *
- * Stories are scoped per `(org, periodEnd)`. Same-day reruns replace
- * stories cleanly — no drift between a fresh run and stale rows.
+ * Stories are scoped per `(org, locale, periodEnd)`. Same-period reruns
+ * replace stories cleanly — no drift between a fresh run and stale rows.
  */
 
 import type { Knex } from "knex";
+import { log } from "@parcae/backend";
 import type { ComposedStory } from "./composer.js";
 import { StoryComposer, validateAgainstFinding } from "./composer.js";
 import type { Finding, Severity } from "./finding.js";
 import { runDetectors, type DetectorContext } from "./finding.js";
 import { generateId } from "./id.js";
+import {
+  assertStructuralColumns,
+  ensureAdditiveColumn,
+} from "./schema-upgrade.js";
 
 export const STORY_TABLE = "analytics_story";
 
@@ -28,6 +33,7 @@ export type StoryStatus =
 export interface StoryRow {
   id: string;
   org: string;
+  locale: string;
   key: string;
   status: StoryStatus;
   severity: Severity;
@@ -52,33 +58,62 @@ export interface StoryRow {
 
 export async function ensureStoryTable(db: Knex): Promise<void> {
   const exists = await db.schema.hasTable(STORY_TABLE);
-  if (exists) return;
-
-  await db.schema.createTable(STORY_TABLE, (t) => {
-    t.string("id", 32).primary();
-    t.string("org", 64).notNullable();
-    t.string("key", 128).notNullable();
-    t.string("status", 16).notNullable();
-    t.string("severity", 8).notNullable();
-    t.string("title", 256).notNullable();
-    t.text("body").notNullable();
-    t.integer("rank").notNullable().defaultTo(0);
-    t.jsonb("subjects").notNullable().defaultTo("[]");
-    t.jsonb("data").notNullable().defaultTo("{}");
-    t.jsonb("metricRefs").notNullable().defaultTo("[]");
-    t.jsonb("quotedValues").notNullable().defaultTo("[]");
-    t.string("modelName", 128).notNullable().defaultTo("");
-    t.jsonb("sourceFindingKeys").notNullable().defaultTo("[]");
-    t.timestamp("periodEnd", { useTz: true }).notNullable();
-    t.timestamp("createdAt", { useTz: true }).notNullable().defaultTo(db.fn.now());
-  });
+  if (!exists) {
+    await db.schema.createTable(STORY_TABLE, (t) => {
+      t.string("id", 32).primary();
+      t.string("org", 64).notNullable();
+      t.string("locale", 32).notNullable();
+      t.string("key", 128).notNullable();
+      t.string("status", 16).notNullable();
+      t.string("severity", 8).notNullable();
+      t.string("title", 256).notNullable();
+      t.text("body").notNullable();
+      t.integer("rank").notNullable().defaultTo(0);
+      t.jsonb("subjects").notNullable().defaultTo("[]");
+      t.jsonb("data").notNullable().defaultTo("{}");
+      t.jsonb("metricRefs").notNullable().defaultTo("[]");
+      t.jsonb("quotedValues").notNullable().defaultTo("[]");
+      t.string("modelName", 128).notNullable().defaultTo("");
+      t.jsonb("sourceFindingKeys").notNullable().defaultTo("[]");
+      t.timestamp("periodEnd", { useTz: true }).notNullable();
+      t.timestamp("createdAt", { useTz: true }).notNullable().defaultTo(db.fn.now());
+    });
+  } else {
+    await assertStructuralColumns(db, STORY_TABLE, [
+      "id",
+      "org",
+      "key",
+      "status",
+      "severity",
+      "title",
+      "body",
+      "rank",
+      "subjects",
+      "data",
+      "metricRefs",
+      "quotedValues",
+      "modelName",
+      "periodEnd",
+    ]);
+    await ensureAdditiveColumn(db, STORY_TABLE, "locale", (t) =>
+      t.string("locale", 32).notNullable().defaultTo("und"),
+    );
+    await ensureAdditiveColumn(db, STORY_TABLE, "sourceFindingKeys", (t) =>
+      t.jsonb("sourceFindingKeys").notNullable().defaultTo("[]"),
+    );
+    await ensureAdditiveColumn(db, STORY_TABLE, "createdAt", (t) =>
+      t.timestamp("createdAt", { useTz: true }).notNullable().defaultTo(db.fn.now()),
+    );
+  }
   await db.raw(
-    `CREATE INDEX IF NOT EXISTS analytics_story_org_period_idx
-       ON ${STORY_TABLE} (org, "periodEnd" DESC)`,
+    `CREATE INDEX IF NOT EXISTS analytics_story_org_locale_period_idx
+       ON ${STORY_TABLE} (org, locale, "periodEnd" DESC)`,
   );
 }
 
 export interface ProjectionContext extends DetectorContext {
+  /** BCP 47 locale of generated title/body prose. */
+  locale: string;
   composer?: StoryComposer;
   /** Hard ceiling on stories per run. Default 6. */
   maxStories?: number;
@@ -128,7 +163,7 @@ async function composeAll(
   );
   for (const s of settled) {
     if (s.status !== "fulfilled") {
-      console.warn(`[projection] composer rejected: ${s.reason}`);
+      log.warn(`[projection] composer rejected: ${s.reason}`);
       continue;
     }
     const { finding, composed } = s.value;
@@ -203,20 +238,15 @@ async function persistStories(
   ctx: ProjectionContext,
   stories: RankedStory[],
 ): Promise<StoryRow[]> {
+  if (!ctx.locale.trim()) {
+    throw new Error("Story projection requires a locale");
+  }
   await ensureStoryTable(ctx.db);
-
-  // Replace policy: drop existing rows for the same (org, periodEnd)
-  // before inserting new ones. Same-day reruns produce no drift.
-  await ctx.db(STORY_TABLE)
-    .where("org", ctx.org)
-    .where("periodEnd", ctx.period.end)
-    .delete();
-
-  if (stories.length === 0) return [];
 
   const rows: StoryRow[] = stories.map((s, i) => ({
     id: generateId(),
     org: ctx.org,
+    locale: ctx.locale,
     key: s.finding.key,
     status: s.status,
     severity: s.finding.severity,
@@ -244,6 +274,40 @@ async function persistStories(
     quotedValues: JSON.stringify(r.quotedValues),
     sourceFindingKeys: JSON.stringify(r.sourceFindingKeys),
   }));
-  await ctx.db(STORY_TABLE).insert(insertRows);
+  await ctx.db.transaction(async (trx) => {
+    if (isPostgres(trx)) {
+      const identity = JSON.stringify([
+        ctx.org,
+        ctx.locale,
+        ctx.period.end.toISOString(),
+      ]);
+      await trx.raw(
+        "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+        [identity],
+      );
+    }
+
+    if (ctx.locale !== "und") {
+      await trx(STORY_TABLE)
+        .where("org", ctx.org)
+        .where("locale", "und")
+        .where("periodEnd", ctx.period.end)
+        .delete();
+    }
+
+    await trx(STORY_TABLE)
+      .where("org", ctx.org)
+      .where("locale", ctx.locale)
+      .where("periodEnd", ctx.period.end)
+      .delete();
+    if (insertRows.length > 0) {
+      await trx(STORY_TABLE).insert(insertRows);
+    }
+  });
   return rows;
+}
+
+function isPostgres(db: Knex | Knex.Transaction): boolean {
+  const client = String(db.client.config.client ?? "");
+  return client === "pg" || client.includes("postgres");
 }

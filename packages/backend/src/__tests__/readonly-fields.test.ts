@@ -9,7 +9,7 @@
  *
  * These tests exercise the boundary at the route shim (without booting
  * a real DB) — they assert the strip / reject behavior happens BEFORE
- * `Model.create` / `model.save` / `adapter.patch` is called.
+ * `Model.create` / `model.save` / `model.patch` is called.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
@@ -55,16 +55,40 @@ function makeAdapterStub() {
     saves: Array<Record<string, any>>;
     patches: Array<{ ops: any[] }>;
     instances: Array<Record<string, any>>;
-  } = { saves: [], patches: [], instances: [] };
+    lockStates: boolean[];
+    saveStates: boolean[];
+  } = {
+    saves: [],
+    patches: [],
+    instances: [],
+    lockStates: [],
+    saveStates: [],
+  };
 
   let nextRow: Record<string, any> | null = { id: "p1", title: "old" };
+  let isTransactionActive = false;
+  let saveGate: Promise<void> | null = null;
 
   const adapter: any = {
+    isSqlite: false,
+    async runInTransaction(fn: () => Promise<any>) {
+      isTransactionActive = true;
+      try {
+        return await fn();
+      } finally {
+        isTransactionActive = false;
+      }
+    },
     query() {
       // Chain that always resolves to `nextRow`.
       const chain: any = {
         select: () => chain,
         where: () => chain,
+        exec: () => ({
+          forUpdate: () => {
+            captured.lockStates.push(isTransactionActive);
+          },
+        }),
         first: async () => nextRow,
         find: async () => (nextRow ? [nextRow] : []),
         count: async () => (nextRow ? 1 : 0),
@@ -78,9 +102,8 @@ function makeAdapterStub() {
       };
       return chain;
     },
-    patch: vi.fn(async (item: any, ops: any[]) => {
-      captured.patches.push({ ops });
-      captured.instances.push(item);
+    patch: vi.fn(async () => {
+      throw new Error("route must use Model.patch");
     }),
     subscriptions: null,
   };
@@ -93,12 +116,30 @@ function makeAdapterStub() {
         ? {
             ...row,
             save: vi.fn(async function (this: any) {
+              captured.saveStates.push(isTransactionActive);
+              if (saveGate) await saveGate;
               captured.saves.push({ ...this });
+            }),
+            patch: vi.fn(async function (this: any, ops: any[]) {
+              captured.patches.push({ ops });
+              captured.instances.push(this);
+              for (const op of ops) {
+                if (op.op !== "add" && op.op !== "replace") continue;
+                const field = op.path.slice(1);
+                this[field] = op.value;
+                this.__data[field] = op.value;
+              }
             }),
             sanitize: undefined,
             __data: row,
           }
         : null;
+    },
+    setSaveGate(gate: Promise<void> | null) {
+      saveGate = gate;
+    },
+    isTransactionActive() {
+      return isTransactionActive;
     },
   };
 }
@@ -228,6 +269,77 @@ describe("auto-CRUD readonlyFields", () => {
     expect(res.captured.status).toBe(200);
     expect(captured.patches).toHaveLength(1);
     expect(captured.patches[0]!.ops).toHaveLength(1);
+    expect(res.captured.body.result.title).toBe("new");
+    expect((adapter.patch as any).mock.calls).toHaveLength(0);
+  });
+
+  it.each(["copy", "move"])(
+    "PATCH rejects unsupported %s before reading the row",
+    async (operation) => {
+      const Post = makePost();
+      const { adapter, captured, setRow } = makeAdapterStub();
+      setRow({
+        id: "p1",
+        title: "public",
+        secret: "must-not-copy",
+      });
+      registerModelRoutes([Post], adapter);
+
+      const route = findRoute("PATCH", "/v1/posts/:id");
+      const res = makeRes();
+      await route!.handler!(
+        {
+          params: { id: "p1" },
+          body: {
+            ops: [
+              {
+                op: operation,
+                from: "/secret",
+                path: "/title",
+              },
+            ],
+          },
+        },
+        res as any,
+      );
+
+      expect(res.captured.status).toBe(400);
+      expect(res.captured.body.error).toContain(`unsupported op \"${operation}\"`);
+      expect(captured.lockStates).toHaveLength(0);
+      expect(captured.patches).toHaveLength(0);
+    },
+  );
+
+  it("keeps scoped lookup, row lock, and PUT save in one transaction", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const Post = makePost();
+    const fixture = makeAdapterStub();
+    fixture.setRow({ id: "p1", title: "old", user: "u1" });
+    fixture.setSaveGate(gate);
+    registerModelRoutes([Post], fixture.adapter);
+
+    const route = findRoute("PUT", "/v1/posts/:id");
+    const response = route!.handler!(
+      {
+        session: { user: { id: "u1" } },
+        params: { id: "p1" },
+        body: { title: "new" },
+      },
+      makeRes() as any,
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(fixture.captured.lockStates).toEqual([true]);
+    expect(fixture.captured.saveStates).toEqual([true]);
+    expect(fixture.isTransactionActive()).toBe(true);
+
+    release();
+    await response;
+    expect(fixture.isTransactionActive()).toBe(false);
   });
 
   it("PATCH rejects system fields (id/createdAt/updatedAt/type) by default", async () => {

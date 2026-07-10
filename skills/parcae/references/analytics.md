@@ -4,22 +4,22 @@ The analytics package adds an event-stream + rollup data model on top of Parcae'
 
 ## Schema
 
-Three tables are auto-DDLed via `installAnalytics(db)` (which calls `ensureAnalyticsTables(db)`) at app start. A fourth — `analytics_story` — is created lazily by `ensureStoryTable()` / `runProjection()`. Never write a migration for any of them. All DDL for the first three lives in `schema.ts` (`analytics_event`, `analytics_snapshot`) and `state-change.ts` (`analytics_state_change`); story DDL lives in `story.ts`.
+Three tables are auto-DDLed via `installAnalytics(db)` (which calls `ensureAnalyticsTables(db)`) at app start. A fourth — `analytics_story` — is created lazily by `ensureStoryTable()` / `runProjection()`. Safe non-key columns are repaired additively; a pre-existing table missing identity or conflict-key columns, or a valid unique index/constraint for an `ON CONFLICT` target, fails startup and requires an explicit versioned migration. All DDL for the first three lives in `schema.ts` (`analytics_event`, `analytics_snapshot`) and `state-change.ts` (`analytics_state_change`); story DDL lives in `story.ts`.
 
 | Table                   | DDL by                  | Purpose                                                                                            |
 | ----------------------- | ----------------------- | ------------------------------------------------------------------------------------------------- |
 | `analytics_event`       | `ensureAnalyticsTables` | Append-only fact stream. One row per real-world event (activity logged, nudge dispatched, etc.).  |
 | `analytics_snapshot`    | `ensureAnalyticsTables` | Rollup table. One row per `(org, metricKey, grain, periodStart, dimensions)` via canonical-JSON dimension key. |
 | `analytics_state_change`| `ensureAnalyticsTables` | Append-only cohort transition stream (`entered` / `left`). Idempotent re-runs.                     |
-| `analytics_story`       | `ensureStoryTable` (lazy) | Composed insight rows. Replace-on-rerun by `(org, periodEnd)`.                                   |
+| `analytics_story`       | `ensureStoryTable` (lazy) | Localized insight rows. Replace-on-rerun by `(org, locale, periodEnd)`.                           |
 
-`installAnalytics(db)` is idempotent: it ensures the three tables and installs the default Knex emitter (`createKnexEmitter`) via `setEventEmitter`. `ensureAnalyticsTables(db)` additively patches existing event tables (adds `source` / `dimensions` columns if missing).
+`installAnalytics(db)` is idempotent: it ensures the three tables and installs the default Knex emitter (`createKnexEmitter`) via `setEventEmitter`. `ensureAnalyticsTables(db)` only patches safe additive columns. For existing snapshot and state-change tables it verifies the exact conflict targets against PostgreSQL's valid, immediate, non-partial unique indexes (including indexes backing unique constraints). It never fills missing IDs or conflict keys with shared defaults and never reconstructs primary/unique constraints on unknown legacy data; resolve duplicates and add the target in a versioned migration.
 
 Indexes:
 - events: `(org, key, occurredAt DESC)` and `(org, subject, occurredAt DESC)`
 - snapshots: unique `(org, metricKey, grain, periodStart, dimensions)` plus lookup `(org, metricKey, grain, periodStart DESC)`
 - state changes: `(org, subject, occurredAt DESC)`, `(org, cohort, occurredAt DESC)`, unique `(org, subject, cohort, sourceSnapshotId, transition)`
-- stories: `(org, periodEnd DESC)`
+- stories: `(org, locale, periodEnd DESC)`
 
 ## Period
 
@@ -242,6 +242,7 @@ import { runProjection } from "@parcae/analytics";
 
 await runProjection({
   org,
+  locale: "en",
   period,
   db,
   now,
@@ -250,13 +251,13 @@ await runProjection({
 });
 ```
 
-`runProjection(ctx)` takes a single `ProjectionContext` — that is `DetectorContext` (`{ org, period, db, now }`) plus optional `composer?` and `maxStories?` (default 6). It:
+`runProjection(ctx)` takes a single `ProjectionContext` — that is `DetectorContext` (`{ org, period, db, now }`) plus required BCP 47 `locale` and optional `composer?` and `maxStories?` (default 6). It:
 
 1. Runs `runDetectors(ctx)` to get findings.
 2. If `composer` is present, composes + validates each finding in parallel (`Promise.allSettled`), dropping any that throw. **If `composer` is omitted, each finding becomes a deterministic `fallbackStory`** built from `narrativeSeed` (title = first 72 chars, body = the seed, `quotedValues = []`, `metricRefs = relatedMetrics`) — no LLM call.
 3. Ranks (`severity × 10` + `+100` meta boost when `sourceFindings` is set + cohort size clamped to 50), dedupes by lowercased title, and caps at `maxStories`.
 4. Promotes the highest-ranked `action`-severity story to `status: "priority"` (at most one).
-5. Persists by deleting prior rows for the same `(org, periodEnd)` first, then inserting.
+5. Persists under a transaction advisory lock whose `(org, locale, periodEnd)` identity is JSON-encoded, then replaces rows for that exact identity. A real-locale write also removes legacy `locale = "und"` rows for only the same org and period.
 
 ## Story shape
 
@@ -264,6 +265,7 @@ await runProjection({
 
 | Column                | Notes                                                                            |
 | --------------------- | -------------------------------------------------------------------------------- |
+| `locale`              | BCP 47 locale of the generated prose; part of the replacement identity.          |
 | `key`                 | Hierarchical, from the source finding, e.g. `meta.onboarding_momentum`.          |
 | `status`              | `priority` / `working` / `slipping` / `watching` / `ready_to_ship` (`StoryStatus`). |
 | `severity`            | `info` / `watch` / `action`. Drives visual weight.                               |
@@ -275,7 +277,7 @@ await runProjection({
 | `quotedValues`        | Validator allow-list — body only cites numbers in this list.                     |
 | `modelName`           | `"meta-detector"` when the finding had `sourceFindings`, else `"atomic-detector"`. |
 | `sourceFindingKeys`   | `string[]` of source finding keys; empty for atomic stories.                     |
-| `periodEnd`           | Replace key — same-period reruns delete-then-insert cleanly.                     |
+| `periodEnd`           | Replace key with `org` and `locale`; same-period reruns replace cleanly.         |
 
 `deriveStatus(finding)`: `action` → `slipping`; key contains `"ready"` → `ready_to_ship`; key contains `"improvement"` → `working`; otherwise `watching`. The single `action` promotion then overrides one row to `priority`.
 
@@ -329,11 +331,12 @@ mountContract(app, new ClinicDashboardContract(), {
 });
 ```
 
-`mountContract(app, contract, opts: MountOptions)` wires the contract into a Polka-like instance (`app.get(path, handler)`). `MountOptions` is `{ db, parsePeriod, guard? }`:
+`mountContract(app, contract, opts: MountOptions)` wires the contract into a Polka-like instance (`app.get(path, handler)`). `MountOptions` includes `{ db, parsePeriod, guard?, authorizeOrg? }`:
 - `parsePeriod(spec: string) => Period` — turns the `?period=` string into a `Period`.
 - `guard?: ContractGuard` — `(req) => string | { error, status? } | undefined`. **Any** string denies with 403 (including `""`, which yields an empty error body); an object denies with its `status` (default 403). Return `undefined` (or a non-string falsy) to allow — note `""` does **not** allow.
+- `authorizeOrg?: ContractOrgAuthorizer` — required when the final resolved `ctx.org` differs from the authenticated session org.
 
-The handler calls `contract.resolveContext(req, db, parsePeriod)`, then runs `data()` and `freshness()` in parallel and responds `{ data, freshness }` (`ContractResponse<T>`). On a thrown `ContractError` it responds with that error's `status`; any other error → 500.
+The handler calls `contract.resolveContext(req, db, parsePeriod)`, authorizes the final `ctx.org`, then runs `data()` and `freshness()` in parallel and responds `{ data, freshness }` (`ContractResponse<T>`). Authorization happens after overrides, so a custom `resolveContext()` cannot bypass tenant checks. On a thrown `ContractError` it responds with that error's `status`; any other error → 500.
 
 `resolveContext` (overridable) reads `?org=` (falling back to `req.session?.orgId`) and `?period=` (default `"28d"`), and throws `ContractError(400, "missing org")` if no org resolves. `ContractContext` is `{ org, period, db, now, req }`.
 
@@ -364,6 +367,7 @@ packages/analytics/src/
   story.ts           # StoryRow + ensureStoryTable + runProjection + deriveStatus
   state-change.ts    # diffCohorts() + persistStateChangeRows() + ensureStateChangeTable
   schema.ts          # installAnalytics/ensureAnalyticsTables, table constants, canonicalDimensions, createKnexEmitter
+  schema-upgrade.ts  # safe additive-column repair + structural fail-loud checks
   examples.ts        # WauMetric + AnomalyDetector reference implementations
   id.ts              # generateId (re-export of @parcae/model)
   index.ts           # Public exports

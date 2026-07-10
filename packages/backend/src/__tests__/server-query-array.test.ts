@@ -143,6 +143,31 @@ describe("BackendAdapter.query() — server-side whereIn on JSON-array columns",
 });
 
 describe("BackendAdapter.query() — aggregate terminals", () => {
+  it("count() clears limit and offset before aggregating", async () => {
+    const cleared: string[] = [];
+    const chain: any = {
+      limit: () => chain,
+      offset: () => chain,
+      clone: () => chain,
+      clearSelect: () => chain,
+      clearOrder: () => chain,
+      clear: (statement: string) => {
+        cleared.push(statement);
+        return chain;
+      },
+      count: async () => [{ total: "4" }],
+    };
+    const adapter = new BackendAdapter({
+      read: () => chain,
+      write: () => chain,
+    });
+
+    await expect(
+      adapter.query(PostArrayModel as any).limit(1).offset(3).count(),
+    ).resolves.toBe(4);
+    expect(cleared).toEqual(["limit", "offset"]);
+  });
+
   it("sum() returns a numeric scalar from the scoped query", async () => {
     const calls: Array<{ method: string; args: any[] }> = [];
     const chain: any = {
@@ -157,6 +182,10 @@ describe("BackendAdapter.query() — aggregate terminals", () => {
       },
       clearOrder: () => {
         calls.push({ method: "clearOrder", args: [] });
+        return chain;
+      },
+      clear: (statement: string) => {
+        calls.push({ method: "clear", args: [statement] });
         return chain;
       },
       sum: async (...args: any[]) => {
@@ -177,6 +206,8 @@ describe("BackendAdapter.query() — aggregate terminals", () => {
       { method: "where", args: [{ name: "paid" }] },
       { method: "clearSelect", args: [] },
       { method: "clearOrder", args: [] },
+      { method: "clear", args: ["limit"] },
+      { method: "clear", args: ["offset"] },
       { method: "sum", args: [{ total: "views" }] },
     ]);
   });

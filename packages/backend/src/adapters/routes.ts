@@ -61,7 +61,7 @@ const AUTO_CRUD_PRIORITY = 200;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function buildScopeContext(req: any, res: any): ScopeContext {
+function buildScopeContext(req: any): ScopeContext {
   return {
     user: req.session?.user ?? null,
     params: req.params ?? {},
@@ -148,6 +148,7 @@ interface RouteModelRow {
   id: string;
   __data: Record<string, any>;
   save(): Promise<void>;
+  patch(ops: any[]): Promise<void>;
   remove(): Promise<void>;
   sanitize?(user?: { id: string }): Record<string, any> | Promise<Record<string, any>>;
   [field: string]: unknown;
@@ -169,22 +170,48 @@ async function findByIdOrTmp(
   ModelClass: ModelConstructor,
   paramId: string,
   scopeResult: any,
+  lock = false,
 ): Promise<RouteModelRow | null> {
-  let item = await adapter
+  const byId = adapter
     .query(ModelClass)
     .select("*")
     .where("id", paramId)
-    .where(scopeResult)
-    .first();
+    .where(scopeResult);
+  if (lock && !adapter.isSqlite) byId.exec().forUpdate();
+  let item = await byId.first();
   if (!item) {
-    item = await adapter
+    const byTmp = adapter
       .query(ModelClass)
       .select("*")
       .where("tmp", paramId)
-      .where(scopeResult)
-      .first();
+      .where(scopeResult);
+    if (lock && !adapter.isSqlite) byTmp.exec().forUpdate();
+    item = await byTmp.first();
   }
   return (item as RouteModelRow | null) ?? null;
+}
+
+function assertSupportedPatchOps(ops: unknown[]): void {
+  for (const candidate of ops) {
+    if (!candidate || typeof candidate !== "object") {
+      throw new ClientError("patch: every op must be an object");
+    }
+    const op = candidate as Record<string, unknown>;
+    if (op.op === "copy" || op.op === "move") {
+      throw new ClientError(`patch: unsupported op "${op.op}"`);
+    }
+    if (
+      op.op !== "add" &&
+      op.op !== "replace" &&
+      op.op !== "remove" &&
+      op.op !== "test"
+    ) {
+      throw new ClientError(`patch: unsupported op "${String(op.op)}"`);
+    }
+    if (typeof op.path !== "string" || !op.path.startsWith("/")) {
+      throw new ClientError("patch: op path must start with '/'");
+    }
+  }
 }
 
 /**
@@ -264,7 +291,7 @@ export function registerModelRoutes(
 
     if (scope.read) {
       route.get(path, async (req: any, res: any) => {
-        const ctx = buildScopeContext(req, res);
+        const ctx = buildScopeContext(req);
         const scopeResult = scope.read!(ctx);
         if (!scopeResult) return forbidden(res);
 
@@ -366,7 +393,7 @@ export function registerModelRoutes(
     if (scope.read) {
       route.get(`${path}/:id`, async (req: any, res: any) => {
         try {
-          const ctx = buildScopeContext(req, res);
+          const ctx = buildScopeContext(req);
           const scopeResult = scope.read!(ctx);
           if (!scopeResult) return forbidden(res);
 
@@ -394,7 +421,7 @@ export function registerModelRoutes(
     if (scope.create) {
       route.post(path, async (req: any, res: any) => {
         try {
-          const ctx = buildScopeContext(req, res);
+          const ctx = buildScopeContext(req);
           const scopeData = scope.create!(ctx);
           if (!scopeData) return forbidden(res);
 
@@ -426,28 +453,33 @@ export function registerModelRoutes(
     if (scope.update) {
       route.put(`${path}/:id`, async (req: any, res: any) => {
         try {
-          const ctx = buildScopeContext(req, res);
+          const ctx = buildScopeContext(req);
           const scopeResult = scope.update!(ctx);
           if (!scopeResult) return forbidden(res);
 
-          const item = await findByIdOrTmp(
-            adapter,
-            ModelClass,
-            req.params.id,
-            scopeResult,
-          );
+          const item = await adapter.runInTransaction(async () => {
+            const current = await findByIdOrTmp(
+              adapter,
+              ModelClass,
+              req.params.id,
+              scopeResult,
+              true,
+            );
+            if (!current) return null;
+
+            // Strip readonly fields BEFORE mass-assigning. The framework
+            // protects id/createdAt/updatedAt/type unconditionally; per-
+            // model `static readonlyFields` adds counter columns,
+            // ownership refs, and state-machine cols on top.
+            const data = stripReadonly(ModelClass, req.body || {});
+            for (const [key, value] of Object.entries(data)) {
+              current[key] = value;
+            }
+
+            await current.save();
+            return current;
+          });
           if (!item) return notFound(res, type);
-
-          // Strip readonly fields BEFORE mass-assigning. The framework
-          // protects id/createdAt/updatedAt/type unconditionally; per-
-          // model `static readonlyFields` adds counter columns,
-          // ownership refs, and state-machine cols on top.
-          const data = stripReadonly(ModelClass, req.body || {});
-          for (const [key, value] of Object.entries(data)) {
-            item[key] = value;
-          }
-
-          await item.save();
 
           json(res, 200, {
             result: await projectForWire(item, ctx.user),
@@ -465,19 +497,23 @@ export function registerModelRoutes(
     if (scope.delete) {
       route.delete(`${path}/:id`, async (req: any, res: any) => {
         try {
-          const ctx = buildScopeContext(req, res);
+          const ctx = buildScopeContext(req);
           const scopeResult = scope.delete!(ctx);
           if (!scopeResult) return forbidden(res);
 
-          const item = await findByIdOrTmp(
-            adapter,
-            ModelClass,
-            req.params.id,
-            scopeResult,
-          );
+          const item = await adapter.runInTransaction(async () => {
+            const current = await findByIdOrTmp(
+              adapter,
+              ModelClass,
+              req.params.id,
+              scopeResult,
+              true,
+            );
+            if (!current) return null;
+            await current.remove();
+            return current;
+          });
           if (!item) return notFound(res, type);
-
-          await item.remove();
 
           json(res, 200, { result: { id: req.params.id }, success: true });
         } catch (err) {
@@ -492,7 +528,7 @@ export function registerModelRoutes(
     if (scope.patch || scope.update) {
       route.patch(`${path}/:id`, async (req: any, res: any) => {
         try {
-          const ctx = buildScopeContext(req, res);
+          const ctx = buildScopeContext(req);
           const scopeResult = (scope.patch ?? scope.update)!(ctx);
           if (!scopeResult) return forbidden(res);
 
@@ -504,6 +540,7 @@ export function registerModelRoutes(
               error: "ops array required",
             });
           }
+          assertSupportedPatchOps(data.ops);
 
           // Reject the whole batch if any op targets a readonly
           // column — fail loud rather than silently dropping ops so
@@ -514,7 +551,11 @@ export function registerModelRoutes(
           const deny = readonlyFieldsFor(ModelClass);
           for (const op of data.ops) {
             if (!op?.path || typeof op.path !== "string") continue;
-            const column = op.path.slice(1).split("/")[0];
+            const column = op.path
+              .slice(1)
+              .split("/")[0]
+              ?.replace(/~1/g, "/")
+              .replace(/~0/g, "~");
             if (column && deny.has(column)) {
               return json(res, 403, {
                 result: null,
@@ -524,15 +565,19 @@ export function registerModelRoutes(
             }
           }
 
-          const item = await findByIdOrTmp(
-            adapter,
-            ModelClass,
-            req.params.id,
-            scopeResult,
-          );
+          const item = await adapter.runInTransaction(async () => {
+            const current = await findByIdOrTmp(
+              adapter,
+              ModelClass,
+              req.params.id,
+              scopeResult,
+              true,
+            );
+            if (!current) return null;
+            await current.patch(data.ops);
+            return current;
+          });
           if (!item) return notFound(res, type);
-
-          await adapter.patch(item, data.ops);
 
           json(res, 200, {
             result: await projectForWire(item, ctx.user),

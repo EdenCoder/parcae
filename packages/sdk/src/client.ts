@@ -31,15 +31,14 @@ export interface ClientConfig {
   /**
    * Extra headers attached to the socket handshake. Applied in Node
    * and React Native; browsers ignore them for WebSocket transport.
-   * Pass a stable reference. Note the client cache is keyed on
-   * `url:version` only, so the first-created client's headers win
-   * for that key (existing behaviour for all config).
+   * Pass a stable reference when this config is created during render.
    */
   extraHeaders?: Record<string, string>;
 }
 
 export interface ParcaeClient {
   transport: Transport;
+  adapter: FrontendAdapter;
   session: SessionMachine;
   connection: ConnectionMachine;
   get(path: string, data?: any, options?: RequestOptions): Promise<any>;
@@ -61,13 +60,13 @@ export interface ParcaeClient {
   off(event: string, handler?: (...args: any[]) => void): void;
   disconnect(): void;
   reconnect(): Promise<void>;
+  /** Bind a Model constructor to this client without changing global state. */
+  bind<T extends typeof Model>(model: T): T;
+  /** Permanently release this client's socket and listeners. */
+  dispose(): void;
 }
 
 export function createClient(config: ClientConfig): ParcaeClient {
-  const cacheKey = `${config.url}:${config.version ?? "v1"}`;
-  const existing = (globalThis as any).__parcae_clients?.get(cacheKey);
-  if (existing) return existing;
-
   const transport = new SocketTransport({
     url: config.url,
     version: config.version ?? "v1",
@@ -76,10 +75,11 @@ export function createClient(config: ClientConfig): ParcaeClient {
     extraHeaders: config.extraHeaders,
   });
 
-  Model.use(new FrontendAdapter(transport));
+  const adapter = new FrontendAdapter(transport);
 
   const client: ParcaeClient = {
     transport,
+    adapter,
     session: transport.session,
     connection: transport.connection,
     get: (p, d, o) => transport.get(p, d, o),
@@ -100,12 +100,9 @@ export function createClient(config: ClientConfig): ParcaeClient {
     off: (e, h) => transport.off(e, h),
     disconnect: () => transport.disconnect(),
     reconnect: () => transport.reconnect(),
+    bind: (model) => model.bind(adapter),
+    dispose: () => transport.dispose(),
   };
-
-  if (!(globalThis as any).__parcae_clients) {
-    (globalThis as any).__parcae_clients = new Map();
-  }
-  (globalThis as any).__parcae_clients.set(cacheKey, client);
 
   return client;
 }

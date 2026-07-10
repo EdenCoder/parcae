@@ -29,6 +29,9 @@ export interface AuthAdapter {
    */
   setup(ctx: AuthSetupContext): Promise<void>;
 
+  /** Release resources owned by the adapter. */
+  close?(): Promise<void> | void;
+
   /**
    * Resolve an HTTP request to an authenticated session.
    * Returns null if the request is unauthenticated.

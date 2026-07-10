@@ -23,6 +23,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import knexFactory from "knex";
 import { BackendAdapter } from "../adapters/model";
 import { clearHooks } from "../routing/hook";
 
@@ -30,7 +31,7 @@ import { clearHooks } from "../routing/hook";
 
 interface RawCall {
   sql: string;
-  bindings: unknown[];
+  bindings: any[];
 }
 
 interface UpdateCall {
@@ -49,7 +50,8 @@ interface KnexCapture {
    * shape per column.
    */
   lastSqlFor: (column: string) => string | undefined;
-  lastBindingsFor: (column: string) => unknown[] | undefined;
+  lastBindingsFor: (column: string) => any[] | undefined;
+  setRow: (row: Record<string, any>) => void;
 }
 
 /**
@@ -66,10 +68,16 @@ function createKnexStub(): {
 } {
   const raws: RawCall[] = [];
   const updates: UpdateCall[] = [];
+  let currentRow: Record<string, any> = {
+    id: "p1",
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+    data: {},
+  };
 
   // Tag returned from raw() so update() can recognise its own raws
   // and (for the test) extract the sql + bindings.
-  type Raw = { __raw: true; sql: string; bindings: unknown[] };
+  type Raw = { __raw: true; sql: string; bindings: any[] };
 
   const knex: any = (table: string) => {
     let whereCol = "";
@@ -80,7 +88,13 @@ function createKnexStub(): {
         whereVal = val;
         return this;
       },
-      async update(fields: Record<string, unknown>) {
+      forUpdate() {
+        return this;
+      },
+      async first() {
+        return currentRow;
+      },
+      update(fields: Record<string, unknown>) {
         // Resolve raw() values into a plain {sql, bindings} record
         // so the test can assert on what was actually compiled.
         const resolved: Record<string, unknown> = {};
@@ -93,14 +107,24 @@ function createKnexStub(): {
           }
         }
         updates.push({ table, whereCol, whereVal, fields: resolved });
+        currentRow = { ...currentRow, id: whereVal as string };
+        for (const [key, value] of Object.entries(fields)) {
+          if (!value || typeof value !== "object" || !(value as Raw).__raw) {
+            currentRow[key] = value;
+          }
+        }
+        return {
+          returning: async () => [{ ...currentRow }],
+        };
       },
     };
   };
 
-  knex.raw = (sql: string, bindings: unknown[] = []) => {
+  knex.raw = (sql: string, bindings: any[] = []) => {
     raws.push({ sql, bindings });
     return { __raw: true, sql, bindings } as Raw;
   };
+  knex.transaction = async (fn: (trx: any) => Promise<any>) => fn(knex);
 
   // The patch path doesn't run schema introspection, but a couple
   // of code paths read `engine` / `pubsub` off the adapter — leave
@@ -128,9 +152,12 @@ function createKnexStub(): {
         if (!last) return undefined;
         const v = last.fields[column];
         if (v && typeof v === "object" && "bindings" in (v as any)) {
-          return (v as any).bindings as unknown[];
+          return (v as any).bindings as any[];
         }
         return undefined;
+      },
+      setRow(row: Record<string, any>) {
+        currentRow = { ...row };
       },
     },
   };
@@ -149,6 +176,11 @@ const ProjectModel: any = {
     blocks: "json",
     tags: "json",
     meta: "json",
+    camelCase: "json",
+    title: "string",
+  },
+  hydrate(_adapter: BackendAdapter, data: Record<string, any>) {
+    return { __data: data };
   },
 };
 
@@ -329,8 +361,8 @@ describe("BackendAdapter._patchPostgres — vivification shape (DOL-553)", () =>
     // The `#-` removes for both shots must survive into the SQL.
     expect(sql).toContain("#-");
     const removeBindings = capture.lastBindingsFor("blocks") ?? [];
-    expect(removeBindings).toContain("{b119,shots,b120}");
-    expect(removeBindings).toContain("{b119,shots,b443}");
+    expect(removeBindings).toContainEqual(["b119", "shots", "b120"]);
+    expect(removeBindings).toContainEqual(["b119", "shots", "b443"]);
     // The `replace` for `b550/order` lands as a `jsonb_set_lax`.
     expect(sql).toMatch(/jsonb_set_lax\(/);
   });
@@ -379,6 +411,56 @@ describe("BackendAdapter._patchPostgres — vivification shape (DOL-553)", () =>
     expect(sql).toContain("#-");
   });
 
+  it("evaluates a test against the locked database row, not the model snapshot", async () => {
+    const model = makeModel();
+    model.__data.title = "after";
+    model.__serverSnapshot.title = "before";
+    capture.setRow({
+      id: "p1",
+      title: "changed-concurrently",
+      createdAt: new Date(0),
+      updatedAt: new Date(0),
+      data: {},
+    });
+
+    await expect(
+      adapter.patch(model, [
+        { op: "test", path: "/title", value: "before" } as any,
+        { op: "replace", path: "/title", value: "after" } as any,
+      ]),
+    ).rejects.toThrow("patch test failed at /title");
+
+    expect(capture.updates).toHaveLength(0);
+  });
+
+  it("rejects copy and move before building SQL", async () => {
+    const model = makeModel();
+    await expect(
+      adapter.patch(model, [
+        { op: "copy", from: "/title", path: "/meta/leak" } as any,
+      ]),
+    ).rejects.toThrow('unsupported op "copy"');
+    await expect(
+      adapter.patch(model, [
+        { op: "move", from: "/title", path: "/meta/leak" } as any,
+      ]),
+    ).rejects.toThrow('unsupported op "move"');
+    expect(capture.updates).toHaveLength(0);
+  });
+
+  it("uses jsonb_insert for numeric array add so existing elements shift", async () => {
+    const model = makeModel();
+    model.__serverSnapshot.tags = ["a", "c"];
+    await adapter.patch(model, [
+      { op: "add", path: "/tags/1", value: "b" } as any,
+    ]);
+
+    const sql = capture.lastSqlFor("tags");
+    expect(sql).toContain("jsonb_insert");
+    expect(sql).not.toMatch(/jsonb_set_lax\([^]*\{1\}/);
+    expect(capture.lastBindingsFor("tags")).toContainEqual(["1"]);
+  });
+
   // ── Pure top-level ops (regression: no array vivification) ────────
 
   it("does not emit jsonb defaults for a top-level scalar replace", async () => {
@@ -402,6 +484,58 @@ describe("BackendAdapter._patchPostgres — vivification shape (DOL-553)", () =>
     // unwanted jsonb vivification side-effect on a scalar-only patch.
     expect(capture.raws.length).toBe(1);
     expect(capture.raws[0]!.sql).toContain("?::text[]");
-    expect(capture.raws[0]!.bindings).toEqual(["{title}"]);
+    expect(capture.raws[0]!.bindings).toEqual(["data", ["title"]]);
+  });
+
+  it("binds camelCase identifiers and decoded JSON Pointer paths", async () => {
+    const model = makeModel();
+    model.__data.camelCase = {};
+    model.__serverSnapshot.camelCase = {};
+
+    await adapter.patch(model, [
+      {
+        op: "replace",
+        path: '/camelCase/a,b/{brace}/quote"key/slash~1tilde~0',
+        value: true,
+      } as any,
+    ]);
+
+    const sql = capture.lastSqlFor("camelCase");
+    const bindings = capture.lastBindingsFor("camelCase");
+    expect(sql).toContain("COALESCE(??, '{}'::jsonb)");
+    expect(bindings?.[0]).toBe("camelCase");
+    expect(bindings).toContainEqual([
+      "a,b",
+      "{brace}",
+      'quote"key',
+      "slash/tilde~",
+    ]);
+
+    const knex = knexFactory({ client: "pg" });
+    try {
+      const compiled = knex.raw(sql!, bindings!).toSQL();
+      expect(compiled.sql).toContain('COALESCE("camelCase"');
+      expect(compiled.bindings).toContainEqual([
+        "a,b",
+        "{brace}",
+        'quote"key',
+        "slash/tilde~",
+      ]);
+    } finally {
+      await knex.destroy();
+    }
+  });
+
+  it("drops obsolete identifier bindings when replacing a JSON root", async () => {
+    await adapter.patch(makeModel(), [
+      {
+        op: "replace",
+        path: "/blocks",
+        value: { next: true },
+      } as any,
+    ]);
+
+    expect(capture.lastSqlFor("blocks")).toBe("?::jsonb");
+    expect(capture.lastBindingsFor("blocks")).toEqual(['{"next":true}']);
   });
 });

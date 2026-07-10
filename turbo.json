@@ -9,6 +9,10 @@
       "dependsOn": ["^build"]
     },
     "lint": {},
+    "test": {
+      "dependsOn": ["^build"],
+      "env": ["ANALYTICS_TEST_DB"]
+    },
     "clean": {
       "cache": false
     }

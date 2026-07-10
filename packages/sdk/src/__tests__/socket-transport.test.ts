@@ -11,9 +11,13 @@
  *   - `terminateSession()` puts the SessionMachine into terminated.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { compress } from "compress-json";
+import pako from "pako";
+import { FrontendAdapter, Model } from "@parcae/model";
 
 class FakeSocket {
   connected = false;
+  disconnectCalls = 0;
   private handlers = new Map<string, Set<(...args: any[]) => void>>();
   public emits: { event: string; args: any[] }[] = [];
 
@@ -67,25 +71,28 @@ class FakeSocket {
   }
 
   disconnect(): void {
+    this.disconnectCalls++;
     this.connected = false;
     this._fire("disconnect");
   }
 }
 
 let currentSocket: FakeSocket;
+let sockets: FakeSocket[] = [];
 
 vi.mock("socket.io-client", () => ({
   default: vi.fn(() => {
     currentSocket = new FakeSocket();
+    sockets.push(currentSocket);
     return currentSocket;
   }),
 }));
 
 // eslint-disable-next-line import/first
-import { SocketTransport, _resetSockets } from "../transports/socket";
+import { SocketTransport } from "../transports/socket";
+import { createClient } from "../client";
 
 function makeTransport(getToken: () => Promise<string | null>) {
-  _resetSockets();
   return new SocketTransport({ url: "http://localhost:0", getToken });
 }
 
@@ -97,12 +104,36 @@ function ackHello(userId: string | null): void {
   cb({ userId });
 }
 
+function respondToLatestCall(response: Record<string, unknown>): void {
+  const call = [...currentSocket.emits].reverse().find((e) => e.event === "call");
+  if (!call) throw new Error("no call emit found");
+  const requestId = call.args[0] as string;
+  currentSocket._fire(
+    requestId,
+    pako.gzip(JSON.stringify(compress(response))),
+  );
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+class Post extends Model {
+  static type = "post" as const;
+}
+
 describe("SocketTransport — hello/resync protocol", () => {
   beforeEach(() => {
-    _resetSockets();
+    sockets = [];
   });
   afterEach(() => {
-    _resetSockets();
+    vi.useRealTimers();
   });
 
   it("starts in connecting and flips to connected on socket connect", () => {
@@ -173,6 +204,15 @@ describe("SocketTransport — hello/resync protocol", () => {
     expect(t.connection.state.status).toBe("disconnected");
     expect(t.session.state.status).toBe("authenticated");
     expect(t.session.state.userId).toBe("u-1");
+  });
+
+  it("disconnect always cancels an underlying connecting socket", () => {
+    const transport = makeTransport(async () => "token");
+
+    transport.disconnect();
+
+    expect(currentSocket.disconnectCalls).toBe(1);
+    expect(transport.connection.state.status).toBe("disconnected");
   });
 
   it("emits resync-required exactly once per hello ack", async () => {
@@ -309,5 +349,336 @@ describe("SocketTransport — hello/resync protocol", () => {
     const results = await promise;
     expect(results).toHaveLength(1);
     expect(results[0]!.hash).toBe("h-1");
+  });
+
+  it("preserves protocol status and code on RPC errors", async () => {
+    const transport = makeTransport(async () => "tok");
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("u-1");
+
+    const request = transport.get("/posts/missing");
+    await Promise.resolve();
+    respondToLatestCall({
+      success: false,
+      error: "Post not found",
+      status: 404,
+      code: "NOT_FOUND",
+    });
+
+    const error = await request.catch((reason) => reason);
+    expect(error).toMatchObject({
+      message: "Post not found",
+      status: 404,
+      code: "NOT_FOUND",
+    });
+  });
+
+  it("settles FrontendAdapter.findById as null for a socket 404", async () => {
+    const transport = makeTransport(async () => "tok");
+    const adapter = new FrontendAdapter(transport);
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("u-1");
+
+    const request = adapter.findById(Post, "missing");
+    await Promise.resolve();
+    respondToLatestCall({
+      success: false,
+      error: "Post not found",
+      status: 404,
+    });
+
+    await expect(request).resolves.toBeNull();
+  });
+
+  it("does not share sockets or disconnect sibling transports", () => {
+    const first = makeTransport(async () => "first");
+    const firstSocket = currentSocket;
+    const second = makeTransport(async () => "second");
+    const secondSocket = currentSocket;
+
+    expect(firstSocket).not.toBe(secondSocket);
+    secondSocket.connect();
+    first.disconnect();
+
+    expect(secondSocket.connected).toBe(true);
+    expect(second.connection.state.status).toBe("connected");
+    first.dispose();
+    second.dispose();
+  });
+
+  it("createClient never aliases clients with different identity configuration", () => {
+    const first = createClient({
+      url: "http://localhost:0",
+      version: "v1",
+      getToken: async () => "first",
+      extraHeaders: { "x-provider": "first" },
+    });
+    const second = createClient({
+      url: "http://localhost:0",
+      version: "v2",
+      getToken: async () => "second",
+      extraHeaders: { "x-provider": "second" },
+    });
+
+    expect(first).not.toBe(second);
+    expect(first.transport).not.toBe(second.transport);
+    expect(sockets).toHaveLength(2);
+    first.dispose();
+    second.dispose();
+  });
+
+  it("keeps model adapters explicit across disposed and replacement clients", () => {
+    class ClientPost extends Model {
+      static type = "client-post" as const;
+    }
+    const first = createClient({
+      url: "http://localhost:0",
+      getToken: async () => "first",
+    });
+    const FirstPost = first.bind(ClientPost);
+    first.dispose();
+    const second = createClient({
+      url: "http://localhost:0",
+      getToken: async () => "second",
+    });
+    const SecondPost = second.bind(ClientPost);
+
+    expect(ClientPost.hasAdapter()).toBe(false);
+    expect(FirstPost.getAdapter()).toBe(first.adapter);
+    expect(SecondPost.getAdapter()).toBe(second.adapter);
+    expect(second.transport).not.toBe(first.transport);
+    second.dispose();
+  });
+
+  it("ignores stale token completions from an older handshake generation", async () => {
+    const firstToken = deferred<string | null>();
+    const secondToken = deferred<string | null>();
+    const getToken = vi
+      .fn<() => Promise<string | null>>()
+      .mockReturnValueOnce(firstToken.promise)
+      .mockReturnValueOnce(secondToken.promise);
+    const transport = makeTransport(getToken);
+    currentSocket.connect();
+
+    const refresh = transport.refreshSession();
+    secondToken.resolve("new-token");
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("new-user");
+    await refresh;
+
+    firstToken.resolve("old-token");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(transport.session.state.userId).toBe("new-user");
+    expect(currentSocket.emits.filter((entry) => entry.event === "hello")).toHaveLength(1);
+  });
+
+  it("ignores a stale hello acknowledgement after a newer identity wins", async () => {
+    const transport = makeTransport(async () => "token");
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    const firstHello = currentSocket.emits.find((entry) => entry.event === "hello")!;
+
+    const refresh = transport.refreshSession();
+    await Promise.resolve();
+    await Promise.resolve();
+    const helloEmits = currentSocket.emits.filter((entry) => entry.event === "hello");
+    const secondHello = helloEmits[1]!;
+    (secondHello.args[1] as (response: any) => void)({ userId: "new-user" });
+    await refresh;
+
+    (firstHello.args[1] as (response: any) => void)({ userId: "old-user" });
+    expect(transport.session.state.userId).toBe("new-user");
+  });
+
+  it("rejects hello readiness when token resolution exceeds the bound", async () => {
+    vi.useFakeTimers();
+    const transport = new SocketTransport({
+      url: "http://localhost:0",
+      getToken: () => new Promise(() => {}),
+      handshakeTimeout: 25,
+    });
+    currentSocket.connect();
+    const ready = transport.reconnect();
+    const rejection = expect(ready).rejects.toThrow("Hello timeout");
+
+    await vi.advanceTimersByTimeAsync(25);
+
+    await rejection;
+  });
+
+  it("rejects hello readiness on disconnect and missing acknowledgements", async () => {
+    const transport = makeTransport(async () => "token");
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    const disconnected = transport.reconnect();
+    currentSocket.disconnect();
+    await expect(disconnected).rejects.toThrow("Disconnected");
+
+    const reconnect = transport.reconnect();
+    await Promise.resolve();
+    await Promise.resolve();
+    const hello = [...currentSocket.emits].reverse().find((entry) => entry.event === "hello")!;
+    (hello.args[1] as (response?: any) => void)();
+    await expect(reconnect).rejects.toThrow("Missing hello acknowledgement");
+  });
+
+  it("starts a fresh handshake when reconnect follows a failed hello", async () => {
+    const transport = makeTransport(async () => "token");
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    const failedHello = currentSocket.emits.find((entry) => entry.event === "hello")!;
+    (failedHello.args[1] as (response: any) => void)({
+      success: false,
+      error: "denied",
+    });
+
+    const reconnect = transport.reconnect();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(currentSocket.emits.filter((entry) => entry.event === "hello")).toHaveLength(2);
+    ackHello("user");
+
+    await expect(reconnect).resolves.toBeUndefined();
+    expect(transport.session.state.userId).toBe("user");
+  });
+
+  it("reconnect waits for both socket connection and hello", async () => {
+    const token = deferred<string | null>();
+    const transport = makeTransport(() => token.promise);
+    let settled = false;
+    const reconnect = transport.reconnect().then(() => {
+      settled = true;
+    });
+
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    token.resolve("token");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    ackHello("user");
+    await reconnect;
+    expect(settled).toBe(true);
+  });
+
+  it("connect_error rejects reconnect and updates connection state", async () => {
+    const transport = makeTransport(async () => "token");
+    const error = new Error("refused");
+    currentSocket.connect = () => {
+      currentSocket._fire("connect_error", error);
+    };
+
+    await expect(transport.reconnect()).rejects.toThrow("refused");
+    expect(transport.connection.state.status).toBe("disconnected");
+    expect(transport.connection.state.lastError).toBe(error);
+  });
+
+  it("deduplicates GETs only within the current session generation", async () => {
+    const transport = makeTransport(async () => "token");
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("user-1");
+
+    const first = transport.get("/posts", { page: 1 }).catch((error) => error);
+    const duplicate = transport.get("/posts", { page: 1 }).catch((error) => error);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(currentSocket.emits.filter((entry) => entry.event === "call")).toHaveLength(1);
+
+    const refresh = transport.refreshSession();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("user-2");
+    await refresh;
+    const nextGeneration = transport
+      .get("/posts", { page: 1 })
+      .catch((error) => error);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(currentSocket.emits.filter((entry) => entry.event === "call")).toHaveLength(2);
+
+    transport.dispose();
+    await Promise.all([first, duplicate, nextGeneration]);
+  });
+
+  it("rejects pending RPC and resync acknowledgements on disconnect", async () => {
+    const transport = makeTransport(async () => "token");
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("user");
+
+    const call = transport.get("/posts");
+    const resync = transport.resync([
+      { key: "posts", modelType: "post", steps: [] },
+    ]);
+    const callRejection = expect(call).rejects.toThrow("Disconnected");
+    const resyncRejection = expect(resync).rejects.toThrow("Disconnected");
+    await Promise.resolve();
+    await Promise.resolve();
+    currentSocket.disconnect();
+
+    await callRejection;
+    await resyncRejection;
+  });
+
+  it("rejects an RPC when a fresh session generation starts", async () => {
+    const transport = makeTransport(async () => "token");
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("user-1");
+
+    const call = transport.get("/posts");
+    await Promise.resolve();
+    const rejection = expect(call).rejects.toThrow("Hello superseded");
+    const refresh = transport.refreshSession();
+    await rejection;
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("user-2");
+    await refresh;
+  });
+
+  it("forwards application socket errors without rejecting unrelated RPCs", async () => {
+    const transport = makeTransport(async () => "token");
+    const onError = vi.fn();
+    transport.on("error", onError);
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("user");
+
+    const request = transport.get("/posts");
+    await Promise.resolve();
+    const applicationError = new Error("application warning");
+    currentSocket._fire("error", applicationError);
+    respondToLatestCall({ success: true, result: { posts: [] } });
+
+    await expect(request).resolves.toEqual({ posts: [] });
+    expect(onError).toHaveBeenCalledWith(applicationError);
+    expect(transport.connection.state.status).toBe("connected");
+  });
+
+  it("rejects connection waiters on dispose", async () => {
+    const transport = makeTransport(async () => "token");
+    currentSocket.connect = () => {};
+    const reconnect = transport.reconnect();
+    const rejection = expect(reconnect).rejects.toThrow("Transport disposed");
+
+    transport.dispose();
+
+    await rejection;
   });
 });

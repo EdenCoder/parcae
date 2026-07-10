@@ -91,7 +91,11 @@ export class PubSub {
 
   emit(event: string, ...args: any[]): void {
     if (this.redisWrite) {
-      this.redisWrite.publish(REDIS_CHANNEL, JSON.stringify([event, ...args]));
+      void this.redisWrite
+        .publish(REDIS_CHANNEL, JSON.stringify([event, ...args]))
+        .catch((err) => {
+          log.error(`PubSub publish failed for "${event}":`, err);
+        });
     } else {
       // In-process fallback
       this.__events.emit(event, ...args);
@@ -223,9 +227,37 @@ export class PubSub {
   // ── Cleanup ──────────────────────────────────────────────────────────
 
   async close(): Promise<void> {
-    if (this.redisLock) await this.redisLock.quit();
-    if (this.redisRead) await this.redisRead.quit();
-    if (this.redisWrite) await this.redisWrite.quit();
+    const clients = Array.from(
+      new Set(
+        [this.redisLock, this.redisRead, this.redisWrite].filter(
+          (client): client is Client => client !== null,
+        ),
+      ),
+    );
+    this.redisLock = null;
+    this.redisRead = null;
+    this.redisWrite = null;
+    this.redlock = null;
     this.__events.removeAllListeners();
+    this.__tryLocks.clear();
+
+    const results = await Promise.allSettled(
+      clients.map(async (client) => {
+        try {
+          await client.quit();
+        } catch (err) {
+          try {
+            client.disconnect();
+          } catch {}
+          throw err;
+        }
+      }),
+    );
+    const failures = results
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => result.reason);
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "Failed to close PubSub Redis clients");
+    }
   }
 }

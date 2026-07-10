@@ -11,6 +11,8 @@ import polka from "polka";
 import { Server as SocketServer } from "socket.io";
 import bodyParser from "body-parser";
 import type { Config } from "./config";
+import { ClientError, error } from "./helpers";
+import { log } from "./logger";
 
 export interface ServerContext {
   polka: ReturnType<typeof polka>;
@@ -36,7 +38,18 @@ export function createServer_(options: ServerOptions): ServerContext {
     : ["http://localhost:*", "https://localhost:*"];
 
   // Create Polka app with body parsing + query string parsing
-  const app = polka();
+  const app = polka({
+    onError: (err: unknown, _req: any, res: any) => {
+      if (res.writableEnded || res.finished) return;
+      const status = err instanceof ClientError ? err.status : 500;
+      const message =
+        err instanceof ClientError
+          ? err.message
+          : "An error occurred while processing your request";
+      log.error("[http] request failed:", err);
+      error(res, status, message);
+    },
+  });
   app.use(
     bodyParser.json({
       limit: "50mb",
@@ -112,6 +125,36 @@ export function createServer_(options: ServerOptions): ServerContext {
   });
 
   return { polka: app, io, httpServer };
+}
+
+/** Start listening and reject startup on bind/runtime listen errors. */
+export function listenServer(
+  server: ReturnType<typeof createServer>,
+  port: number,
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      server.off("error", handleError);
+      server.off("listening", handleListening);
+    };
+    const handleError = (err: Error) => {
+      cleanup();
+      reject(err);
+    };
+    const handleListening = () => {
+      cleanup();
+      resolve();
+    };
+
+    server.once("error", handleError);
+    server.once("listening", handleListening);
+    try {
+      server.listen(port);
+    } catch (err) {
+      cleanup();
+      reject(err);
+    }
+  });
 }
 
 /**

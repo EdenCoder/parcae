@@ -4,7 +4,10 @@
  */
 
 const isDev =
-  typeof process !== "undefined" ? process.env.NODE_ENV !== "production" : true;
+  (globalThis as { __PARCAE_DEV__?: boolean }).__PARCAE_DEV__ === true ||
+  (typeof process !== "undefined" &&
+    (process.env.PARCAE_DEBUG === "true" ||
+      process.env.NODE_ENV === "development"));
 
 const isBrowser =
   typeof window !== "undefined" && typeof window.document !== "undefined";
@@ -30,7 +33,7 @@ export const log = {
   warn: (...args: any[]) =>
     isDev && console.warn(...prefix("#fb3"), ...args),
   error: (...args: any[]) =>
-    console.error(...prefix("#f44"), ...args),
+    isDev && console.error(...prefix("#f44"), ...args),
   debug: (...args: any[]) =>
     isDev && console.debug(...prefix("#888"), ...args),
 };

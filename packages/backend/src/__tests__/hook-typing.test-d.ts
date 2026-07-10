@@ -28,11 +28,13 @@ type Assert<T extends true> = T;
 // A named handler annotated with the bare model type. HookContext applies
 // WithRefs internally, so `model.$owner` is typed without spelling WithRefs.
 function namedProbe({ model }: HookContext<TypingProbe>): void {
-  type _ModelNotAny = Assert<IsAny<typeof model> extends true ? false : true>;
+  type ModelNotAny = Assert<IsAny<typeof model> extends true ? false : true>;
+  const modelNotAny: ModelNotAny = true;
   const owner: string = model.$owner;
   const title: string = model.title;
   void owner;
   void title;
+  void modelNotAny;
 }
 
 // Never invoked. Exists purely so tsc validates the inferred ctx types.
@@ -43,10 +45,12 @@ export function __hookTypingProbe(): void {
 
   // Inline handlers infer the model type from the class argument.
   hook.before(TypingProbe, "remove", (ctx) => {
-    type _ModelNotAny = Assert<
+    type ModelNotAny = Assert<
       IsAny<typeof ctx.model> extends true ? false : true
     >;
+    const modelNotAny: ModelNotAny = true;
     const owner: string = ctx.model.$owner;
     void owner;
+    void modelNotAny;
   });
 }

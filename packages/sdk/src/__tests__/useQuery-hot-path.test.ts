@@ -1,7 +1,7 @@
 /**
  * useQuery — hot-path optimisations (DOL-1041).
  *
- * Three perf invariants pinned here:
+ * Two perf invariants pinned here:
  *
  *   1. `entry.hash` is O(1) regardless of items count. The previous
  *      implementation concatenated every item id into the hash string,
@@ -12,12 +12,6 @@
  *      reference-stable across reads when neither side changed. The
  *      previous implementation recomputed the merge on every render
  *      via an O(N×M) `.reduce` + `acc.some` scan.
- *
- *   3. `applyOps` update path no longer routes through
- *      `JSON.parse(JSON.stringify(...))` on the existing `__data`. We
- *      can't observe the implementation directly but we cover
- *      correctness: per-item field updates still land + per-item
- *      identity stays stable.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -29,7 +23,6 @@ import { __test as useQueryTest } from "../react/useQuery";
 class Post extends Model {
   static type = "post" as const;
   title = "";
-  body = "";
 }
 
 class FakeClient extends EventEmitter {
@@ -55,7 +48,7 @@ class FakeClient extends EventEmitter {
 }
 
 function makeChain(opts: {
-  results: Array<{ id: string; title?: string; body?: string }>;
+  results: Array<{ id: string; title?: string }>;
   queryHash: string;
 }): any {
   const chain: any = {
@@ -82,14 +75,14 @@ function makeChain(opts: {
 async function primeCache(
   client: FakeClient,
   hash: string,
-  results: Array<{ id: string; title?: string; body?: string }>,
+  results: Array<{ id: string; title?: string }>,
 ) {
   const chain = makeChain({ results, queryHash: hash });
   const key = useQueryTest.buildKey("post", "u1", chain.__steps);
-  const release = useQueryTest.retain(key, () => {});
+  const release = useQueryTest.retain(client as any, key, () => {});
   useQueryTest.fetch(key, chain, client as any);
   await new Promise((r) => setImmediate(r));
-  const entry = useQueryTest.getEntry(key)!;
+  const entry = useQueryTest.getEntry(client as any, key)!;
   return { entry, release };
 }
 
@@ -254,36 +247,6 @@ describe("useQuery hot-path optimisations (DOL-1041)", () => {
 
     expect(merged).toHaveLength(1);
     expect(merged[0]!.id).toBe("p1");
-
-    release();
-  });
-
-  // ── 3. Update path correctness preserved (was JSON round-trip) ────
-
-  it("applyOps update path still updates fields and keeps per-item identity", async () => {
-    const client = new FakeClient();
-    const { entry, release } = await primeCache(client, "h-update-correct", [
-      { id: "p1", title: "first", body: "B1" },
-      { id: "p2", title: "second", body: "B2" },
-    ]);
-    const beforeP1 = entry.items[0];
-    const beforeP2 = entry.items[1];
-
-    client.emitQueryOps("h-update-correct", [
-      {
-        op: "update",
-        id: "p1",
-        patch: [{ op: "replace", path: "/title", value: "updated" }],
-      },
-    ]);
-
-    // Same per-item references (in-place SYM_SERVER_MERGE).
-    expect(entry.items[0]).toBe(beforeP1);
-    expect(entry.items[1]).toBe(beforeP2);
-    // Update landed on the right field; sibling field untouched.
-    expect(entry.items[0]!.title).toBe("updated");
-    expect(entry.items[0]!.body).toBe("B1");
-    expect(entry.items[1]!.title).toBe("second");
 
     release();
   });

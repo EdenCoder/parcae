@@ -237,7 +237,7 @@ interface ModelAdapter {
 }
 ```
 
-There is no `ChangeSet` and no three-way HTTP-method priority. The adapter is set globally via `Model.use(adapter)` and stored on `globalThis.__parcae_adapter` so multiple copies of `@parcae/model` (common with pnpm) share one adapter.
+There is no `ChangeSet` and no three-way HTTP-method priority. `Model.use(adapter)` binds the default adapter once and rejects attempts to replace it. `Model.bind(adapter)` returns a constructor proxy whose static operations use that adapter without mutating the source class, so multiple clients and server/client contexts stay independent. The SDK exposes this as `client.bind(ModelClass)`.
 
 ## FrontendAdapter
 
@@ -279,6 +279,6 @@ When set, `ensureTable()` creates a generated `_search` tsvector column + GIN in
 
 > **Gotcha — `searchFields` must be plain text columns only.** Listing a JSONB/array field (e.g. `string[]`) makes the generated `_search` tsvector DDL fail with `invalid input syntax for type json`, aborting that table's schema sync halfway. For array fields use `static indexes` + `.where(col, "@>", [...])`, or denormalize into a computed text column for search.
 
-## GlobalThis Pattern
+## Adapter Lifetime
 
-The active adapter (plus its `__parcae_pending` / `__parcae_resolve` await helpers) lives on `globalThis` so it behaves correctly when multiple copies of `@parcae/model` coexist in the dependency tree (common in pnpm monorepos). The reference cache is **not** global — it's a private static `Model.__refCache` map.
+The default adapter and its pending resolver are module-local. `Model.use()` resolves that default once and rejects replacement; `Model.bind(adapter)` captures independent adapters on constructor proxies. The reference cache is also module-local in the private static `Model.__refCache` map.

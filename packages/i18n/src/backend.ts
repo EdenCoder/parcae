@@ -5,7 +5,7 @@ import {
   resolveLocale,
   type LocaleDetectionOptions,
   type ParcaeI18nConfig,
-} from "./index";
+} from "./locale";
 
 export const DEFAULT_I18N_ROUTE_PATH = "/v1/locale";
 
@@ -14,7 +14,7 @@ export interface I18nRoutesOptions extends LocaleDetectionOptions {
   path?: string;
   /** Route priority used by @parcae/backend. Default: 100. */
   priority?: RouteOptions["priority"];
-  /** Cache-Control header for catalog responses. */
+  /** Cache-Control for explicit locale catalogs. Negotiated responses are no-store. */
   cacheControl?: string;
 }
 
@@ -30,7 +30,7 @@ export function registerI18nRoutes<TLocale extends string>(
     async (req: any, res: any) => {
       const resolution = req.i18nContext ?? detectLocale(req, config, options);
 
-      await sendMessages(res, config, resolution.locale, options);
+      await sendMessages(res, config, resolution.locale, options, true);
     },
     routeOptions,
   );
@@ -39,7 +39,7 @@ export function registerI18nRoutes<TLocale extends string>(
     joinRoutePath(path, ":locale"),
     async (req: any, res: any) => {
       const resolution = resolveLocale(readParam(req, "locale"), config);
-      await sendMessages(res, config, resolution.locale, options);
+      await sendMessages(res, config, resolution.locale, options, false);
     },
     routeOptions,
   );
@@ -50,10 +50,11 @@ async function sendMessages<TLocale extends string>(
   config: ParcaeI18nConfig<TLocale>,
   locale: TLocale,
   options: I18nRoutesOptions,
+  negotiated: boolean,
 ): Promise<void> {
   try {
     const messages = await config.loadMessages(locale);
-    sendLocaleJson(res, locale, messages, options);
+    sendLocaleJson(res, locale, messages, options, negotiated);
   } catch {
     notFound(res, "locale");
   }
@@ -68,13 +69,23 @@ function sendLocaleJson(
   locale: string,
   body: unknown,
   options: I18nRoutesOptions,
+  negotiated: boolean,
 ): void {
   res.writeHead(200, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control":
-      options.cacheControl ??
-      "public, max-age=300, stale-while-revalidate=86400",
+      negotiated
+        ? "private, no-store"
+        : options.cacheControl ??
+          "public, max-age=300, stale-while-revalidate=86400",
     "Content-Language": locale,
+    ...(negotiated && {
+      Vary: [
+        options.headerName ?? "x-locale",
+        options.acceptLanguageHeader ?? "accept-language",
+        "cookie",
+      ].join(", "),
+    }),
   });
   res.end(JSON.stringify(body));
 }

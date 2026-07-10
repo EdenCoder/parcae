@@ -14,6 +14,7 @@
  */
 
 import type { Knex } from "knex";
+import { log } from "@parcae/backend";
 import type { Period } from "./period.js";
 
 export type Severity = "info" | "watch" | "action";
@@ -96,7 +97,7 @@ async function safeRun(
     return await d.detect(ctx, findings);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[detector ${d.key}] failed: ${msg}`);
+    log.warn(`[detector ${d.key}] failed: ${msg}`);
     return [];
   }
 }

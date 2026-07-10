@@ -367,13 +367,17 @@ describe("QueueService — per-job-name queue routing", () => {
     );
   });
 
-  it("collapses colons in job names — BullMQ v5 rejects them in queues", () => {
+  it("escapes colons in job names without creating collisions", () => {
     const q = new QueueService();
     // The `post:index` convention from older parcae docs/examples still
     // works at the `enqueue("post:index", …)` layer; only the derived
     // BullMQ queue name is sanitised.
-    expect(q.queueNameFor("post:index")).toBe("parcae-post-index");
-    expect(q.queueNameFor("a:b:c")).toBe("parcae-a-b-c");
+    expect(q.queueNameFor("post:index")).toBe("parcae-post%3Aindex");
+    expect(q.queueNameFor("a:b:c")).toBe("parcae-a%3Ab%3Ac");
+    expect(q.queueNameFor("post:index")).not.toBe(q.queueNameFor("post-index"));
+    expect(q.queueNameFor("post:index")).not.toBe(
+      q.queueNameFor("post%3Aindex"),
+    );
   });
 
   it("honours a custom defaultName", () => {

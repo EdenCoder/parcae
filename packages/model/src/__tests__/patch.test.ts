@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { dedupOps, ops } from "../patch";
-import type { PatchOp } from "../adapters/types";
+import { orderEmissionDisabled, type PatchOp } from "../adapters/types";
 
 describe("ops (unscoped builders)", () => {
   it("builds a remove op", () => {
@@ -154,5 +154,25 @@ describe("dedupOps", () => {
     ];
     const out = dedupOps(input);
     expect(out).toEqual(input);
+  });
+});
+
+describe("orderEmissionDisabled", () => {
+  it("uses the last orderBy call when false comes last", () => {
+    expect(
+      orderEmissionDisabled([
+        { method: "orderBy", args: ["createdAt", "desc"] },
+        { method: "orderBy", args: [false] },
+      ]),
+    ).toBe(true);
+  });
+
+  it("re-enables order emission when a column order comes last", () => {
+    expect(
+      orderEmissionDisabled([
+        { method: "orderBy", args: [false] },
+        { method: "orderBy", args: ["createdAt", "desc"] },
+      ]),
+    ).toBe(false);
   });
 });

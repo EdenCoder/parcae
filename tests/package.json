@@ -1,0 +1,22 @@
+{
+  "name": "@parcae/tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "lint": "tsc --noEmit",
+    "test": "vitest run --config ../vitest.config.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@parcae/backend": "workspace:*",
+    "@parcae/model": "workspace:*",
+    "@parcae/sdk": "workspace:*",
+    "better-sqlite3": "^12.11.1",
+    "knex": "^3.2.10"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  }
+}

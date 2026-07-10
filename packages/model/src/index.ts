@@ -14,6 +14,7 @@ export {
   Model,
   serializeLazyQueryArgs,
   SYM_SERVER_MERGE,
+  SYM_SERVER_PATCH,
   SYM_VERSION,
 } from "./Model";
 export type { WithRefs } from "./Model";
@@ -29,7 +30,12 @@ export type { OpBuilder } from "./patch";
 export type Text = string & { readonly __brand: "Text" };
 
 export { FrontendAdapter } from "./adapters/client";
-export type { Transport, RequestOptions } from "./adapters/client";
+export { isNotFoundError } from "./adapters/client";
+export type {
+  Transport,
+  TransportError,
+  RequestOptions,
+} from "./adapters/client";
 
 export {
   CHAINABLE_METHODS,

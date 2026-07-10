@@ -36,6 +36,7 @@
 
 import type { Server as SocketServer } from "socket.io";
 import type { Knex } from "knex";
+import type { AuthAdapter } from "./auth";
 import { log } from "./logger";
 import type { ChangeBus } from "./services/changeBus";
 import type { ListenNotifyPoller } from "./services/listenNotifyPoller";
@@ -69,6 +70,8 @@ export interface ShutdownResources {
   queue?: QueueService | null;
   /** PubSub Redis clients (3 connections: read, write, lock). */
   pubsub?: PubSub | null;
+  /** Optional auth-owned resources, such as Better Auth's pg pool. */
+  auth?: AuthAdapter | null;
   /** Write-side Knex pool. */
   writeDb?: Knex | null;
   /** Read-side Knex pool. Only destroyed if distinct from writeDb. */
@@ -102,9 +105,13 @@ async function safe(label: string, fn: () => Promise<void> | void): Promise<void
 export async function shutdownResources(r: ShutdownResources): Promise<void> {
   // ── 1. Stop accepting new connections ────────────────────────────
   if (r.io) {
-    await safe("io.close", () => {
-      r.io!.close();
-    });
+    await safe(
+      "io.close",
+      () =>
+        new Promise<void>((resolve) => {
+          r.io!.close(() => resolve());
+        }),
+    );
   }
   if (r.httpServer) {
     await safe(
@@ -141,30 +148,36 @@ export async function shutdownResources(r: ShutdownResources): Promise<void> {
   // ── 3. Drain BullMQ workers (bounded) ────────────────────────────
   if (r.queue) {
     const timeoutMs = r.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS;
-    await safe("queue.close", async () => {
-      if (timeoutMs <= 0) {
-        await r.queue!.close();
-        return;
-      }
+    if (timeoutMs <= 0) {
+      await safe("queue.close", () => r.queue!.close());
+    } else {
       let timer: ReturnType<typeof setTimeout> | null = null;
-      const drain = r.queue!.close();
-      const timeout = new Promise<void>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error(`queue drain timed out after ${timeoutMs}ms`)),
-          timeoutMs,
-        );
-      });
-      try {
-        await Promise.race([drain, timeout]);
-      } finally {
-        if (timer) clearTimeout(timer);
+      const outcome = await Promise.race([
+        r.queue.close().then(
+          () => "closed" as const,
+          (error: unknown) => ({ error }),
+        ),
+        new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => resolve("timeout"), timeoutMs);
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+      if (outcome === "timeout") {
+        log.warn(`shutdown: queue drain timed out after ${timeoutMs}ms`);
+        await safe("queue.forceClose", () => r.queue!.forceClose());
+      } else if (typeof outcome === "object") {
+        log.warn(`shutdown: queue.close threw — ${String(outcome.error)}`);
       }
-    });
+    }
   }
 
   // ── 4. Close PubSub Redis clients ────────────────────────────────
   if (r.pubsub) {
     await safe("pubsub.close", () => r.pubsub!.close());
+  }
+
+  if (r.auth?.close) {
+    await safe("auth.close", () => r.auth!.close!());
   }
 
   // ── 5. Destroy Knex pools ────────────────────────────────────────

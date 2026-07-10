@@ -14,17 +14,62 @@
 
 import type { AuthClientAdapter } from "@parcae/sdk";
 
+type TokenChangeCallback = (token: string | null) => void;
+
 export interface EmitterAuthAdapterOptions {
   /** Resolve the current bearer token. `null` = anonymous. */
   getToken(): Promise<string | null>;
   /** GlobalEventEmitter event announcing token changes. Default `auth.changed`. */
   event?: string;
+  /** Retries after a transient token-read failure. Default one retry. */
+  retryAttempts?: number;
+  /** Delay between token-read attempts in milliseconds. Default 250. */
+  retryDelay?: number;
 }
 
 export function createEmitterAuthAdapter(
   options: EmitterAuthAdapterOptions,
 ): AuthClientAdapter {
   const event = options.event ?? "auth.changed";
+  const retryAttempts = Math.max(0, options.retryAttempts ?? 1);
+  const retryDelay = Math.max(0, options.retryDelay ?? 250);
+  function onChange(callback: TokenChangeCallback) {
+    "background only";
+    let generation = 0;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    const handler = () => {
+      "background only";
+      const readGeneration = ++generation;
+      if (retryTimer) clearTimeout(retryTimer);
+      retryTimer = null;
+      const read = (attempt: number) => {
+        options.getToken().then(
+          (token) => {
+            if (readGeneration === generation) callback(token);
+          },
+          () => {
+            if (readGeneration !== generation || attempt >= retryAttempts) {
+              return;
+            }
+            retryTimer = setTimeout(() => {
+              retryTimer = null;
+              read(attempt + 1);
+            }, retryDelay);
+          },
+        );
+      };
+      read(0);
+    };
+    const emitter = lynx.getJSModule("GlobalEventEmitter");
+    emitter.addListener(event, handler);
+    return () => {
+      generation++;
+      if (retryTimer) clearTimeout(retryTimer);
+      retryTimer = null;
+      emitter.removeListener(event, handler);
+    };
+  }
+
   return {
     init() {
       // Base URL binding is the app facade's concern.
@@ -33,15 +78,6 @@ export function createEmitterAuthAdapter(
       "background only";
       return options.getToken();
     },
-    onChange(callback) {
-      "background only";
-      const handler = () => {
-        "background only";
-        options.getToken().then(callback, () => callback(null));
-      };
-      const emitter = lynx.getJSModule("GlobalEventEmitter");
-      emitter.addListener(event, handler);
-      return () => emitter.removeListener(event, handler);
-    },
+    onChange,
   };
 }

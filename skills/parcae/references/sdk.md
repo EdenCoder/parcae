@@ -35,11 +35,10 @@ interface ClientConfig {
 
 - `getToken` is **required**. It is called once before the initial `hello` and again on
   every reconnect / token rotation. Returning `null` means an anonymous session.
-- **Idempotent**: returns a cached client for the same `${url}:${version ?? "v1"}` key.
-  The cache lives on `globalThis.__parcae_clients` (a `Map`) so multiple copies of the
-  package share one client.
-- Calls `Model.use(new FrontendAdapter(transport))` automatically, wiring the model
-  layer to this transport.
+- Every call creates an independent transport, session, connection machine, and
+  `FrontendAdapter`. Reuse a client explicitly when identity should be shared.
+- If no default model adapter exists, the first client installs its adapter once.
+  Use `client.bind(ModelClass)` for explicit and multiple client contexts.
 - There is **no** `transport` option — `SocketTransport` is hard-wired.
 
 ### ParcaeClient surface
@@ -70,12 +69,22 @@ interface ParcaeClient {
 
   disconnect(): void;
   reconnect(): Promise<void>;
+  bind<T extends typeof Model>(model: T): T;              // explicit adapter context
+  dispose(): void;                                        // permanent teardown
 }
 ```
 
 There is **no** `authenticate(token)` method. Sign-in / token rotation is
 `refreshSession()`; sign-out is `terminateSession()`. `subscribe()` returns an
 unsubscribe function (unlike `unsubscribe()` / `off()`, which are imperative).
+
+`client.bind(Post)` returns a constructor whose static queries use that client's adapter.
+Binding does not mutate `Post`, another bound constructor, or the one-time default:
+
+```typescript
+const UserPost = userClient.bind(Post);
+const AdminPost = adminClient.bind(Post);
+```
 
 Paths are version-prefixed automatically: a call to `client.get("/posts")` is emitted
 as `GET /v1/posts`.
@@ -84,11 +93,10 @@ as `GET /v1/posts`.
 
 Source: `packages/sdk/src/transports/socket.ts` (exported as `SocketTransport`)
 
-- Socket.IO, **WebSocket transport only** (`transports: ["websocket"]`), with
-  `withCredentials: true`. Default socket path is **`/ws`** (overridable via the
-  internal `path` config; `createClient` does not expose it).
-- **Socket pooling**: one shared socket per `${url}:${path}` via a module-level
-  `SOCKETS` Map.
+- Socket.IO with `withCredentials: true`. WebSocket is the default; `createClient`
+  accepts `transports: ["polling"]` or `transports: ["polling", "websocket"]` for
+  runtimes without a native WebSocket. Default socket path is **`/ws`**.
+- Each client owns one socket; there is no implicit global client/socket pool.
 - **Handshake**: on `connect`, emits `"hello"` with `{ token }` (token from
   `getToken()`); the server acks `{ userId }`. The transport calls
   `session.resolve(userId)` and resolves an internal `helloReady` promise. Every
@@ -112,7 +120,7 @@ Source: `packages/sdk/src/transports/socket.ts` (exported as `SocketTransport`)
   lifecycle events.
 - `reconnect()` is a no-op if already connected; otherwise sets `connection.connecting()`
   and calls `socket.connect()`.
-- `_resetSockets()` is exported as an `@internal` test helper.
+- `dispose()` permanently rejects pending calls, removes listeners, and closes the socket.
 
 ### resync RPC
 
@@ -168,8 +176,9 @@ class SessionMachine {
 - `terminate()` is sticky: once terminated, `resolve()` is ignored until `reset()`.
   `refreshSession()` in the transport calls `reset()` first if the session was
   terminated, supporting sign-out → sign-in-again on a reused client.
-- Only three callers mutate session: the transport's `hello` ack, the auth adapter's
-  `onChange`, and `terminate()`. Socket connect/disconnect/error never touch it.
+- Session changes come from the transport's `hello` acknowledgement or explicit
+  termination/reset. The Provider's auth `onChange` callback requests those transport
+  operations; socket connect/disconnect/error alone never mutate identity.
 
 ## ConnectionMachine
 

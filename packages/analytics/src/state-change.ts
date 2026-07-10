@@ -30,6 +30,11 @@
 
 import type { Knex } from "knex";
 import { generateId } from "./id.js";
+import {
+  assertUniqueConflictTarget,
+  assertStructuralColumns,
+  ensureAdditiveColumn,
+} from "./schema-upgrade.js";
 
 export const ANALYTICS_STATE_CHANGE_TABLE = "analytics_state_change";
 
@@ -185,21 +190,57 @@ export async function persistStateChangeRows(
  */
 export async function ensureStateChangeTable(db: Knex): Promise<void> {
   const exists = await db.schema.hasTable(ANALYTICS_STATE_CHANGE_TABLE);
-  if (exists) return;
-  await db.schema.createTable(ANALYTICS_STATE_CHANGE_TABLE, (t) => {
-    t.string("id", 32).primary();
-    t.string("org", 64).notNullable();
-    t.string("subject", 64).notNullable();
-    t.string("cohort", 128).notNullable();
-    t.string("transition", 8).notNullable();
-    t.timestamp("occurredAt", { useTz: true }).notNullable();
-    t.string("metricKey", 128).notNullable();
-    t.string("sourceSnapshotId", 32).notNullable();
-    t.string("previousSnapshotId", 32).nullable();
-    t.string("reasonCode", 64).nullable();
-    t.text("reason").nullable();
-    t.timestamp("createdAt", { useTz: true }).notNullable().defaultTo(db.fn.now());
-  });
+  if (!exists) {
+    await db.schema.createTable(ANALYTICS_STATE_CHANGE_TABLE, (t) => {
+      t.string("id", 32).primary();
+      t.string("org", 64).notNullable();
+      t.string("subject", 64).notNullable();
+      t.string("cohort", 128).notNullable();
+      t.string("transition", 8).notNullable();
+      t.timestamp("occurredAt", { useTz: true }).notNullable();
+      t.string("metricKey", 128).notNullable();
+      t.string("sourceSnapshotId", 32).notNullable();
+      t.string("previousSnapshotId", 32).nullable();
+      t.string("reasonCode", 64).nullable();
+      t.text("reason").nullable();
+      t.timestamp("createdAt", { useTz: true }).notNullable().defaultTo(db.fn.now());
+    });
+    await db.raw(
+      `CREATE UNIQUE INDEX analytics_state_change_idempotent_idx
+         ON ${ANALYTICS_STATE_CHANGE_TABLE}
+         (org, subject, cohort, "sourceSnapshotId", transition)`,
+    );
+  } else {
+    await assertStructuralColumns(db, ANALYTICS_STATE_CHANGE_TABLE, [
+      "id",
+      "org",
+      "subject",
+      "cohort",
+      "transition",
+      "occurredAt",
+      "metricKey",
+      "sourceSnapshotId",
+    ]);
+    await assertUniqueConflictTarget(db, ANALYTICS_STATE_CHANGE_TABLE, [
+      "org",
+      "subject",
+      "cohort",
+      "sourceSnapshotId",
+      "transition",
+    ]);
+    await ensureAdditiveColumn(db, ANALYTICS_STATE_CHANGE_TABLE, "previousSnapshotId", (t) =>
+      t.string("previousSnapshotId", 32).nullable(),
+    );
+    await ensureAdditiveColumn(db, ANALYTICS_STATE_CHANGE_TABLE, "reasonCode", (t) =>
+      t.string("reasonCode", 64).nullable(),
+    );
+    await ensureAdditiveColumn(db, ANALYTICS_STATE_CHANGE_TABLE, "reason", (t) =>
+      t.text("reason").nullable(),
+    );
+    await ensureAdditiveColumn(db, ANALYTICS_STATE_CHANGE_TABLE, "createdAt", (t) =>
+      t.timestamp("createdAt", { useTz: true }).notNullable().defaultTo(db.fn.now()),
+    );
+  }
   await db.raw(
     `CREATE INDEX IF NOT EXISTS analytics_state_change_subject_idx
        ON ${ANALYTICS_STATE_CHANGE_TABLE} (org, subject, "occurredAt" DESC)`,
@@ -207,10 +248,5 @@ export async function ensureStateChangeTable(db: Knex): Promise<void> {
   await db.raw(
     `CREATE INDEX IF NOT EXISTS analytics_state_change_cohort_idx
        ON ${ANALYTICS_STATE_CHANGE_TABLE} (org, cohort, "occurredAt" DESC)`,
-  );
-  await db.raw(
-    `CREATE UNIQUE INDEX IF NOT EXISTS analytics_state_change_idempotent_idx
-       ON ${ANALYTICS_STATE_CHANGE_TABLE}
-       (org, subject, cohort, "sourceSnapshotId", transition)`,
   );
 }

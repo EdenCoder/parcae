@@ -120,6 +120,7 @@ export interface ModelConstructor<T = any> {
  * generic calls (`ModelClass.where(...)`) produce the same chain.
  */
 export interface ModelClass<T> extends ModelConstructor<T> {
+  bind(adapter: ModelAdapter): ModelClass<T>;
   create(data?: Record<string, any>): T;
   findById(id: string): Promise<T | null>;
   where(...args: any[]): QueryChain<T>;
@@ -414,16 +415,16 @@ export interface QueryChain<T> {
  * - BackendAdapter: Knex + PostgreSQL + hooks + pub/sub
  */
 export interface ModelAdapter {
-  /** Create the data store. Frontend: shallow copy. Backend: plain object. */
-  createStore(data: Record<string, any>): Record<string, any>;
-
   /**
-   * Upsert the model's entire current state. No diffing, no dirty
-   * tracking — the model carries its full `__data` and (on the
-   * backend) an `__isNew` flag that controls hook routing (create vs
-   * save).
+   * Upsert the exact `data` snapshot captured by Model.save(). The model
+   * carries the `__isNew` flag used for create-vs-save hook routing. Return
+   * the authoritative row, or void only when the adapter has already applied
+   * every authoritative mutation to `model` itself.
    */
-  save(model: any): Promise<void>;
+  save(
+    model: any,
+    data: Record<string, any>,
+  ): Promise<Record<string, any> | void>;
 
   /** Delete a model. */
   remove(model: any): Promise<void>;
@@ -444,8 +445,15 @@ export interface ModelAdapter {
     rawSteps: QueryStep[] | string | undefined,
   ): QueryChain<T>;
 
-  /** Apply atomic RFC 6902 JSON Patch operations. */
-  patch(model: any, ops: PatchOp[]): Promise<void>;
+  /**
+   * Apply atomic RFC 6902 JSON Patch operations. Return the authoritative row,
+   * or void only when the adapter has already applied it to `model` itself.
+   */
+  patch(
+    model: any,
+    ops: PatchOp[],
+    data: Record<string, any>,
+  ): Promise<Record<string, any> | void>;
 }
 
 export type { PatchOp };
@@ -568,18 +576,17 @@ export function stripExpandSteps(
  * reads this to decide whether to compute and emit the `order` field
  * on the wire envelope.
  *
- * Returns `true` when ANY `orderBy` step in the chain was passed
- * `false` (caller opted out of order emission). The last call in
- * the chain doesn't have to be the false one — if any opt-out
- * appears, we honour it.
+ * Returns the last `orderBy` call's order-emission choice. A later
+ * `.orderBy(column)` re-enables ordering after `.orderBy(false)`.
  */
 export function orderEmissionDisabled(
   steps: QueryStep[] | null | undefined,
 ): boolean {
   if (!Array.isArray(steps) || steps.length === 0) return false;
-  for (const step of steps) {
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const step = steps[i]!;
     if (step.method !== "orderBy") continue;
-    if (step.args.length === 1 && step.args[0] === false) return true;
+    return step.args.length === 1 && step.args[0] === false;
   }
   return false;
 }

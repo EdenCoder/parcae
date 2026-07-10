@@ -15,8 +15,9 @@
  * Dedup: hook-path writes carry a freshly-generated `requestId`; the
  * LISTEN/NOTIFY poller emits the same `requestId` (read from the
  * trigger payload's `parcae.request_id`). The bus holds a small TTL
- * map of recently-seen hook requestIds and drops LISTEN emissions
- * that match, so a Parcae-originated write isn't re-dispatched twice.
+ * map of recently-seen hook requestId + table + id tuples and drops
+ * matching LISTEN emissions, so raw writes sharing a transaction request id
+ * are still dispatched when they target a different row.
  *
  * Without LISTEN/NOTIFY enabled, the dedup map is empty and all events
  * pass through.
@@ -65,7 +66,7 @@ export class ChangeBus {
   private pubsub: PubSub;
   private channel: string;
   private dedupTtlMs: number;
-  /** requestId → expires-at (ms epoch). */
+  /** requestId + table + id → expires-at (ms epoch). */
   private dedup = new Map<string, number>();
   private listeners = new Set<ChangeListener>();
   private unsubscribePubsub: (() => void) | null = null;
@@ -106,12 +107,18 @@ export class ChangeBus {
    */
   emit(change: Change): void {
     if (change.source === "hook" && change.requestId) {
-      this.dedup.set(change.requestId, Date.now() + this.dedupTtlMs);
+      this.reserve(change);
     }
     // PubSub.emit publishes to Redis when configured, otherwise routes
     // to the in-process EventEmitter — the local handler we installed
     // in `on(channel, …)` fires uniformly in both modes.
     this.pubsub.emit(this.channel, change);
+  }
+
+  /** Reserve one hook-emitted row for LISTEN dedupe without dispatching it. */
+  reserve(change: Pick<Change, "requestId" | "table" | "id">): void {
+    if (!change.requestId) return;
+    this.dedup.set(this._dedupKey(change), Date.now() + this.dedupTtlMs);
   }
 
   /** Register a listener. Returns an unsubscribe function. */
@@ -171,10 +178,13 @@ export class ChangeBus {
   }
 
   private _handle(change: Change): void {
+    // Every process that receives the hook event must reserve its row before
+    // its local LISTEN connection receives the matching trigger echo.
+    if (change.source === "hook" && change.requestId) this.reserve(change);
     // Drop LISTEN echoes of a hook-path emit we already dispatched.
     // Hook-path emits are never dropped — they're authoritative.
     if (change.source === "listen" && change.requestId) {
-      const expiresAt = this.dedup.get(change.requestId);
+      const expiresAt = this.dedup.get(this._dedupKey(change));
       if (expiresAt && expiresAt > Date.now()) return;
     }
     for (const listener of this.listeners) {
@@ -192,6 +202,12 @@ export class ChangeBus {
     for (const [key, expiresAt] of this.dedup) {
       if (expiresAt <= now) this.dedup.delete(key);
     }
+  }
+
+  private _dedupKey(
+    change: Pick<Change, "requestId" | "table" | "id">,
+  ): string {
+    return `${change.requestId}\0${change.table}\0${change.id}`;
   }
 
   // ── Test/inspection helpers ─────────────────────────────────────────

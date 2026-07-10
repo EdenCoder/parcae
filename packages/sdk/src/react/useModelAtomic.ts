@@ -73,6 +73,7 @@
 import { Model } from "@parcae/model";
 import { objectEquals } from "@observ33r/object-equals";
 import { useCallback, useRef, useSyncExternalStore } from "react";
+import { log } from "../log";
 
 // ─── Shared rAF batcher for `coalesced: true` subscriptions ─────────────────
 //
@@ -104,7 +105,7 @@ function flushCoalesced(): void {
     } catch (err) {
       // Surface but keep draining — one listener throwing must not
       // strand the rest of the batch.
-      console.error("[parcae] coalesced notify threw", err);
+      log.error("coalesced notify threw", err);
     }
   }
 }
