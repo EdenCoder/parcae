@@ -386,6 +386,8 @@ function lazyQuery<T extends Model>(
   chain.first = async () => (await resolve()).first();
   chain.count = async () => (await resolve()).count();
   chain.sum = async (column: string) => (await resolve()).sum(column);
+  chain.update = async (patch: Record<string, any>) =>
+    (await resolve()).update(patch as Partial<T> & Record<string, any>);
 
   chain.__steps = keySteps;
   chain.__modelType = modelClass.type;

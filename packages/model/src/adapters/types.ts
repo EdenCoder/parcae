@@ -353,6 +353,29 @@ export interface QueryChain<T> {
   count(): Promise<number>;
   sum(column: string): Promise<number>;
 
+  /**
+   * Bulk UPDATE every row the chain matches, as ONE SQL statement —
+   * no per-row hydration, no per-model `save()` round-trips, no
+   * "model saved" log line per row. Returns the number of rows
+   * updated.
+   *
+   *   Scene.whereNotNull("generatingAt").update({ generatingAt: null })
+   *
+   * Semantics (server adapter):
+   * - Schema columns are set directly; unknown keys are merged into
+   *   the `data` JSONB overflow (existing overflow keys survive).
+   * - `updatedAt` is stamped on every matched row; `id` / `createdAt`
+   *   / `type` / `updatedAt` in the patch are rejected.
+   * - Save hooks and scopes DO NOT run — this is a server-side bulk
+   *   primitive, the caller owns authorization and invariants.
+   * - Realtime change capture flows through the row-level DB triggers
+   *   (Postgres), so subscribers still receive per-id change events.
+   *   On SQLite no change events are emitted.
+   *
+   * The frontend adapter throws — there is no auto-CRUD bulk route.
+   */
+  update(patch: Partial<T> & Record<string, any>): Promise<number>;
+
   // Introspection — access underlying query builder
   /** @internal Return the underlying query builder (e.g. Knex QueryBuilder). */
   exec(): any;

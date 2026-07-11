@@ -272,6 +272,14 @@ export class FrontendAdapter implements ModelAdapter {
       return Number.isFinite(total) ? total : 0;
     };
 
+    chain.update = async (): Promise<number> => {
+      throw new Error(
+        "bulk update is server-only — there is no auto-CRUD bulk route. " +
+          "Load the models and save them individually, or move the " +
+          "operation behind a server endpoint.",
+      );
+    };
+
     /**
      * Returns a sibling chain that, on `.find()`, sets the
      * `__forceRefresh: true` request flag. The backend's LIST handler
