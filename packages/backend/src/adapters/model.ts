@@ -2610,7 +2610,7 @@ export class BackendAdapter implements ModelAdapter {
     const tsvectorParts = fields
       .map((field, i) => {
         const weight = weights[Math.min(i, weights.length - 1)];
-        return `setweight(to_tsvector('english', coalesce(${field}, '')), '${weight}')`;
+        return `setweight(to_tsvector('english', coalesce(${field}::text, '')), '${weight}')`;
       })
       .join(" || ");
 
