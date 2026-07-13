@@ -979,6 +979,11 @@ export class Model extends EventEmitter {
     for (const [key, value] of Object.entries(data)) {
       if (SYSTEM_DATA_KEYS.has(key)) continue;
       if (refTargets.has(key)) continue;
+      // Skip `$`-prefixed keys — these are runtime raw-id accessors
+      // installed by _installRefField. A stale `$user` column lingering
+      // in the DB (pre-migration) would clobber the ref state's raw slot
+      // through the accessor's setter, wiping the real value.
+      if (key.startsWith("$")) continue;
       (this as any)[key] = value;
     }
 
