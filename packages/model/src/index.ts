@@ -17,7 +17,11 @@ export {
   SYM_SERVER_PATCH,
   SYM_VERSION,
 } from "./Model";
-export type { WithRefs } from "./Model";
+export type {
+  ModelOperationSource,
+  ModelOperationsEvent,
+  WithRefs,
+} from "./Model";
 
 export { ops, dedupOps } from "./patch";
 export type { OpBuilder } from "./patch";

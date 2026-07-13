@@ -3,8 +3,10 @@ import {
   Model,
   SYM_SERVER_MERGE,
   SYM_SERVER_PATCH,
+  SYM_VERSION,
   generateId,
 } from "../Model";
+import type { ModelOperationsEvent } from "../Model";
 import type { ModelAdapter, QueryChain } from "../adapters/types";
 
 function deferred<T>() {
@@ -789,6 +791,126 @@ describe("Model", () => {
       } finally {
         adapter.patch = originalPatch;
       }
+    });
+  });
+
+  describe("operations", () => {
+    it("stage applies locally without calling the adapter or changing write state", () => {
+      const post = Post.hydrate(adapter, { id: "p1", title: "before" });
+
+      post.stage([{ op: "replace", path: "/title", value: "after" }]);
+
+      expect(post.title).toBe("after");
+      expect(adapter.patched).toHaveLength(0);
+      expect(adapter.saved).toHaveLength(0);
+      expect(post.__savingCount).toBe(0);
+      expect(post.__patchingPaths.size).toBe(0);
+    });
+
+    it("emits normalized cloned local ops with the current revision", () => {
+      const post = Post.hydrate(adapter, {
+        id: "p1",
+        meta: { nested: true },
+      });
+      const events: ModelOperationsEvent[] = [];
+      post.on("operations", (event: ModelOperationsEvent) => events.push(event));
+
+      post.stage([
+        { op: "remove", path: "/meta" },
+        { op: "remove", path: "/meta/nested" },
+        { op: "remove", path: "/meta" },
+      ]);
+
+      expect(events).toEqual([
+        {
+          ops: [{ op: "remove", path: "/meta" }],
+          source: "local",
+          revision: 1,
+        },
+      ]);
+      expect(events[0]!.revision).toBe(post[SYM_VERSION]);
+    });
+
+    it("patch applies and emits once while adapter ops remain listener-safe", async () => {
+      const post = Post.hydrate(adapter, { id: "p1", tags: [] });
+      const events: ModelOperationsEvent[] = [];
+      post.on("operations", (event: ModelOperationsEvent) => {
+        events.push(event);
+        (event.ops[0] as any).value = "mutated by listener";
+      });
+
+      await post.patch([{ op: "add", path: "/tags/-", value: "first" }]);
+
+      expect((post as any).tags).toEqual(["first"]);
+      expect(events).toHaveLength(1);
+      expect(adapter.patched).toHaveLength(1);
+      expect(adapter.patched[0].ops).toEqual([
+        { op: "add", path: "/tags/-", value: "first" },
+      ]);
+    });
+
+    it("emits effective remote ops with the post-merge revision", () => {
+      const post = Post.hydrate(adapter, {
+        id: "p1",
+        profile: { name: "before", rank: 1 },
+      });
+      const events: ModelOperationsEvent[] = [];
+      post.on("operations", (event: ModelOperationsEvent) => events.push(event));
+
+      post[SYM_SERVER_MERGE]({
+        ...post.__serverSnapshot,
+        profile: { name: "after", rank: 1 },
+      });
+
+      expect(events).toEqual([
+        {
+          ops: [{ op: "replace", path: "/profile/name", value: "after" }],
+          source: "remote",
+          revision: 1,
+        },
+      ]);
+    });
+
+    it("does not emit remote ops when local replay hides a same-path change", () => {
+      const post = Post.hydrate(adapter, { id: "p1", title: "before" });
+      const events: ModelOperationsEvent[] = [];
+      post.on("operations", (event: ModelOperationsEvent) => events.push(event));
+      post.stage([{ op: "replace", path: "/title", value: "local" }]);
+      events.length = 0;
+
+      post[SYM_SERVER_MERGE]({
+        ...post.__serverSnapshot,
+        title: "remote",
+      });
+
+      expect(post.title).toBe("local");
+      expect(events).toHaveLength(0);
+    });
+
+    it("preserves staged local edits while emitting remote sibling changes", () => {
+      const post = Post.hydrate(adapter, {
+        id: "p1",
+        profile: { name: "before", rank: 1 },
+      });
+      const events: ModelOperationsEvent[] = [];
+      post.on("operations", (event: ModelOperationsEvent) => events.push(event));
+      post.stage([
+        { op: "replace", path: "/profile/name", value: "local" },
+      ]);
+      events.length = 0;
+
+      post[SYM_SERVER_PATCH]([
+        { op: "replace", path: "/profile/rank", value: 2 },
+      ]);
+
+      expect((post as any).profile).toEqual({ name: "local", rank: 2 });
+      expect(events).toEqual([
+        {
+          ops: [{ op: "replace", path: "/profile/rank", value: 2 }],
+          source: "remote",
+          revision: 2,
+        },
+      ]);
     });
   });
 

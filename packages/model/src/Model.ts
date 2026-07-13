@@ -2,14 +2,17 @@
  * @parcae/model — Model Base Class
  *
  * The instance IS the data store. No Proxy wrapper, no write interception.
- * Writes are one of three explicit primitives:
+ * Writes are explicit primitives:
  *
  *   - save()        → upsert the entire current document. No diff, no
  *                     dirty-tracking. Used for creates and full-document
  *                     writes. Runs the adapter's "save" path (which on
  *                     the backend invokes "save" hooks).
  *
- *   - patch(ops)    → apply RFC 6902 ops locally, then send them. Caller
+ *   - stage(ops)    → apply RFC 6902 ops locally and emit them without
+ *                     persistence or write-state changes.
+ *
+ *   - patch(ops)    → stage RFC 6902 ops locally, then send them. Caller
  *                     knows exactly what changed. Already self-contained,
  *                     already tracks in-flight paths for server-echo
  *                     filtering.
@@ -26,14 +29,13 @@
  * `SYM_SERVER_MERGE` on server-initiated updates, and reapplied after
  * save() / patch() acks.
  *
- * `"change"` fires from exactly three sites: patch(), flush(), and
- * SYM_SERVER_MERGE. Direct field writes do NOT
- * emit — callers who want to signal UI re-render call flush() (or patch()
- * with explicit ops). `useModel` / `useModelAtomic` subscribe to
- * `"change"`; reference identity across merges is trivially stable
- * because `this` is stable.
+ * `"operations"` synchronously reports staged, patched, and effective remote
+ * RFC 6902 changes with the current model revision. Direct field writes do
+ * NOT emit; use stage() / patch(), or flush() to persist them.
+ * `useModel` / `useModelAtomic` subscribe to `"change"`; reference identity
+ * across merges is stable.
  *
- * `patch()` / `flush()` emit synchronously (optimistic UI relies on
+ * `stage()` / `patch()` / `flush()` emit synchronously (optimistic UI relies on
  * the immediate update). `SYM_SERVER_MERGE` emits via a microtask-
  * batched queue — multiple per-row merges in a single server frame
  * coalesce into one render commit per instance. See
@@ -52,6 +54,14 @@ import {
   type SchemaDefinition,
   type PatchOp,
 } from "./adapters/types";
+
+export type ModelOperationSource = "local" | "remote";
+
+export interface ModelOperationsEvent {
+  readonly ops: readonly PatchOp[];
+  readonly source: ModelOperationSource;
+  readonly revision: number;
+}
 
 // ─── ID Generation ───────────────────────────────────────────────────────────
 
@@ -195,6 +205,7 @@ function scheduleChangeEmit(model: Model): void {
 
 const INSTANCE_METHODS = new Set([
   "save",
+  "stage",
   "patch",
   "flush",
   "remove",
@@ -1185,6 +1196,15 @@ export class Model extends EventEmitter {
   }
 
   /**
+   * Apply a batch of RFC 6902 ops locally without persisting it or entering
+   * patching/saving state. Emits `"operations"`, then `"change"`,
+   * synchronously for optimistic consumers.
+   */
+  stage(rawOps: PatchOp[]): void {
+    this._applyLocalOperations(rawOps);
+  }
+
+  /**
    * Apply a batch of RFC 6902 ops locally (optimistic) and send them to
    * the server. Emits `"change"` synchronously before the server
    * round-trip so UI updates immediately.
@@ -1194,14 +1214,25 @@ export class Model extends EventEmitter {
    * specific sub-paths still in flight.
    */
   patch(rawOps: PatchOp[]): Promise<void> {
-    if (rawOps.length === 0) return Promise.resolve();
+    const ops = this._applyLocalOperations(rawOps);
+    if (ops.length === 0) return Promise.resolve();
+
+    const expectedData = structuredClone(this.__data);
+    const paths = this._beginPatch(ops);
+    return this._enqueueWrite(() =>
+      this._writePatch(ops, expectedData, paths),
+    );
+  }
+
+  private _applyLocalOperations(rawOps: PatchOp[]): PatchOp[] {
+    if (rawOps.length === 0) return [];
     // Normalize: drop ops whose path lives UNDER another `remove`
     // op in the same batch. Without this, fast-json-patch crashes
     // on the sub-path op when its parent has just been removed.
     // Callers can freely compose helpers — the framework keeps the
     // batch consistent. See `patch.ts:dedupOps` for the contract.
     const ops = structuredClone(dedupOps(rawOps)) as PatchOp[];
-    if (ops.length === 0) return Promise.resolve();
+    if (ops.length === 0) return ops;
 
     // Apply locally on a plain-object snapshot (fast-json-patch
     // mutates in place), then copy the touched top-level keys back
@@ -1214,13 +1245,20 @@ export class Model extends EventEmitter {
     this._copyPatchedTopLevels(snap, ops);
 
     (this as any)[SYM_VERSION] = (this as any)[SYM_VERSION] + 1;
+    this._emitOperations(ops, "local");
     this.emit("change");
+    return ops;
+  }
 
-    const expectedData = structuredClone(this.__data);
-    const paths = this._beginPatch(ops);
-    return this._enqueueWrite(() =>
-      this._writePatch(ops, expectedData, paths),
-    );
+  private _emitOperations(
+    ops: readonly PatchOp[],
+    source: ModelOperationSource,
+  ): void {
+    this.emit("operations", {
+      ops: structuredClone(ops),
+      source,
+      revision: this[SYM_VERSION],
+    } satisfies ModelOperationsEvent);
   }
 
   private _enqueueWrite(write: () => Promise<void>): Promise<void> {
@@ -1449,6 +1487,10 @@ export class Model extends EventEmitter {
     serverValue: Record<string, any> | Model,
     expectedData?: Record<string, any>,
   ): this {
+    const previousEffectiveData =
+      this.listenerCount("operations") > 0
+        ? dateSafeClone(this.__data)
+        : null;
     const sourceModel = serverValue instanceof Model ? serverValue : null;
     const incomingData: Record<string, any> = sourceModel
       ? sourceModel.__data
@@ -1543,6 +1585,13 @@ export class Model extends EventEmitter {
 
     if (didChange) {
       (this as any)[SYM_VERSION] = (this as any)[SYM_VERSION] + 1;
+      if (previousEffectiveData) {
+        const ops = compare(
+          previousEffectiveData,
+          dateSafeClone(this.__data),
+        ) as unknown as PatchOp[];
+        if (ops.length > 0) this._emitOperations(ops, "remote");
+      }
       scheduleChangeEmit(this);
     }
 
