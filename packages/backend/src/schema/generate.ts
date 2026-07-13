@@ -32,8 +32,11 @@ import { SchemaResolver } from "./resolver";
  *   3: skip ambient (`declare`) and `$`-prefixed properties — a
  *      type-only `declare $user: string` companion was resolving to
  *      a real column whose NULL clobbered the ref accessor on hydrate
+ *   4: `Text` branded string now correctly resolves to "text" (TEXT
+ *      column) instead of "json" (JSONB) — stale caches with the
+ *      wrong mapping will be regenerated on first boot
  */
-const RESOLVER_VERSION = 3;
+const RESOLVER_VERSION = 4;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
