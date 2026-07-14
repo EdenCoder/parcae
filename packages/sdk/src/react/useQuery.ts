@@ -1011,7 +1011,7 @@ export function useQuery<T>(
   }, [client, key, subscribe]);
 
   // ── Drift poll ─────────────────────────────────────────────────
-  const pollMs = options.poll ?? 60_000;
+  const pollMs = options.poll ?? 0;
   useEffect(() => {
     if (!key) return;
     const entry = getOrCreate(client, key, subscribe);
