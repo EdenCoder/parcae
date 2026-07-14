@@ -93,9 +93,10 @@ function resolveType(type: Type): ColumnType {
 
   // Text — branded string type for unlimited TEXT columns.
   // Matches `Text` (string & { __brand: "Text" }) from @parcae/model.
-  // The `'"Text"'` check catches the branded intersection form that
-  // ts-morph represents as `string & { readonly __brand: "Text" }`.
-  if (text === "Text" || text.includes('"Text"')) return "text";
+  // Alias-symbol check is the most reliable path: for imported type aliases
+  // ts-morph's getText() returns the full module path, not just "Text".
+  const aliasName = type.getAliasSymbol()?.getName();
+  if (aliasName === "Text" || text === "Text" || text.includes('"Text"')) return "text";
 
   // Primitives
   if (type.isString() || type.isStringLiteral()) return "string";

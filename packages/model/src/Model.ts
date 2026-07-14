@@ -83,7 +83,7 @@ const SYM_PENDING_DATA = Symbol("parcae:pendingData");
 /** Tail of the instance's single save/patch/flush write lane. */
 const SYM_WRITE_LANE = Symbol("parcae:writeLane");
 /** Per-field raw id, proxy, and loaded expanded instance. */
-const SYM_REFS = Symbol("parcae:refs");
+
 
 const classAdapters = new WeakMap<ModelConstructor, ModelAdapter>();
 const boundSources = new WeakMap<ModelConstructor, ModelConstructor>();
@@ -528,18 +528,7 @@ function topLevelKeys(ops: readonly PatchOp[]): Set<string> {
   return keys;
 }
 
-interface RefControl {
-  refId: string;
-  loaded: Model | null | undefined;
-  loading: Promise<Model | null> | null;
-}
 
-interface RefState {
-  targetClass: ModelConstructor;
-  raw: string | null;
-  proxy: any | null;
-  control: RefControl | null;
-}
 
 // ─── Model Class ─────────────────────────────────────────────────────────────
 
@@ -568,7 +557,7 @@ export class Model extends EventEmitter {
   declare [SYM_SNAPSHOT]: Record<string, any>;
   declare [SYM_PENDING_DATA]: Record<string, any> | undefined;
   declare [SYM_WRITE_LANE]: Promise<void> | null | undefined;
-  declare [SYM_REFS]: Map<string, RefState>;
+
   declare [SYM_VERSION]: number;
 
   // ── Static ─────────────────────────────────────────────────────────
@@ -857,7 +846,7 @@ export class Model extends EventEmitter {
     this[SYM_ADAPTER] = adapter;
     this[SYM_PATCHING] = new Map<string, number>();
     this[SYM_SNAPSHOT] = {};
-    this[SYM_REFS] = new Map();
+
     (this as any)[SYM_VERSION] = 0;
     if (data) this[SYM_PENDING_DATA] = data;
   }
@@ -893,80 +882,16 @@ export class Model extends EventEmitter {
     // overrides cleanly, so we still avoid the deopt-inducing
     // `delete + defineProperty` pattern of the previous design.
     const schema = (this.constructor as typeof Model).__schema;
-    const refTargets = new Map<string, ModelConstructor>();
+    const refFields = new Set<string>();
     if (schema) {
       for (const [field, col] of Object.entries(schema)) {
-        if (
-          typeof col === "object" &&
-          col !== null &&
-          "kind" in col &&
-          col.kind === "ref" &&
-          typeof col.target === "function"
-        ) {
-          refTargets.set(
-            field,
-            bindModelClass(col.target, this[SYM_ADAPTER]),
-          );
+        if (typeof col === "object" && col !== null && "kind" in col && col.kind === "ref") {
+          refFields.add(field);
         }
       }
     }
-    for (const [field, target] of refTargets) {
-      // Seed the closure's raw-id slot from whatever the caller passed
-      // in. Three shapes:
-      //   - Model instance     — use its id as raw; instance is already
-      //                          a Model, no pre-hydration needed.
-      //   - Inline ref object  — wire payload from `.expand("file")` /
-      //                          `.expand("file.url")`. Hydrate the
-      //                          object into a target-class instance
-      //                          and pre-populate the ref proxy so
-      //                          consumers don't trigger a Suspense
-      //                          throw on first access.
-      //   - String id / null   — bare raw id (or no value). Lazy load
-      //                          on first access via `_buildRefProxy`.
-      const incoming = data[field] ?? (this as any)[field];
-      let raw: string | null;
-      let prehydrated: Model | null = null;
-      if (incoming instanceof Model) {
-        raw = (incoming as any).id ?? null;
-        prehydrated = incoming;
-      } else if (
-        incoming &&
-        typeof incoming === "object" &&
-        typeof (incoming as Record<string, any>).id === "string"
-      ) {
-        // Inline expanded ref. Hydrate via the target's `.hydrate(...)`
-        // factory so the produced instance has the same shape as one
-        // returned by `findById` — including its own ref-field
-        // accessors and __serverSnapshot, so a subsequent edit on the
-        // linked row diffs / saves cleanly.
-        //
-        // `target` here is the schema entry's `target` constructor —
-        // when the schema was built from ts-morph (`schema/resolver.ts`)
-        // this may be a stub with just `{ type }`. The backend's
-        // schema generator (`schema/generate.ts:200-205`) and
-        // BackendAdapter's `_models` lookup (model.ts:359) both
-        // resolve it back to a real constructor before any hydrate
-        // runs server-side; the runtime `_apply` path here only
-        // executes on already-resolved schemas (model bodies that
-        // direct-imported their ref targets). The `hydrate`
-        // type-guard below is the safety net for the stub case.
-        raw = (incoming as Record<string, any>).id as string;
-        if (typeof (target as any).hydrate === "function") {
-          prehydrated = (target as any).hydrate(
-            this[SYM_ADAPTER],
-            incoming,
-          ) as Model;
-        }
-      } else if (typeof incoming === "string") {
-        raw = incoming || null;
-      } else {
-        // Anything else (object without id, number, Date, etc.) is
-        // not a usable ref payload. Treat it as null so the accessor
-        // returns null and a downstream read can't synthesise a
-        // garbage findById call against a stringified non-id.
-        raw = null;
-      }
-      this._installRefField(field, target, raw, prehydrated);
+    for (const field of refFields) {
+      this._installRefField(field, data[field] ?? (this as any)[field] ?? null);
     }
 
     // Apply provided non-system, non-ref data. These OVERWRITE subclass
@@ -983,13 +908,24 @@ export class Model extends EventEmitter {
     // ref loop just installed.
     for (const [key, value] of Object.entries(data)) {
       if (SYSTEM_DATA_KEYS.has(key)) continue;
-      if (refTargets.has(key)) continue;
+      if (refFields.has(key)) continue;
       // Skip `$`-prefixed keys — these are runtime raw-id accessors
       // installed by _installRefField. A stale `$user` column lingering
       // in the DB (pre-migration) would clobber the ref state's raw slot
       // through the accessor's setter, wiping the real value.
       if (key.startsWith("$")) continue;
       (this as any)[key] = value;
+    }
+
+    // Schema-free $key mirrors. Every non-ref, non-system field in
+    // the payload gets `$key = raw_value` so callers can read the
+    // wire value without a schema-derived ref accessor.
+    // Ref fields already have `$key` as a getter from _installRefField
+    // above, so skip them here.
+    for (const [key, value] of Object.entries(data)) {
+      if (SYSTEM_DATA_KEYS.has(key) || key.startsWith("$")) continue;
+      if (refFields.has(key)) continue;
+      (this as any)[`$${key}`] = value;
     }
 
     // Seed the server snapshot from the fully-applied state. For a
@@ -1027,75 +963,29 @@ export class Model extends EventEmitter {
    * the lazy path resumes (correct: the new ref id may not have
    * been expanded).
    */
-  private _installRefField(
-    field: string,
-    targetClass: ModelConstructor,
-    initialRaw: string | null,
-    prehydrated: Model | null = null,
-  ): void {
-    const state: RefState = {
-      targetClass,
-      raw: initialRaw,
-      proxy: null,
-      control:
-        prehydrated && initialRaw
-          ? {
-              refId: initialRaw,
-              loaded: prehydrated,
-              loading: null,
-            }
-          : null,
-    };
-    if (state.control) state.proxy = this._buildRefProxy(targetClass, state.control);
-    this[SYM_REFS].set(field, state);
-    const self = this;
-
-    const setRaw = (raw: string | null): void => {
-      if (raw === state.raw) return;
-      state.raw = raw;
-      state.proxy = null;
-      state.control = null;
-    };
-
-    Object.defineProperty(this, field, {
-      configurable: true,
-      enumerable: true,
-      get() {
-        if (!state.raw) return null;
-        if (!state.control || state.control.refId !== state.raw) {
-          state.control = {
-            refId: state.raw,
-            loaded: undefined,
-            loading: null,
-          };
-        }
-        if (!state.proxy) {
-          state.proxy = self._buildRefProxy(targetClass, state.control);
-        }
-        return state.proxy;
-      },
-      set(value: Model | string | null | undefined) {
-        setRaw(
-          value instanceof Model
-            ? ((value as any).id ?? null)
-            : (value ?? null),
-        );
-      },
-    });
-
-    Object.defineProperty(this, `$${field}`, {
-      configurable: true,
-      // Excluded from Object.keys so __data / serializers don't see it —
-      // the ref field itself already serializes to the raw id via the
-      // `__data` getter's schema lookup.
-      enumerable: false,
-      get() {
-        return state.raw;
-      },
-      set(v: string | null | undefined) {
-        setRaw(v ?? null);
-      },
-    });
+  private _installRefField(field: string, incoming: unknown): void {
+    const v =
+      incoming instanceof Model
+        ? incoming
+        : incoming && typeof incoming === "object" && typeof (incoming as any).id === "string"
+        ? incoming
+        : typeof incoming === "string"
+        ? incoming || null
+        : null;
+    (this as any)[field] = v;
+    if (!Object.getOwnPropertyDescriptor(this, `$${field}`)) {
+      Object.defineProperty(this, `$${field}`, {
+        configurable: true,
+        enumerable: false,
+        get(this: any) {
+          const cur = this[field];
+          return cur?.id ?? cur ?? null;
+        },
+        set(this: any, v: string | null | undefined) {
+          this[field] = v ?? null;
+        },
+      });
+    }
   }
 
   // ── Data Access (for adapters / serialization) ──────────────────────
@@ -1438,56 +1328,6 @@ export class Model extends EventEmitter {
     return this._writePatch(ops, expectedData, paths);
   }
 
-  private _mergeRefField(
-    field: string,
-    nextRaw: string | null,
-    expanded?: Model | Record<string, any>,
-  ): boolean {
-    const state = this[SYM_REFS].get(field);
-    if (!state) return false;
-
-    let incomingLoaded: Model | undefined;
-    if (expanded instanceof Model) {
-      incomingLoaded = expanded;
-    } else if (expanded && typeof expanded.id === "string") {
-      incomingLoaded = (state.targetClass as any).hydrate(
-        this[SYM_ADAPTER],
-        expanded,
-      ) as Model;
-    }
-
-    if (state.raw !== nextRaw) {
-      state.raw = nextRaw;
-      state.proxy = null;
-      state.control =
-        nextRaw && incomingLoaded
-          ? { refId: nextRaw, loaded: incomingLoaded, loading: null }
-          : null;
-      return true;
-    }
-    if (!nextRaw || !incomingLoaded) return false;
-
-    if (!state.control || state.control.refId !== nextRaw) {
-      state.control = {
-        refId: nextRaw,
-        loaded: incomingLoaded,
-        loading: null,
-      };
-      return true;
-    }
-
-    const loaded = state.control.loaded;
-    state.control.loading = null;
-    if (loaded instanceof Model) {
-      if (loaded === incomingLoaded) return false;
-      const previousVersion = loaded[SYM_VERSION];
-      loaded[SYM_SERVER_MERGE](incomingLoaded);
-      return loaded[SYM_VERSION] !== previousVersion;
-    }
-    state.control.loaded = incomingLoaded;
-    return true;
-  }
-
   /**
    * Atomically merge a server row while replaying local edits made after the
    * supplied baseline. Write acknowledgements use their outbound payload as
@@ -1543,20 +1383,16 @@ export class Model extends EventEmitter {
       const isRef =
         col && typeof col === "object" && "kind" in col && col.kind === "ref";
       if (isRef) {
-        let expanded: Model | Record<string, any> | undefined;
+        let incoming: unknown = nextVal ?? null;
         if (dataValuesEqual(nextVal, authoritativeData[key])) {
-          if (sourceModel) {
-            const sourceState = sourceModel[SYM_REFS].get(key);
-            const loaded = sourceState?.control?.loaded;
-            if (loaded instanceof Model) expanded = loaded;
-          } else {
-            const incoming = incomingData[key];
-            if (incoming instanceof Model || (incoming && typeof incoming === "object")) {
-              expanded = incoming as Model | Record<string, any>;
-            }
+          const source = sourceModel ? (sourceModel as any)[key] : incomingData[key];
+          if (source instanceof Model || (source && typeof source === "object")) {
+            incoming = source;
           }
         }
-        didChange = this._mergeRefField(key, nextVal ?? null, expanded) || didChange;
+        const prev = (this as any)[`$${key}`];
+        this._installRefField(key, incoming);
+        if ((this as any)[`$${key}`] !== prev) didChange = true;
         continue;
       }
 
@@ -1614,10 +1450,11 @@ export class Model extends EventEmitter {
 
     for (const op of ops) {
       const segments = pointerSegments(op.path);
-      const state = segments.length > 1 ? this[SYM_REFS].get(segments[0]!) : null;
+      const fieldVal = segments.length > 1 ? (this as any)[segments[0]!] : null;
+      const isNestedRef = fieldVal instanceof Model;
       const from = op.op === "copy" || op.op === "move" ? op.from : null;
       const fromSegments = from ? pointerSegments(from) : null;
-      if (!state || (fromSegments && fromSegments[0] !== segments[0])) {
+      if (!isNestedRef || (fromSegments && fromSegments[0] !== segments[0])) {
         outerOps.push(op);
         continue;
       }
@@ -1636,7 +1473,7 @@ export class Model extends EventEmitter {
 
     let didRefChange = false;
     for (const [field, patches] of refOps) {
-      const loaded = this[SYM_REFS].get(field)?.control?.loaded;
+      const loaded = (this as any)[field];
       if (!(loaded instanceof Model)) continue;
       const previousVersion = loaded[SYM_VERSION];
       loaded[SYM_SERVER_PATCH](patches);
@@ -1737,92 +1574,6 @@ export class Model extends EventEmitter {
    * safety still applies. Pre-hydration seeds the same field-local
    * proxy protocol used by lazy refs.
    */
-  private _buildRefProxy(
-    targetClass: ModelConstructor,
-    control: RefControl,
-  ): any {
-    const adapter = this[SYM_ADAPTER];
-    const refId = control.refId;
-
-    const proxy = new Proxy({} as any, {
-      get(_target, prop) {
-        if (prop === "id") return refId;
-        if (prop === "type") return targetClass.type;
-        if (prop === "then") return undefined;
-        if (prop === "toJSON")
-          return () => ({ id: refId, type: targetClass.type });
-        if (prop === Symbol.toPrimitive) return () => refId;
-
-        if (control.loaded !== undefined) {
-          return control.loaded === null
-            ? undefined
-            : (control.loaded as any)[prop];
-        }
-
-        if (!control.loading) {
-          let request!: Promise<Model | null>;
-          request = adapter.findById(targetClass, refId).then(
-            (result) => {
-              if (control.loading === request) {
-                control.loaded = result as Model | null;
-                control.loading = null;
-              }
-              return result as Model | null;
-            },
-            (error: unknown) => {
-              // Explicit retry policy: reject this Suspense read, then
-              // let the next property read start a fresh adapter call.
-              if (control.loading === request) control.loading = null;
-              throw error;
-            },
-          );
-          control.loading = request;
-        }
-
-        // React Suspense integration — throw the pending promise.
-        throw control.loading;
-      },
-      // ── Iteration safety ─────────────────────────────────────────
-      //
-      // Without these two traps, `Object.keys(proxy)` /
-      // `JSON.stringify(walk)` / `for..in` would surface the empty
-      // backing target (`{}`) and any framework-internal property
-      // lookup (DevTools console expansion, `lodash.isEqual`,
-      // `react-fast-compare`) would land on the `get` trap above
-      // and fire `findById` plus throw a Promise into a consumer
-      // that almost never wants either. We restrict the visible
-      // surface to the same whitelist the `get` trap returns
-      // synchronously — `{id, type}` — so iteration sees a tidy
-      // 2-key stub and stays clear of the lazy-load path.
-      ownKeys(): ArrayLike<string | symbol> {
-        return ["id", "type"];
-      },
-      getOwnPropertyDescriptor(_target, prop) {
-        if (prop === "id") {
-          return {
-            value: refId,
-            writable: false,
-            enumerable: true,
-            configurable: true,
-          };
-        }
-        if (prop === "type") {
-          return {
-            value: targetClass.type,
-            writable: false,
-            enumerable: true,
-            configurable: true,
-          };
-        }
-        return undefined;
-      },
-      has(_target, prop) {
-        return prop === "id" || prop === "type";
-      },
-    });
-
-    return proxy;
-  }
 }
 
 /**

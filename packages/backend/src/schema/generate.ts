@@ -35,8 +35,10 @@ import { SchemaResolver } from "./resolver";
  *   4: `Text` branded string now correctly resolves to "text" (TEXT
  *      column) instead of "json" (JSONB) — stale caches with the
  *      wrong mapping will be regenerated on first boot
+ *   5: use getAliasSymbol().getName() for Text detection — getText()
+ *      returns the full module import path for imported type aliases
  */
-const RESOLVER_VERSION = 4;
+const RESOLVER_VERSION = 5;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
