@@ -7,6 +7,7 @@
  */
 
 import type { Operation as PatchOp } from "fast-json-patch";
+import type { Model, WithRefs } from "../Model";
 
 // ─── Column Types ────────────────────────────────────────────────────────────
 
@@ -119,21 +120,21 @@ export interface ModelConstructor<T = any> {
  * mirror the class statics so concrete calls (`Scene.where(...)`) and
  * generic calls (`ModelClass.where(...)`) produce the same chain.
  */
-export interface ModelClass<T> extends ModelConstructor<T> {
+export interface ModelClass<T extends Model> extends ModelConstructor<T> {
   bind(adapter: ModelAdapter): ModelClass<T>;
-  create(data?: Record<string, any>): T;
-  findById(id: string): Promise<T | null>;
-  where(...args: any[]): QueryChain<T>;
-  whereRaw(query: string, ...bindings: any[]): QueryChain<T>;
-  whereIn(column: string, values: any[]): QueryChain<T>;
-  whereNot(...args: any[]): QueryChain<T>;
-  whereNotIn(column: string, values: any[]): QueryChain<T>;
-  whereNull(column: string): QueryChain<T>;
-  whereNotNull(column: string): QueryChain<T>;
-  select(...columns: string[]): QueryChain<T>;
+  create(data?: Record<string, any>): WithRefs<T>;
+  findById(id: string): Promise<WithRefs<T> | null>;
+  where(...args: any[]): QueryChain<WithRefs<T>>;
+  whereRaw(query: string, ...bindings: any[]): QueryChain<WithRefs<T>>;
+  whereIn(column: string, values: any[]): QueryChain<WithRefs<T>>;
+  whereNot(...args: any[]): QueryChain<WithRefs<T>>;
+  whereNotIn(column: string, values: any[]): QueryChain<WithRefs<T>>;
+  whereNull(column: string): QueryChain<WithRefs<T>>;
+  whereNotNull(column: string): QueryChain<WithRefs<T>>;
+  select(...columns: string[]): QueryChain<WithRefs<T>>;
   count(): Promise<number>;
   sum(column: string): Promise<number>;
-  search(term: string): QueryChain<T>;
+  search(term: string): QueryChain<WithRefs<T>>;
 }
 
 // ─── Scope System ────────────────────────────────────────────────────────────
@@ -289,14 +290,12 @@ export interface QueryChain<T> {
    *     `sanitize()` projection of the linked row.
    *   - One or more `"file.<field>"` entries — server emits ONLY
    *     `{ id, type, <fields> }`. The id and type are always
-   *     present so the frontend can still hydrate a ref-proxy.
+   *     present so the frontend retains stable ref identity.
    *   - Mixing a bare ref with dotted projections of the same ref
    *     promotes to whole-row (the bare entry wins).
    *
-   * The raw id ALWAYS lands in `$file` regardless — the frontend
-   * accessor pair `(file, $file)` is the same shape the lazy ref
-   * proxy. `.expand()` only changes whether
-   * the linked row is pre-hydrated, not whether the id is present.
+   * The raw id ALWAYS lands in `$file` regardless. `.expand()` changes
+   * `file` from the raw id to the inline linked row; `$file` remains the id.
    *
    * Realtime: subscription invalidation is currently **naive** for
    * projected expands. Any change to a linked-row column re-emits
@@ -306,12 +305,9 @@ export interface QueryChain<T> {
    * subscriber) but stays correct. Field-aware invalidation is a
    * follow-up.
    *
-   * `Model.hydrate` walks the schema; ref-field objects pre-populate
-   * the ref-proxy's loaded slot so `asset.file.url` is synchronous
-   * (no Suspense throw, no extra HTTP). Field projections come
-   * back as a partial linked row — the proxy serves whatever fields
-   * the server included and falls through to a lazy `findById` only
-   * when the consumer asks for an unprojected field.
+   * `Model.hydrate` keeps an expanded ref object inline, so
+   * `asset.file.url` is synchronous with no extra HTTP. Field projections
+   * come back as partial linked rows; unprojected fields remain absent.
    *
    * Validation runs on the backend:
    *   - Bare field (`"file"`) — must exist in `ModelClass.__schema`
@@ -390,7 +386,8 @@ export interface QueryChain<T> {
   // Internal — used by hooks and subscription manager
   /** @internal */ __steps: QueryStep[];
   /** @internal */ __modelType: string;
-  /** @internal */ __modelClass: ModelConstructor<T>;
+  /** @internal The source constructor; independent of the projected row type. */
+  __modelClass: ModelConstructor;
   /** @internal */ __adapter: ModelAdapter;
   /** @internal — true when `.withForceRefresh()` was applied. */
   __forceRefresh?: boolean;
@@ -430,20 +427,23 @@ export interface ModelAdapter {
   remove(model: any): Promise<void>;
 
   /** Fetch a single model by ID. */
-  findById<T>(modelClass: ModelConstructor<T>, id: string): Promise<T | null>;
+  findById<T extends Model>(
+    modelClass: ModelConstructor<T>,
+    id: string,
+  ): Promise<WithRefs<T> | null>;
 
   /** Start a query chain. */
-  query<T>(modelClass: ModelConstructor<T>): QueryChain<T>;
+  query<T extends Model>(modelClass: ModelConstructor<T>): QueryChain<WithRefs<T>>;
 
   /**
    * Build a scoped query from client-sent QueryStep[] (backend only).
    * Safe replay of __query steps with scope applied first.
    */
-  queryFromClient?<T>(
+  queryFromClient?<T extends Model>(
     modelClass: ModelConstructor<T>,
     scope: Record<string, any>,
     rawSteps: QueryStep[] | string | undefined,
-  ): QueryChain<T>;
+  ): QueryChain<WithRefs<T>>;
 
   /**
    * Apply atomic RFC 6902 JSON Patch operations. Return the authoritative row,

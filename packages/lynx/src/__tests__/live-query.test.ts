@@ -7,7 +7,7 @@
  * behaviour on identity changes and reconnects.
  */
 
-import { Model, SYM_SERVER_MERGE } from "@parcae/model";
+import { Model, SYM_SERVER_MERGE, type Ref } from "@parcae/model";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { provideClient } from "../client-registry";
@@ -36,7 +36,7 @@ class Article extends Model {
   static __schema = {
     author: { kind: "ref", target: Author },
   } as any;
-  declare author: Author;
+  declare author: Ref<Author>;
 }
 
 // ── Fakes ──────────────────────────────────────────────────────────
@@ -243,7 +243,7 @@ describe("fetch", () => {
     expect(after.items[0]?.project).toBe("new");
   });
 
-  it("refreshes a same-id expanded ref in place on a subscription refetch", async () => {
+  it("replaces a changed same-id expanded ref on a subscription refetch", async () => {
     vi.useFakeTimers();
     const adapter = {} as any;
     let call = 0;
@@ -282,7 +282,8 @@ describe("fetch", () => {
     await vi.advanceTimersByTimeAsync(250);
 
     expect((article as any).$author).toBe("author-1");
-    expect(article.author).toBe(author);
+    expect(article.author).not.toBe(author);
+    if (typeof article.author === "string") throw new Error("author was not expanded");
     expect(article.author.name).toBe("fresh");
     release();
   });

@@ -18,6 +18,7 @@ import {
   type QueryChain,
   type QueryStep,
 } from "./types";
+import type { Model, WithRefs } from "../Model";
 
 // ─── Transport Interface ─────────────────────────────────────────────────────
 
@@ -162,15 +163,15 @@ export class FrontendAdapter implements ModelAdapter {
 
   // ── findById ─────────────────────────────────────────────────────────
 
-  async findById<T>(
+  async findById<T extends Model>(
     modelClass: ModelConstructor<T>,
     id: string,
-  ): Promise<T | null> {
+  ): Promise<WithRefs<T> | null> {
     const path = this.resolvePath(modelClass);
     try {
       const data = await this.transport.get(`${path}/${id}`);
       if (!data) return null;
-      return (modelClass as any).hydrate(this, data) as T;
+      return (modelClass as any).hydrate(this, data) as WithRefs<T>;
     } catch (error) {
       if (isNotFoundError(error)) return null;
       throw error;
@@ -179,15 +180,15 @@ export class FrontendAdapter implements ModelAdapter {
 
   // ── query ────────────────────────────────────────────────────────────
 
-  query<T>(modelClass: ModelConstructor<T>): QueryChain<T> {
+  query<T extends Model>(modelClass: ModelConstructor<T>): QueryChain<WithRefs<T>> {
     return this._buildQuery(modelClass, []);
   }
 
-  private _buildQuery<T>(
+  private _buildQuery<T extends Model>(
     modelClass: ModelConstructor<T>,
     steps: QueryStep[],
     options: { forceRefresh?: boolean; subscribe?: boolean } = {},
-  ): QueryChain<T> {
+  ): QueryChain<WithRefs<T>> {
     const chain: any = {};
 
     for (const method of CHAINABLE_METHODS) {
@@ -203,7 +204,7 @@ export class FrontendAdapter implements ModelAdapter {
       };
     }
 
-    chain.find = async (): Promise<T[]> => {
+    chain.find = async (): Promise<WithRefs<T>[]> => {
       const path = this.resolvePath(modelClass);
       const requestData: Record<string, any> = { __query: steps };
       // `__forceRefresh: true` tells the backend's LIST handler to
@@ -247,7 +248,7 @@ export class FrontendAdapter implements ModelAdapter {
       return models;
     };
 
-    chain.first = async (): Promise<T | null> => {
+    chain.first = async (): Promise<WithRefs<T> | null> => {
       const all = await chain.find();
       return all[0] ?? null;
     };
@@ -280,7 +281,7 @@ export class FrontendAdapter implements ModelAdapter {
      * fluent API, kept on the chain so consumers can probe it via
      * `useQuery`'s `poll` option.
      */
-    chain.withForceRefresh = (): QueryChain<T> => {
+    chain.withForceRefresh = (): QueryChain<WithRefs<T>> => {
       return this._buildQuery(modelClass, steps, {
         ...options,
         forceRefresh: true,
@@ -296,7 +297,7 @@ export class FrontendAdapter implements ModelAdapter {
      * subscribe: false })` and `prefetch(..., { subscribe: false })`
      * for static queries.
      */
-    chain.withSubscribe = (subscribe: boolean): QueryChain<T> => {
+    chain.withSubscribe = (subscribe: boolean): QueryChain<WithRefs<T>> => {
       return this._buildQuery(modelClass, steps, {
         ...options,
         subscribe,
@@ -316,7 +317,7 @@ export class FrontendAdapter implements ModelAdapter {
     // the step array.
     chain.__expand = extractExpandFields(steps);
 
-    return chain as QueryChain<T>;
+    return chain as QueryChain<WithRefs<T>>;
   }
 
   private _serializeArgs(args: any[]): any[] {

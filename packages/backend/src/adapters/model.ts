@@ -20,7 +20,7 @@ import {
   type QueryStep,
   type SchemaDefinition,
 } from "@parcae/model";
-import { generateId, type Model } from "@parcae/model";
+import { generateId, type Model, type WithRefs } from "@parcae/model";
 import type { QuerySubscriptionManager } from "../services/subscriptions";
 import equal from "deep-equal";
 import fastJsonPatch from "fast-json-patch";
@@ -165,11 +165,11 @@ function resolveColType(col: ColumnType): string {
  * to revert. `save()` rewrites the blob and resolves the drift, but
  * `patch()` is incremental and never touches `data`.
  */
-function hydrate<T>(
+function hydrate<T extends Model>(
   modelClass: ModelConstructor<T>,
   adapter: BackendAdapter,
   row: Record<string, any>,
-): T {
+): WithRefs<T> {
   const data = { ...row };
   const schema = modelClass.__schema as SchemaDefinition | undefined;
 
@@ -221,7 +221,7 @@ function hydrate<T>(
   // ModelConstructor interface (it's the constructor's job from the
   // adapter's POV). Cast to `any` for this single invocation — every
   // Model subclass inherits the static so the call is sound.
-  return (modelClass as any).hydrate(adapter, data) as T;
+  return (modelClass as any).hydrate(adapter, data) as WithRefs<T>;
 }
 
 /**
@@ -687,22 +687,22 @@ export class BackendAdapter implements ModelAdapter {
 
   // ── findById ─────────────────────────────────────────────────────────
 
-  async findById<T>(
+  async findById<T extends Model>(
     modelClass: ModelConstructor<T>,
     id: string,
-  ): Promise<T | null> {
+  ): Promise<WithRefs<T> | null> {
     if (!id) return null;
     // When called inside an `app.start()`-installed request scope, a
     // RefLoader is attached to the AsyncLocalStorage frame. Defer to
-    // it so concurrent ref-proxy resolutions in the same microtask
-    // coalesce into one `WHERE id IN (...)` batch instead of N
+    // it so concurrent ref resolutions in the same microtask coalesce
+    // into one `WHERE id IN (...)` batch instead of N
     // sequential `WHERE id = ?` lookups. Outside a request (jobs,
     // hook handlers without a request frame, tests) we fall through
     // to the direct path. See `services/ref-loader.ts`.
     const loader = getRefLoader();
     if (loader) {
       const row = await loader.load(modelClass.type, id);
-      return (row as T | null) ?? null;
+      return (row as WithRefs<T> | null) ?? null;
     }
     const row = await this.read(tableName(modelClass))
       .select("*")
@@ -745,7 +745,7 @@ export class BackendAdapter implements ModelAdapter {
 
   // ── query ────────────────────────────────────────────────────────────
 
-  query<T>(modelClass: ModelConstructor<T>): QueryChain<T> {
+  query<T extends Model>(modelClass: ModelConstructor<T>): QueryChain<WithRefs<T>> {
     return this._buildQuery(modelClass, this.read(tableName(modelClass)));
   }
 
@@ -934,11 +934,11 @@ export class BackendAdapter implements ModelAdapter {
     return c.whereRaw(`(${parts})`, bindings);
   }
 
-  queryFromClient<T>(
+  queryFromClient<T extends Model>(
     modelClass: ModelConstructor<T>,
     scope: Record<string, any>,
     rawSteps: QueryStep[] | string | undefined,
-  ): QueryChain<T> {
+  ): QueryChain<WithRefs<T>> {
     // Normalize: socket sends an array, HTTP may send a JSON string
     let steps: QueryStep[] = [];
     if (Array.isArray(rawSteps)) {
@@ -962,7 +962,7 @@ export class BackendAdapter implements ModelAdapter {
 
     // Start with scope — always first, never overridable.
     // Scope can be an object { org: "xxx" } or a function (qb) => qb.where(...)
-    let chain: QueryChain<T>;
+    let chain: QueryChain<WithRefs<T>>;
     if (typeof scope === "function") {
       const table = tableName(modelClass);
       let knexQuery = this.read(table);
@@ -1294,11 +1294,11 @@ export class BackendAdapter implements ModelAdapter {
     return null;
   }
 
-  private _buildQuery<T>(
+  private _buildQuery<T extends Model>(
     modelClass: ModelConstructor<T>,
     knexQuery: any,
     expand: readonly string[] = [],
-  ): QueryChain<T> {
+  ): QueryChain<WithRefs<T>> {
     const chain: any = {};
 
     for (const method of CHAINABLE_METHODS) {
@@ -1392,14 +1392,14 @@ export class BackendAdapter implements ModelAdapter {
       return this._buildQuery(modelClass, modified, expand);
     };
 
-    chain.find = async (): Promise<T[]> => {
+    chain.find = async (): Promise<WithRefs<T>[]> => {
       const rows = await knexQuery;
       return Array.isArray(rows)
         ? rows.map((row: any) => hydrate(modelClass, this, row))
         : [];
     };
 
-    chain.first = async (): Promise<T | null> => {
+    chain.first = async (): Promise<WithRefs<T> | null> => {
       const row = await knexQuery.first();
       return row ? hydrate(modelClass, this, row) : null;
     };
@@ -1439,7 +1439,7 @@ export class BackendAdapter implements ModelAdapter {
     // opt in — preserves the current "string-id-only" wire shape.
     chain.__expand = expand;
 
-    return chain as QueryChain<T>;
+    return chain as QueryChain<WithRefs<T>>;
   }
 
   // ── patch (atomic JSONB SQL) ─────────────────────────────────────────

@@ -53,6 +53,7 @@ import { getRefLoader } from "./context";
 import {
   hydrateExpansions,
   parseExpandSpecs,
+  projectForWire,
   validateExpandSpecs,
   type ResolvedExpand,
 } from "./hydrate-expansions";
@@ -267,12 +268,7 @@ export async function runQueryStatic(
   // privateFields; the fallback covers test fixtures and oddball
   // model implementations that don't define sanitize.
   const items = await Promise.all(
-    rawItems.map(async (m: any) => {
-      if (typeof m?.sanitize === "function") {
-        return await m.sanitize(user ?? undefined);
-      }
-      return m?.__data ?? m;
-    }),
+    rawItems.map((model) => projectForWire(model, user)),
   );
 
   if (expandResolved.length > 0) {

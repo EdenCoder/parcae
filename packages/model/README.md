@@ -1,6 +1,6 @@
 # @parcae/model
 
-The core Model system for Parcae. Class properties are the schema. Direct property access with EventEmitter-based change tracking, lazy-loading references, and a pluggable adapter pattern that runs the same code on frontend and backend.
+The core Model system for Parcae. Class properties are the schema. Direct property access with EventEmitter-based change tracking, explicit reference expansion, and a pluggable adapter pattern that runs the same code on frontend and backend.
 
 ## Install
 
@@ -11,12 +11,12 @@ npm install @parcae/model
 ## Define a Model
 
 ```typescript
-import { Model } from "@parcae/model";
+import { Model, type Ref } from "@parcae/model";
 
 class Post extends Model {
   static type = "post" as const;
 
-  user!: User; // reference -> VARCHAR storing ID
+  user!: Ref<User>; // raw ID or explicitly expanded User -> VARCHAR storing ID
   title: string = ""; // string -> VARCHAR
   body: PostBody = {}; // object -> JSONB
   tags: string[] = []; // array -> JSONB
@@ -43,23 +43,22 @@ await post.save(); // flushes tracked changes
 
 ## References
 
-Properties typed as another Model class become lazy-loading proxies. The `$` prefix gives raw ID access.
+Declare references with `Ref<T>`. They stay raw ids until explicitly expanded;
+expanded values are plain projections (not guaranteed Model instances), and the
+`$` prefix always gives direct raw-id access.
 
 ```typescript
-post.user; // User proxy — loads on property access, Suspense-compatible
+post.user; // "user_k8f2m9x" — unexpanded Ref<User>
 post.$user; // "user_k8f2m9x" — raw string ID, no loading
 
-// Setting a reference accepts a Model instance or raw ID
-post.user = someUser; // extracts someUser.id
+const [expanded] = await Post.where({ id: post.id }).expand("user").find();
+if (typeof expanded.user !== "string") {
+  expanded.user.name; // synchronous — User was inlined by the query
+}
+
+// Setting a reference accepts a Model instance or raw ID.
+post.user = someUser;
 post.$user = "user_abc123"; // sets raw ID directly
-```
-
-The reference proxy throws a Promise on first property access for React Suspense integration:
-
-```tsx
-<Suspense fallback={<span>Loading...</span>}>
-  <span>{post.user.name}</span>
-</Suspense>
 ```
 
 ## Static Query Methods

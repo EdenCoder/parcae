@@ -201,6 +201,7 @@ describe("auto-CRUD readonlyFields", () => {
           title: "new title",
           viewCount: 9999, // readonly counter — should be ignored
           user: "u-attacker", // readonly ownership ref — should be ignored
+          $user: "u-dollar-attacker", // raw-id companions are never writable
           createdAt: new Date(0), // system field — should be ignored
         },
       },
@@ -213,6 +214,7 @@ describe("auto-CRUD readonlyFields", () => {
     expect(saved.title).toBe("new title");
     expect(saved.viewCount).toBe(5); // unchanged from original
     expect(saved.user).toBe("u-original"); // unchanged from original
+    expect(saved.$user).toBeUndefined();
   });
 
   it("PATCH rejects ops targeting readonly columns with 403", async () => {
@@ -243,6 +245,30 @@ describe("auto-CRUD readonlyFields", () => {
     expect(res.captured.body.error).toContain("viewCount");
     // Even though the title op is fine, the whole batch is rejected
     // — fail-loud is the desired contract.
+    expect(captured.patches).toHaveLength(0);
+  });
+
+  it("PATCH rejects raw ref companion ops with 403", async () => {
+    const Post = makePost();
+    const { adapter, captured, setRow } = makeAdapterStub();
+    setRow({ id: "p1", title: "old", user: "u-original" });
+    registerModelRoutes([Post], adapter);
+
+    const route = findRoute("PATCH", "/v1/posts/:id");
+    const res = makeRes();
+    await route!.handler!(
+      {
+        session: { user: { id: "u1" } },
+        params: { id: "p1" },
+        body: {
+          ops: [{ op: "replace", path: "/$user", value: "u-attacker" }],
+        },
+      },
+      res as any,
+    );
+
+    expect(res.captured.status).toBe(403);
+    expect(res.captured.body.error).toContain("$user");
     expect(captured.patches).toHaveLength(0);
   });
 

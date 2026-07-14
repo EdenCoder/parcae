@@ -38,6 +38,7 @@ import { RefLoader } from "./ref-loader";
 import { getRefLoader } from "./context";
 import {
   hydrateExpansions,
+  projectForWire,
   type ResolvedExpand,
 } from "./hydrate-expansions";
 
@@ -927,12 +928,7 @@ export class QuerySubscriptionManager {
     // itself, so the fallback is effectively unreachable for real
     // model classes).
     const wireRows = await Promise.all(
-      models.map(async (m: any) => {
-        if (typeof m?.sanitize === "function") {
-          return await m.sanitize(user ?? undefined);
-        }
-        return m?.__data ?? m;
-      }),
+      models.map((model) => projectForWire(model, user)),
     );
 
     if (expand.length === 0 || !hydrateExpand) return wireRows;

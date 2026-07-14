@@ -6,7 +6,7 @@ import {
   SYM_VERSION,
   generateId,
 } from "../Model";
-import type { ModelOperationsEvent } from "../Model";
+import type { ModelOperationsEvent, Ref, WithRefs } from "../Model";
 import type { ModelAdapter, QueryChain } from "../adapters/types";
 
 function deferred<T>() {
@@ -1140,20 +1140,8 @@ describe("Model", () => {
 
   // ── Reference field accessors (DOL-1045) ──────────────────────────
   //
-  // Refs are installed as getter/setter pairs on the instance. Two
-  // perf invariants pinned here:
-  //
-  //   1. Per-instance proxy memoization — `post.author` read twice
-  //      with the same underlying raw id returns the SAME Proxy
-  //      reference. A <UserCard user={post.author}> rendered 60×/sec
-  //      should not allocate a fresh Proxy every render.
-  //
-  //   2. The lazy-load proxy's `ownKeys` / `getOwnPropertyDescriptor`
-  //      surface is restricted so iteration (`Object.keys`,
-  //      `JSON.stringify` shallow walk, `for..in`) doesn't trip the
-  //      "any non-whitelisted prop access throws `loading`" trap and
-  //      fire unintended `findById` requests from incidental code
-  //      (DevTools, isEqual, structured-logger walks).
+  // A ref field keeps either its raw id or an explicitly expanded object.
+  // `$field` always projects the raw id and never triggers a fetch.
   describe("reference field accessors", () => {
     class Author extends Model {
       static type = "author" as const;
@@ -1170,76 +1158,83 @@ describe("Model", () => {
       title: string = "";
       // Declared but uninitialised — the accessor installer replaces
       // the (absent) data property with a getter/setter pair.
-      declare author: Author;
+      declare author: Ref<Author>;
     }
 
-    // `expect(proxy).toBe(...)` walks the proxy via vitest's diff
-    // formatter and trips the lazy-load `get` trap, so we compare
-    // identity directly via `===` here and assert on the boolean.
-    it("post.author returns the SAME proxy reference across reads (memoized per raw id)", () => {
+    it("keeps field identity stable across reads", () => {
       const article = Article.hydrate(adapter, { title: "x", author: "a1" });
       const first = article.author;
       const second = article.author;
       expect(first === second).toBe(true);
     });
 
-    it("changing the raw id via post.author = ... invalidates the proxy cache", () => {
+    it("changing the field updates the raw accessor", () => {
       const article = Article.hydrate(adapter, { title: "x", author: "a1" });
       const first = article.author;
       article.author = "a2" as any;
       const after = article.author;
-      // Different raw id → different proxy reference.
       expect(after === first).toBe(false);
-      // …but two reads after the change are still memoized.
       const afterAgain = article.author;
       expect(afterAgain === after).toBe(true);
+      expect(article.$author).toBe("a2");
     });
 
-    it("changing the raw id via post.$author = ... also invalidates the proxy cache", () => {
+    it("changing the raw accessor updates the field", () => {
       const article = Article.hydrate(adapter, { title: "x", author: "a1" });
       const first = article.author;
       (article as any).$author = "a3";
       const after = article.author;
       expect(after === first).toBe(false);
+      expect(after).toBe("a3");
     });
 
-    it("Object.keys(post.author) lists only the safe whitelist — no findById trip", () => {
-      // Mark up the adapter so any accidental load attempt is loud
-      // and obvious in the assertion (we'd see it in the spy).
+    it("keeps an unexpanded ref as its raw id without loading", () => {
       const findByIdSpy = vi.fn(async () => null);
       const oldFindById = adapter.findById;
       adapter.findById = findByIdSpy as any;
       try {
         const article = Article.hydrate(adapter, { title: "x", author: "a1" });
-        const keys = Object.keys(article.author);
-        // Only stable safe keys — anything that would force a load is absent.
-        expect(keys.sort()).toEqual(["id", "type"]);
+        expect(article.author).toBe("a1");
+        expect(article.$author).toBe("a1");
         expect(findByIdSpy).not.toHaveBeenCalled();
       } finally {
         adapter.findById = oldFindById;
       }
     });
 
-    it("JSON.stringify(post.author) serializes the {id,type} stub without firing findById", () => {
+    it("serializes an unexpanded ref as its raw id", () => {
       const findByIdSpy = vi.fn(async () => null);
       const oldFindById = adapter.findById;
       adapter.findById = findByIdSpy as any;
       try {
         const article = Article.hydrate(adapter, { title: "x", author: "a1" });
         const serialized = JSON.stringify(article.author);
-        expect(JSON.parse(serialized)).toEqual({ id: "a1", type: "author" });
+        expect(JSON.parse(serialized)).toBe("a1");
         expect(findByIdSpy).not.toHaveBeenCalled();
       } finally {
         adapter.findById = oldFindById;
       }
     });
 
-    it("post.$author returns the raw id directly (no proxy allocation)", () => {
+    it("includes raw ref companions in sanitized wire data", async () => {
+      const article = Article.hydrate(adapter, {
+        id: "article-1",
+        title: "x",
+        author: "a1",
+      });
+
+      expect(article.sanitize()).toMatchObject({
+        author: "a1",
+        $author: "a1",
+      });
+    });
+
+    it("post.$author returns the raw id directly", () => {
       const article = Article.hydrate(adapter, { title: "x", author: "a1" });
       expect((article as any).$author).toBe("a1");
     });
 
-    it("post.author = null clears both the proxy and the raw id", () => {
+    it("post.author = null clears both the field and raw id", () => {
       const article = Article.hydrate(adapter, { title: "x", author: "a1" });
       // Cast so the strict declared type doesn't fight us.
       (article as any).author = null;
@@ -1247,111 +1242,42 @@ describe("Model", () => {
       expect((article as any).$author).toBeNull();
     });
 
-    it("loads refs through the owning instance adapter without cross-session reuse", async () => {
-      const firstAdapter = createMockAdapter();
-      const secondAdapter = createMockAdapter();
-      firstAdapter.findById = vi.fn(async (modelClass, id) =>
-        (modelClass as any).hydrate(firstAdapter, {
-          id,
-          name: "first session",
-        }),
-      );
-      secondAdapter.findById = vi.fn(async (modelClass, id) =>
-        (modelClass as any).hydrate(secondAdapter, {
-          id,
-          name: "second session",
-        }),
-      );
-      const first = Article.hydrate(firstAdapter, { author: "shared" });
-      const second = Article.hydrate(secondAdapter, { author: "shared" });
-
-      let firstLoad: Promise<unknown> | null = null;
-      let secondLoad: Promise<unknown> | null = null;
-      try {
-        void (first.author as any).name;
-      } catch (error) {
-        firstLoad = error as Promise<unknown>;
-      }
-      try {
-        void (second.author as any).name;
-      } catch (error) {
-        secondLoad = error as Promise<unknown>;
-      }
-      await Promise.all([firstLoad, secondLoad]);
-
-      expect((first.author as any).name).toBe("first session");
-      expect((second.author as any).name).toBe("second session");
-      expect(firstAdapter.findById).toHaveBeenCalledTimes(1);
-      expect(secondAdapter.findById).toHaveBeenCalledTimes(1);
-    });
-
-    it("settles a missing ref as loaded null instead of throwing forever", async () => {
+    it("does not auto-load raw refs on property access", () => {
       const refAdapter = createMockAdapter();
       refAdapter.findById = vi.fn(async () => null);
-      const article = Article.hydrate(refAdapter, { author: "missing" });
-
-      let load: Promise<unknown> | null = null;
-      try {
-        void (article.author as any).name;
-      } catch (error) {
-        load = error as Promise<unknown>;
-      }
-      expect(load).not.toBeNull();
-      await load;
-
-      expect((article.author as any).name).toBeUndefined();
-      expect(refAdapter.findById).toHaveBeenCalledTimes(1);
-    });
-
-    it("propagates a ref load error and retries on the next read", async () => {
-      const refAdapter = createMockAdapter();
-      const failure = new Error("temporary failure");
-      refAdapter.findById = vi
-        .fn()
-        .mockRejectedValueOnce(failure)
-        .mockImplementationOnce(async (modelClass, id) =>
-          (modelClass as any).hydrate(refAdapter, {
-            id,
-            name: "recovered",
-          }),
-        );
       const article = Article.hydrate(refAdapter, { author: "a1" });
 
-      let failedLoad: Promise<unknown> | null = null;
-      try {
-        void (article.author as any).name;
-      } catch (error) {
-        failedLoad = error as Promise<unknown>;
-      }
-      await expect(failedLoad).rejects.toBe(failure);
-
-      let retry: Promise<unknown> | null = null;
-      try {
-        void (article.author as any).name;
-      } catch (error) {
-        retry = error as Promise<unknown>;
-      }
-      await retry;
-
-      expect((article.author as any).name).toBe("recovered");
-      expect(refAdapter.findById).toHaveBeenCalledTimes(2);
+      expect((article.author as any).name).toBeUndefined();
+      expect(article.$author).toBe("a1");
+      expect(refAdapter.findById).not.toHaveBeenCalled();
     });
 
-    // ── Pre-hydrated ref proxy (DOL-1093 `.expand("file")` payload) ─────────
+    it("Ref<T> remains raw-or-expanded across query chains", () => {
+      const chain = Article.where({ title: "x" }).expand("author");
+      type Row = Awaited<ReturnType<typeof chain.find>>[number];
+      const includesRawId: string extends Row["author"] ? true : false = true;
+      type ExpandedAuthor = Exclude<Row["author"], string>;
+      const exposesData: "name" extends keyof ExpandedAuthor ? true : false = true;
+      const exposesModelMethods: "save" extends keyof ExpandedAuthor ? true : false = false;
+      const readName = (row: Row): string | undefined =>
+        typeof row.author === "string" ? undefined : row.author.name;
+
+      expect(includesRawId).toBe(true);
+      expect(exposesData).toBe(true);
+      expect(exposesModelMethods).toBe(false);
+      expect(readName).toBeTypeOf("function");
+    });
+
+    // ── Inline `.expand("file")` payload ───────────────────────────
     //
     // When the wire payload includes a nested object on a ref field
     // (e.g. `.expand("file")` inlines the full File row), `_apply`
     // should:
     //
     //   1. Store the inline object's id as the raw id (`$file`).
-    //   2. Hydrate the object into a target-class instance.
-    //   3. Pre-populate the ref proxy's `loaded` slot so property
-    //      access is SYNCHRONOUS — no `findById`, no Suspense throw.
-    //
-    // Without (3), the editor's `asset.file.url` reads would Suspense
-    // even when the row was right there in the payload.
-    describe("pre-hydrated ref proxy from inline expand payload", () => {
-      it("hydrates an inline object into a target instance and serves fields synchronously", () => {
+    //   2. Keep the inline object available synchronously.
+    describe("inline expanded ref payload", () => {
+      it("keeps an inline object and serves fields synchronously", () => {
         const findByIdSpy = vi.fn(async () => null);
         const oldFindById = adapter.findById;
         adapter.findById = findByIdSpy as any;
@@ -1360,7 +1286,7 @@ describe("Model", () => {
             title: "x",
             author: { id: "a1", name: "Alice" },
           });
-          // Synchronous read — no Suspense, no findById trip.
+          // Synchronous read with no findById trip.
           expect((article.author as any).name).toBe("Alice");
           expect(findByIdSpy).not.toHaveBeenCalled();
         } finally {
@@ -1376,7 +1302,7 @@ describe("Model", () => {
         expect((article as any).$author).toBe("a1");
       });
 
-      it("memoizes the pre-hydrated proxy across reads", () => {
+      it("keeps the inline object's identity across reads", () => {
         const article = Article.hydrate(adapter, {
           title: "x",
           author: { id: "a1", name: "Alice" },
@@ -1386,7 +1312,7 @@ describe("Model", () => {
         expect(first === second).toBe(true);
       });
 
-      it("falls through to lazy load when the field is reassigned to a bare string id", () => {
+      it("keeps a reassigned bare id raw and synchronized", () => {
         const findByIdSpy = vi.fn(async (_cls: any, _id: string) => null);
         const oldFindById = adapter.findById;
         adapter.findById = findByIdSpy as any;
@@ -1395,25 +1321,12 @@ describe("Model", () => {
             title: "x",
             author: { id: "a1", name: "Alice" },
           });
-          // Synchronous on the pre-hydrated id.
           expect((article.author as any).name).toBe("Alice");
           expect(findByIdSpy).not.toHaveBeenCalled();
-          // Reassign to a different id — must shed the pre-hydrated
-          // proxy. Refs are cached only on the owning instance, so
-          // reassignment always mints a fresh lazy proxy.
           article.author = "a2" as any;
-          // Reading a non-whitelisted field now throws the lazy
-          // load Promise (Suspense integration). Catch it so we
-          // can assert findById was called.
-          try {
-            void (article.author as any).name;
-          } catch (e) {
-            if (!(e && typeof (e as any).then === "function")) throw e;
-          }
-          // findById is called synchronously inside the get trap;
-          // the spy is recorded before the Promise resolves.
-          expect(findByIdSpy).toHaveBeenCalledTimes(1);
-          expect(findByIdSpy.mock.calls[0]![1]).toBe("a2");
+          expect(article.author).toBe("a2");
+          expect(article.$author).toBe("a2");
+          expect(findByIdSpy).not.toHaveBeenCalled();
         } finally {
           adapter.findById = oldFindById;
         }
@@ -1424,14 +1337,14 @@ describe("Model", () => {
           title: "x",
           author: { name: "no-id" } as any,
         });
-        // No id → no raw id, no proxy. Same as `author: null`.
+        // No id means no usable ref. Same as `author: null`.
         expect(article.author).toBeNull();
         expect((article as any).$author).toBeNull();
       });
 
       it("WithRefs<T> surfaces `$<refField>` even for nullable ref columns", () => {
         // Type-level assertion — the new `Nullable | Model` Model
-        // class lets us declare `file: File | null = null` and have
+        // class lets us declare `file: Ref<File> | null = null` and have
         // `WithRefs<File>` still project the `$file` accessor.
         // Without the `NonNullable<T[K]> extends Model` predicate
         // change, this test wouldn't typecheck.
@@ -1440,36 +1353,146 @@ describe("Model", () => {
           static override __schema = {
             author: { kind: "ref", target: Author },
           } as any;
-          declare author: Author | null;
+          declare author: Ref<Author> | null;
         }
-        type Refs = import("../Model").WithRefs<NullableRefModel>;
-        const sample = NullableRefModel.create({
+        const sample: WithRefs<NullableRefModel> = NullableRefModel.create({
           author: "a1",
-        }) as Refs;
-        // Type assertion + runtime sanity: $author is a string id.
+        });
+        const rawId: string | null = sample.$author;
         expect(typeof sample.$author).toBe("string");
-        expect(sample.$author).toBe("a1");
+        expect(rawId).toBe("a1");
+      });
+
+      it("WithRefs<T> does not infer refs from any fields", () => {
+        class JsonModel extends Model {
+          static override type = "json-model" as const;
+          payload: any = {};
+        }
+        type HasRawPayload = "$payload" extends keyof WithRefs<JsonModel>
+          ? true
+          : false;
+        const hasRawPayload: HasRawPayload = false;
+        expect(hasRawPayload).toBe(false);
+      });
+
+      it("WithRefs<T> does not infer refs from mixed structural JSON fields", () => {
+        class JsonModel extends Model {
+          static override type = "json-model" as const;
+          payload: { id: string; name?: string } | string | { value: string } = {
+            value: "x",
+          };
+        }
+        type HasRawPayload = "$payload" extends keyof WithRefs<JsonModel>
+          ? true
+          : false;
+        const hasRawPayload: HasRawPayload = false;
+        expect(hasRawPayload).toBe(false);
+      });
+
+      it("WithRefs<T> does not hide legacy bare Model declarations", () => {
+        class LegacyArticle extends Model {
+          static override type = "legacy-article" as const;
+          declare author: Author;
+        }
+        type HasRawAuthor = "$author" extends keyof WithRefs<LegacyArticle>
+          ? true
+          : false;
+        const hasRawAuthor: HasRawAuthor = false;
+        expect(hasRawAuthor).toBe(false);
       });
     });
 
-    // ── SYM_SERVER_MERGE preserves pre-hydrated ref proxy (DOL-1097) ────────
+    describe("schema-free client refs", () => {
+      class SchemaFreeArticle extends Model {
+        static override type = "schema-free-article" as const;
+        author: Ref<Author> | null = null;
+        payload: { id: string; name: string } = { id: "", name: "" };
+      }
+
+      it("retains wire-declared refs and serializes their raw ids", () => {
+        const article = SchemaFreeArticle.hydrate(adapter, {
+          author: { id: "a1", name: "Alice" },
+          $author: "a1",
+        });
+
+        expect(article.$author).toBe("a1");
+        expect(article.__data.author).toBe("a1");
+      });
+
+      it("keeps the raw id when an expansion target is unavailable", () => {
+        const article = SchemaFreeArticle.hydrate(adapter, {
+          author: null,
+          $author: "missing",
+        });
+
+        expect(article.author).toBe("missing");
+        expect(article.$author).toBe("missing");
+      });
+
+      it("does not treat ordinary JSON objects with ids as refs", () => {
+        const article = SchemaFreeArticle.hydrate(adapter, {
+          payload: { id: "payload-1", name: "before" },
+        });
+        article[SYM_SERVER_PATCH]([
+          { op: "replace", path: "/payload/name", value: "after" },
+        ]);
+
+        expect(article.payload.name).toBe("after");
+        expect(article.__serverSnapshot.payload.name).toBe("after");
+      });
+
+      it("serializes an assigned Model as a raw id", () => {
+        const article = SchemaFreeArticle.hydrate(adapter, {
+          author: "a1",
+          $author: "a1",
+        });
+        article.author = Author.hydrate(adapter, {
+          id: "a2",
+          name: "Alice",
+        });
+
+        expect(article.$author).toBe("a2");
+        expect(article.__data.author).toBe("a2");
+      });
+
+      it("serializes an assigned Model on a fresh schema-free ref", () => {
+        const article = SchemaFreeArticle.create();
+        article.author = Author.hydrate(adapter, {
+          id: "a2",
+          name: "Alice",
+        });
+
+        expect(article.$author).toBe("a2");
+        expect(article.__data.author).toBe("a2");
+      });
+
+      it("carries expanded-ref identity into a fresh schema-free model", () => {
+        const source = SchemaFreeArticle.hydrate(adapter, {
+          author: { id: "a1", name: "Alice" },
+          $author: "a1",
+        });
+        const article = SchemaFreeArticle.create();
+        article.author = source.author;
+
+        expect(article.$author).toBe("a1");
+        expect(article.__data.author).toBe("a1");
+      });
+
+    });
+
+    // ── SYM_SERVER_MERGE keeps refs stable without hiding updates ──
     //
     // Subscriptions ship `__data`-style server snapshots: ref columns
     // serialize as raw id strings (`{ file: "f1" }`), NOT as inlined
     // objects. When the merge writes the incoming string into the
-    // ref-field setter, `invalidate()` drops the cached proxy — which
-    // means the pre-hydrated proxy installed by `.expand("file")` is
-    // wiped on every patch and the lazy `_createRefProxy` path takes
-    // over until a fresh `findById` round-trips. The editor's
-    // `useAssetFile` snaps to `null` on every status flip / job
-    // update.
+    // ref field directly, replacing an expanded object with the id would
+    // make linked data disappear after every unrelated patch.
     //
-    // Fix: in SYM_SERVER_MERGE, compare against the `$field` raw-id
-    // slot and skip the assignment when the raw id is unchanged. The
-    // proxy survives unchanged-ref patches; genuine ref changes (a
-    // reshoot, a swap) still flow through the setter and invalidate.
+    // Raw snapshots with the same id preserve an existing expansion.
+    // Fresh expanded data replaces plain projections so identity-based
+    // subscribers observe changes and removed fields do not stay stale.
     describe("SYM_SERVER_MERGE — ref-field stability (DOL-1097)", () => {
-      it("preserves the pre-hydrated proxy when serverData carries the same raw id", () => {
+      it("preserves the expanded object when serverData carries the same raw id", () => {
         const findByIdSpy = vi.fn(async () => null);
         const oldFindById = adapter.findById;
         adapter.findById = findByIdSpy as any;
@@ -1478,8 +1501,7 @@ describe("Model", () => {
             title: "x",
             author: { id: "a1", name: "Alice" },
           });
-          // Capture the pre-hydrated proxy and confirm synchronous
-          // read (proves it's hydrated, not lazy).
+          // Capture the expanded object and confirm synchronous access.
           const before = article.author;
           expect((before as any).name).toBe("Alice");
           expect(findByIdSpy).not.toHaveBeenCalled();
@@ -1496,8 +1518,7 @@ describe("Model", () => {
           } as any);
 
           const after = article.author;
-          // Same proxy reference. Pre-hydrated data still present —
-          // no findById round-trip needed.
+          // Same object reference. Expanded data remains available.
           expect(after === before).toBe(true);
           expect((after as any).name).toBe("Alice");
           expect(findByIdSpy).not.toHaveBeenCalled();
@@ -1506,7 +1527,7 @@ describe("Model", () => {
         }
       });
 
-      it("invalidates the proxy when serverData carries a different raw id", () => {
+      it("replaces the expanded value when serverData carries a different raw id", () => {
         const article = Article.hydrate(adapter, {
           title: "x",
           author: "a1",
@@ -1517,14 +1538,14 @@ describe("Model", () => {
           author: "a2",
         } as any);
         const after = article.author;
-        // Different raw id → fresh proxy, raw id updated.
+        // Different raw id replaces the old expanded value.
         expect(after === before).toBe(false);
         expect((article as any).$author).toBe("a2");
       });
 
       it("does not touch the ref accessor when serverData omits the ref field", () => {
         // A patch that only changes `title` doesn't include the
-        // `author` key — the loop body never sees it, so the proxy
+        // `author` key — the loop body never sees it, so the expanded value
         // is untouched regardless of this fix.
         const article = Article.hydrate(adapter, {
           title: "x",
@@ -1536,7 +1557,143 @@ describe("Model", () => {
         expect(article.author === before).toBe(true);
       });
 
-      it("applies a nested ref patch to the loaded instance without replacing the raw id", () => {
+      it("keeps an omitted ref in the flush baseline", async () => {
+        const article = Article.hydrate(adapter, {
+          id: "article-1",
+          title: "x",
+          author: { id: "a1", name: "Alice" },
+        });
+
+        article[SYM_SERVER_MERGE]({ title: "y" } as any);
+        await article.flush();
+
+        expect(adapter.patched).toHaveLength(0);
+      });
+
+      it("advances an omitted ref baseline after a write acknowledgement", async () => {
+        const article = Article.hydrate(adapter, {
+          id: "article-1",
+          title: "x",
+          author: "a1",
+        });
+        article.author = "a2";
+        const expected = structuredClone(article.__data);
+
+        article[SYM_SERVER_MERGE]({ id: "article-1", title: "x" }, expected);
+
+        expect(article.author).toBe("a2");
+        expect(article.__serverSnapshot.author).toBe("a2");
+        await article.flush();
+        expect(adapter.patched).toHaveLength(0);
+      });
+
+      it("tracks the new raw id after an expanded subscription ref swap", async () => {
+        const article = Article.hydrate(adapter, {
+          id: "article-1",
+          author: { id: "a1", name: "Alice" },
+          $author: "a1",
+        });
+
+        article[SYM_SERVER_PATCH]([
+          { op: "replace", path: "/author/id", value: "a2" },
+          { op: "replace", path: "/author/name", value: "Bob" },
+          { op: "replace", path: "/$author", value: "a2" },
+        ]);
+
+        expect(article.$author).toBe("a2");
+        expect(article.__serverSnapshot.author).toBe("a2");
+        await article.flush();
+        expect(adapter.patched).toHaveLength(0);
+      });
+
+      it("keeps the raw id when an expanded target becomes unavailable", async () => {
+        const article = Article.hydrate(adapter, {
+          id: "article-1",
+          author: { id: "a1", name: "Alice" },
+          $author: "a1",
+        });
+
+        article[SYM_SERVER_PATCH]([
+          { op: "replace", path: "/author", value: null },
+        ]);
+
+        expect(article.author).toBe("a1");
+        expect(article.$author).toBe("a1");
+        expect(article.__serverSnapshot.author).toBe("a1");
+        await article.flush();
+        expect(adapter.patched).toHaveLength(0);
+      });
+
+      it("keeps the raw id when a collapsed expansion becomes unavailable", () => {
+        const article = Article.hydrate(adapter, {
+          id: "article-1",
+          author: { id: "a1", name: "Alice" },
+          $author: "a1",
+        });
+        article.author = "a1";
+
+        article[SYM_SERVER_PATCH]([
+          { op: "replace", path: "/author", value: null },
+        ]);
+
+        expect(article.author).toBe("a1");
+        expect(article.$author).toBe("a1");
+      });
+
+      it("clears a ref when the expanded raw id is also cleared", () => {
+        const article = Article.hydrate(adapter, {
+          id: "article-1",
+          author: { id: "a1", name: "Alice" },
+          $author: "a1",
+        });
+
+        article[SYM_SERVER_PATCH]([
+          { op: "replace", path: "/author", value: null },
+          { op: "replace", path: "/$author", value: null },
+        ]);
+
+        expect(article.author).toBeNull();
+        expect(article.$author).toBeNull();
+      });
+
+      it("clears a ref explicitly removed from the wire projection", async () => {
+        const article = Article.hydrate(adapter, {
+          id: "article-1",
+          author: { id: "a1", name: "Alice" },
+          $author: "a1",
+        });
+
+        article[SYM_SERVER_PATCH]([
+          { op: "remove", path: "/author" },
+          { op: "remove", path: "/$author" },
+        ]);
+
+        expect(article.author).toBeNull();
+        expect(article.$author).toBeNull();
+        expect(article.__serverSnapshot.author).toBeNull();
+        await article.flush();
+        expect(adapter.patched).toHaveLength(0);
+      });
+
+      it("preserves the raw id when only the expanded field is removed", async () => {
+        const article = Article.hydrate(adapter, {
+          id: "article-1",
+          author: { id: "a1", name: "Alice" },
+          $author: "a1",
+        });
+
+        article[SYM_SERVER_PATCH]([
+          { op: "remove", path: "/author" },
+        ]);
+
+        expect(article.author).toBe("a1");
+        expect(article.$author).toBe("a1");
+        expect(article.__serverSnapshot.author).toBe("a1");
+        await article.flush();
+        expect(adapter.patched).toHaveLength(0);
+      });
+
+      it("replaces a plain expanded ref after a nested patch", () => {
         const article = Article.hydrate(adapter, {
           id: "article-1",
           author: { id: "a1", name: "Alice" },
@@ -1548,14 +1705,51 @@ describe("Model", () => {
         ]);
 
         expect((article as any).$author).toBe("a1");
-        expect(article.author === before).toBe(true);
+        expect(article.author === before).toBe(false);
         expect((article.author as any).name).toBe("Alicia");
       });
 
-      it("refreshes a same-id loaded ref from a fresh expanded model", () => {
+      it("emits nested expanded-ref subscription operations", () => {
         const article = Article.hydrate(adapter, {
           id: "article-1",
-          author: { id: "a1", name: "stale" },
+          author: { id: "a1", name: "Alice" },
+        });
+        const events: ModelOperationsEvent[] = [];
+        article.on("operations", (event: ModelOperationsEvent) => events.push(event));
+
+        article[SYM_SERVER_PATCH]([
+          { op: "replace", path: "/author/name", value: "Alicia" },
+        ]);
+
+        expect(events).toHaveLength(1);
+        expect(events[0]).toMatchObject({
+          source: "remote",
+          ops: [{ op: "replace", path: "/author/name", value: "Alicia" }],
+        });
+      });
+
+      it("omits ineffective nested expanded-ref operations", () => {
+        const article = Article.hydrate(adapter, {
+          id: "article-1",
+          author: { id: "a1", name: "Alice" },
+        });
+        const events: ModelOperationsEvent[] = [];
+        article.on("operations", (event: ModelOperationsEvent) => events.push(event));
+
+        article[SYM_SERVER_PATCH]([
+          { op: "replace", path: "/author/name", value: "Alice" },
+          { op: "add", path: "/author/avatar", value: "new" },
+        ]);
+
+        expect(events[0]?.ops).toEqual([
+          { op: "add", path: "/author/avatar", value: "new" },
+        ]);
+      });
+
+      it("replaces changed same-id plain projections without retaining stale fields", () => {
+        const article = Article.hydrate(adapter, {
+          id: "article-1",
+          author: { id: "a1", name: "stale", avatar: "old" },
         });
         const before = article.author;
         const fresh = Article.hydrate(adapter, {
@@ -1566,8 +1760,9 @@ describe("Model", () => {
         article[SYM_SERVER_MERGE](fresh);
 
         expect((article as any).$author).toBe("a1");
-        expect(article.author === before).toBe(true);
+        expect(article.author === before).toBe(false);
         expect((article.author as any).name).toBe("fresh");
+        expect((article.author as any).avatar).toBeUndefined();
       });
     });
   });

@@ -37,8 +37,15 @@ import { SchemaResolver } from "./resolver";
  *      wrong mapping will be regenerated on first boot
  *   5: use getAliasSymbol().getName() for Text detection — getText()
  *      returns the full module import path for imported type aliases
+ *   6: resolve `Ref<Model>` (`Model | string`) as a ref column
+ *   7: follow named aliases such as `type UserRef = Ref<User>`
+ *   8: resolve nullable/generic Ref aliases and Model names containing `Date`
+ *   9: require explicit `Ref<T>` declarations for Model reference columns
+ *  10: reject non-concrete Ref targets and Model members in JSON unions
+ *  11: propagate concrete type arguments through chained Ref aliases
+ *  12: distinguish Parcae Ref<T> from unrelated aliases named Ref
  */
-const RESOLVER_VERSION = 5;
+const RESOLVER_VERSION = 12;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -266,7 +273,18 @@ export function loadCachedSchemas(
 ): Record<string, SchemaDefinition> | null {
   try {
     const cache = loadCache(join(projectRoot, ".parcae"));
-    return cache?.schemas ?? null;
+    if (!cache || !cache.hash.startsWith(`v${RESOLVER_VERSION}:`)) return null;
+    const modelsDir = findModelsDir(projectRoot);
+    if (modelsDir) {
+      const sourceFiles = collectTsFiles(modelsDir);
+      if (
+        sourceFiles.length > 0 &&
+        cache.hash !== `v${RESOLVER_VERSION}:${hashFiles(sourceFiles)}`
+      ) {
+        return null;
+      }
+    }
+    return cache.schemas;
   } catch {
     return null;
   }

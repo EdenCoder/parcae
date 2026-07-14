@@ -13,6 +13,7 @@ export {
   isArrayIndexSegment,
   Model,
   serializeLazyQueryArgs,
+  SYM_EXPANDED_REF,
   SYM_SERVER_MERGE,
   SYM_SERVER_PATCH,
   SYM_VERSION,
@@ -20,6 +21,8 @@ export {
 export type {
   ModelOperationSource,
   ModelOperationsEvent,
+  ExpandedRef,
+  Ref,
   WithRefs,
 } from "./Model";
 

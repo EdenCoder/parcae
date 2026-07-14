@@ -148,7 +148,9 @@ import { useQuery } from "@parcae/sdk/react";
 
 function PostList() {
   const { items, loading, error, refetch } = useQuery(
-    Post.where({ published: true }).orderBy("createdAt", "desc"),
+    Post.where({ published: true })
+      .expand("user")
+      .orderBy("createdAt", "desc"),
   );
 
   if (loading) return <p>Loading...</p>;
@@ -157,9 +159,7 @@ function PostList() {
   return items.map((post) => (
     <article key={post.id}>
       <h2>{post.title}</h2>
-      <Suspense fallback="...">
-        <span>{post.user.name}</span>
-      </Suspense>
+      <span>{typeof post.user === "string" ? "" : post.user?.name}</span>
     </article>
   ));
 }

@@ -12,12 +12,16 @@
  * functions below have no runtime effect and never touch the hook registry.
  */
 
-import { Model } from "@parcae/model";
+import { Model, type Ref } from "@parcae/model";
 import { type HookContext, hook } from "../routing/hook";
+
+class Owner extends Model {
+  static type = "owner" as const;
+}
 
 class TypingProbe extends Model {
   static type = "typing-probe" as const;
-  owner!: Model;
+  owner!: Ref<Owner>;
   title = "";
 }
 

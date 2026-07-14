@@ -24,10 +24,8 @@
  * `"file"` with `"file.url"` promotes to whole-row (bare wins).
  *
  * The raw id is preserved on the wire as `$file` alongside the
- * embedded object so the frontend lazy-ref-proxy contract stays
- * intact — the accessor pair `(file, $file)` is the same shape the
- * client has used, regardless of whether the row was
- * expanded.
+ * embedded object so the frontend keeps both forms: `file` is the
+ * inline row and `$file` remains the stable raw id.
  *
  * Errors:
  *   - Unknown spec syntax → `ClientError` (400). Triggers the route
@@ -249,20 +247,42 @@ function rowRefId(row: WireRow, refField: string): string | null {
   return null;
 }
 
+/** Sanitize one model and stamp raw companions for every visible ref field. */
+export async function projectForWire(
+  item: unknown,
+  user: { id: string } | null | undefined,
+): Promise<WireRow> {
+  // boundary: query rows are Model instances, with plain test doubles allowed.
+  const model = item as {
+    sanitize?: (user?: { id: string }) => Record<string, any> | Promise<Record<string, any>>;
+    __data?: Record<string, any>;
+    constructor?: ModelConstructor;
+  };
+  const row: WireRow =
+    typeof model?.sanitize === "function"
+      ? await model.sanitize(user ?? undefined)
+      : (model?.__data ?? (item as WireRow));
+  const schema = model?.constructor?.__schema;
+  if (!schema) return row;
+  for (const [field, column] of Object.entries(schema)) {
+    if (typeof column !== "object" || column.kind !== "ref") continue;
+    if (!Object.prototype.hasOwnProperty.call(row, field)) continue;
+    row[`$${field}`] = rowRefId(row, field);
+  }
+  return row;
+}
+
 /**
  * Project a sanitized linked row down to the requested field set.
- * `id` and `type` are always included so the frontend ref-proxy
- * can hydrate a stable identity even from a heavily-projected
- * payload.
+ * `id` and `type` are always included so a heavily-projected payload
+ * still carries stable ref identity.
  */
 function projectFields(
   sanitized: Record<string, any>,
   projection: ReadonlySet<string>,
 ): Record<string, any> {
   const out: Record<string, any> = {};
-  // id + type are non-negotiable identity columns. Without them
-  // the frontend's pre-hydration path in Model.hydrate has nothing
-  // to anchor the ref-proxy to.
+  // id + type are non-negotiable identity columns for inline refs.
   if (sanitized.id !== undefined) out.id = sanitized.id;
   if (sanitized.type !== undefined) out.type = sanitized.type;
   for (const field of projection) {
@@ -344,10 +364,7 @@ export async function hydrateExpansions(
         row[exp.refField] = null;
         continue;
       }
-      const sanitized: Record<string, any> =
-        typeof loaded.sanitize === "function"
-          ? await loaded.sanitize(sanitizeUser ?? undefined)
-          : (loaded.__data ?? (loaded as unknown as Record<string, any>));
+      const sanitized = await projectForWire(loaded, sanitizeUser);
       row[exp.refField] = exp.projection
         ? projectFields(sanitized, exp.projection)
         : sanitized;

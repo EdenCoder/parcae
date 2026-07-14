@@ -10,7 +10,7 @@
  *      embeds the linked File rows in the wire payload — batched
  *      through `RefLoader` (one `WHERE id IN (...)` for all files).
  *   4. The wire payload carries `{ file: { ... }, $file: "f_xyz" }`.
- *   5. The frontend `Model.hydrate` pre-populates the ref proxy so
+ *   5. The frontend `Model.hydrate` keeps the inline ref object so
  *      `asset.file.url` reads are synchronous.
  *
  * Subscription path additions:
@@ -205,11 +205,10 @@ describe("expand — integration through BackendAdapter + RefLoader", () => {
     ).toThrow(/not a column on file/);
   });
 
-  it("Model.hydrate(...) of a row with an inline expanded ref pre-populates the proxy", () => {
+  it("Model.hydrate(...) keeps an inline expanded ref", () => {
     // Same shape the LIST handler produces post-hydrateExpansions:
     // the wire row has `file: { id, type, url, ... }` AND `$file: id`.
-    // The frontend `Model.hydrate` should pre-populate the ref proxy
-    // so `asset.file.url` is synchronous.
+    // The frontend keeps the inline row so `asset.file.url` is synchronous.
     const asset = AssetM.hydrate(adapter, {
       id: "a1",
       kind: "image",
@@ -220,8 +219,9 @@ describe("expand — integration through BackendAdapter + RefLoader", () => {
         mime: "image/png",
         bytes: 0,
       },
+      $file: "f1",
     });
-    // Synchronous — no Suspense throw.
+    // Synchronous with no second lookup.
     expect((asset as any).file.url).toBe("https://cdn/1.png");
     expect((asset as any).$file).toBe("f1");
   });

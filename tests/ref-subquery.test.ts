@@ -10,7 +10,7 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import knex from "knex";
 import { Model } from "@parcae/model";
-import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
+import type { ModelConstructor, Ref, SchemaDefinition } from "@parcae/model";
 import { BackendAdapter } from "../packages/backend/src/adapters/model";
 
 // ─── Mock models ─────────────────────────────────────────────────────────────
@@ -24,7 +24,7 @@ class Test extends Model {
 
 class Result extends Model {
   static type = "result" as const;
-  test!: Test;
+  test!: Ref<Test>;
   score: number = 0;
   passed: boolean = false;
 }

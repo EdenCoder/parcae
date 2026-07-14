@@ -9,11 +9,23 @@
  *   number            → "number"    (DOUBLE PRECISION)
  *   boolean           → "boolean"   (BOOLEAN)
  *   Date              → "datetime"  (TIMESTAMP)
- *   Model subclass    → { kind: "ref", target: Constructor }
+ *   Ref<Model>        → { kind: "ref", target: Constructor }
  *   object/array/any  → "json"      (JSONB)
  */
 
-import { Project, ClassDeclaration, Type, SyntaxKind } from "ts-morph";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import {
+  Project,
+  ClassDeclaration,
+  Type,
+  SyntaxKind,
+  type Node,
+  type TypeAliasDeclaration,
+  type TypeNode,
+  type TypeReferenceNode,
+  type UnionTypeNode,
+} from "ts-morph";
 import type {
   SchemaDefinition,
   ColumnType,
@@ -25,6 +37,44 @@ import type {
 const BUILTIN_PROPERTIES = new Set(["id", "type", "createdAt", "updatedAt"]);
 
 const SKIP_PREFIXES = ["__", "___"];
+const PACKAGE_NAMES = new Map<string, string | null>();
+
+function packageNameForSource(filePath: string): string | null {
+  const cached = PACKAGE_NAMES.get(filePath);
+  if (cached !== undefined) return cached;
+  let directory = dirname(filePath);
+  while (true) {
+    const packagePath = join(directory, "package.json");
+    if (existsSync(packagePath)) {
+      try {
+        // boundary: package.json is external JSON with an optional name.
+        const parsed = JSON.parse(readFileSync(packagePath, "utf8")) as {
+          name?: unknown;
+        };
+        const name = typeof parsed.name === "string" ? parsed.name : null;
+        PACKAGE_NAMES.set(filePath, name);
+        return name;
+      } catch {
+        PACKAGE_NAMES.set(filePath, null);
+        return null;
+      }
+    }
+    const parent = dirname(directory);
+    if (parent === directory) {
+      PACKAGE_NAMES.set(filePath, null);
+      return null;
+    }
+    directory = parent;
+  }
+}
+
+function isParcaeRef(declarations: readonly Node[]): boolean {
+  return declarations.some(
+    (declaration) =>
+      packageNameForSource(declaration.getSourceFile().getFilePath()) ===
+      "@parcae/model",
+  );
+}
 
 // ─── Type Resolution ─────────────────────────────────────────────────────────
 
@@ -64,8 +114,117 @@ function isBooleanLike(t: Type): boolean {
   return false;
 }
 
+function refTargetFromNode(
+  node: TypeNode,
+  replacements: ReadonlyMap<string, Type>,
+  seen: Set<string>,
+): Type | null {
+  if (node.getKind() === SyntaxKind.UnionType) {
+    let target: Type | null = null;
+    for (const member of (node as UnionTypeNode).getTypeNodes()) {
+      if (member.getText() === "null" || member.getText() === "undefined") continue;
+      const candidate = refTargetFromNode(member, replacements, seen);
+      if (!candidate) return null;
+      if (target && target.getText() !== candidate.getText()) return null;
+      target = candidate;
+    }
+    return target;
+  }
+  if (node.getKind() !== SyntaxKind.TypeReference) return null;
+
+  const reference = node as TypeReferenceNode;
+  const name = reference.getTypeName().getText().split(".").pop();
+  const symbol = reference.getTypeName().getSymbol();
+  const alias = symbol?.getAliasedSymbol() ?? symbol;
+  if (name === "Ref" && alias && isParcaeRef(alias.getDeclarations())) {
+    const argument = reference.getTypeArguments()[0];
+    if (!argument) return null;
+    return replacements.get(argument.getText()) ?? argument.getType();
+  }
+  const arguments_ = reference.getTypeArguments().map(
+    (argument) => replacements.get(argument.getText()) ?? argument.getType(),
+  );
+  for (const declaration of alias?.getDeclarations() ?? []) {
+    if (declaration.getKind() !== SyntaxKind.TypeAliasDeclaration) continue;
+    const key = `${declaration.getSourceFile().getFilePath()}:${declaration.getStart()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const aliasDeclaration = declaration as TypeAliasDeclaration;
+    const aliasNode = aliasDeclaration.getTypeNode();
+    if (!aliasNode) continue;
+    const nestedReplacements = new Map<string, Type>();
+    aliasDeclaration.getTypeParameters().forEach((parameter, index) => {
+      const argument = arguments_[index];
+      if (argument) nestedReplacements.set(parameter.getName(), argument);
+    });
+    const target = refTargetFromNode(aliasNode, nestedReplacements, seen);
+    if (target) return target;
+  }
+  return refTarget(reference.getType(), seen, arguments_);
+}
+
+function refTarget(
+  type: Type,
+  seen = new Set<string>(),
+  providedArguments?: readonly Type[],
+): Type | null {
+  const alias = type.getAliasSymbol();
+  if (alias?.getName() === "Ref" && isParcaeRef(alias.getDeclarations())) {
+    return type.getAliasTypeArguments()[0] ?? null;
+  }
+
+  if (!alias) return null;
+  for (const declaration of alias.getDeclarations()) {
+    if (declaration.getKind() !== SyntaxKind.TypeAliasDeclaration) continue;
+    const key = `${declaration.getSourceFile().getFilePath()}:${declaration.getStart()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const aliasDeclaration = declaration as TypeAliasDeclaration;
+    const node = aliasDeclaration.getTypeNode();
+    if (!node) continue;
+    const argumentsByName = new Map<string, Type>();
+    const arguments_ = providedArguments ?? type.getAliasTypeArguments();
+    aliasDeclaration.getTypeParameters().forEach((parameter, index) => {
+      const argument = arguments_[index];
+      if (argument) argumentsByName.set(parameter.getName(), argument);
+    });
+    const target = refTargetFromNode(node, argumentsByName, seen);
+    if (target) return target;
+  }
+  return null;
+}
+
+function modelReference(type: Type): Extract<ColumnType, { kind: "ref" }> | null {
+  const symbol = type.getSymbol() ?? type.getAliasSymbol();
+  if (!symbol) return null;
+  for (const declaration of symbol.getDeclarations()) {
+    if (declaration.getKind() !== SyntaxKind.ClassDeclaration) continue;
+    const classDeclaration = declaration as ClassDeclaration;
+    if (!extendsModel(classDeclaration)) continue;
+    return {
+      kind: "ref",
+      target: { type: classDeclaration.getName() ?? "" } as any,
+    };
+  }
+  return null;
+}
+
 function resolveType(type: Type): ColumnType {
   const text = type.getText();
+  const aliasName = type.getAliasSymbol()?.getName();
+
+  // Ref<Model> expands to a runtime union that includes raw ids and plain
+  // projected data. Resolve from its target type instead of treating that
+  // implementation union as JSON. Follow one named alias as well so
+  // `type UserRef = Ref<User>` keeps the same schema.
+  const target = refTarget(type);
+  if (target) {
+    const reference = modelReference(target);
+    if (!reference) {
+      throw new Error(`Ref target "${target.getText()}" must be one concrete Model subclass`);
+    }
+    return reference;
+  }
 
   // Unwrap union with null/undefined: `string | null` → string
   if (type.isUnion()) {
@@ -74,6 +233,12 @@ function resolveType(type: Type): ColumnType {
       .filter((t) => !t.isNull() && !t.isUndefined());
     if (nonNullTypes.length === 1) {
       return resolveType(nonNullTypes[0]!);
+    }
+    const modelMember = nonNullTypes.find((member) => modelReference(member));
+    if (modelMember) {
+      throw new Error(
+        `Model value "${modelMember.getText()}" must be declared through Ref<T>`,
+      );
     }
     // Check if all members are the same primitive type
     // e.g. "active" | "pending" | "completed" → string
@@ -95,7 +260,6 @@ function resolveType(type: Type): ColumnType {
   // Matches `Text` (string & { __brand: "Text" }) from @parcae/model.
   // Alias-symbol check is the most reliable path: for imported type aliases
   // ts-morph's getText() returns the full module path, not just "Text".
-  const aliasName = type.getAliasSymbol()?.getName();
   if (aliasName === "Text" || text === "Text" || text.includes('"Text"')) return "text";
 
   // Primitives
@@ -103,25 +267,12 @@ function resolveType(type: Type): ColumnType {
   if (type.isNumber() || type.isNumberLiteral()) return "number";
   if (type.isBoolean() || type.isBooleanLiteral()) return "boolean";
 
+  if (modelReference(type)) {
+    throw new Error(`Model reference "${text}" must be declared with Ref<T>`);
+  }
+
   // Date
   if (text === "Date" || text.includes("Date")) return "datetime";
-
-  // Check if it's a class that extends Model
-  const symbol = type.getSymbol() ?? type.getAliasSymbol();
-  if (symbol) {
-    const declarations = symbol.getDeclarations();
-    for (const decl of declarations) {
-      if (decl.getKind() === SyntaxKind.ClassDeclaration) {
-        const classDecl = decl as ClassDeclaration;
-        if (extendsModel(classDecl)) {
-          return {
-            kind: "ref",
-            target: { type: classDecl.getName() ?? "" } as any,
-          };
-        }
-      }
-    }
-  }
 
   // Array → json
   if (type.isArray()) return "json";
@@ -246,7 +397,12 @@ export class SchemaResolver {
 
       // Get the declared type
       const type = prop.getType();
-      schema[name] = resolveType(type);
+      try {
+        schema[name] = resolveType(type);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`${classDecl.getName() ?? "Model"}.${name}: ${message}`);
+      }
     }
 
     return schema;

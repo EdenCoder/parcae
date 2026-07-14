@@ -1,12 +1,12 @@
 import { Model } from '@parcae/model';
-import type { QueryChain, ScopeContext } from '@parcae/model';
+import type { QueryChain, Ref, ScopeContext } from '@parcae/model';
 import { User } from './User';
 
 /**
  * Post model — a simple blog post.
  *
  * Properties ARE the schema:
- * - user: User → VARCHAR (reference, lazy-loads User on access)
+ * - user: Ref<User> → VARCHAR (raw id, expanded explicitly)
  * - title: string → VARCHAR
  * - body: PostBody → JSONB (any object = json)
  * - published: boolean → BOOLEAN
@@ -40,7 +40,7 @@ export class Post extends Model {
     },
   };
 
-  user!: User;
+  user!: Ref<User>;
   title: string = '';
   body: PostBody = { content: '' };
   published: boolean = false;

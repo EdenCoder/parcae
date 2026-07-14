@@ -39,7 +39,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Model, SYM_SERVER_MERGE } from "@parcae/model";
+import { Model, SYM_SERVER_MERGE, type Ref } from "@parcae/model";
 import { EventEmitter } from "eventemitter3";
 
 import { __test as useQueryTest } from "../react/useQuery";
@@ -63,7 +63,7 @@ class Article extends Model {
   static __schema = {
     author: { kind: "ref", target: Author },
   } as any;
-  declare author: Author;
+  declare author: Ref<Author>;
 }
 
 // ─── FakeClient — minimal ParcaeClient surface useQuery touches ─────────────
@@ -350,7 +350,7 @@ describe("useQuery — items-array reference contract", () => {
     release();
   });
 
-  it("merges subscription patches below an expanded ref without replacing its raw id", async () => {
+  it("replaces a patched expanded ref without replacing its raw id", async () => {
     const client = new FakeClient();
     const adapter = {} as any;
     const chain: any = {
@@ -388,12 +388,12 @@ describe("useQuery — items-array reference contract", () => {
     ]);
 
     expect(article.$author).toBe("author-1");
-    expect(article.author).toBe(author);
+    expect(article.author).not.toBe(author);
     expect(article.author.name).toBe("Alicia");
     release();
   });
 
-  it("refreshes a same-id expanded ref while preserving both model identities", async () => {
+  it("refreshes a same-id expanded ref while preserving parent identity", async () => {
     const client = new FakeClient();
     const adapter = {} as any;
     const makeArticleChain = (name: string): any => ({
@@ -420,7 +420,7 @@ describe("useQuery — items-array reference contract", () => {
     await new Promise((resolve) => setImmediate(resolve));
 
     expect(entry.items[0]).toBe(article);
-    expect(article.author).toBe(author);
+    expect(article.author).not.toBe(author);
     expect(article.$author).toBe("author-1");
     expect(article.author.name).toBe("fresh");
     release();

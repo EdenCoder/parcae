@@ -205,23 +205,19 @@ The list result array carries non-enumerable `__queryHash` and `__totalCount` pr
 
 ### `expand()` — the N+1 fix
 
-Without `.expand()`, ref columns serialize as raw id strings and the client must `findById` per row. `.expand("file")` inlines the full linked row; `.expand("file.url", "file.mime")` projects only `{ id, type, ...fields }`. The expanded ref is pre-hydrated into the ref proxy, so reads are synchronous (no Suspense throw). v1 is one-hop only (dot-syntax is reserved for ref + field projection, not nested ref-chaining). Mixing a bare ref with dotted projections of the same ref promotes to whole-row. The raw id always lands in `$file` regardless. Backend validates each spec against `__schema` (unknown/non-ref → 400).
+Without `.expand()`, ref columns stay raw id strings. `.expand("file")` inlines the full sanitized linked row; `.expand("file.url", "file.mime")` projects only `{ id, type, ...fields }`. Expanded values are plain partial data, not Model instances. v1 is one-hop only (dot-syntax is reserved for ref + field projection, not nested ref-chaining). Mixing a bare ref with dotted projections of the same ref promotes to whole-row. The raw id always lands in `$file` regardless. Backend validates each spec against `__schema` (unknown/non-ref → 400).
 
 ## Reference Fields
 
-Properties typed as another `Model` get an accessor pair installed by `_apply()` (no Proxy on the Model itself; the *ref value* is a small Proxy):
+Declare model references with `Ref<T>`. `_apply()` keeps the value and its raw-id accessor synchronized without lazy loading or proxies:
 
 ```typescript
-post.author       // lazy-loading ref proxy (memoized per raw id), or null
-post.author = u   // accepts a Model, an id string, or null; stores the raw id
-post.$author      // raw id string (no load); also settable
+post.author       // raw id, assigned Model, expanded plain data, or null
+post.author = u   // accepts a Model, a query expansion, an id string, or null
+post.$author      // raw id string (no I/O); also settable
 ```
 
-The ref proxy returns `.id` and `.type` **synchronously** (and handles `then` → `undefined`, `toJSON`, and `Symbol.toPrimitive` without loading). Most OTHER property reads before the row loads throw the pending `findById` promise (React Suspense). `ownKeys` / `has` / `getOwnPropertyDescriptor` restrict the visible surface to `{ id, type }`, so iteration / `isEqual` / DevTools expansion don't trip the lazy-load trap. Proxies are cached in `Model.__refCache`, a 30s-TTL map keyed `${type}:${id}`.
-
-> **Gotchas.**
-> - Never write `'id' in ref` — the ref proxy wraps `{}` and only whitelists `id`/`type` in its `has` trap (`'someOtherKey' in ref` is false). Read `ref.id` directly.
-> - `$field` raw-id accessors are reliable on the server (schema resolved at startup). On the dashboard/client the `$field` getter may be undefined if `__schema` wasn't populated for that model — read ref ids via a runtime shape check (a string id, or an object with `.id`) rather than relying on `$field`.
+Reading a raw ref never performs I/O. Query with `.expand()` when linked data is needed, then narrow the `string | ExpandedRef<T>` value before reading projected fields. Sanitized wire rows include `$field`, so schema-free clients retain ref identity and serialize expanded values back to raw ids.
 
 ## Adapter Interface
 
@@ -281,4 +277,4 @@ When set, `ensureTable()` creates a generated `_search` tsvector column + GIN in
 
 ## Adapter Lifetime
 
-The default adapter and its pending resolver are module-local. `Model.use()` resolves that default once and rejects replacement; `Model.bind(adapter)` captures independent adapters on constructor proxies. The reference cache is also module-local in the private static `Model.__refCache` map.
+The default adapter and its pending resolver are module-local. `Model.use()` resolves that default once and rejects replacement; `Model.bind(adapter)` captures independent adapters on constructor proxies.

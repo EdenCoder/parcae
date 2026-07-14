@@ -97,6 +97,8 @@ PATCH  /v1/posts/:id      atomic JSON Patch (RFC 6902)
 Scopes define per-operation access control. They receive the request context and return a query modifier, a data object, or null to deny.
 
 ```typescript
+import { Model, type Ref } from "@parcae/model";
+
 class Post extends Model {
   static type = "post" as const;
 
@@ -108,7 +110,7 @@ class Post extends Model {
     delete: (ctx) => (qb) => qb.where("user", ctx.user.id),
   };
 
-  user!: User;
+  user!: Ref<User>;
   title: string = "";
   published: boolean = false;
 }

@@ -31,7 +31,7 @@ Your class IS the schema, the API, and the type system. One `createApp()` call b
 ## Model + createApp
 
 ```typescript
-import { Model } from "@parcae/model";
+import { Model, type Ref } from "@parcae/model";
 
 class Post extends Model {
   static type = "post" as const; // table = pluralize(type) → "posts"
@@ -40,7 +40,7 @@ class Post extends Model {
     create: (ctx) => (ctx.user ? { user: ctx.user.id } : null),
   };
 
-  user!: User; // Reference → VARCHAR FK
+  user!: Ref<User>; // Reference → VARCHAR raw id
   title: string = ""; // → VARCHAR
   published: boolean = false;
 }

@@ -19,13 +19,14 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
-import { Model } from "@parcae/model";
+import { Model, type Ref } from "@parcae/model";
 import { ClientError } from "../helpers";
 import { RefLoader } from "../services/ref-loader";
 import {
   expandHashKey,
   hydrateExpansions,
   parseExpandSpecs,
+  projectForWire,
   validateExpandSpecs,
   type ResolvedExpand,
 } from "../services/hydrate-expansions";
@@ -57,6 +58,16 @@ class AssetModel extends Model {
     file: { kind: "ref", target: FileModel },
     owner: { kind: "ref", target: UserModel },
   } as any;
+  declare file: Ref<FileModel>;
+  declare owner: Ref<UserModel>;
+}
+
+class CustomSanitizedAsset extends AssetModel {
+  static override type = "custom-asset";
+
+  override sanitize(): Record<string, any> {
+    return { id: this.id, file: this.file };
+  }
 }
 
 const REGISTRY = new Map<string, any>([
@@ -64,6 +75,21 @@ const REGISTRY = new Map<string, any>([
   ["user", UserModel],
   ["asset", AssetModel],
 ]);
+
+describe("projectForWire", () => {
+  it("stamps visible refs returned by a custom sanitizer", async () => {
+    const asset = CustomSanitizedAsset.hydrate({} as any, {
+      id: "asset-1",
+      file: "file-1",
+    });
+
+    await expect(projectForWire(asset, null)).resolves.toEqual({
+      id: "asset-1",
+      file: "file-1",
+      $file: "file-1",
+    });
+  });
+});
 
 // ─── parseExpandSpecs ────────────────────────────────────────────────────────
 

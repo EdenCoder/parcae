@@ -929,7 +929,7 @@ export function createApp(config: AppConfig): ParcaeApp {
       //
       // We also create a per-request `RefLoader` here so every
       // `BackendAdapter.findById` call inside the request scope
-      // coalesces concurrent ref-proxy resolutions into one
+      // coalesces concurrent ref resolutions into one
       // `WHERE id IN (...)` batch per type per microtask. Outside
       // this scope (background jobs, hooks fired from non-HTTP code
       // paths, tests) `findById` falls through to the direct

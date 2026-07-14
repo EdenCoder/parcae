@@ -46,6 +46,7 @@ import {
   runQuerySubscription,
   runQueryStatic,
 } from "../services/query-subscription";
+import { projectForWire } from "../services/hydrate-expansions";
 import type { BackendAdapter } from "./model";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -132,7 +133,7 @@ function stripReadonly(
   const deny = readonlyFieldsFor(modelClass);
   const out: Record<string, any> = {};
   for (const [key, value] of Object.entries(data)) {
-    if (deny.has(key)) continue;
+    if (key.startsWith("$") || deny.has(key)) continue;
     out[key] = value;
   }
   return out;
@@ -212,23 +213,6 @@ function assertSupportedPatchOps(ops: unknown[]): void {
       throw new ClientError("patch: op path must start with '/'");
     }
   }
-}
-
-/**
- * Project a model instance into the wire shape for a route response.
- * Honours the subclass's `sanitize()` (which honours `privateFields`
- * by default after the latest Model changes); falls back to
- * `__data` for any row that somehow lacks `sanitize` (defensive —
- * with the Model default in place this is effectively unreachable).
- */
-async function projectForWire(
-  item: RouteModelRow,
-  user: { id: string } | null | undefined,
-): Promise<Record<string, any>> {
-  if (typeof item.sanitize === "function") {
-    return item.sanitize(user ?? undefined);
-  }
-  return item.__data;
 }
 
 /**
@@ -556,7 +540,7 @@ export function registerModelRoutes(
               .split("/")[0]
               ?.replace(/~1/g, "/")
               .replace(/~0/g, "~");
-            if (column && deny.has(column)) {
+            if (column && (column.startsWith("$") || deny.has(column))) {
               return json(res, 403, {
                 result: null,
                 success: false,

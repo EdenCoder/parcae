@@ -19,9 +19,11 @@
 TypeScript backend framework. Your class is the schema, the API, and the type system. One function call gives you Postgres, REST, realtime, auth, and a React SDK. No codegen, no dashboard, no vendor lock-in.
 
 ```typescript
+import { Model, type Ref } from "@parcae/model";
+
 class Post extends Model {
   static type = "post" as const;
-  user!: User;
+  user!: Ref<User>;
   title: string = "";
   published: boolean = false;
   views: number = 0;
@@ -116,7 +118,7 @@ GET    /v1/health         status, uptime, model count
 
 | Package                                                 | Description                                                         |
 | ------------------------------------------------------- | ------------------------------------------------------------------- |
-| [`@parcae/model`](./packages/model)                     | Model base class, Proxy system, query builder, adapter interface    |
+| [`@parcae/model`](./packages/model)                     | Model base class, query builder, adapter interface                  |
 | [`@parcae/backend`](./packages/backend)                 | createApp, auto-CRUD, hooks, jobs, PubSub, queue, schema resolution |
 | [`@parcae/sdk`](./packages/sdk)                         | Client SDK — Socket.IO transport, session lifecycle, React hooks    |
 | [`@parcae/auth-betterauth`](./packages/auth-betterauth) | Better Auth adapter — self-hosted, same Postgres                    |
@@ -125,15 +127,15 @@ GET    /v1/health         status, uptime, model count
 
 ## Models
 
-A class property with a default value becomes a Postgres column. A property typed as another Model becomes a lazy-loading reference. That's the whole system.
+A class property with a default value becomes a Postgres column. A `Ref<Model>` property becomes a raw-id reference that can be expanded explicitly. That's the whole system.
 
 ```typescript
-import { Model } from "@parcae/model";
+import { Model, type Ref } from "@parcae/model";
 
 class Post extends Model {
   static type = "post" as const;
 
-  user!: User; // -> VARCHAR (foreign key, lazy-loads User)
+  user!: Ref<User>; // -> VARCHAR raw id; expanded explicitly
   title: string = ""; // -> VARCHAR
   body: PostBody = { content: "" }; // -> JSONB
   tags: string[] = []; // -> JSONB
@@ -148,7 +150,7 @@ Direct property access. No `.get()`, no `.data.title`. Just `post.title`.
 const post = await Post.findById("abc");
 
 post.title; // "Hello" — typed as string
-post.user; // User proxy — loads on access, works with Suspense
+post.user; // "user_k8f2m9x" — raw id until explicitly expanded
 post.$user; // "user_k8f2m9x" — raw ID, no loading
 post.title = "New"; // change tracked automatically
 
@@ -306,7 +308,9 @@ function App() {
 
 function PostList() {
   const { items, loading } = useQuery(
-    Post.where({ published: true }).orderBy("createdAt", "desc"),
+    Post.where({ published: true })
+      .expand("user")
+      .orderBy("createdAt", "desc"),
   );
 
   if (loading) return <p>Loading...</p>;
@@ -314,9 +318,7 @@ function PostList() {
   return items.map((post) => (
     <article key={post.id}>
       <h2>{post.title}</h2>
-      <Suspense fallback="...">
-        <span>by {post.user.name}</span>
-      </Suspense>
+      <span>by {typeof post.user === "string" ? "Unknown" : post.user?.name}</span>
     </article>
   ));
 }

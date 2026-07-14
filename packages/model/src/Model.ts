@@ -82,8 +82,10 @@ const SYM_SNAPSHOT = Symbol("parcae:serverSnapshot");
 const SYM_PENDING_DATA = Symbol("parcae:pendingData");
 /** Tail of the instance's single save/patch/flush write lane. */
 const SYM_WRITE_LANE = Symbol("parcae:writeLane");
-/** Per-field raw id, proxy, and loaded expanded instance. */
-
+/** Schema-known or wire-declared reference field names. */
+const SYM_REF_FIELDS = Symbol("parcae:refFields");
+/** Symbol marker carried by plain expanded projections. */
+export const SYM_EXPANDED_REF = Symbol.for("parcae:expandedRef");
 
 const classAdapters = new WeakMap<ModelConstructor, ModelAdapter>();
 const boundSources = new WeakMap<ModelConstructor, ModelConstructor>();
@@ -350,12 +352,12 @@ export function serializeLazyQueryArgs(args: any[]): any[] {
   });
 }
 
-function lazyQuery<T>(
+function lazyQuery<T extends Model>(
   modelClass: ModelConstructor<T>,
   steps: any[] = [],
   keySteps: any[] = [],
   capturedAdapter: ModelAdapter | null = getBoundAdapter(modelClass),
-): QueryChain<T> {
+): QueryChain<WithRefs<T>> {
   const chain: any = {};
 
   for (const method of CHAINABLE_METHODS) {
@@ -368,7 +370,7 @@ function lazyQuery<T>(
       );
   }
 
-  const resolve = async (): Promise<QueryChain<T>> => {
+  const resolve = async (): Promise<QueryChain<WithRefs<T>>> => {
     const adapter =
       capturedAdapter ??
       getBoundAdapter(modelClass) ??
@@ -390,7 +392,7 @@ function lazyQuery<T>(
   chain.__modelClass = modelClass;
   chain.__adapter = capturedAdapter;
 
-  return chain as QueryChain<T>;
+  return chain as QueryChain<WithRefs<T>>;
 }
 
 // ─── Patch helpers ──────────────────────────────────────────────────────────
@@ -412,9 +414,25 @@ function decodePointerSegment(segment: string): string {
   return segment.replace(/~1/g, "/").replace(/~0/g, "~");
 }
 
+function encodePointerSegment(segment: string): string {
+  return segment.replace(/~/g, "~0").replace(/\//g, "~1");
+}
+
 function pointerSegments(path: string): string[] {
   if (!path.startsWith("/")) return [];
   return path.slice(1).split("/").map(decodePointerSegment);
+}
+
+function prefixPatchOps(field: string, ops: readonly PatchOp[]): PatchOp[] {
+  const prefix = `/${encodePointerSegment(field)}`;
+  // boundary: spreading the fast-json-patch discriminated union preserves it.
+  return ops.map((op) => ({
+    ...op,
+    path: `${prefix}${op.path}`,
+    ...((op.op === "copy" || op.op === "move")
+      ? { from: `${prefix}${op.from}` }
+      : {}),
+  })) as PatchOp[];
 }
 
 /**
@@ -498,6 +516,14 @@ function dataValuesEqual(left: any, right: any): boolean {
   return compare(dateSafeClone(left), dateSafeClone(right)).length === 0;
 }
 
+function rawReferenceId(value: unknown): string | null {
+  if (typeof value === "string") return value || null;
+  if (value && typeof value === "object" && typeof (value as any).id === "string") {
+    return (value as any).id || null;
+  }
+  return null;
+}
+
 function mergeServerWithLocalChanges(
   serverData: Record<string, any>,
   baselineData: Record<string, any>,
@@ -527,9 +553,6 @@ function topLevelKeys(ops: readonly PatchOp[]): Set<string> {
   }
   return keys;
 }
-
-
-
 // ─── Model Class ─────────────────────────────────────────────────────────────
 
 export class Model extends EventEmitter {
@@ -557,7 +580,7 @@ export class Model extends EventEmitter {
   declare [SYM_SNAPSHOT]: Record<string, any>;
   declare [SYM_PENDING_DATA]: Record<string, any> | undefined;
   declare [SYM_WRITE_LANE]: Promise<void> | null | undefined;
-
+  declare [SYM_REF_FIELDS]: Set<string>;
   declare [SYM_VERSION]: number;
 
   // ── Static ─────────────────────────────────────────────────────────
@@ -678,12 +701,9 @@ export class Model extends EventEmitter {
   //
   // Every method below uses `this: ModelConstructor<T>` so the typing
   // closes via the call shape: `Scene.where(...)` binds T = Scene from
-  // `typeof Scene satisfies ModelConstructor<Scene>`. The returned
-  // chain wraps T in `WithRefs<T>` to surface the `$`-prefixed ref
-  // accessors that `_apply()` installs at runtime. The single cast at
-  // the end of each body bridges the `QueryChain<T>` lazyQuery returns
-  // with the wider `QueryChain<WithRefs<T>>` the contract advertises;
-  // safe because `WithRefs<T>` is `T` plus extra fields.
+  // `typeof Scene satisfies ModelConstructor<Scene>`. Hydration and query
+  // boundaries retain `WithRefs<T>`, surfacing the `$` raw-id accessors
+  // that `_apply()` installs at runtime.
 
   /**
    * Create a new, unsaved Model instance. Data provided here wins over
@@ -708,18 +728,18 @@ export class Model extends EventEmitter {
    * result is NOT marked `__isNew`, and `__serverSnapshot` is seeded
    * from `data` so flush() knows there's nothing to send initially.
    *
-   * Returns `T` (not `WithRefs<T>`) because adapters are type-erased at
-   * the call site — they work generically across model classes.
+   * Adapters are generic, but hydration still installs the `$` raw-id
+   * accessors, so retain them in the result type.
    */
   static hydrate<T extends Model>(
     this: ModelConstructor<T>,
     adapter: ModelAdapter,
     data: Record<string, any>,
-  ): T {
+  ): WithRefs<T> {
     const instance = new this(adapter, data);
     applyInstance(instance);
     markNew(instance, false);
-    return instance;
+    return instance as WithRefs<T>;
   }
 
   static findById<T extends Model>(
@@ -728,16 +748,14 @@ export class Model extends EventEmitter {
   ): Promise<WithRefs<T> | null> {
     return Model.getAdapter
       .call(this as unknown as typeof Model)
-      .findById(this, id) as Promise<WithRefs<T> | null>;
+      .findById(this, id);
   }
 
   static where<T extends Model>(
     this: ModelConstructor<T>,
     ...args: any[]
   ): QueryChain<WithRefs<T>> {
-    return lazyQuery(this, [], [], getBoundAdapter(this)).where(
-      ...args
-    ) as QueryChain<WithRefs<T>>;
+    return lazyQuery(this, [], [], getBoundAdapter(this)).where(...args);
   }
 
   static whereRaw<T extends Model>(
@@ -745,10 +763,7 @@ export class Model extends EventEmitter {
     query: string,
     ...bindings: any[]
   ): QueryChain<WithRefs<T>> {
-    return lazyQuery(this, [], [], getBoundAdapter(this)).whereRaw(
-      query,
-      ...bindings
-    ) as QueryChain<WithRefs<T>>;
+    return lazyQuery(this, [], [], getBoundAdapter(this)).whereRaw(query, ...bindings);
   }
 
   static whereIn<T extends Model>(
@@ -756,19 +771,14 @@ export class Model extends EventEmitter {
     column: string,
     values: any[],
   ): QueryChain<WithRefs<T>> {
-    return lazyQuery(this, [], [], getBoundAdapter(this)).whereIn(
-      column,
-      values,
-    ) as QueryChain<WithRefs<T>>;
+    return lazyQuery(this, [], [], getBoundAdapter(this)).whereIn(column, values);
   }
 
   static whereNot<T extends Model>(
     this: ModelConstructor<T>,
     ...args: any[]
   ): QueryChain<WithRefs<T>> {
-    return lazyQuery(this, [], [], getBoundAdapter(this)).whereNot(
-      ...args
-    ) as QueryChain<WithRefs<T>>;
+    return lazyQuery(this, [], [], getBoundAdapter(this)).whereNot(...args);
   }
 
   static whereNotIn<T extends Model>(
@@ -776,37 +786,28 @@ export class Model extends EventEmitter {
     column: string,
     values: any[],
   ): QueryChain<WithRefs<T>> {
-    return lazyQuery(this, [], [], getBoundAdapter(this)).whereNotIn(
-      column,
-      values,
-    ) as QueryChain<WithRefs<T>>;
+    return lazyQuery(this, [], [], getBoundAdapter(this)).whereNotIn(column, values);
   }
 
   static whereNull<T extends Model>(
     this: ModelConstructor<T>,
     column: string,
   ): QueryChain<WithRefs<T>> {
-    return lazyQuery(this, [], [], getBoundAdapter(this)).whereNull(
-      column,
-    ) as QueryChain<WithRefs<T>>;
+    return lazyQuery(this, [], [], getBoundAdapter(this)).whereNull(column);
   }
 
   static whereNotNull<T extends Model>(
     this: ModelConstructor<T>,
     column: string,
   ): QueryChain<WithRefs<T>> {
-    return lazyQuery(this, [], [], getBoundAdapter(this)).whereNotNull(
-      column,
-    ) as QueryChain<WithRefs<T>>;
+    return lazyQuery(this, [], [], getBoundAdapter(this)).whereNotNull(column);
   }
 
   static select<T extends Model>(
     this: ModelConstructor<T>,
     ...columns: string[]
   ): QueryChain<WithRefs<T>> {
-    return lazyQuery(this, [], [], getBoundAdapter(this)).select(
-      ...columns
-    ) as QueryChain<WithRefs<T>>;
+    return lazyQuery(this, [], [], getBoundAdapter(this)).select(...columns);
   }
 
   static count<T extends Model>(this: ModelConstructor<T>): Promise<number> {
@@ -824,9 +825,7 @@ export class Model extends EventEmitter {
     this: ModelConstructor<T>,
     term: string,
   ): QueryChain<WithRefs<T>> {
-    return lazyQuery(this, [], [], getBoundAdapter(this)).search(
-      term,
-    ) as QueryChain<WithRefs<T>>;
+    return lazyQuery(this, [], [], getBoundAdapter(this)).search(term);
   }
 
   // ── Constructor ────────────────────────────────────────────────────
@@ -846,7 +845,7 @@ export class Model extends EventEmitter {
     this[SYM_ADAPTER] = adapter;
     this[SYM_PATCHING] = new Map<string, number>();
     this[SYM_SNAPSHOT] = {};
-
+    this[SYM_REF_FIELDS] = new Set();
     (this as any)[SYM_VERSION] = 0;
     if (data) this[SYM_PENDING_DATA] = data;
   }
@@ -877,7 +876,7 @@ export class Model extends EventEmitter {
     // accessors BEFORE writing non-ref user data so the ref slots
     // never go through a data-property phase that would have to be
     // converted (with a hidden-class transition) on the way out.
-    // Subclass field initializers like `author: Author | null = null`
+    // Subclass field initializers like `author: Ref<Author> | null = null`
     // may have already written a data property — `defineProperty`
     // overrides cleanly, so we still avoid the deopt-inducing
     // `delete + defineProperty` pattern of the previous design.
@@ -889,9 +888,22 @@ export class Model extends EventEmitter {
           refFields.add(field);
         }
       }
+    } else {
+      // Expanded wire rows carry both `field: { id, ... }` and `$field: id`.
+      // That explicit pair is enough to recover ref semantics without shipping
+      // the backend's schema resolver to the client.
+      for (const key of Object.keys(data)) {
+        if (!key.startsWith("$") || key.length === 1) continue;
+        const field = key.slice(1);
+        if (Object.prototype.hasOwnProperty.call(data, field)) refFields.add(field);
+      }
     }
+    this[SYM_REF_FIELDS] = refFields;
     for (const field of refFields) {
-      this._installRefField(field, data[field] ?? (this as any)[field] ?? null);
+      this._installRefField(
+        field,
+        data[field] ?? data[`$${field}`] ?? (this as any)[field] ?? null,
+      );
     }
 
     // Apply provided non-system, non-ref data. These OVERWRITE subclass
@@ -917,15 +929,14 @@ export class Model extends EventEmitter {
       (this as any)[key] = value;
     }
 
-    // Schema-free $key mirrors. Every non-ref, non-system field in
-    // the payload gets `$key = raw_value` so callers can read the
-    // wire value without a schema-derived ref accessor.
-    // Ref fields already have `$key` as a getter from _installRefField
-    // above, so skip them here.
-    for (const [key, value] of Object.entries(data)) {
-      if (SYSTEM_DATA_KEYS.has(key) || key.startsWith("$")) continue;
-      if (refFields.has(key)) continue;
-      (this as any)[`$${key}`] = value;
+    // Install synchronized `$key = key?.id ?? key ?? null` accessors for
+    // schema-free clients and field-initializer defaults. Typed callers only
+    // see accessors for `Ref<Model>` fields through `WithRefs<T>`; the broader
+    // runtime fallback keeps hydration correct when client schema is absent.
+    for (const key of Object.keys(this)) {
+      if (SYSTEM_DATA_KEYS.has(key) || key.startsWith("_") || key.startsWith("$")) continue;
+      if (EVENTEMITTER_KEYS.has(key) || INSTANCE_METHODS.has(key)) continue;
+      this._installRawAccessor(key);
     }
 
     // Seed the server snapshot from the fully-applied state. For a
@@ -937,55 +948,54 @@ export class Model extends EventEmitter {
     this[SYM_SNAPSHOT] = structuredClone(this.__data);
   }
 
-  /**
-   * Replace the plain `post.author` / `post.$author` pair with an
-   * accessor pair driven by a closed-over `raw` id slot.
-   *
-   *   post.author            → lazy-loading Model proxy (memoized on this field)
-   *   post.author = user     → stores user.id, invalidates cached proxy
-   *   post.author = "u_abc"  → stores "u_abc", invalidates cached proxy
-   *   post.$author           → "u_abc" (raw id, no load)
-   *   post.$author = "u_xyz" → overwrites raw id, invalidates cached proxy
-   *
-   * No `delete` of the pre-existing data property — `Object.defineProperty`
-   * overrides cleanly without forcing V8 into dictionary mode. The
-   * caller in `_apply()` also tries to install accessors BEFORE writing
-   * non-ref user data, so the most common path (no subclass field
-   * initializer with `= null` default) goes through one hidden-class
-   * transition per ref instead of three.
- *
-   * `prehydrated` lets the caller pre-populate the ref proxy with a
-   * fully-loaded target Model — the `.expand("file")` path uses it
-   * to embed the linked row inline so consumers don't
-   * Suspense-throw on first access. The pre-population mints a fresh
-   * field-local proxy, so no other instance or adapter can shadow it.
-   * On any subsequent reassignment the cached proxy is cleared and
-   * the lazy path resumes (correct: the new ref id may not have
-   * been expanded).
-   */
+  /** Keep an expanded object or raw id on the field and expose its raw id at `$field`. */
   private _installRefField(field: string, incoming: unknown): void {
+    this[SYM_REF_FIELDS].add(field);
     const v =
       incoming instanceof Model
         ? incoming
         : incoming && typeof incoming === "object" && typeof (incoming as any).id === "string"
-        ? incoming
+        ? this._markExpandedRef(incoming as Record<string, any>)
         : typeof incoming === "string"
         ? incoming || null
         : null;
     (this as any)[field] = v;
-    if (!Object.getOwnPropertyDescriptor(this, `$${field}`)) {
-      Object.defineProperty(this, `$${field}`, {
+    this._installRawAccessor(field);
+  }
+
+  private _markExpandedRef(value: Record<string, any>): Record<string, any> {
+    if ((value as any)[SYM_EXPANDED_REF] === true) return value;
+    try {
+      Object.defineProperty(value, SYM_EXPANDED_REF, {
         configurable: true,
-        enumerable: false,
-        get(this: any) {
-          const cur = this[field];
-          return cur?.id ?? cur ?? null;
-        },
-        set(this: any, v: string | null | undefined) {
-          this[field] = v ?? null;
-        },
+        enumerable: true,
+        value: true,
       });
+      return value;
+    } catch {
+      const copy = { ...value };
+      Object.defineProperty(copy, SYM_EXPANDED_REF, {
+        enumerable: true,
+        value: true,
+      });
+      return copy;
     }
+  }
+
+  /** Install the synchronized raw-value companion used by ref fields. */
+  private _installRawAccessor(field: string): void {
+    if (Object.getOwnPropertyDescriptor(this, `$${field}`)) return;
+    Object.defineProperty(this, `$${field}`, {
+      configurable: true,
+      enumerable: false,
+      get(this: any) {
+        const current = this[field];
+        return current?.id ?? current ?? null;
+      },
+      set(this: any, value: unknown) {
+        this[field] = value ?? null;
+      },
+    });
   }
 
   // ── Data Access (for adapters / serialization) ──────────────────────
@@ -996,25 +1006,25 @@ export class Model extends EventEmitter {
    * accessors. Ref fields serialize to their raw id.
    */
   get __data(): Record<string, any> {
-    const schema = (this.constructor as typeof Model).__schema;
     const data: Record<string, any> = {};
     for (const key of Object.keys(this)) {
       if (EVENTEMITTER_KEYS.has(key)) continue;
       if (INSTANCE_METHODS.has(key)) continue;
       if (key.startsWith("_")) continue;
       if (key.startsWith("$")) continue;
-      const col = schema?.[key];
+      const value = (this as any)[key];
       if (
-        col &&
-        typeof col === "object" &&
-        "kind" in col &&
-        col.kind === "ref"
+        !this[SYM_REF_FIELDS].has(key) &&
+        (value instanceof Model || value?.[SYM_EXPANDED_REF] === true)
       ) {
-        // Read the raw id directly; the public getter would return a
-        // Model proxy which isn't serializable.
+        this[SYM_REF_FIELDS].add(key);
+        this._installRawAccessor(key);
+      }
+      if (this[SYM_REF_FIELDS].has(key)) {
+        // Read the raw id directly; the field may hold an expanded object.
         data[key] = (this as any)[`$${key}`];
       } else {
-        data[key] = (this as any)[key];
+        data[key] = value;
       }
     }
     return data;
@@ -1336,6 +1346,7 @@ export class Model extends EventEmitter {
   [SYM_SERVER_MERGE](
     serverValue: Record<string, any> | Model,
     expectedData?: Record<string, any>,
+    removedFields?: ReadonlySet<string>,
   ): this {
     const previousEffectiveData =
       this.listenerCount("operations") > 0
@@ -1345,23 +1356,33 @@ export class Model extends EventEmitter {
     const incomingData: Record<string, any> = sourceModel
       ? sourceModel.__data
       : (serverValue as Record<string, any>);
-    const schema = (this.constructor as typeof Model).__schema;
-    const authoritativeData: Record<string, any> = {};
+    const refFields = new Set(this[SYM_REF_FIELDS]);
+    if (sourceModel) {
+      for (const field of sourceModel[SYM_REF_FIELDS]) refFields.add(field);
+    }
+    for (const key of Object.keys(incomingData)) {
+      if (!key.startsWith("$") || key.length === 1) continue;
+      const field = key.slice(1);
+      if (Object.prototype.hasOwnProperty.call(incomingData, field)) refFields.add(field);
+    }
+    this[SYM_REF_FIELDS] = refFields;
+    const authoritativeData: Record<string, any> = expectedData
+      ? structuredClone(expectedData)
+      : {};
 
     for (const [key, value] of Object.entries(incomingData)) {
-      const col = schema?.[key];
-      if (
-        col &&
-        typeof col === "object" &&
-        "kind" in col &&
-        col.kind === "ref"
-      ) {
+      if (key.startsWith("$")) continue;
+      if (refFields.has(key)) {
+        const rawKey = `$${key}`;
+        const refValue = Object.prototype.hasOwnProperty.call(incomingData, rawKey)
+          ? incomingData[rawKey]
+          : value;
         authoritativeData[key] =
-          value instanceof Model
-            ? value.id
-            : value && typeof value === "object"
-              ? (value as Record<string, any>).id ?? null
-              : value;
+          refValue instanceof Model
+            ? refValue.id
+            : refValue && typeof refValue === "object"
+              ? (refValue as Record<string, any>).id ?? null
+              : refValue;
       } else {
         authoritativeData[key] = value;
       }
@@ -1379,20 +1400,56 @@ export class Model extends EventEmitter {
 
     for (const [key, nextVal] of Object.entries(mergedData)) {
       if (key === "type") continue;
-      const col = schema?.[key];
-      const isRef =
-        col && typeof col === "object" && "kind" in col && col.kind === "ref";
+      const isRef = refFields.has(key);
       if (isRef) {
         let incoming: unknown = nextVal ?? null;
+        let isUnavailableExpansion = false;
         if (dataValuesEqual(nextVal, authoritativeData[key])) {
           const source = sourceModel ? (sourceModel as any)[key] : incomingData[key];
           if (source instanceof Model || (source && typeof source === "object")) {
             incoming = source;
+          } else if (
+            !sourceModel &&
+            Object.prototype.hasOwnProperty.call(incomingData, `$${key}`) &&
+            source == null &&
+            authoritativeData[key] != null
+          ) {
+            incoming = authoritativeData[key];
+            isUnavailableExpansion = true;
+          }
+        }
+        const current = (this as any)[key];
+        const currentId = rawReferenceId(current);
+        const incomingId = rawReferenceId(incoming);
+        let didExpandedChange = false;
+        if (
+          currentId &&
+          currentId === incomingId &&
+          current &&
+          typeof current === "object" &&
+          !isUnavailableExpansion
+        ) {
+          if (incoming && typeof incoming === "object" && incoming !== current) {
+            didExpandedChange = !dataValuesEqual(current, incoming);
+            if (!didExpandedChange) {
+              incoming = current;
+            } else if (current instanceof Model && incoming instanceof Model) {
+              current[SYM_SERVER_MERGE](incoming);
+              incoming = current;
+            }
+          } else {
+            incoming = current;
           }
         }
         const prev = (this as any)[`$${key}`];
         this._installRefField(key, incoming);
-        if ((this as any)[`$${key}`] !== prev) didChange = true;
+        if (
+          (this as any)[`$${key}`] !== prev ||
+          didExpandedChange ||
+          !Object.is(current, incoming)
+        ) {
+          didChange = true;
+        }
         continue;
       }
 
@@ -1400,6 +1457,7 @@ export class Model extends EventEmitter {
         (this as any)[key] = nextVal;
         didChange = true;
       }
+      if (!SYSTEM_DATA_KEYS.has(key)) this._installRawAccessor(key);
     }
 
     for (const key of Object.keys(this)) {
@@ -1408,13 +1466,12 @@ export class Model extends EventEmitter {
       if (EVENTEMITTER_KEYS.has(key)) continue;
       if (key.startsWith("_") || key.startsWith("$")) continue;
       if (mergedKeys.has(key)) continue;
-      const col = schema?.[key];
-      if (
-        col &&
-        typeof col === "object" &&
-        "kind" in col &&
-        col.kind === "ref"
-      ) {
+      if (refFields.has(key)) {
+        if (!removedFields?.has(key)) continue;
+        if ((this as any)[key] != null) {
+          this._installRefField(key, null);
+          didChange = true;
+        }
         continue;
       }
       delete (this as any)[key];
@@ -1423,11 +1480,17 @@ export class Model extends EventEmitter {
 
     const snapshot = this[SYM_SNAPSHOT];
     for (const key of Object.keys(snapshot)) {
-      if (!serverKeys.has(key)) delete snapshot[key];
+      if (serverKeys.has(key)) continue;
+      if (removedFields?.has(key)) {
+        snapshot[key] = null;
+      } else if (!refFields.has(key)) {
+        delete snapshot[key];
+      }
     }
     for (const [key, value] of Object.entries(authoritativeData)) {
       snapshot[key] = structuredClone(value);
     }
+    for (const field of removedFields ?? []) snapshot[field] = null;
 
     if (didChange) {
       (this as any)[SYM_VERSION] = (this as any)[SYM_VERSION] + 1;
@@ -1451,7 +1514,10 @@ export class Model extends EventEmitter {
     for (const op of ops) {
       const segments = pointerSegments(op.path);
       const fieldVal = segments.length > 1 ? (this as any)[segments[0]!] : null;
-      const isNestedRef = fieldVal instanceof Model;
+      const isNestedRef =
+        segments.length > 1 &&
+        this[SYM_REF_FIELDS].has(segments[0]!) &&
+        !!(fieldVal && typeof fieldVal === "object");
       const from = op.op === "copy" || op.op === "move" ? op.from : null;
       const fromSegments = from ? pointerSegments(from) : null;
       if (!isNestedRef || (fromSegments && fromSegments[0] !== segments[0])) {
@@ -1472,24 +1538,88 @@ export class Model extends EventEmitter {
     }
 
     let didRefChange = false;
+    const changedRefOps: PatchOp[] = [];
     for (const [field, patches] of refOps) {
       const loaded = (this as any)[field];
-      if (!(loaded instanceof Model)) continue;
-      const previousVersion = loaded[SYM_VERSION];
-      loaded[SYM_SERVER_PATCH](patches);
-      if (loaded[SYM_VERSION] !== previousVersion) didRefChange = true;
+      if (loaded instanceof Model) {
+        const previous = dateSafeClone(loaded.__data);
+        const previousVersion = loaded[SYM_VERSION];
+        loaded[SYM_SERVER_PATCH](patches);
+        const effective = compare(
+          previous,
+          dateSafeClone(loaded.__data),
+        ) as unknown as PatchOp[];
+        if (loaded[SYM_VERSION] !== previousVersion) {
+          didRefChange = true;
+          changedRefOps.push(
+            ...prefixPatchOps(field, effective.length > 0 ? effective : patches),
+          );
+        }
+        continue;
+      }
+      if (!loaded || typeof loaded !== "object") continue;
+      const previous = dateSafeClone(loaded);
+      const next = dateSafeClone(previous);
+      ensureIntermediates(next, patches);
+      applyPatch(next, patches, false, true);
+      const effective = compare(
+        previous,
+        next,
+      ) as unknown as PatchOp[];
+      if (effective.length > 0) {
+        this._installRefField(field, next);
+        didRefChange = true;
+        changedRefOps.push(...prefixPatchOps(field, effective));
+      }
     }
 
     const previousVersion = this[SYM_VERSION];
     if (outerOps.length > 0) {
       const snapshot = structuredClone(this[SYM_SNAPSHOT]);
+      const removedValueFields = new Set<string>();
+      const removedRawFields = new Set<string>();
+      for (const op of outerOps) {
+        const segments = pointerSegments(op.path);
+        if (op.op !== "remove" || segments.length !== 1) continue;
+        const field = segments[0]!;
+        if (field.startsWith("$") && this[SYM_REF_FIELDS].has(field.slice(1))) {
+          removedRawFields.add(field.slice(1));
+        } else if (this[SYM_REF_FIELDS].has(field)) {
+          removedValueFields.add(field);
+        }
+      }
+      const removedFields = new Set(
+        [...removedValueFields].filter((field) => removedRawFields.has(field)),
+      );
+      for (const field of this[SYM_REF_FIELDS]) {
+        const hasRawPatch = outerOps.some(
+          (op) => pointerSegments(op.path)[0] === `$${field}`,
+        );
+        const clearsExpandedField = outerOps.some((op) => {
+          const segments = pointerSegments(op.path);
+          if (segments.length !== 1 || segments[0] !== field) return false;
+          if (op.op === "remove") return true;
+          return (op.op === "add" || op.op === "replace") && op.value == null;
+        });
+        if (!hasRawPatch && clearsExpandedField) {
+          snapshot[`$${field}`] = (this as any)[`$${field}`];
+        }
+      }
       ensureIntermediates(snapshot, outerOps);
       applyPatch(snapshot, outerOps, false, true);
-      this[SYM_SERVER_MERGE](snapshot);
+      for (const field of removedValueFields) {
+        if (!removedFields.has(field)) snapshot[field] = null;
+      }
+      this[SYM_SERVER_MERGE](snapshot, undefined, removedFields);
     }
-    if (didRefChange && this[SYM_VERSION] === previousVersion) {
-      (this as any)[SYM_VERSION] = previousVersion + 1;
-      scheduleChangeEmit(this);
+    if (didRefChange) {
+      if (this[SYM_VERSION] === previousVersion) {
+        (this as any)[SYM_VERSION] = previousVersion + 1;
+        scheduleChangeEmit(this);
+      }
+      if (changedRefOps.length > 0) {
+        this._emitOperations(changedRefOps, "remote");
+      }
     }
     return this;
   }
@@ -1545,6 +1675,11 @@ export class Model extends EventEmitter {
         delete out[field];
       }
     }
+    for (const field of this[SYM_REF_FIELDS]) {
+      if (Object.prototype.hasOwnProperty.call(out, field)) {
+        out[`$${field}`] = out[field];
+      }
+    }
     return out;
   }
 
@@ -1563,34 +1698,57 @@ export class Model extends EventEmitter {
     };
   }
 
-  // ── Reference Proxy ──────────────────────────────────────────────────
-
-  /**
-   * Shared proxy factory for lazy and expanded refs. The mutable control is
-   * retained by the owning field so subscription patches and full fetches can
-   * refresh a loaded instance without replacing either proxy or raw id.
-   *
-   * The trap shape stays identical between the two cases — iteration
-   * safety still applies. Pre-hydration seeds the same field-local
-   * proxy protocol used by lazy refs.
-   */
 }
 
 /**
- * Adds typed `$`-prefixed string accessors for all reference fields.
+ * Adds typed `$`-prefixed raw-id accessors for all reference fields.
  * The accessor installation in `_apply()` provides these at runtime —
  * this type just surfaces them to TypeScript so no casting is needed.
  *
- * The mapped-type predicate uses `NonNullable<T[K]> extends Model`
- * (rather than `T[K] extends Model`) so nullable ref columns like
- * `file: File | null = null` still surface their `$file` accessor.
- * Without the unwrap, `File | null extends Model` resolves to
- * `never` and the `$<ref>` accessor disappears from the projected
- * type — even though the runtime installer fires regardless of
- * nullability.
+ * The mapped type extracts the Model member from `Ref<Model> | null`, so
+ * nullable refs still surface their `$field` accessor.
+ * `any` is excluded so untyped JSON fields do not accidentally gain a
+ * fictitious `$field` accessor. Nullable/optional refs include `null`; required
+ * refs stay `string` so their model declaration remains the source of truth.
  */
+type IsAny<T> = 0 extends 1 & T ? true : false;
+type ModelMember<T> = Extract<NonNullable<T>, Model>;
+type NonModelMember<T> = Exclude<NonNullable<T>, Model>;
+type ProjectionMember<T> = Exclude<NonModelMember<T>, string>;
+type ReferenceTarget<T> = IsAny<T> extends true
+  ? never
+  : [ModelMember<T>] extends [never]
+    ? never
+    : [Extract<NonModelMember<T>, string>] extends [never]
+      ? never
+      : [ProjectionMember<T>] extends [never]
+        ? never
+        : [ProjectionMember<T>] extends [ExpandedRef<ModelMember<T>>]
+          ? ModelMember<T>
+          : never;
+
+/** Plain, potentially projected data carried by `.expand()`. */
+export type ExpandedRef<T extends Model> = {
+  [K in keyof T as K extends string
+    ? K extends `__${string}`
+      ? never
+      : T[K] extends (...args: any[]) => any
+      ? never
+      : K
+    : never]?: T[K];
+} & { id: string; type?: string; readonly [SYM_EXPANDED_REF]: true };
+
+/** A reference is a raw id, assigned Model, or inline wire projection. */
+export type Ref<T extends Model> = T | ExpandedRef<T> | string;
+
 export type WithRefs<T extends Model> = T & {
-  [K in keyof T as NonNullable<T[K]> extends Model
-    ? `$${string & K}`
-    : never]: string;
+  [K in keyof T as K extends string
+    ? [ReferenceTarget<T[K]>] extends [never]
+      ? never
+      : `$${K}`
+    : never]: null extends T[K]
+    ? string | null
+    : undefined extends T[K]
+    ? string | null
+    : string;
 };
