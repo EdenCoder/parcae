@@ -63,6 +63,14 @@ export interface SocketTransportConfig {
   extraHeaders?: Record<string, string>;
   /** Maximum time to wait for a hello acknowledgement. */
   handshakeTimeout?: number;
+  /**
+   * Dial the socket at construction (socket.io's default). Pass
+   * `false` for connection-less transports — e.g. a client created
+   * for SSR, where the tree renders once against a forever-`pending`
+   * session and no wire traffic must leave the render server. The
+   * connection machine stays `"idle"`; `reconnect()` dials on demand.
+   */
+  autoConnect?: boolean;
 }
 
 /** Wire shape for a single `resync` entry. */
@@ -138,14 +146,16 @@ export class SocketTransport extends EventEmitter implements Transport {
     const socketPath = config.path ?? "/ws";
     const transports = config.transports ?? ["websocket"];
     const extraHeaders = config.extraHeaders;
+    const autoConnect = config.autoConnect ?? true;
     this.socket = SocketIO(this.url, {
       path: socketPath,
       transports,
       withCredentials: true,
+      autoConnect,
       ...(extraHeaders ? { extraHeaders } : {}),
     });
 
-    this.connection.connecting();
+    if (autoConnect) this.connection.connecting();
 
     this.socket.on("connect", () => {
       if (this.isDisposed) return;

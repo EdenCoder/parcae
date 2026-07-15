@@ -34,6 +34,13 @@ export interface ClientConfig {
    * Pass a stable reference when this config is created during render.
    */
   extraHeaders?: Record<string, string>;
+  /**
+   * Dial the socket at construction (default `true`). Pass `false`
+   * for a connection-less client — e.g. one created at module scope
+   * for SSR, where the session must stay `pending` and no socket may
+   * leave the render server. `reconnect()` dials on demand.
+   */
+  autoConnect?: boolean;
 }
 
 export interface ParcaeClient {
@@ -73,6 +80,7 @@ export function createClient(config: ClientConfig): ParcaeClient {
     getToken: config.getToken,
     transports: config.transports,
     extraHeaders: config.extraHeaders,
+    autoConnect: config.autoConnect,
   });
 
   const adapter = new FrontendAdapter(transport);
