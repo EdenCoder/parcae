@@ -15,15 +15,18 @@ import { createApp } from "@parcae/backend";
 
 const app = createApp({ models: "./models" });
 await app.start();
-// -> .parcae/ generated, tables created, CRUD routes live, WebSocket ready
+// -> .parcae/ generated, Postgres connected, CRUD + WebSocket ready
 ```
 
-`.env` files are auto-loaded at startup:
+`.env` files are auto-loaded at startup. Enable schema management for the first deploy or a dedicated migration step:
 
 ```bash
 # .env
 DATABASE_URL=postgresql://localhost:5432/myapp
+ENSURE_SCHEMA=true
 ```
+
+Later API boots should omit `ENSURE_SCHEMA`: they perform no DDL and verify that the required realtime triggers are already installed.
 
 ## createApp()
 
@@ -35,6 +38,7 @@ import { User, Post } from "./models";
 
 const app = createApp({
   models: [User, Post], // or "./models" for auto-discovery
+  migrations: "./migrations", // optional — schema/data migrations
   controllers: "./controllers", // optional — auto-import route files
   hooks: "./hooks", // optional — auto-import hook files
   jobs: "./jobs", // optional — auto-import job files
@@ -54,19 +58,15 @@ Controllers, hooks, and jobs self-register on import — just put files in the d
 ### Startup Sequence
 
 1. Parse and validate env config (Zod), auto-load `.env`
-2. Discover models (array or directory scan)
+2. Discover models and registered migrations
 3. Generate `.parcae/` type metadata (ts-morph schema resolver)
-4. Connect Postgres (Knex, optional read replica)
-5. Connect Redis (PubSub + Queue, optional — falls back to in-process)
-6. Create `BackendAdapter`, bind it once as the process's application adapter
-7. Ensure tables exist (additive DDL migration)
-8. Create HTTP server (Polka) + WebSocket server (Socket.IO)
-9. Set up `QuerySubscriptionManager` for realtime
-10. Mount auth middleware + routes (if configured)
-11. Mount app-wide middleware (if configured)
-12. Register auto-CRUD routes for scoped models
-13. Auto-discover and import controllers, hooks, jobs
-14. Start BullMQ workers + HTTP listener
+4. Connect the Postgres primary and optional ordinary-read replica
+5. Connect Redis for application events, locks, and queues (optional — local fallback)
+6. Bind the `BackendAdapter` and set up auth
+7. With `ENSURE_SCHEMA=true`, run migrations, ensure the additive model schema, and install realtime triggers
+8. Without `ENSURE_SCHEMA`, verify realtime triggers with read-only catalog queries before an API process starts
+9. Create Polka + Socket.IO, the `QuerySubscriptionManager`, and one Postgres `LISTEN` connection per API process
+10. Register routes, hooks, jobs, and crons; then start selected workers and the HTTP listener
 
 ### ParcaeApp
 
@@ -301,7 +301,7 @@ await enqueue(
 
 ## BackendAdapter
 
-The server-side `ModelAdapter` implementation. Handles Knex/Postgres persistence, hooks, pub/sub, and the overflow column pattern.
+The server-side `ModelAdapter` implementation. Handles Knex/Postgres persistence, hooks, subscriptions, and the overflow column pattern.
 
 ```typescript
 import { BackendAdapter } from "@parcae/backend";
@@ -309,7 +309,6 @@ import { BackendAdapter } from "@parcae/backend";
 const adapter = new BackendAdapter({
   read: readDb, // Knex instance (read replica or same as write)
   write: writeDb, // Knex instance
-  pubsub, // PubSub instance (optional)
 });
 
 Model.use(adapter); // one-time application binding; use Model.bind() for other contexts
@@ -317,16 +316,42 @@ Model.use(adapter); // one-time application binding; use Model.bind() for other 
 
 ### Key Features
 
-- **Upsert** — `INSERT ... ON CONFLICT MERGE` for save operations
+- **Atomic save** — New rows use `INSERT ... ON CONFLICT`; existing rows lock and patch the current row from the model's last server snapshot, preserving unrelated concurrent JSONB edits and rejecting unsafe array conflicts with `409`
 - **Atomic JSON Patch** — Generates `jsonb_set_lax`, `jsonb_insert`, `#-` SQL for JSONB columns; direct `SET` for scalar columns
 - **Overflow column** — Declared schema properties get typed columns; everything else goes into a `data` JSONB column automatically
-- **Additive migration** — `ensureAllTables()` creates tables/columns/indexes if missing. Never drops.
-- **Read/write splitting** — Separate Knex instances for read and write queries
-- **Hook execution** — Runs registered before/after hooks during persistence operations
+- **Additive schema** — `ensureAllTables()` creates missing tables, columns, indexes, and realtime triggers when schema management is enabled
+- **Read/write splitting** — Ordinary reads may use a replica; subscription rows, counts, and expansions read the primary to stay consistent with notifications
+- **Hook execution** — Runs registered before/after hooks during persistence operations; after-hooks receive the authoritative persisted state
+
+## Schema and Migrations
+
+Pass a migrations directory to `createApp()` to discover files that self-register with `migration()`:
+
+```typescript
+const app = createApp({
+  models: "./models",
+  migrations: "./migrations",
+});
+```
+
+`ENSURE_SCHEMA=true` makes startup run registered migrations, `ensureAllTables()`, and versioned realtime-trigger installation. A normal `RUN_SERVER=true` boot without the flag performs read-only catalog verification and fails if any managed table is missing the expected trigger.
+
+Migrations run lexicographically before the additive schema pass, use transactions by default, and share Knex's cross-process migration lock. State lives in `parcae_migrations`; checksum, description, ticket, duration, and effect metadata live in `parcae_migration_meta`.
+
+**Applied migration files are immutable and permanent.** Never edit one after application, and never delete it while its name remains in `parcae_migrations`. Edit drift throws `MigrationChecksumError`; a missing file makes Knex treat the migration directory as corrupt. Restore the original file and add a new compensating migration. The `--allow-checksum-drift` CLI flag and `PARCAE_ALLOW_CHECKSUM_DRIFT=true` startup variable are emergency, audit-visible bypasses only.
+
+The CLI manages registered migration files only. Automatic model columns, indexes, and realtime triggers still require an app schema step with `ENSURE_SCHEMA=true`.
+
+```bash
+npx parcae migrate:make add-post-slug
+npx parcae migrate:list
+npx parcae migrate:status
+npx parcae migrate:latest
+```
 
 ## PubSub
 
-Redis-backed cross-process events. Falls back to in-process `EventEmitter` when Redis is unavailable.
+Redis-backed cross-process application events. Falls back to an in-process `EventEmitter` when Redis is unavailable. Realtime model changes do not use this service.
 
 ```typescript
 import { PubSub } from "@parcae/backend";
@@ -375,9 +400,11 @@ await queue.building;
 await addJobIfNotExists(queue.get(), "post:index", { postId: "abc" });
 ```
 
-## QuerySubscriptionManager
+## Realtime Subscriptions
 
-Manages realtime query subscriptions for connected clients. When a model changes, affected queries are re-evaluated and surgical diff ops (`add`, `remove`, `update`) are pushed to subscribers.
+Postgres `AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW` triggers publish compact notifications only after commit. Every API process owns one dedicated `LISTEN parcae_change` connection and forwards changes to its local `QuerySubscriptionManager`; Redis and adapter-side duplicate events are not involved.
+
+The manager caches each scoped query once, shares it across subscribed sockets, and executes subscription rows, counts, and expansions on the primary. Safe updates fetch only the changed row or referenced expansion. Inserts, deletes, membership/order uncertainty, and reconnect reconciliation use a full scoped query. Both paths emit surgical diff ops (`add`, `remove`, `update`).
 
 ## Auth
 
@@ -426,21 +453,23 @@ At startup, `createApp()` generates type metadata into `.parcae/` (gitignored, l
 
 ## Configuration
 
-Environment variables validated at startup via Zod. `.env` files are auto-loaded.
+`.env` files are auto-loaded at startup; core configuration is validated with Zod.
 
-| Variable            | Required | Default       | Description                                       |
-| ------------------- | -------- | ------------- | ------------------------------------------------- |
-| `DATABASE_URL`      | Yes      | --            | PostgreSQL connection string                      |
-| `DATABASE_READ_URL` | No       | --            | Read replica connection string                    |
-| `REDIS_URL`         | No       | --            | Redis for PubSub + Queue                          |
-| `PORT`              | No       | `3000`        | HTTP server port                                  |
-| `AUTH_SECRET`       | No       | --            | Session signing secret (required if auth enabled) |
-| `TRUSTED_ORIGINS`   | No       | --            | Comma-separated CORS origins                      |
-| `NODE_ENV`          | No       | `development` | `development` / `production` / `test`             |
-| `RUN_SERVER`        | No       | `true`        | Register CRUD / custom routes / Socket.IO         |
-| `RUN_HOOKS`         | No       | `true`        | Run model lifecycle hooks                         |
-| `RUN_JOBS`          | No       | `false`       | `true` / `false` / `"name1,name2"` (workers)      |
-| `RUN_CRONS`         | No       | follows JOBS  | `true` / `false` / `"name1,name2"` (schedulers)   |
+| Variable                          | Required | Default       | Description                                       |
+| --------------------------------- | -------- | ------------- | ------------------------------------------------- |
+| `DATABASE_URL`                    | Yes      | --            | PostgreSQL connection string                      |
+| `DATABASE_READ_URL`               | No       | --            | Read replica connection string                    |
+| `REDIS_URL`                       | No       | --            | Redis for app events, locks, and queues           |
+| `PORT`                            | No       | `3000`        | HTTP server port                                  |
+| `AUTH_SECRET`                     | No       | --            | Session signing secret (required if auth enabled) |
+| `TRUSTED_ORIGINS`                 | No       | --            | Comma-separated CORS origins                      |
+| `NODE_ENV`                        | No       | `development` | `development` / `production` / `test`             |
+| `RUN_SERVER`                      | No       | `true`        | Register CRUD / custom routes / Socket.IO         |
+| `RUN_HOOKS`                       | No       | `true`        | Run model lifecycle hooks                         |
+| `RUN_JOBS`                        | No       | `false`       | `true` / `false` / `"name1,name2"` (workers)      |
+| `RUN_CRONS`                       | No       | follows JOBS  | `true` / `false` / `"name1,name2"` (schedulers)   |
+| `ENSURE_SCHEMA`                   | No       | `false`       | Run migrations, additive schema, and trigger DDL  |
+| `PARCAE_ALLOW_CHECKSUM_DRIFT`     | No       | `false`       | Emergency bypass for applied-migration drift      |
 
 ### Process roles
 

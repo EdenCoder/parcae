@@ -169,7 +169,7 @@ function PostList() {
 
 1. On mount, calls `chain.find()` to fetch initial data
 2. Backend response includes a `__queryHash` — client subscribes to `query:{hash}` socket event
-3. Server re-evaluates the query when matching models change
+3. Postgres changes trigger a targeted cache refresh, with a full scoped-query fallback when required
 4. Diff ops (`add`, `remove`, `update`) are pushed and applied client-side
 5. Uses `useSyncExternalStore` for tear-safe rendering
 

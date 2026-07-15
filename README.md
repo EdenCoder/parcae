@@ -16,7 +16,7 @@
 
 ---
 
-TypeScript backend framework. Your class is the schema, the API, and the type system. One function call gives you Postgres, REST, realtime, auth, and a React SDK. No codegen, no dashboard, no vendor lock-in.
+TypeScript backend framework. Your class is the schema, the API, and the type system. One function call gives you Postgres-native persistence and realtime, REST, auth, and a React SDK. No codegen, no dashboard, no vendor lock-in.
 
 ```typescript
 import { Model, type Ref } from "@parcae/model";
@@ -33,7 +33,7 @@ const app = createApp({ models: [Post] });
 await app.start();
 ```
 
-That's a running server. Tables exist. CRUD routes are live. WebSocket is ready.
+With `DATABASE_URL` configured and the schema applied, that's a running server. CRUD routes are live. WebSocket queries update from committed Postgres changes.
 
 ## The pitch (or: why not Supabase)
 
@@ -46,11 +46,11 @@ Parcae is the opposite. Everything is TypeScript. The class _is_ the schema. The
 | **Schema**             | SQL migrations or dashboard               | TypeScript classes. That's it.                    |
 | **Types**              | Generated from DB, always one step behind | Flow from the class. Nothing to generate.         |
 | **Business logic**     | Edge Functions or Postgres triggers       | Hooks, jobs, routes — same codebase, same types   |
-| **Realtime**           | Postgres CDC (row-level)                  | Query-level subs — re-evaluates and pushes diffs  |
+| **Realtime**           | Postgres CDC (row-level)                  | Postgres triggers → targeted query diffs          |
 | **Auth**               | Proprietary, tied to their infra          | Pluggable — Better Auth, Clerk, or roll your own  |
 | **Row-level security** | SQL policies (hard to test)               | TypeScript scope functions (composable, testable) |
 | **Background jobs**    | Not built in                              | BullMQ with retries and backoff                   |
-| **Lock-in**            | Deep                                      | Zero. Postgres + Redis. Swap anything.            |
+| **Lock-in**            | Deep                                      | Zero. Postgres; Redis only for jobs/events/locks  |
 
 ```typescript
 // supabase: types are generated. schema lives in SQL. business logic is elsewhere.
@@ -86,13 +86,18 @@ Start the server.
 // index.ts
 import { createApp } from "@parcae/backend";
 
-const app = createApp({ models: "./models" });
+const app = createApp({
+  models: "./models",
+  migrations: "./migrations",
+});
 await app.start();
 ```
 
 ```bash
-DATABASE_URL=postgresql://localhost:5432/myapp node index.ts
+ENSURE_SCHEMA=true DATABASE_URL=postgresql://localhost:5432/myapp node index.ts
 ```
+
+Use `ENSURE_SCHEMA=true` for the migration/schema step. Normal API boots should omit it: they run no database DDL and verify that the required realtime triggers are already installed before listening.
 
 ```
 09:41:02 INF Found 1 model(s): post
@@ -156,6 +161,8 @@ post.title = "New"; // change tracked automatically
 
 await post.save();
 ```
+
+Existing-row `save()` locks the row and applies only the changes made since the model's last server snapshot, so unrelated concurrent JSONB edits survive. Incompatible structural edits to the same JSON array fail with `409` instead of silently overwriting data.
 
 Properties not in the schema spill into an overflow `data` JSONB column. You can throw anything on a model and it persists — declared properties just get their own typed columns.
 
@@ -324,7 +331,7 @@ function PostList() {
 }
 ```
 
-`useQuery` is realtime. When something changes on the server, your query is re-evaluated and surgical diffs (`add`, `remove`, `update`) are pushed to the client. No polling, no refetching.
+`useQuery` is realtime. Row triggers publish compact `LISTEN/NOTIFY` messages after commit; every API process refreshes the affected cache from the primary and pushes surgical diffs (`add`, `remove`, `update`) to its clients. Safe updates fetch only the changed row or expansion, while membership/order changes and reconnect gaps fall back to a full scoped query. Redis is not in the model-change path.
 
 Other hooks: `useApi`, `useSDK`, `useSetting`, `useConnectionStatus`.
 
@@ -334,13 +341,29 @@ Other hooks: `useApi`, `useSDK`, `useSetting`, `useConnectionStatus`.
 
 ```bash
 DATABASE_URL=postgresql://localhost:5432/myapp  # required
-DATABASE_READ_URL=postgresql://...              # read replica (optional)
-REDIS_URL=redis://localhost:6379                # PubSub + Queue (optional)
+DATABASE_READ_URL=postgresql://...              # ordinary read replica (optional)
+REDIS_URL=redis://localhost:6379                # queues, app events, locks (optional)
 PORT=3000                                       # default: 3000
 AUTH_SECRET=...                                 # required if auth enabled
 BACKEND_URL=https://api.myapp.com               # for auth callbacks (optional)
 FRONTEND_URL=https://myapp.com                  # (optional)
-ENSURE_SCHEMA=true                              # run DDL migration on startup
+ENSURE_SCHEMA=true                              # migrations + additive schema + triggers
+```
+
+## Schema and migrations
+
+Schema mutation is explicit. With `ENSURE_SCHEMA=true`, startup runs registered migrations, applies the additive model schema, and installs versioned row triggers for realtime. Without it, an API process performs read-only trigger verification and fails with migration guidance if the database is not ready.
+
+Registered migrations run lexicographically before the additive schema pass and are tracked in `parcae_migrations`. Parcae also records a SHA-256 checksum and metadata in `parcae_migration_meta`.
+
+**Never edit or delete an applied migration file.** Editing causes `MigrationChecksumError`; deleting leaves the Knex ledger pointing at a missing file and blocks later migrations. Revert the file and write a new compensating migration instead. `PARCAE_ALLOW_CHECKSUM_DRIFT=true` and `--allow-checksum-drift` are emergency audit-visible bypasses, not normal workflow.
+
+The CLI manages registered migration files only. Automatic model columns, indexes, and realtime triggers still require an app schema step with `ENSURE_SCHEMA=true`.
+
+```bash
+npx parcae migrate:make add-post-slug
+npx parcae migrate:list
+npx parcae migrate:latest
 ```
 
 ## Project structure
