@@ -333,6 +333,9 @@ export async function runMigrations(
   await ensureMetaTable(opts.db);
 
   const meta = await readMetaRows(opts.db);
+  log.info(
+    `Verifying migration checksums — ${meta.size} applied, ${sorted.length} registered`,
+  );
   verifyChecksums(sorted, meta, opts.allowChecksumDrift ?? false);
 
   const source = new ParcaeMigrationSource(

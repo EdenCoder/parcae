@@ -159,6 +159,7 @@ export class MigrationChecksumError extends Error {
   constructor(
     public readonly drifted: readonly {
       readonly name: string;
+      readonly path: string;
       readonly expected: string;
       readonly actual: string;
     }[],
@@ -166,7 +167,7 @@ export class MigrationChecksumError extends Error {
     const lines = drifted
       .map(
         (d) =>
-          `  - ${d.name}\n      expected: ${d.expected}\n      actual:   ${d.actual}`,
+          `  - ${d.name}\n      source:   ${d.path}\n      expected: ${d.expected}\n      actual:   ${d.actual}`,
       )
       .join("\n");
     super(
@@ -196,7 +197,12 @@ export function verifyChecksums(
   meta: Map<string, MigrationMetaRow>,
   allowDrift: boolean,
 ): void {
-  const drifted: Array<{ name: string; expected: string; actual: string }> = [];
+  const drifted: Array<{
+    name: string;
+    path: string;
+    expected: string;
+    actual: string;
+  }> = [];
 
   for (const entry of entries) {
     const recorded = meta.get(entry.name);
@@ -206,8 +212,12 @@ export function verifyChecksums(
 
     const actual = sha256File(entry.path);
     if (actual && actual !== recorded.checksum) {
+      log.error(
+        `[parcae] migration checksum mismatch name="${entry.name}" path="${entry.path}" expected=${recorded.checksum} actual=${actual}`,
+      );
       drifted.push({
         name: entry.name,
+        path: entry.path,
         expected: recorded.checksum,
         actual,
       });
