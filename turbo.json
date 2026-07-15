@@ -11,7 +11,7 @@
     "lint": {},
     "test": {
       "dependsOn": ["^build"],
-      "env": ["ANALYTICS_TEST_DB"]
+      "env": ["ANALYTICS_TEST_DB", "PARCAE_TEST_DATABASE_URL"]
     },
     "clean": {
       "cache": false

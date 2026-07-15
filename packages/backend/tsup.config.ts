@@ -15,7 +15,6 @@ export default defineConfig({
   external: [
     "@parcae/model",
     "knex",
-    "better-sqlite3",
     "socket.io",
     "bullmq",
     "ioredis",

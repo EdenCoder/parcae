@@ -7,12 +7,13 @@ import { loadCachedSchemas } from "../schema/generate";
  *
  * Uses ts-morph-resolved schemas (resolved at startup, cached to
  * `.parcae/schema.json`) to map Model classes to Postgres columns,
- * plus Parcae's hook/pubsub systems.
+ * plus Parcae's hook and subscription systems.
  */
 
 import {
   CHAINABLE_METHODS,
   isArrayIndexSegment,
+  SYM_SERVER_MERGE,
   type ColumnType,
   type ModelAdapter,
   type ModelConstructor,
@@ -20,7 +21,12 @@ import {
   type QueryStep,
   type SchemaDefinition,
 } from "@parcae/model";
-import { generateId, type Model, type WithRefs } from "@parcae/model";
+import {
+  dateSafeClone,
+  generateId,
+  type Model,
+  type WithRefs,
+} from "@parcae/model";
 import type { QuerySubscriptionManager } from "../services/subscriptions";
 import equal from "deep-equal";
 import fastJsonPatch from "fast-json-patch";
@@ -37,24 +43,22 @@ import {
   getRequestUser,
   getRuntimeFlags,
 } from "../services/context";
-import type { ChangeBus, ChangeOp } from "../services/changeBus";
 import {
   activeTransactionHandle,
-  bufferChangeIfActive,
-  getActiveTransactionFrame,
   runAfterCommitIfActive,
   runAfterRollbackIfActive,
   withTransaction,
 } from "../services/transactionContext";
-import { ensureChangeTriggers } from "../services/changeTriggers";
+import {
+  ensureChangeTriggers,
+  verifyChangeTriggers,
+} from "../services/change-triggers";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface BackendServices {
   read: any; // Knex read replica
   write: any; // Knex primary
-  pubsub?: any; // Redis pub/sub + lock (optional)
-  changeBus?: ChangeBus; // Cross-process model-change fan-out (optional)
 }
 
 /**
@@ -62,8 +66,7 @@ export interface BackendServices {
  * of `ensureAllTables()` and consumed by every per-model `ensureTable()`
  * call. This replaces the previous O(models × columns) sequential
  * `hasColumn` / `hasIndex` round-trips with a small fixed number of
- * bulk queries against `information_schema` (Postgres) or
- * `sqlite_master` + `PRAGMA table_info` (SQLite).
+ * bulk queries against Postgres `information_schema` and `pg_indexes`.
  *
  * The snapshot is **read-only**. DDL emitted during `ensureTable()` is
  * NOT reflected back into the cache — the cache exists to answer "does
@@ -104,6 +107,14 @@ const PARCAE_OWNED_COLUMNS: ReadonlySet<string> = new Set([
   "_embedding",
 ]);
 
+const SYSTEM_DATA_KEYS = new Set([
+  "id",
+  "type",
+  "createdAt",
+  "updatedAt",
+  "tmp",
+]);
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function tableName(modelClass: ModelConstructor): string {
@@ -137,6 +148,146 @@ function assertSupportedPatchOps(ops: readonly PatchOp[]): void {
     }
     parsePatchPath(op.path);
   }
+}
+
+function encodePatchSegment(segment: string): string {
+  return segment.replace(/~/g, "~0").replace(/\//g, "~1");
+}
+
+function prefixPatchOps(field: string, ops: readonly PatchOp[]): PatchOp[] {
+  const prefix = `/${encodePatchSegment(field)}`;
+  return ops.map((op) => ({
+    ...op,
+    path: `${prefix}${op.path}`,
+    ...((op.op === "copy" || op.op === "move")
+      ? { from: `${prefix}${op.from}` }
+      : {}),
+  })) as PatchOp[];
+}
+
+function overflowData(
+  data: Record<string, any>,
+  schema: SchemaDefinition,
+): Record<string, any> {
+  const overflow: Record<string, any> = {};
+  for (const [key, value] of Object.entries(data)) {
+    if (SYSTEM_DATA_KEYS.has(key) || key in schema) continue;
+    overflow[key] = value;
+  }
+  return overflow;
+}
+
+function saveState(
+  data: Record<string, any>,
+  schema: SchemaDefinition,
+): Record<string, any> {
+  return {
+    ...data,
+    data: overflowData(data, schema),
+  };
+}
+
+function saveConflictTests(
+  state: Record<string, any>,
+  schema: SchemaDefinition,
+  ops: readonly PatchOp[],
+): PatchOp[] {
+  const tests = new Map<string, PatchOp>();
+  const addTest = (segments: string[], value: unknown): void => {
+    const path = `/${segments.map(encodePatchSegment).join("/")}`;
+    tests.set(path, { op: "test", path, value: dateSafeClone(value) });
+  };
+
+  for (const op of ops) {
+    const segments = parsePatchPath(op.path);
+    const field = segments[0]!;
+    if (resolveColType(schema[field]!) !== "json") continue;
+    const inner = segments.slice(1);
+    if (inner.length === 0) {
+      addTest([field], state[field]);
+      continue;
+    }
+
+    let cursor = state[field];
+    const path = [field];
+    for (const segment of inner) {
+      if (Array.isArray(cursor)) {
+        addTest(path, cursor);
+        break;
+      }
+      if (cursor === null || typeof cursor !== "object") break;
+      cursor = cursor[segment];
+      path.push(segment);
+    }
+    if (Array.isArray(cursor)) addTest(path, cursor);
+  }
+
+  return [...tests.values(), ...ops];
+}
+
+function saveDiff(
+  schema: SchemaDefinition,
+  before: Record<string, any>,
+  after: Record<string, any>,
+): {
+  ops: PatchOp[];
+  patchSchema: SchemaDefinition;
+} {
+  const state = saveState(before, schema);
+  const current = saveState(after, schema);
+  const patchSchema: SchemaDefinition = {
+    ...schema,
+    tmp: "string",
+    data: "json",
+  };
+  const ops: PatchOp[] = [];
+  for (const [field, column] of Object.entries(patchSchema)) {
+    const previous = state[field];
+    const next = current[field];
+    if (equal(previous, next, { strict: true })) continue;
+    if (resolveColType(column) === "json") {
+      if (previous === undefined) {
+        ops.push({ op: "add", path: `/${encodePatchSegment(field)}`, value: next });
+      } else if (next === undefined) {
+        ops.push({ op: "remove", path: `/${encodePatchSegment(field)}` });
+      } else if (
+        previous !== null &&
+        next !== null &&
+        typeof previous === "object" &&
+        typeof next === "object"
+      ) {
+        ops.push(
+          ...prefixPatchOps(
+            field,
+            fastJsonPatch.compare(
+              dateSafeClone(previous),
+              dateSafeClone(next),
+            ),
+          ),
+        );
+      } else {
+        ops.push({
+          op: "replace",
+          path: `/${encodePatchSegment(field)}`,
+          value: next,
+        });
+      }
+      continue;
+    }
+    ops.push(
+      next === undefined
+        ? { op: "remove", path: `/${encodePatchSegment(field)}` }
+        : {
+            op: previous === undefined ? "add" : "replace",
+            path: `/${encodePatchSegment(field)}`,
+            value: next,
+          },
+    );
+  }
+  return {
+    ops: saveConflictTests(state, patchSchema, ops),
+    patchSchema,
+  };
 }
 
 /** Resolve a ColumnType to a primitive string type. */
@@ -195,8 +346,7 @@ function hydrate<T extends Model>(
 
   // Coerce per-column types from the row shape we get back from Knex.
   // - datetime: ISO strings → Date instances
-  // - json:     SQLite stores these as TEXT, so they come back as strings
-  //             (Postgres jsonb arrives pre-parsed, so we no-op there).
+  // - json: legacy text values are parsed defensively; jsonb is already parsed.
   if (schema) {
     for (const [key, colDef] of Object.entries(schema)) {
       const t = resolveColType(colDef);
@@ -248,10 +398,8 @@ function serialize(
   };
 
   const overflow: Record<string, any> = {};
-  const systemKeys = new Set(["id", "createdAt", "updatedAt", "type", "tmp"]);
-
   for (const [key, value] of Object.entries(raw)) {
-    if (systemKeys.has(key)) continue;
+    if (SYSTEM_DATA_KEYS.has(key)) continue;
     if (key in schema) {
       const colType = resolveColType(schema[key]!);
       if (colType === "json" && value != null) {
@@ -280,7 +428,7 @@ export class BackendAdapter implements ModelAdapter {
   private _models = new Map<string, ModelConstructor>();
 
   /** Detected database engine — set by detectEngine(). */
-  public engine: "alloydb" | "postgres" | "sqlite" = "postgres";
+  public engine: "alloydb" | "postgres" = "postgres";
 
   /** Whether search extensions have been enabled for this database. */
   private _searchExtensionsReady = false;
@@ -294,19 +442,6 @@ export class BackendAdapter implements ModelAdapter {
   get write() {
     return activeTransactionHandle() ?? this.services.write;
   }
-  get pubsub() {
-    return this.services.pubsub;
-  }
-  /**
-   * Cross-process model-change fan-out. Set by `createApp()` after
-   * the bus + manager are wired together. If `null`, `_notifyChange`
-   * falls through to the local manager only (legacy single-process
-   * mode).
-   */
-  get changeBus(): ChangeBus | null {
-    return this.services.changeBus ?? null;
-  }
-
   constructor(services: BackendServices) {
     this.services = services;
   }
@@ -395,21 +530,12 @@ export class BackendAdapter implements ModelAdapter {
   // ── Engine Detection ────────────────────────────────────────────────
 
   /**
-   * Detect database engine: SQLite, AlloyDB, or standard Postgres.
-   * Should be called once at startup, before ensureAllTables().
-   * Pass hint="sqlite" when the Knex client is better-sqlite3.
+   * Detect AlloyDB or standard Postgres. Called once before schema setup.
    */
-  async detectEngine(
-    hint?: "sqlite",
-  ): Promise<"alloydb" | "postgres" | "sqlite"> {
-    this.engine = await detectEngine(this.write, hint);
+  async detectEngine(): Promise<"alloydb" | "postgres"> {
+    this.engine = await detectEngine(this.write);
     log.info(`Database engine detected: ${this.engine}`);
     return this.engine;
-  }
-
-  /** Whether the engine is SQLite. */
-  get isSqlite(): boolean {
-    return this.engine === "sqlite";
   }
 
   // ── Search Extensions ───────────────────────────────────────────────
@@ -417,14 +543,9 @@ export class BackendAdapter implements ModelAdapter {
   /**
    * Enable search extensions (idempotent). Called once when the first
    * model with `static searchFields` is encountered during ensureTable().
-   * No-op for SQLite (uses LIKE fallback instead).
    */
   private async _ensureSearchExtensions(): Promise<void> {
     if (this._searchExtensionsReady) return;
-    if (this.isSqlite) {
-      this._searchExtensionsReady = true;
-      return;
-    }
 
     // Standard Postgres — trigram fuzzy matching
     await this.write.raw("CREATE EXTENSION IF NOT EXISTS pg_trgm");
@@ -446,79 +567,8 @@ export class BackendAdapter implements ModelAdapter {
     this._searchExtensionsReady = true;
   }
 
-  /**
-   * Notify the subscription layer that a model was written.
-   *
-   * Routing rules, in order:
-   *   1. Inside a `withTransaction(...)` frame → buffer the Change;
-   *      the wrapper flushes on commit and drops on rollback.
-   *   2. ChangeBus wired → publish on the bus. The bus delivers to
-   *      every instance's local `QuerySubscriptionManager` plus
-   *      back to this instance via Redis loopback (or in-process
-   *      EventEmitter when no Redis is configured).
-   *   3. No bus → fall through to the local manager directly. This
-   *      preserves legacy single-process behaviour for tests and
-   *      consumers that haven't migrated.
-   *
-   * `op` is one of `"insert" | "update" | "delete"`. We derive it
-   * from the call site (save with `__isNew`, save without, patch,
-   * remove) rather than asking the model — that way a model with
-   * a custom `__isNew` getter can't corrupt the bus contract.
-   */
-  private _notifyChange(model: any, op: ChangeOp): void {
-    const ModelClass = model.constructor as typeof Model;
-    this._notifyChangeById(
-      ModelClass as unknown as ModelConstructor,
-      model.id,
-      op,
-    );
-  }
-
-  private _notifyChangeById(
-    ModelClass: ModelConstructor,
-    id: string | undefined,
-    op: ChangeOp,
-  ): void {
-    const table = tableName(ModelClass as unknown as ModelConstructor);
-
-    if (!this.changeBus) {
-      const notify = () => this.subscriptions?.onModelChange(ModelClass.type);
-      if (!runAfterCommitIfActive(notify)) notify();
-      return;
-    }
-
-    if (!id) {
-      // A write without an id shouldn't be possible (serialize()
-      // generates one), but guard so the bus contract holds.
-      log.warn(
-        `subscriptions: _notifyChange called without id model=${ModelClass.type}`,
-      );
-      return;
-    }
-
-    const frame = getActiveTransactionFrame();
-    const requestId = frame?.requestId ?? this.changeBus.newRequestId();
-    const change = {
-      table,
-      op,
-      id,
-      requestId,
-      source: "hook" as const,
-    };
-
-    if (bufferChangeIfActive(change)) return;
-    this.changeBus.emit(change);
-  }
-
   private _withTransaction<T>(fn: () => Promise<T>): Promise<T> {
-    return withTransaction(
-      {
-        knex: this.services.write,
-        changeBus: this.changeBus,
-        setRequestIdGuc: !this.isSqlite && Boolean(this.changeBus),
-      },
-      fn,
-    );
+    return withTransaction({ knex: this.services.write }, fn);
   }
 
   // ── Search Query ────────────────────────────────────────────────────
@@ -537,16 +587,6 @@ export class BackendAdapter implements ModelAdapter {
     if (!searchFields?.length || !term.trim()) return knexQuery;
 
     const table = tableName(modelClass);
-
-    // ── SQLite: LIKE-based fallback ─────────────────────────────────
-    if (this.isSqlite) {
-      const likeTerm = `%${term}%`;
-      const whereParts = searchFields.map((f) => `${table}.${f} LIKE ?`);
-      const whereBindings = searchFields.map(() => likeTerm);
-      return knexQuery.whereRaw(`(${whereParts.join(" OR ")})`, whereBindings);
-    }
-
-    // ── Postgres: full-text + trigram + optional vector ──────────────
 
     // Build the ranking expression
     // 1. Full-text rank (weight: 2x)
@@ -605,13 +645,9 @@ export class BackendAdapter implements ModelAdapter {
   // ── save ─────────────────────────────────────────────────────────────
 
   /**
-   * Upsert the entire current state of `model`. The `__isNew` flag (set
-   * by `Model.create()`, cleared after the first successful save or by
-   * `hydrate()`) controls hook routing: new instances run "create" /
-   * "save" hooks, existing instances run "save" hooks only.
-   *
-   * Targeted RFC 6902 updates go through `.patch()` instead; this path
-   * is intentionally "replace the whole row".
+   * Persist one captured model state. New instances insert the complete row;
+   * existing instances diff against their last server snapshot so unrelated
+   * concurrent JSONB edits survive.
    */
   async save(
     model: any,
@@ -623,6 +659,7 @@ export class BackendAdapter implements ModelAdapter {
     const action = creating ? "create" : "save";
     const cleanups: Array<() => Promise<void> | void> = [];
     const operationModel = this._captureSaveModel(model, data, creating);
+    const serverSnapshot = structuredClone(model.__serverSnapshot ?? data);
     let persistedData: Record<string, any>;
 
     try {
@@ -635,12 +672,57 @@ export class BackendAdapter implements ModelAdapter {
         }
 
         const writeData = structuredClone(operationModel.__data);
-        const row = serialize(operationModel, writeData);
-        await this.write(table).insert(row).onConflict("id").merge();
+        if (creating) {
+          const inserted = await this.write(table)
+            .insert(serialize(operationModel, writeData))
+            .onConflict("id")
+            .merge()
+            .returning("*");
+          const insertedRow = Array.isArray(inserted) ? inserted[0] : inserted;
+          if (!insertedRow) {
+            throw new ClientError(`save: row not found id=${operationModel.id}`);
+          }
+          persistedData =
+            typeof (ModelClass as any).hydrate === "function"
+              ? (hydrate(
+                  ModelClass as unknown as ModelConstructor,
+                  this,
+                  insertedRow,
+                ) as any).__data
+              : {
+                  ...writeData,
+                  id: insertedRow.id ?? operationModel.id,
+                  createdAt: insertedRow.createdAt ?? writeData.createdAt,
+                  updatedAt: insertedRow.updatedAt ?? writeData.updatedAt,
+                };
+        } else {
+          const schema = (ModelClass.__schema as SchemaDefinition) ?? {};
+          const { ops, patchSchema } = saveDiff(
+            schema,
+            serverSnapshot,
+            writeData,
+          );
+          persistedData = await this._patchPostgres(
+            operationModel,
+            ops,
+            table,
+            patchSchema,
+            cleanups,
+            {
+              lockRow: true,
+              runHooks: false,
+              testFailureStatus: 409,
+            },
+          );
+        }
 
+        if (typeof operationModel[SYM_SERVER_MERGE] === "function") {
+          operationModel[SYM_SERVER_MERGE](persistedData, writeData);
+        } else {
+          this._replaceOperationData(operationModel, persistedData);
+        }
         await this.runHooks(operationModel, action, "after", { cleanups });
-        this._notifyChange(operationModel, creating ? "insert" : "update");
-        return writeData;
+        return persistedData;
       });
     } catch (err) {
       await this._runCleanups(cleanups, `${ModelClass.type}:${action}`);
@@ -667,13 +749,6 @@ export class BackendAdapter implements ModelAdapter {
         await this.runHooks(model, "remove", "before", { cleanups });
         await this.write(table).where("id", model.id).del();
         await this.runHooks(model, "remove", "after", { cleanups });
-        runAfterCommitIfActive(() =>
-          this.pubsub?.emit?.(
-            `delete+${ModelClass.type}:${model.id}`,
-            model.__data,
-          ),
-        );
-        this._notifyChange(model, "delete");
       });
     } catch (err) {
       await this._runCleanups(cleanups, `${ModelClass.type}:remove`);
@@ -726,6 +801,22 @@ export class BackendAdapter implements ModelAdapter {
     type: string,
     ids: string[],
   ): Promise<Map<string, any>> {
+    return this._batchFindByType(this.read, type, ids);
+  }
+
+  /** @internal Primary-backed ref hydration for subscription caches. */
+  async batchFindByTypeOnWrite(
+    type: string,
+    ids: string[],
+  ): Promise<Map<string, any>> {
+    return this._batchFindByType(this.write, type, ids);
+  }
+
+  private async _batchFindByType(
+    db: any,
+    type: string,
+    ids: string[],
+  ): Promise<Map<string, any>> {
     const result = new Map<string, any>();
     if (ids.length === 0) return result;
 
@@ -733,7 +824,7 @@ export class BackendAdapter implements ModelAdapter {
     if (!modelClass) return result;
 
     const uniqueIds = Array.from(new Set(ids));
-    const rows = await this.read(tableName(modelClass))
+    const rows = await db(tableName(modelClass))
       .select("*")
       .whereIn("id", uniqueIds);
     for (const row of rows ?? []) {
@@ -747,6 +838,32 @@ export class BackendAdapter implements ModelAdapter {
 
   query<T extends Model>(modelClass: ModelConstructor<T>): QueryChain<WithRefs<T>> {
     return this._buildQuery(modelClass, this.read(tableName(modelClass)));
+  }
+
+  /** @internal Execute a compiled subscription query on the primary. */
+  async executeSubscriptionQuery(query: QueryChain<any>): Promise<any[]> {
+    const compiled = query.exec().toSQL();
+    const response = await this.write.raw(compiled.sql, compiled.bindings);
+    const rows = response?.rows ?? response ?? [];
+    return rows.map((row: Record<string, any>) =>
+      hydrate(query.__modelClass, this, row),
+    );
+  }
+
+  /** @internal Count a subscribed query on the same primary snapshot source. */
+  async executeSubscriptionCount(query: QueryChain<any>): Promise<number> {
+    const compiled = query
+      .exec()
+      .clone()
+      .clearSelect()
+      .clearOrder()
+      .clear("limit")
+      .clear("offset")
+      .count("*")
+      .toSQL();
+    const response = await this.write.raw(compiled.sql, compiled.bindings);
+    const row = (response?.rows ?? response ?? [])[0] ?? {};
+    return Number.parseInt(`${Object.values(row)[0] ?? 0}`, 10);
   }
 
   // ── queryFromClient — safe replay of client-sent __query steps ────────
@@ -892,12 +1009,6 @@ export class BackendAdapter implements ModelAdapter {
    *     element on the right exists in the left (so wrapping each value
    *     in `[v]` gives us proper "any of" semantics across an OR fan-out).
    *
-   *   - SQLite TEXT: `(CAST(col AS TEXT) LIKE ? OR …)` where each
-   *     binding is `%"<value>"%`. The surrounding quotes are essential —
-   *     they pin the match to a literal JSON-array element and stop
-   *     prefix/suffix collisions between ids that happen to share a
-   *     common substring.
-   *
    * An empty values array yields a hard-false predicate so the result
    * matches the conventional `WHERE col IN ()` semantics ("nothing").
    *
@@ -916,15 +1027,7 @@ export class BackendAdapter implements ModelAdapter {
     if (!Array.isArray(values) || values.length === 0) {
       return c.whereRaw("1 = 0");
     }
-    if (this.isSqlite) {
-      const parts = values.map(() => `CAST(?? AS TEXT) LIKE ?`).join(" OR ");
-      const bindings: any[] = [];
-      for (const v of values) {
-        bindings.push(colName, `%"${String(v)}"%`);
-      }
-      return c.whereRaw(`(${parts})`, bindings);
-    }
-    // Postgres jsonb. Wrap each value in a one-element JSON array so
+    // Wrap each value in a one-element JSON array so
     // `@>` is true iff the column's array contains that value.
     const parts = values.map(() => `?? @> ?::jsonb`).join(" OR ");
     const bindings: any[] = [];
@@ -1324,6 +1427,13 @@ export class BackendAdapter implements ModelAdapter {
         if (method === "orderBy" && args.length === 1 && args[0] === false) {
           return this._buildQuery(modelClass, knexQuery, expand);
         }
+        if (method === "clearLimit") {
+          return this._buildQuery(
+            modelClass,
+            knexQuery.clear("limit"),
+            expand,
+          );
+        }
         // Dot-notation ref subquery rewriting for server-side queries
         if (
           typeof args[0] === "string" &&
@@ -1460,14 +1570,7 @@ export class BackendAdapter implements ModelAdapter {
 
     try {
       const persistedData = await this._withTransaction(async () => {
-        if (this.isSqlite) {
-          const row = await this._patchSqlite(model, ops, table, schema, cleanups);
-          this._notifyChange(model, "update");
-          return row;
-        }
-        const row = await this._patchPostgres(model, ops, table, schema, cleanups);
-        this._notifyChange(model, "update");
-        return row;
+        return await this._patchPostgres(model, ops, table, schema, cleanups);
       });
       this._retainCleanupsForOuterRollback(
         cleanups,
@@ -1486,15 +1589,22 @@ export class BackendAdapter implements ModelAdapter {
     table: string,
     schema: SchemaDefinition,
     cleanups: Array<() => Promise<void> | void>,
+    options: {
+      lockRow?: boolean;
+      runHooks?: boolean;
+      testFailureStatus?: number;
+    } = {},
   ): Promise<Record<string, any>> {
     const ModelClass = model.constructor as typeof Model;
-    await this.runHooks(model, "patch", "before", {
-      data: { ops },
-      cleanups,
-    });
+    if (options.runHooks !== false) {
+      await this.runHooks(model, "patch", "before", {
+        data: { ops },
+        cleanups,
+      });
+    }
 
     let patchState = model.__serverSnapshot ?? model.__data;
-    if (ops.some((op) => op.op === "test")) {
+    if (options.lockRow || ops.some((op) => op.op === "test")) {
       const currentRow = await this.write(table)
         .where("id", model.id)
         .forUpdate()
@@ -1502,13 +1612,18 @@ export class BackendAdapter implements ModelAdapter {
       if (!currentRow) {
         throw new ClientError(`patch: row not found id=${model.id}`);
       }
-      patchState = (hydrate(
+      const currentData = (hydrate(
         ModelClass as unknown as ModelConstructor,
         this,
         currentRow,
       ) as any).__data;
+      patchState = saveState(currentData, schema);
     }
-    this._validatePatchTests(patchState, ops);
+    this._validatePatchTests(
+      patchState,
+      ops,
+      options.testFailureStatus,
+    );
 
     type ParsedOp = {
       op: PatchOp;
@@ -1748,16 +1863,18 @@ export class BackendAdapter implements ModelAdapter {
     // leaving the JSON copy to win on the next read (see the
     // `hydrate()` overflow filter for the symmetric guard).
     const staleKeys = [...byColumn.keys()].filter(
-      (k) => k !== "data" && k in schema,
+      (k) => k !== "data" && !SYSTEM_DATA_KEYS.has(k) && k in schema,
     );
     if (staleKeys.length > 0) {
       // `data` jsonb column always exists; COALESCE handles the rare
       // row where it's null. `- text[]` removes the listed top-level
       // keys (PostgreSQL ≥ 10).
-      updateFields.data = this.write.raw(
-        `COALESCE(??, '{}'::jsonb) - ?::text[]`,
-        ["data", staleKeys],
-      );
+      updateFields.data = updateFields.data
+        ? this.write.raw(`(? - ?::text[])`, [updateFields.data, staleKeys])
+        : this.write.raw(`COALESCE(??, '{}'::jsonb) - ?::text[]`, [
+            "data",
+            staleKeys,
+          ]);
     }
 
     const updated = await this.write(table)
@@ -1766,10 +1883,12 @@ export class BackendAdapter implements ModelAdapter {
       .returning("*");
     const updatedRow = Array.isArray(updated) ? updated[0] : updated;
     if (!updatedRow) throw new ClientError(`patch: row not found id=${model.id}`);
-    await this.runHooks(model, "patch", "after", {
-      data: { ops },
-      cleanups,
-    });
+    if (options.runHooks !== false) {
+      await this.runHooks(model, "patch", "after", {
+        data: { ops },
+        cleanups,
+      });
+    }
     return (hydrate(
       ModelClass as unknown as ModelConstructor,
       this,
@@ -1857,38 +1976,14 @@ export class BackendAdapter implements ModelAdapter {
       if (cursor == null || typeof cursor !== "object") return false;
       cursor = cursor[seg];
     }
-    return cursor != null;
+    return cursor !== null && typeof cursor === "object";
   }
 
-  /**
-   * SQLite patch fallback: read-modify-write.
-   * Reads the current row, applies RFC 6902 ops per-column in JS,
-   * then writes back. Safe for SQLite's single-writer model.
-   */
-  private async _patchSqlite(
-    model: any,
+  private _validatePatchTests(
+    data: Record<string, any>,
     ops: PatchOp[],
-    table: string,
-    schema: SchemaDefinition,
-    cleanups: Array<() => Promise<void> | void>,
-  ): Promise<Record<string, any>> {
-    await this.runHooks(model, "patch", "before", {
-      data: { ops },
-      cleanups,
-    });
-    const updatedRow = await this._patchSqliteBody(model, ops, table, schema);
-    await this.runHooks(model, "patch", "after", {
-      data: { ops },
-      cleanups,
-    });
-    return (hydrate(
-      model.constructor as ModelConstructor,
-      this,
-      updatedRow,
-    ) as any).__data;
-  }
-
-  private _validatePatchTests(data: Record<string, any>, ops: PatchOp[]): void {
+    failureStatus = 400,
+  ): void {
     const state = structuredClone(data);
     for (const op of ops) {
       if (op.op === "test") {
@@ -1897,7 +1992,7 @@ export class BackendAdapter implements ModelAdapter {
           actual = actual?.[segment];
         }
         if (!equal(actual, op.value)) {
-          throw new ClientError(`patch test failed at ${op.path}`);
+          throw new ClientError(`patch test failed at ${op.path}`, failureStatus);
         }
         continue;
       }
@@ -1917,122 +2012,6 @@ export class BackendAdapter implements ModelAdapter {
     }
   }
 
-  private async _patchSqliteBody(
-    model: any,
-    ops: PatchOp[],
-    table: string,
-    schema: SchemaDefinition,
-  ): Promise<Record<string, any>> {
-    // Read current row
-    const row = await this.write(table).where("id", model.id).first();
-    if (!row) throw new ClientError(`patch: row not found id=${model.id}`);
-    if (ops.some((op) => op.op === "test")) {
-      const currentData = (hydrate(
-        model.constructor as ModelConstructor,
-        this,
-        row,
-      ) as any).__data;
-      this._validatePatchTests(currentData, ops);
-    }
-
-    const updateFields: Record<string, any> = { updatedAt: new Date() };
-
-    // Group ops by top-level column
-    const byColumn = new Map<string, PatchOp[]>();
-    for (const op of ops) {
-      const column = parsePatchPath(op.path)[0]!;
-      if (!byColumn.has(column)) byColumn.set(column, []);
-      byColumn.get(column)!.push(op);
-    }
-
-    for (const [column, columnOps] of byColumn) {
-      if (!(column in schema)) {
-        throw new ClientError(
-          `patch: unknown column "${column}" on model "${(model.constructor as typeof Model).type}"`,
-        );
-      }
-
-      const colType = resolveColType(schema[column]!);
-
-      // Scalar columns: just take the last replace/add value
-      if (colType !== "json") {
-        const lastOp = columnOps[columnOps.length - 1]!;
-        if (lastOp.op === "test") continue;
-        const value =
-          lastOp.op === "add" || lastOp.op === "replace"
-            ? lastOp.value
-            : undefined;
-        updateFields[column] =
-          colType === "datetime"
-            ? value
-              ? new Date(value)
-              : null
-            : (value ?? null);
-        continue;
-      }
-
-      // JSON columns: apply RFC 6902 patch in JS
-      let current = row[column];
-      if (typeof current === "string") {
-        try {
-          current = JSON.parse(current);
-        } catch {
-          current = {};
-        }
-      }
-      if (current == null) current = {};
-
-      // Wrap column ops as a proper JSON Patch document (paths relative to column root)
-      const subOps: PatchOp[] = columnOps.map((op) => {
-        const nextSlash = op.path.indexOf("/", 1);
-        return {
-          ...op,
-          path: nextSlash < 0 ? "" : op.path.slice(nextSlash),
-        };
-      });
-
-      const result = applyPatch(current, subOps, true, false);
-      updateFields[column] = JSON.stringify(result.newDocument);
-    }
-
-    // Heal legacy `data` overflow — mirror of the Postgres branch.
-    // See `_patchPostgres` for the full rationale; in short, rows
-    // imported when a column was still part of the JSON overflow blob
-    // can resurrect stale snapshots on the next read, so we strip the
-    // touched schema keys from the blob whenever we patch them.
-    const staleKeys = [...byColumn.keys()].filter(
-      (k) => k !== "data" && k in schema,
-    );
-    if (staleKeys.length > 0) {
-      let dataBlob: Record<string, any> = {};
-      const existing = row.data;
-      if (typeof existing === "string") {
-        try {
-          dataBlob = JSON.parse(existing) ?? {};
-        } catch {
-          dataBlob = {};
-        }
-      } else if (existing && typeof existing === "object") {
-        dataBlob = { ...(existing as Record<string, any>) };
-      }
-      let touched = false;
-      for (const key of staleKeys) {
-        if (key in dataBlob) {
-          delete dataBlob[key];
-          touched = true;
-        }
-      }
-      if (touched) {
-        updateFields.data = JSON.stringify(dataBlob);
-      }
-    }
-
-    await this.write(table).where("id", model.id).update(updateFields);
-    const updatedRow = await this.write(table).where("id", model.id).first();
-    if (!updatedRow) throw new ClientError(`patch: row not found id=${model.id}`);
-    return updatedRow;
-  }
-
   // ── Increment/Decrement ──────────────────────────────────────────────
 
   async increment(model: any, field: string, amount = 1): Promise<void> {
@@ -2045,7 +2024,6 @@ export class BackendAdapter implements ModelAdapter {
         .select(field)
         .first();
       if (row) (model as any)[field] = row[field];
-      this._notifyChange(model, "update");
     });
   }
 
@@ -2059,7 +2037,6 @@ export class BackendAdapter implements ModelAdapter {
         .select(field)
         .first();
       if (row) (model as any)[field] = row[field];
-      this._notifyChange(model, "update");
     });
   }
 
@@ -2091,7 +2068,6 @@ export class BackendAdapter implements ModelAdapter {
     const table = tableName(modelClass);
     await this._withTransaction(async () => {
       await this.write(table).whereIn("id", ids).increment(field, amount);
-      this._notifyChangeById(modelClass, ids[0], "update");
     });
   }
 
@@ -2099,8 +2075,7 @@ export class BackendAdapter implements ModelAdapter {
    * Run `fn` inside a Knex transaction. Returns whatever `fn` returns,
    * or rolls back on any thrown error.
    *
-   * Model operations and raw statements both use the same active handle;
-   * model-change events flush only after the outermost commit succeeds.
+   * Model operations and raw statements both use the same active handle.
    */
   async runInTransaction<T>(
     fn: (trx: any) => Promise<T>,
@@ -2264,25 +2239,34 @@ export class BackendAdapter implements ModelAdapter {
     });
   }
 
+  private _replaceOperationData(
+    model: any,
+    data: Record<string, any>,
+  ): void {
+    const current = model.__data ?? {};
+    for (const key of Object.keys(current)) {
+      if (!(key in data)) delete model[key];
+    }
+    for (const [key, value] of Object.entries(data)) {
+      model[key] = structuredClone(value);
+    }
+  }
+
   // ── Schema Management ────────────────────────────────────────────────
 
   /**
    * Bulk-load existing table / column / index metadata for a set of
    * tables in a small fixed number of round-trips. Replaces the
    * previous per-(model × column) sequential `hasColumn` calls and the
-   * per-table `pg_indexes` / `pragma_index_list` queries — cuts cold
-   * start from O(N×C) RTTs to O(1) on Postgres and O(N) on SQLite.
+   * per-table `pg_indexes` queries, cutting cold start from O(N×C) RTTs
+   * to O(1).
    *
    * The returned snapshot is read-only and only reflects schema state
    * at the moment of introspection. Any DDL emitted later in the
    * `ensureTable()` pass is NOT reflected back.
    *
-   * On Postgres we use a single `= ANY(?)` query against
-   * `information_schema` and `pg_indexes`. SQLite has no array-bind
-   * support and `PRAGMA` is per-table, so we issue one PRAGMA per
-   * table — still O(N) instead of O(N×C). For an empty `tables`
-   * argument the method returns an empty snapshot without touching
-   * the database.
+   * Uses one `= ANY(?)` query each against `information_schema` and
+   * `pg_indexes`. Empty input returns without touching the database.
    */
   private async _bulkIntrospectSchema(
     tables: string[],
@@ -2297,92 +2281,44 @@ export class BackendAdapter implements ModelAdapter {
     const kx = this.write;
     const wantedTables = new Set(tables);
 
-    if (this.isSqlite) {
-      // ── SQLite path ────────────────────────────────────────────
-      // 1) Which of the wanted tables exist.
-      const placeholders = tables.map(() => "?").join(", ");
-      const tableRows: Array<{ name: string }> = await kx.raw(
-        `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${placeholders})`,
-        tables,
-      );
-      const existingTables = (tableRows ?? []).map((r) => r.name);
-      for (const t of existingTables) result.tables.add(t);
+    // Scoped to the current schema so a same-named table elsewhere is ignored.
+    const tableRes = await kx.raw(
+      `SELECT table_name FROM information_schema.tables
+       WHERE table_schema = current_schema() AND table_name = ANY(?)`,
+      [tables],
+    );
+    for (const row of tableRes?.rows ?? []) {
+      if (wantedTables.has(row.table_name)) result.tables.add(row.table_name);
+    }
 
-      // 2) Columns per existing table — one PRAGMA per table.
-      //    `PRAGMA table_info(X)` doesn't accept a bound parameter
-      //    for the table name, so we splice it into the SQL after
-      //    intersecting with the wanted set (above) — table names
-      //    are model-derived (pluralized type), not user input.
-      for (const t of existingTables) {
-        if (!wantedTables.has(t)) continue;
-        const colRows: Array<{ name: string }> = await kx.raw(
-          `PRAGMA table_info(\`${t.replace(/`/g, "")}\`)`,
-        );
-        result.columns.set(
-          t,
-          new Set((colRows ?? []).map((r) => r.name)),
-        );
+    const colRes = await kx.raw(
+      `SELECT table_name, column_name FROM information_schema.columns
+       WHERE table_schema = current_schema() AND table_name = ANY(?)`,
+      [tables],
+    );
+    for (const row of colRes?.rows ?? []) {
+      if (!wantedTables.has(row.table_name)) continue;
+      let set = result.columns.get(row.table_name);
+      if (!set) {
+        set = new Set();
+        result.columns.set(row.table_name, set);
       }
+      set.add(row.column_name);
+    }
 
-      // 3) Indexes — one shot across all wanted tables.
-      const idxRows: Array<{ name: string; tbl_name: string }> = await kx.raw(
-        `SELECT name, tbl_name FROM sqlite_master WHERE type = 'index' AND tbl_name IN (${placeholders})`,
-        tables,
-      );
-      for (const row of idxRows ?? []) {
-        if (!wantedTables.has(row.tbl_name)) continue;
-        let set = result.indexes.get(row.tbl_name);
-        if (!set) {
-          set = new Set();
-          result.indexes.set(row.tbl_name, set);
-        }
-        set.add(row.name);
+    const idxRes = await kx.raw(
+      `SELECT tablename, indexname FROM pg_indexes
+       WHERE schemaname = current_schema() AND tablename = ANY(?)`,
+      [tables],
+    );
+    for (const row of idxRes?.rows ?? []) {
+      if (!wantedTables.has(row.tablename)) continue;
+      let set = result.indexes.get(row.tablename);
+      if (!set) {
+        set = new Set();
+        result.indexes.set(row.tablename, set);
       }
-    } else {
-      // ── Postgres path ──────────────────────────────────────────
-      // One query each for tables / columns / indexes via `= ANY(?)`.
-      // Scoped to the current schema (typically `public`) so we don't
-      // pick up the same table name in another schema.
-      const tableRes = await kx.raw(
-        `SELECT table_name FROM information_schema.tables
-         WHERE table_schema = current_schema() AND table_name = ANY(?)`,
-        [tables],
-      );
-      for (const row of tableRes?.rows ?? []) {
-        if (wantedTables.has(row.table_name)) {
-          result.tables.add(row.table_name);
-        }
-      }
-
-      const colRes = await kx.raw(
-        `SELECT table_name, column_name FROM information_schema.columns
-         WHERE table_schema = current_schema() AND table_name = ANY(?)`,
-        [tables],
-      );
-      for (const row of colRes?.rows ?? []) {
-        if (!wantedTables.has(row.table_name)) continue;
-        let set = result.columns.get(row.table_name);
-        if (!set) {
-          set = new Set();
-          result.columns.set(row.table_name, set);
-        }
-        set.add(row.column_name);
-      }
-
-      const idxRes = await kx.raw(
-        `SELECT tablename, indexname FROM pg_indexes
-         WHERE schemaname = current_schema() AND tablename = ANY(?)`,
-        [tables],
-      );
-      for (const row of idxRes?.rows ?? []) {
-        if (!wantedTables.has(row.tablename)) continue;
-        let set = result.indexes.get(row.tablename);
-        if (!set) {
-          set = new Set();
-          result.indexes.set(row.tablename, set);
-        }
-        set.add(row.indexname);
-      }
+      set.add(row.indexname);
     }
 
     return result;
@@ -2412,9 +2348,7 @@ export class BackendAdapter implements ModelAdapter {
     }
 
     // When a migration calls ensureModel, it passes its transactional handle
-    // here so DDL runs inside the migration's transaction (matters on SQLite
-    // where pool=1 would deadlock against the adapter's outer connection,
-    // and on Postgres where it gives proper rollback semantics).
+    // here so DDL runs inside the migration transaction and rolls back with it.
     const kx = opts.knex ?? this.write;
 
     const table = tableName(modelClass);
@@ -2454,19 +2388,11 @@ export class BackendAdapter implements ModelAdapter {
       if (idx) existingIndexes = [...idx];
     } else {
       try {
-        if (this.isSqlite) {
-          const rows = await kx.raw(
-            "SELECT name FROM pragma_index_list(?)",
-            [table],
-          );
-          existingIndexes = (rows ?? []).map((r: any) => r.name);
-        } else {
-          const result = await kx.raw(
-            "SELECT * FROM pg_indexes WHERE tablename = ?",
-            [table],
-          );
-          existingIndexes = result.rows.map((r: any) => r.indexname);
-        }
+        const result = await kx.raw(
+          "SELECT * FROM pg_indexes WHERE tablename = ?",
+          [table],
+        );
+        existingIndexes = result.rows.map((r: any) => r.indexname);
       } catch {}
     }
 
@@ -2502,7 +2428,7 @@ export class BackendAdapter implements ModelAdapter {
       (t: any) => {
         if (!hasTable) {
           t.string("id").primary().unique();
-          this.isSqlite ? t.text("data") : t.jsonb("data");
+          t.jsonb("data");
           t.datetime("createdAt");
           t.datetime("updatedAt");
           t.string("tmp", 2048).nullable();
@@ -2533,7 +2459,7 @@ export class BackendAdapter implements ModelAdapter {
           const resolved = resolveColType(colDef);
           switch (resolved) {
             case "json":
-              this.isSqlite ? t.text(key) : t.jsonb(key);
+              t.jsonb(key);
               break;
             case "string":
               t.string(key, 2048);
@@ -2595,14 +2521,6 @@ export class BackendAdapter implements ModelAdapter {
     fields: string[],
     kx: any = this.write,
   ): Promise<void> {
-    // SQLite: no tsvector/trigram/GIN. Search uses LIKE at query time.
-    if (this.isSqlite) {
-      log.info(
-        `search: sqlite mode — using LIKE fallback — table=${table} fields=[${fields.join(", ")}]`,
-      );
-      return;
-    }
-
     await this._ensureSearchExtensions();
 
     // Weights by field order: A (highest), B, C, D
@@ -2706,25 +2624,23 @@ export class BackendAdapter implements ModelAdapter {
       this._registerEmbeddingHooks(models);
     }
 
-    // Install LISTEN/NOTIFY trigger function + per-table triggers so
-    // external writes (raw SQL, migrations, ops console) reach the
-    // ChangeBus via pg_notify. SQLite is a no-op. Gated by env so
-    // operators can turn it off if it conflicts with custom triggers.
-    if (
-      this.engine !== "sqlite" &&
-      process.env.PARCAE_LISTEN_NOTIFY !== "false"
-    ) {
-      const managedTables: string[] = [];
-      for (const modelClass of models) {
-        if (modelClass.managed === false) continue;
-        managedTables.push(tableName(modelClass));
-      }
-      await ensureChangeTriggers({
-        knex: this.write,
-        engine: this.engine,
-        tables: managedTables,
-      });
-    }
+    await this.ensureChangeTriggers(models);
+  }
+
+  /** Ensure every framework-managed table emits the sole realtime signal. */
+  async ensureChangeTriggers(models: ModelConstructor[]): Promise<void> {
+    const changeTables = models
+      .filter((modelClass) => modelClass.managed !== false)
+      .map(tableName);
+    await ensureChangeTriggers({ knex: this.write, tables: changeTables });
+  }
+
+  /** Verify out-of-band migrations installed every required trigger. */
+  async verifyChangeTriggers(models: ModelConstructor[]): Promise<void> {
+    const changeTables = models
+      .filter((modelClass) => modelClass.managed !== false)
+      .map(tableName);
+    await verifyChangeTriggers({ knex: this.write, tables: changeTables });
   }
 
   /**

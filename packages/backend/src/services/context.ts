@@ -23,7 +23,6 @@ import { log } from "../logger";
 import type { QueueService } from "./queue";
 import { addJobIfNotExists } from "./queue";
 import type { PubSub } from "./pubsub";
-import type { ChangeBus } from "./changeBus";
 import type { RefLoader } from "./ref-loader";
 import type { RuntimeFlags } from "../config";
 
@@ -75,7 +74,6 @@ export function getRefLoader(): RefLoader | null {
 
 let _queue: QueueService | null = null;
 let _pubsub: PubSub | null = null;
-let _changeBus: ChangeBus | null = null;
 let _io: any = null;
 // Default: hooks run, server runs, jobs and crons do not. Mirrors
 // `resolveRuntimeFlags` defaults so adapter callers see sensible behaviour
@@ -94,11 +92,6 @@ export function _setServices(queue: QueueService, pubsub: PubSub): void {
   _pubsub = pubsub;
 }
 
-/** @internal — called by createApp() after the bus is constructed. */
-export function _setChangeBus(bus: ChangeBus): void {
-  _changeBus = bus;
-}
-
 /** @internal — called by createApp() after server creation */
 export function _setIo(io: any): void {
   _io = io;
@@ -113,7 +106,6 @@ export function _setRuntimeFlags(flags: RuntimeFlags): void {
 export function _clearServices(): void {
   _queue = null;
   _pubsub = null;
-  _changeBus = null;
   _io = null;
   _flags = {
     server: true,
@@ -238,11 +230,6 @@ export function getQueue(): QueueService | null {
 /** Get the raw PubSub instance. */
 export function getPubSub(): PubSub | null {
   return _pubsub;
-}
-
-/** Get the cross-process model-change bus. */
-export function getChangeBus(): ChangeBus | null {
-  return _changeBus;
 }
 
 /** Get the Socket.IO server instance. */

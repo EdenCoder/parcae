@@ -70,7 +70,6 @@ function makeAdapterStub() {
   let saveGate: Promise<void> | null = null;
 
   const adapter: any = {
-    isSqlite: false,
     async runInTransaction(fn: () => Promise<any>) {
       isTransactionActive = true;
       try {

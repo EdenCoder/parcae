@@ -85,9 +85,6 @@ migration(
     // transaction: false,  // opt out for CREATE INDEX CONCURRENTLY, etc.
   },
   async ({ db, engine, log }) => {
-    if (engine === "sqlite") {
-      // SQLite-only or PG-only code paths — gate here.
-    }
     // await db.raw(\`ALTER TABLE ... \`);
   },
 );

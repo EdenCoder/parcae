@@ -13,16 +13,15 @@
  *      `findById` falls back to the direct per-id query — preserving
  *      existing behaviour for the no-context path.
  *
- * Tests run against an in-memory SQLite database. Knex emits a
+ * Tests run against an isolated Postgres schema. Knex emits a
  * `query` event per dispatched SQL statement; we listen on it to
  * assert query count without mocking the adapter internals.
  */
 
-import knexFactory, { type Knex } from "knex";
+import type { Knex } from "knex";
 import {
   afterEach,
   beforeEach,
-  describe,
   expect,
   it,
 } from "vitest";
@@ -30,14 +29,11 @@ import { Model } from "@parcae/model";
 import { BackendAdapter } from "../adapters/model";
 import { RefLoader } from "../services/ref-loader";
 import { runWithRequestContext } from "../services/context";
-
-function sqlite(): Knex {
-  return knexFactory({
-    client: "better-sqlite3",
-    connection: { filename: ":memory:" },
-    useNullAsDefault: true,
-  });
-}
+import {
+  createPostgresTestDatabase,
+  describePostgres,
+  type PostgresTestDatabase,
+} from "./postgres-test";
 
 /**
  * Build a real Model subclass for a test type. ts-morph schema
@@ -54,7 +50,7 @@ function makeModel(typeName: string, schema: Record<string, any> = {}): any {
 
 async function makeAdapter(db: Knex): Promise<BackendAdapter> {
   const adapter = new (BackendAdapter as any)({ read: db, write: db });
-  await adapter.detectEngine("sqlite");
+  await adapter.detectEngine();
   return adapter as BackendAdapter;
 }
 
@@ -81,14 +77,16 @@ async function captureQueriesDuring(
   return queries;
 }
 
-describe("BackendAdapter.findById — RefLoader integration", () => {
+describePostgres("BackendAdapter.findById — RefLoader integration", () => {
   let db: Knex;
+  let database: PostgresTestDatabase;
   let adapter: BackendAdapter;
   let User: any;
   let Post: any;
 
   beforeEach(async () => {
-    db = sqlite();
+    database = await createPostgresTestDatabase();
+    db = database.db;
     User = makeModel("user", { name: "string" });
     Post = makeModel("post", { title: "string" });
     adapter = await makeAdapter(db);
@@ -111,7 +109,7 @@ describe("BackendAdapter.findById — RefLoader integration", () => {
   });
 
   afterEach(async () => {
-    await db.destroy();
+    await database.close();
   });
 
   it("coalesces N concurrent findById calls in a request scope into ONE batch query", async () => {

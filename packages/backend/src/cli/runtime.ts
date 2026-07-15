@@ -19,7 +19,7 @@
 import { resolve } from "node:path";
 import type { Knex } from "knex";
 import knexFactory from "knex";
-import { isSqliteUrl, parseConfig, sqliteFilename } from "../config";
+import { parseConfig } from "../config";
 import { detectEngine, type Engine } from "../adapters/engine";
 import {
   discoverMigrations,
@@ -98,20 +98,16 @@ export async function bootstrap(
     );
   }
 
-  const useSqlite = isSqliteUrl(dbUrl);
-  const db: Knex = useSqlite
-    ? knexFactory({
-        client: "better-sqlite3",
-        connection: { filename: sqliteFilename(dbUrl) },
-        useNullAsDefault: true,
-      })
-    : knexFactory({
-        client: "pg",
-        connection: pgConnectionFromUrl(dbUrl),
-        pool: { min: 1, max: 2 }, // CLI = short-lived, minimal pool
-      });
+  if (!/^postgres(?:ql)?:\/\//.test(dbUrl)) {
+    throw new Error("[parcae] DATABASE_URL must be a Postgres URL");
+  }
+  const db: Knex = knexFactory({
+    client: "pg",
+    connection: pgConnectionFromUrl(dbUrl),
+    pool: { min: 1, max: 2 }, // CLI = short-lived, minimal pool
+  });
 
-  const engine: Engine = await detectEngine(db, useSqlite ? "sqlite" : undefined);
+  const engine: Engine = await detectEngine(db);
   await ensureMetaTable(db);
 
   const dir = resolve(opts.dir ?? "./migrations");

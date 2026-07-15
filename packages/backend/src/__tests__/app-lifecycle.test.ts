@@ -5,9 +5,7 @@ const mocks = vi.hoisted(() => {
   const pubsubs: any[] = [];
   const queues: any[] = [];
   const buses: any[] = [];
-  const pollers: any[] = [];
   const servers: any[] = [];
-  const offs: any[] = [];
   let listenError: Error | null = null;
 
   const knex = vi.fn(() => {
@@ -41,23 +39,14 @@ const mocks = vi.hoisted(() => {
   });
 
   const ChangeBus = vi.fn().mockImplementation(function () {
-    const off = vi.fn();
     const bus = {
-      on: vi.fn(() => off),
-      close: vi.fn(),
-    };
-    offs.push(off);
-    buses.push(bus);
-    return bus;
-  });
-
-  const ListenNotifyPoller = vi.fn().mockImplementation(function () {
-    const poller = {
+      on: vi.fn(() => vi.fn()),
+      onReconnect: vi.fn(() => vi.fn()),
       start: vi.fn(async () => {}),
       stop: vi.fn(async () => {}),
     };
-    pollers.push(poller);
-    return poller;
+    buses.push(bus);
+    return bus;
   });
 
   const createServer_ = vi.fn(() => {
@@ -93,6 +82,8 @@ const mocks = vi.hoisted(() => {
     }
     async detectEngine() {}
     async ensureAllTables() {}
+    async ensureChangeTriggers() {}
+    async verifyChangeTriggers() {}
     async batchFindByType() {
       return new Map();
     }
@@ -103,14 +94,11 @@ const mocks = vi.hoisted(() => {
     pubsubs,
     queues,
     buses,
-    pollers,
     servers,
-    offs,
     knex,
     PubSub,
     QueueService,
     ChangeBus,
-    ListenNotifyPoller,
     BackendAdapter,
     createServer_,
     listenServer,
@@ -122,15 +110,12 @@ const mocks = vi.hoisted(() => {
       pubsubs.length = 0;
       queues.length = 0;
       buses.length = 0;
-      pollers.length = 0;
       servers.length = 0;
-      offs.length = 0;
       listenError = null;
       knex.mockClear();
       PubSub.mockClear();
       QueueService.mockClear();
       ChangeBus.mockClear();
-      ListenNotifyPoller.mockClear();
       createServer_.mockClear();
       listenServer.mockClear();
     },
@@ -148,10 +133,7 @@ vi.mock("../services/queue", () => ({
   QueueService: mocks.QueueService,
   addJobIfNotExists: vi.fn(),
 }));
-vi.mock("../services/changeBus", () => ({ ChangeBus: mocks.ChangeBus }));
-vi.mock("../services/listenNotifyPoller", () => ({
-  ListenNotifyPoller: mocks.ListenNotifyPoller,
-}));
+vi.mock("../services/change-bus", () => ({ ChangeBus: mocks.ChangeBus }));
 vi.mock("../server", () => ({
   createServer_: mocks.createServer_,
   listenServer: mocks.listenServer,
@@ -160,6 +142,7 @@ vi.mock("../server", () => ({
 import {
   createApp,
   createSocketSessionController,
+  indexModelTypesByTable,
   mountAuthRoutes,
   normalizeModels,
   resyncQueries,
@@ -174,7 +157,6 @@ describe("application lifecycle", () => {
     mocks.reset();
     delete (globalThis as any)[claim];
     vi.stubEnv("DATABASE_URL", "postgres://unused/test");
-    vi.stubEnv("PARCAE_LISTEN_NOTIFY", "true");
     vi.stubEnv("ENSURE_SCHEMA", "false");
   });
 
@@ -197,10 +179,8 @@ describe("application lifecycle", () => {
     await expect(stop).resolves.toBeUndefined();
     expect(mocks.servers[0]!.io.close).toHaveBeenCalledTimes(1);
     expect(mocks.servers[0]!.httpServer.close).toHaveBeenCalledTimes(1);
-    expect(mocks.offs[0]).toHaveBeenCalledTimes(1);
-    expect(mocks.buses[0]!.close).toHaveBeenCalledTimes(1);
-    expect(mocks.pollers[0]!.start).toHaveBeenCalledTimes(1);
-    expect(mocks.pollers[0]!.stop).toHaveBeenCalledTimes(1);
+    expect(mocks.buses[0]!.start).toHaveBeenCalledTimes(1);
+    expect(mocks.buses[0]!.stop).toHaveBeenCalledTimes(1);
     expect(mocks.queues[0]!.close).toHaveBeenCalledTimes(1);
     expect(mocks.pubsubs[0]!.close).toHaveBeenCalledTimes(1);
     expect(mocks.dbs[0]!.destroy).toHaveBeenCalledTimes(1);
@@ -319,6 +299,16 @@ describe("model discovery normalization", () => {
     expect(() =>
       normalizeModels([Project as any, OtherProject as any]),
     ).toThrow('same type "project"');
+  });
+
+  it("maps plural table names back to the exact declared model type", () => {
+    const index = indexModelTypesByTable([
+      { type: "settings" } as any,
+      { type: "category" } as any,
+    ]);
+
+    expect(index.get("settings")).toBe("settings");
+    expect(index.get("categories")).toBe("category");
   });
 });
 

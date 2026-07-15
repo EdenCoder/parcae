@@ -178,7 +178,7 @@ async function findByIdOrTmp(
     .select("*")
     .where("id", paramId)
     .where(scopeResult);
-  if (lock && !adapter.isSqlite) byId.exec().forUpdate();
+  if (lock) byId.exec().forUpdate();
   let item = await byId.first();
   if (!item) {
     const byTmp = adapter
@@ -186,7 +186,7 @@ async function findByIdOrTmp(
       .select("*")
       .where("tmp", paramId)
       .where(scopeResult);
-    if (lock && !adapter.isSqlite) byTmp.exec().forUpdate();
+    if (lock) byTmp.exec().forUpdate();
     item = await byTmp.first();
   }
   return (item as RouteModelRow | null) ?? null;

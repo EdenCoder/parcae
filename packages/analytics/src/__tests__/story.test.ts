@@ -73,7 +73,7 @@ describe("story replacement", () => {
 
   it("encodes the advisory lock identity without NUL bytes", async () => {
     const period = Period.last("7d", new Date("2026-06-01T00:00:00Z"));
-    const database = createPersistingStoryDatabase([], "pg");
+    const database = createPersistingStoryDatabase([]);
     registerDetector(new FindingDetector());
 
     await runProjection({
@@ -119,11 +119,11 @@ function createStoryDatabase(initialRows: Array<Record<string, unknown>>) {
     },
     fn: { now: () => "now" },
     raw: async () => undefined,
-    client: { config: { client: "sqlite" } },
+    client: { config: { client: "pg" } },
     transaction: async (run: (trx: unknown) => Promise<void>) => {
       const before = [...rows];
       const trx = Object.assign(query, {
-        client: { config: { client: "sqlite" } },
+        client: { config: { client: "pg" } },
         raw: async () => undefined,
       });
       try {
@@ -139,7 +139,6 @@ function createStoryDatabase(initialRows: Array<Record<string, unknown>>) {
 
 function createPersistingStoryDatabase(
   initialRows: Array<Record<string, unknown>>,
-  client = "sqlite",
 ) {
   let rows = [...initialRows];
   const rawCalls: Array<{ statement: string; bindings?: unknown[] }> = [];
@@ -164,7 +163,7 @@ function createPersistingStoryDatabase(
     };
   };
   const trx = Object.assign(query, {
-    client: { config: { client } },
+    client: { config: { client: "pg" } },
     raw,
   });
   const db = Object.assign(query, {
@@ -174,7 +173,7 @@ function createPersistingStoryDatabase(
     },
     fn: { now: () => "now" },
     raw,
-    client: { config: { client } },
+        client: { config: { client: "pg" } },
     transaction: async (run: (transaction: typeof trx) => Promise<void>) =>
       run(trx),
   }) as unknown as Knex;

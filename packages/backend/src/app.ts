@@ -21,8 +21,6 @@ import { ClientError } from "./helpers";
 import { generateSchemas } from "./schema/generate";
 import {
   parseConfig,
-  isSqliteUrl,
-  sqliteFilename,
   resolveRuntimeFlags,
 } from "./config";
 import type { Config, RuntimeFlags } from "./config";
@@ -45,12 +43,10 @@ import {
   QuerySubscriptionManager,
   parsePositiveInteger,
 } from "./services/subscriptions";
-import { ChangeBus } from "./services/changeBus";
-import { ListenNotifyPoller } from "./services/listenNotifyPoller";
+import { ChangeBus } from "./services/change-bus";
 import {
   _setServices,
   _setIo,
-  _setChangeBus,
   _setRuntimeFlags,
   _clearServices,
   runWithRequestContext,
@@ -236,6 +232,24 @@ export function normalizeModels(
     models.push(model);
   }
   return models;
+}
+
+/** Preserve the declared type when mapping its pluralized table back. */
+export function indexModelTypesByTable(
+  models: readonly ModelConstructor[],
+): Map<string, string> {
+  const result = new Map<string, string>();
+  for (const modelClass of models) {
+    const table = pluralize(modelClass.type);
+    const existing = result.get(table);
+    if (existing && existing !== modelClass.type) {
+      throw new Error(
+        `Model types "${existing}" and "${modelClass.type}" map to the same table "${table}"`,
+      );
+    }
+    result.set(table, modelClass.type);
+  }
+  return result;
 }
 
 // ─── Auto-discovery ──────────────────────────────────────────────────────────
@@ -654,11 +668,6 @@ export function createApp(config: AppConfig): ParcaeApp {
       }
 
       // ── Step 3: Connect database ───────────────────────────────────
-      const useSqlite = isSqliteUrl(envConfig.DATABASE_URL);
-
-      let writeDb: ReturnType<typeof knex>;
-      let readDb: ReturnType<typeof knex>;
-
       // Postgres connection-pool size. The prior hardcoded max of 10 was
       // exhausted when many scheduled jobs fired in the same minute on the
       // daemon (which runs every job worker concurrently), so acquiring a
@@ -666,35 +675,23 @@ export function createApp(config: AppConfig): ParcaeApp {
       // depend on setting an env; DB_POOL_MAX overrides it per-deployment.
       const dbPoolMax = Math.max(2, Number(process.env.DB_POOL_MAX) || 25);
 
-      if (useSqlite) {
-        const filename = sqliteFilename(envConfig.DATABASE_URL);
-        writeDb = knex({
-          client: "better-sqlite3",
-          connection: { filename },
-          useNullAsDefault: true,
-        });
-        resources.writeDb = writeDb;
-        readDb = writeDb; // SQLite has no read replica
-        resources.readDb = readDb;
-        log.info(`SQLite database: ${filename}`);
-      } else {
-        writeDb = knex({
+      const writeDb = knex({
+        client: "pg",
+        connection: envConfig.DATABASE_URL,
+        pool: { min: 2, max: dbPoolMax },
+      });
+      resources.writeDb = writeDb;
+      let readDb: ReturnType<typeof knex>;
+      if (envConfig.DATABASE_READ_URL) {
+        readDb = knex({
           client: "pg",
-          connection: envConfig.DATABASE_URL,
+          connection: envConfig.DATABASE_READ_URL,
           pool: { min: 2, max: dbPoolMax },
         });
-        resources.writeDb = writeDb;
-        if (envConfig.DATABASE_READ_URL) {
-          readDb = knex({
-            client: "pg",
-            connection: envConfig.DATABASE_READ_URL,
-            pool: { min: 2, max: dbPoolMax },
-          });
-        } else {
-          readDb = writeDb;
-        }
-        resources.readDb = readDb;
+      } else {
+        readDb = writeDb;
       }
+      resources.readDb = readDb;
 
       log.info("Database connected");
 
@@ -723,27 +720,17 @@ export function createApp(config: AppConfig): ParcaeApp {
         log.info("Redis not configured — using in-process fallbacks");
       }
 
-      // ── Step 4.5: ChangeBus (model-change fan-out) ─────────────────
-      // Single structured event bus over PubSub. _notifyChange in the
-      // adapter publishes here; QuerySubscriptionManager listens
-      // (wired below). One bus per app; close()'d at shutdown.
-      const changeBus = new ChangeBus({ pubsub });
-      resources.changeBus = changeBus;
-      _setChangeBus(changeBus);
-
       // ── Step 5: Set up BackendAdapter + Model.use() ────────────────
       const adapter = new BackendAdapter({
         read: readDb,
         write: writeDb,
-        pubsub,
-        changeBus,
       });
       adapter.registerModels(models);
       Model.use(adapter);
 
-      // Detect database engine (SQLite / Postgres / AlloyDB)
+      // Detect standard Postgres vs AlloyDB.
       log.info("Detecting database engine...");
-      await adapter.detectEngine(useSqlite ? "sqlite" : undefined);
+      await adapter.detectEngine();
       log.info("Database engine detected");
 
       // ── Step 6: Set up auth (opt-in) ───────────────────────────────
@@ -857,50 +844,23 @@ export function createApp(config: AppConfig): ParcaeApp {
       );
       adapter.subscriptions = subscriptions;
 
-      // ChangeBus → manager: every Change (hook-path or LISTEN-path)
-      // triggers a debounced re-eval for every cached query watching
-      // that table. The bus is per-process; PubSub fans across
-      // processes underneath it. Tracked so we can dispose on close.
-      const offChange = changeBus.on((change) => {
-        // ChangeBus carries DB table names because LISTEN/NOTIFY
-        // payloads originate from Postgres triggers (`projectAssets`).
-        // QuerySubscriptionManager indexes subscriptions by Model.type
-        // (`projectAsset`). Convert at the boundary so hook-path and
-        // trigger-path events hit the same index.
-        const modelType = pluralize.singular(change.table);
-        subscriptions.onModelChange(modelType);
-      });
-      resources.offChange = offChange;
-
-      // ── Step 9.5: LISTEN/NOTIFY poller (Postgres only) ─────────────
-      // Captures external writes that bypass Parcae's adapter (raw
-      // SQL, migrations, ops console). Installs trigger DDL during
-      // ensureAllTables above; the poller subscribes via a dedicated
-      // pg client and emits Changes onto the bus with `source: "listen"`.
-      // Echoes of our own hook-path emits are deduped by request-id.
-      const listenNotifyEnabled =
-        adapter.engine !== "sqlite" &&
-        process.env.PARCAE_LISTEN_NOTIFY !== "false";
-      let listenNotify: ListenNotifyPoller | null = null;
-      if (listenNotifyEnabled && envConfig.DATABASE_URL) {
-        listenNotify = new ListenNotifyPoller({
-          url: envConfig.DATABASE_URL,
-          changeBus,
+      // ── Step 9.5: Postgres change bus ──────────────────────────────
+      // API processes LISTEN directly on the primary database. PostgreSQL
+      // delivers row-trigger notifications only after commit and fans them to
+      // every instance, so no adapter or Redis change path exists.
+      if (flags.server) {
+        if (!ensureSchema) await adapter.verifyChangeTriggers(models);
+        const modelTypeByTable = indexModelTypesByTable(models);
+        const changeBus = new ChangeBus({ url: envConfig.DATABASE_URL });
+        resources.changeBus = changeBus;
+        changeBus.on((change) => {
+          const modelType = modelTypeByTable.get(change.table);
+          if (!modelType) return;
+          subscriptions.onModelChange(modelType, change);
         });
-        resources.listenNotify = listenNotify;
-        try {
-          await listenNotify.start();
-          log.info("LISTEN/NOTIFY poller started");
-        } catch (err) {
-          log.warn(
-            `LISTEN/NOTIFY poller failed to start (continuing without external-write capture): ${
-              (err as Error).message
-            }`,
-          );
-          await listenNotify.stop();
-          listenNotify = null;
-          resources.listenNotify = null;
-        }
+        changeBus.onReconnect(() => subscriptions.refreshAll());
+        await changeBus.start();
+        log.info("Postgres change bus started");
       }
       resources.crons = [];
 

@@ -4,16 +4,15 @@
  * `app.stop()` (in `./app.ts`) collects every long-lived resource that
  * `app.start()` opened — Socket.IO + HTTP server, BullMQ workers via the
  * `QueueService`, PubSub Redis clients, Knex pools, cron timers, the
- * Postgres LISTEN poller, the ChangeBus event emitter — and hands them
+ * Postgres change bus — and hands them
  * here. We tear them down in a specific order:
  *
  *   1. Stop accepting new HTTP and WebSocket connections.
  *      (`io.close()` then await `httpServer.close()`)
  *   2. Stop schedulers and change-bus fan-out.
  *      Cron handlers continue to completion in-flight but won't tick
- *      again. The ChangeBus listener attached by `start()` is removed
- *      so no further `onModelChange` notifications fire hooks, and the
- *      pg LISTEN poller's dedicated connection is closed.
+ *      again. The change bus closes its dedicated LISTEN connection and
+ *      removes local listeners.
  *   3. Drain BullMQ workers with a bounded timeout.
  *      `queue.close()` waits for in-flight jobs to finish before it
  *      resolves; if a job is misbehaving we cap the wait so the process
@@ -25,8 +24,8 @@
  *      spurious "connection lost" errors during the drain.
  *   5. Destroy Knex pools.
  *      Done last because in-flight hooks/jobs may still need DB access
- *      during the drain. If `readDb === writeDb` (SQLite or no read
- *      replica) we only destroy once.
+ *      during the drain. If `readDb === writeDb` (no read replica) we
+ *      only destroy once.
  *
  * Errors at any step are caught and logged but never propagated. A slow
  * Redis disconnect must not prevent the DB pool from closing, etc. The
@@ -38,8 +37,7 @@ import type { Server as SocketServer } from "socket.io";
 import type { Knex } from "knex";
 import type { AuthAdapter } from "./auth";
 import { log } from "./logger";
-import type { ChangeBus } from "./services/changeBus";
-import type { ListenNotifyPoller } from "./services/listenNotifyPoller";
+import type { ChangeBus } from "./services/change-bus";
 import type { PubSub } from "./services/pubsub";
 import type { QueueService } from "./services/queue";
 
@@ -60,11 +58,7 @@ export interface ShutdownResources {
   httpServer?: HttpServerLike | null;
   /** Cron schedulers started by app.start(). Each .stop() is best-effort. */
   crons?: CronLike[] | null;
-  /** Postgres LISTEN/NOTIFY poller. Owns a dedicated pg connection. */
-  listenNotify?: ListenNotifyPoller | null;
-  /** Disposer returned by `changeBus.on(...)` during start(). */
-  offChange?: (() => void) | null;
-  /** ChangeBus event emitter — calls removeAllListeners + drops dedup map. */
+  /** Postgres-native change bus. Owns a dedicated LISTEN connection. */
   changeBus?: ChangeBus | null;
   /** BullMQ workers + queues. Drained with `drainTimeoutMs` cap. */
   queue?: QueueService | null;
@@ -131,18 +125,8 @@ export async function shutdownResources(r: ShutdownResources): Promise<void> {
       });
     }
   }
-  if (r.listenNotify) {
-    await safe("listenNotify.stop", () => r.listenNotify!.stop());
-  }
-  if (r.offChange) {
-    await safe("offChange", () => {
-      r.offChange!();
-    });
-  }
   if (r.changeBus) {
-    await safe("changeBus.close", () => {
-      r.changeBus!.close();
-    });
+    await safe("changeBus.stop", () => r.changeBus!.stop());
   }
 
   // ── 3. Drain BullMQ workers (bounded) ────────────────────────────

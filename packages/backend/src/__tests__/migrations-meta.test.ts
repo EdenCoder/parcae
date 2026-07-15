@@ -5,7 +5,7 @@
 import { writeFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import knexFactory, { type Knex } from "knex";
+import type { Knex } from "knex";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   MigrationChecksumError,
@@ -22,14 +22,11 @@ import {
   writeMetaRow,
 } from "../adapters/migration-meta";
 import type { MigrationEntry } from "../routing/migration";
-
-function sqlite(): Knex {
-  return knexFactory({
-    client: "better-sqlite3",
-    connection: { filename: ":memory:" },
-    useNullAsDefault: true,
-  });
-}
+import {
+  createPostgresTestDatabase,
+  describePostgres,
+  type PostgresTestDatabase,
+} from "./postgres-test";
 
 function tempFile(content = ""): string {
   const dir = mkdtempSync(join(tmpdir(), "parcae-meta-"));
@@ -118,12 +115,14 @@ describe("sha256File", () => {
   });
 });
 
-describe("ensureMetaTable", () => {
+describePostgres("ensureMetaTable", () => {
   let db: Knex;
-  beforeEach(() => {
-    db = sqlite();
+  let database: PostgresTestDatabase;
+  beforeEach(async () => {
+    database = await createPostgresTestDatabase();
+    db = database.db;
   });
-  afterEach(() => db.destroy());
+  afterEach(() => database.close());
 
   it("creates the table if absent", async () => {
     expect(await db.schema.hasTable(META_TABLE)).toBe(false);
@@ -175,13 +174,15 @@ describe("ensureMetaTable", () => {
   });
 });
 
-describe("writeMetaRow upsert", () => {
+describePostgres("writeMetaRow upsert", () => {
   let db: Knex;
+  let database: PostgresTestDatabase;
   beforeEach(async () => {
-    db = sqlite();
+    database = await createPostgresTestDatabase();
+    db = database.db;
     await ensureMetaTable(db);
   });
-  afterEach(() => db.destroy());
+  afterEach(() => database.close());
 
   it("is idempotent on duplicate keys (onConflict merge)", async () => {
     const row = makeMeta({
@@ -453,26 +454,14 @@ describe("buildListing", () => {
     expect(classifyStatement("SAVEPOINT sp1")).toBe("noise");
   });
 
-  it("extractRowCount reads from pg and better-sqlite3 response shapes", () => {
-    // pg — { rowCount } shape, readable from either post-processed or raw
+  it("extractRowCount reads Postgres response shapes", () => {
     expect(extractRowCount({ rowCount: 5 })).toBe(5);
     expect(extractRowCount(null, { rowCount: 5 })).toBe(5);
-
-    // better-sqlite3 raw — { changes } on the raw driver response
-    expect(extractRowCount(null, { changes: 7 })).toBe(7);
-    expect(extractRowCount({ changes: 7 })).toBe(7);
-
-    // mysql2 — affectedRows
-    expect(extractRowCount({ affectedRows: 3 })).toBe(3);
-
-    // SQLite processed UPDATE/DEL — Knex collapses to plain number
-    expect(extractRowCount(2)).toBe(2);
-
-    // SQLite processed INSERT — Knex returns [lastID] array
-    expect(extractRowCount([42], null, "INSERT INTO t VALUES (1)")).toBe(1);
-
-    // A SELECT-result-shaped array without a matching INSERT sql → null
+    // SELECT-shaped and unrelated dialect responses are ignored.
     expect(extractRowCount([{ id: 1 }, { id: 2 }])).toBeNull();
+    expect(extractRowCount({ changes: 7 })).toBeNull();
+    expect(extractRowCount({ affectedRows: 3 })).toBeNull();
+    expect(extractRowCount(2)).toBeNull();
 
     // Nothing readable
     expect(extractRowCount(null)).toBeNull();

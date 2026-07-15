@@ -1,10 +1,15 @@
 import { Model } from "@parcae/model";
-import knexFactory from "knex";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { Knex } from "knex";
+import { afterEach, beforeEach, expect, it } from "vitest";
 
 import { BackendAdapter } from "../adapters/model";
 import { registerModelRoutes } from "../adapters/routes";
 import { clearRoutes, getRoutes } from "../routing/route";
+import {
+  createPostgresTestDatabase,
+  describePostgres,
+  type PostgresTestDatabase,
+} from "./postgres-test";
 
 class AuthoritativePost extends Model {
   static type = "authoritativePost" as const;
@@ -28,24 +33,22 @@ function makeRes() {
   };
 }
 
-describe("authoritative patch responses", () => {
-  let db: ReturnType<typeof knexFactory>;
+describePostgres("authoritative patch responses", () => {
+  let database: PostgresTestDatabase;
+  let db: Knex;
   let adapter: BackendAdapter;
 
   beforeEach(async () => {
     clearRoutes();
-    db = knexFactory({
-      client: "better-sqlite3",
-      connection: { filename: ":memory:" },
-      useNullAsDefault: true,
-    });
+    database = await createPostgresTestDatabase();
+    db = database.db;
     await db.schema.createTable("authoritativePosts", (table) => {
       table.string("id").primary();
       table.string("title");
       table.dateTime("createdAt");
       table.dateTime("updatedAt");
       table.string("tmp");
-      table.text("data");
+      table.jsonb("data");
     });
     await db("authoritativePosts").insert({
       id: "p1",
@@ -56,12 +59,11 @@ describe("authoritative patch responses", () => {
       data: "{}",
     });
     adapter = new BackendAdapter({ read: db, write: db });
-    adapter.engine = "sqlite";
   });
 
   afterEach(async () => {
     clearRoutes();
-    await db.destroy();
+    await database.close();
   });
 
   it("returns updatedAt to Model and through the PATCH route", async () => {

@@ -1,5 +1,5 @@
 /**
- * Integration tests for `.expand(...)` against a real SQLite-backed
+ * Integration tests for `.expand(...)` against a real Postgres-backed
  * BackendAdapter + RefLoader + subscription manager. The flow under
  * test is the production wire path:
  *
@@ -21,16 +21,15 @@
  *      it, regardless of which parent type they were subscribed
  *      against (v1 naive invalidation; see DOL-1093).
  *
- * Tests run against an in-memory SQLite DB with a minimal
- * Asset + File pair — same schema shape as Dollhouse's
+ * Tests use an isolated Postgres schema with a minimal Asset + File pair —
+ * the same shape as Dollhouse's
  * ProjectAsset.file → File ref the screenshot was attacking.
  */
 
-import knexFactory, { type Knex } from "knex";
+import type { Knex } from "knex";
 import {
   afterEach,
   beforeEach,
-  describe,
   expect,
   it,
 } from "vitest";
@@ -44,6 +43,11 @@ import {
   validateExpandSpecs,
 } from "../services/hydrate-expansions";
 import { QuerySubscriptionManager } from "../services/subscriptions";
+import {
+  createPostgresTestDatabase,
+  describePostgres,
+  type PostgresTestDatabase,
+} from "./postgres-test";
 
 // ─── Fixture ─────────────────────────────────────────────────────────────────
 
@@ -71,17 +75,9 @@ class AssetM extends Model {
   kind: string = "";
 }
 
-function sqlite(): Knex {
-  return knexFactory({
-    client: "better-sqlite3",
-    connection: { filename: ":memory:" },
-    useNullAsDefault: true,
-  });
-}
-
 async function makeAdapter(db: Knex): Promise<BackendAdapter> {
   const adapter = new (BackendAdapter as any)({ read: db, write: db });
-  await adapter.detectEngine("sqlite");
+  await adapter.detectEngine();
   (adapter as any).registerModels([FileM, AssetM]);
   await adapter.ensureAllTables([FileM, AssetM]);
   return adapter as BackendAdapter;
@@ -94,17 +90,19 @@ const REGISTRY: ReadonlyMap<string, any> = new Map<string, any>([
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
-describe("expand — integration through BackendAdapter + RefLoader", () => {
+describePostgres("expand — integration through BackendAdapter + RefLoader", () => {
   let db: Knex;
+  let database: PostgresTestDatabase;
   let adapter: BackendAdapter;
 
   beforeEach(async () => {
-    db = sqlite();
+    database = await createPostgresTestDatabase();
+    db = database.db;
     adapter = await makeAdapter(db);
   });
 
   afterEach(async () => {
-    await db.destroy();
+    await database.close();
   });
 
   it("embeds the linked File row in the LIST payload in ONE batched query", async () => {
@@ -229,14 +227,16 @@ describe("expand — integration through BackendAdapter + RefLoader", () => {
 
 // ─── Subscription manager ────────────────────────────────────────────────────
 
-describe("expand — subscription manager integration", () => {
+describePostgres("expand — subscription manager integration", () => {
   let db: Knex;
+  let database: PostgresTestDatabase;
   let adapter: BackendAdapter;
   let manager: QuerySubscriptionManager;
   let emitted: Array<{ socketId: string; event: string; data: any }>;
 
   beforeEach(async () => {
-    db = sqlite();
+    database = await createPostgresTestDatabase();
+    db = database.db;
     adapter = await makeAdapter(db);
     emitted = [];
     manager = new QuerySubscriptionManager(
@@ -249,7 +249,7 @@ describe("expand — subscription manager integration", () => {
   });
 
   afterEach(async () => {
-    await db.destroy();
+    await database.close();
   });
 
   it("subscription with .expand('file') ships embedded File rows in the initial items", async () => {
@@ -343,7 +343,12 @@ describe("expand — subscription manager integration", () => {
     // wake (the production path fires this on every `updatedAt`
     // bump or successful save).
     await db("files").update({ url: "https://cdn/after" }).where({ id: "f1" });
-    manager.onModelChange("file");
+    manager.onModelChange("file", {
+      table: "files",
+      op: "update",
+      id: "f1",
+      changedFields: ["url"],
+    });
 
     // Wait for the (debounceMs=0) re-eval cycle.
     await new Promise((resolve) => setTimeout(resolve, 10));

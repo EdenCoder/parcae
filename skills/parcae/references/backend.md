@@ -53,27 +53,25 @@ Directory options are **not** auto-defaulted to conventional paths — every dir
 1. Discover models (array or directory scan via `discoverModels` — picks up any export with a non-empty `static type`).
 2. Generate `.parcae/` schemas (RTTIST/ts-morph, with caching).
 3. Discover migrations (if `migrations` set) — registered via `migration()`, before the DB opens.
-4. Connect database (Knex; Postgres pool min 2 / max 10, optional read replica via `DATABASE_READ_URL`; or SQLite via `better-sqlite3`).
-5. Connect Redis: `PubSub` and `QueueService` (queue name from `JOB_QUEUE_NAME`, default `"parcae"`). Falls back to in-process implementations when `REDIS_URL` is unset. Wired into `enqueue()` / `lock()` via `_setServices`.
-6. Create `ChangeBus` (model-change fan-out over PubSub).
-7. Create `BackendAdapter`, `registerModels`, bind it once as the application adapter; detect engine (sqlite / postgres / alloydb). Independent contexts use `Model.bind()` rather than replacing this binding.
-8. Set up auth (opt-in) — runs **before** `ensureAllTables` so auth-owned tables exist first; runs its own migrations when `ENSURE_SCHEMA=true`.
-9. Run user migrations (`runMigrations`) — gated on `ENSURE_SCHEMA`, before `ensureAllTables`.
-10. `ensureAllTables` — additive DDL — gated on `ENSURE_SCHEMA`.
-11. Create HTTP server (Polka) + Socket.IO; wire `QuerySubscriptionManager`.
-12. Subscribe the manager to `ChangeBus` (table → `Model.type` via `pluralize.singular`).
-13. Start the LISTEN/NOTIFY poller (Postgres only; captures external/raw-SQL/migration writes for subscriptions; disable with `PARCAE_LISTEN_NOTIFY=false`).
-14. Mount auth routes + session-resolve middleware; install per-request `AsyncLocalStorage` context (user + `RefLoader` for batched ref resolution); install the optional `onAuthenticatedRequest` middleware.
-15. Register `/{version}/health`.
-16. Register auto-CRUD routes — **only when `RUN_SERVER` is true** (`registerModelRoutes`).
-17. Auto-discover + import `controllers` / `hooks` / `jobs` / `crons` (files always imported so module side effects fire identically across processes; per-flag gating applied below).
-18. Attach discovered custom routes to Polka — only when `RUN_SERVER` is true.
-19. Start per-job-name BullMQ workers — gated on `RUN_JOBS`.
-20. Schedule in-process crons (croner) — gated on `RUN_CRONS`.
-21. Socket.IO connection handling (RPC `call`, `hello`, `resync`, `route.on()` handlers, query subscribe/unsubscribe) — only when `RUN_SERVER` is true.
-22. Always bind the HTTP listener to `PORT` (even worker-only processes, so health probes work).
+4. Connect Postgres through Knex (pool min 2 / max 25, optional ordinary-read replica via `DATABASE_READ_URL`).
+5. Connect Redis-backed `PubSub` locks and `QueueService` (queue name from `JOB_QUEUE_NAME`, default `"parcae"`). Both have in-process fallbacks when `REDIS_URL` is unset.
+6. Create `BackendAdapter`, `registerModels`, bind it once as the application adapter; detect standard Postgres vs AlloyDB. Independent contexts use `Model.bind()` rather than replacing this binding.
+7. Set up auth (opt-in) — runs **before** `ensureAllTables` so auth-owned tables exist first; runs its own migrations when `ENSURE_SCHEMA=true`.
+8. Run user migrations (`runMigrations`) — gated on `ENSURE_SCHEMA`, before `ensureAllTables`.
+9. `ensureAllTables` — additive DDL — gated on `ENSURE_SCHEMA`.
+10. Create HTTP server (Polka) + Socket.IO; wire `QuerySubscriptionManager`.
+11. For server roles, verify managed-model change triggers and start the dedicated Postgres `ChangeBus` LISTEN connection. `ENSURE_SCHEMA=true` installs the triggers; otherwise missing triggers fail startup with migration guidance. Listener startup failures also fail the app.
+12. Mount auth routes + session-resolve middleware; install per-request `AsyncLocalStorage` context (user + `RefLoader` for batched ref resolution); install the optional `onAuthenticatedRequest` middleware.
+13. Register `/{version}/health`.
+14. Register auto-CRUD routes — **only when `RUN_SERVER` is true** (`registerModelRoutes`).
+15. Auto-discover + import `controllers` / `hooks` / `jobs` / `crons` (files always imported so module side effects fire identically across processes; per-flag gating applied below).
+16. Attach discovered custom routes to Polka — only when `RUN_SERVER` is true.
+17. Start per-job-name BullMQ workers — gated on `RUN_JOBS`.
+18. Schedule in-process crons (croner) — gated on `RUN_CRONS`.
+19. Socket.IO connection handling (RPC `call`, `hello`, `resync`, `route.on()` handlers, query subscribe/unsubscribe) — only when `RUN_SERVER` is true.
+20. Always bind the HTTP listener to `PORT` (even worker-only processes, so health probes work).
 
-`stop()` tears down crons, the LISTEN/NOTIFY poller, the ChangeBus subscription, the queue, pubsub, the optional auth adapter, and both DB pools via `shutdownResources` (errors swallowed per-resource so a slow Redis can't block DB pool close). Startup failures use the same teardown path.
+`stop()` tears down crons, the Postgres ChangeBus, queue, pubsub, optional auth adapter, and both DB pools via `shutdownResources` (errors swallowed per-resource so a slow Redis can't block DB pool close). Startup failures use the same teardown path.
 
 ## Runtime Flags & Process Roles
 
@@ -94,9 +92,9 @@ Source: `packages/backend/src/adapters/model.ts`
 
 Server-side `ModelAdapter` implementation.
 
-### Save (Upsert)
+### Save
 
-`serialize()` splits a model into declared columns vs. an overflow `data` JSONB blob, then upserts via Knex `INSERT ... ON CONFLICT`. Fires before/after hooks, then notifies the subscription layer via `_notifyChange` (buffered inside a transaction frame; otherwise published on the ChangeBus, falling back to the local manager when no bus is wired).
+New models serialize declared columns plus overflow `data` JSONB and insert via `INSERT ... ON CONFLICT`. Existing models diff the captured save payload (after before-hooks) against `__serverSnapshot`, lock the current row, then apply scalar and nested JSONB changes atomically through the same SQL builder as `patch()`. Unchanged fields are not written, so unrelated concurrent JSON paths and scalar columns survive. Positional array edits and whole-JSON replacements carry baseline tests; an incompatible concurrent structural edit returns a `409` instead of writing the wrong path. After-save hooks receive the authoritative merged row, while internal diff application does not dispatch patch hooks. PostgreSQL triggers are the only subscription notification source.
 
 ### Overflow Column
 
@@ -120,13 +118,13 @@ Parent JSON paths are auto-materialised so a deep set into a missing object does
 
 ### Read/Write Split
 
-Separate Knex instances for reads vs writes. Reads default to the read replica (`DATABASE_READ_URL`); writes always use the primary. SQLite has no replica — both point at the same connection.
+Separate Knex instances for reads vs writes. Ordinary reads use `DATABASE_READ_URL` when configured; writes and every subscription cache read use the primary so a commit-triggered notification cannot race replica lag.
 
 ### ensureTable()
 
 Additive DDL only (never drops by default). Skips models with `static managed = false`. Reuses a bulk introspection snapshot when called via `ensureAllTables()`.
 
-- **Create branch (`!hasTable`)**: creates the table with the base columns `id` (PK), `data` (JSONB / text on SQLite), `createdAt`, `updatedAt`, `tmp` (`varchar(2048)`), plus all declared schema columns, plus `createdAt`/`updatedAt` indexes.
+- **Create branch (`!hasTable`)**: creates the table with the base columns `id` (PK), `data` (JSONB), `createdAt`, `updatedAt`, `tmp` (`varchar(2048)`), plus all declared schema columns, plus `createdAt`/`updatedAt` indexes.
 - **Repair branch (table already exists)**: only adds **missing declared columns**, the `tmp` column if absent, and missing indexes.
 
 > **Gotcha — base columns are write-once.** The base columns (`id`, `data`, `createdAt`, `updatedAt`, `tmp`) are emitted **only** in the create branch. The repair branch reconciles declared columns and `tmp`, but **never** re-adds `id` / `data` / `createdAt` / `updatedAt`. A pre-existing table missing `data` cannot be fixed by `ensureAllTables()` — every INSERT then crashes with `column "data" of relation X does not exist`. Never hand-write `CREATE TABLE` for a Parcae model unless you include all base columns yourself; a wrong-shape pre-existing table can only be fixed by DROP + recreate (or a `migration()` that adds the missing columns).
@@ -146,8 +144,7 @@ import { migration } from "@parcae/backend";
 migration(
   "20260401000000-rename-type-columns",
   { description: "Legacy type columns -> typed names", ticket: "FRE-200" },
-  async ({ db, engine }) => {
-    if (engine === "sqlite") return;                  // pg-only guard
+  async ({ db }) => {
     await db.raw(`ALTER TABLE activities RENAME COLUMN "type" TO "activityType"`);
   },
 );
@@ -212,7 +209,7 @@ Secure replay of client-sent `QueryStep[]` arrays:
 
 ### Search System
 
-Hybrid full-text + fuzzy + optional semantic search (Postgres). SQLite uses a `LIKE` fallback. Extensions are created lazily the first time a model with `static searchFields` is ensured:
+Hybrid full-text + fuzzy + optional semantic search. Extensions are created lazily the first time a model with `static searchFields` is ensured:
 
 - `_search` generated `tsvector` column (built with `to_tsvector('english', ...)`, weighted A/B/C/D by field order) + GIN index; queried via `websearch_to_tsquery('english', ?)`.
 - Per-field trigram GIN indexes (`pg_trgm` extension).
@@ -438,7 +435,7 @@ would silently bypass every save hook, validation included.)
 }
 ```
 
-`onError(fn)` registers a compensating action that runs in **LIFO** order if any later before-hook, the DB write, or an after-hook throws — for rolling back external side effects (Clerk users, S3 uploads, Stripe subscriptions). Cleanup errors are logged but never replace the original error. It is a **no-op in `async: true` hooks** (those run outside the caller's error path; a warning is logged) and provides **no DB rollback** — the adapter's INSERT/UPDATE/DELETE is not transaction-wrapped, so use `onError` only for external (non-DB) effects.
+`onError(fn)` registers a compensating action that runs in **LIFO** order if any later before-hook, the DB write, or an after-hook throws — for rolling back external side effects (Clerk users, S3 uploads, Stripe subscriptions). Cleanup errors are logged but never replace the original error. It is a **no-op in `async: true` hooks** (those run outside the caller's error path; a warning is logged). Database writes in the synchronous operation are already rolled back transactionally; use `onError` for external effects.
 
 ### Hook Execution Order
 
@@ -544,9 +541,9 @@ Environment variables validated at startup via Zod (`configSchema`):
 
 | Variable            | Required    | Default        | Description                                                       |
 | ------------------- | ----------- | -------------- | ----------------------------------------------------------------- |
-| `DATABASE_URL`      | Yes         | —              | Postgres or SQLite (`sqlite:...`, `:memory:`, `*.db`) connection  |
-| `DATABASE_READ_URL` | No          | —              | Read replica (ignored for SQLite)                                 |
-| `REDIS_URL`         | No          | —              | Redis for PubSub + Queue (in-process fallback if absent)          |
+| `DATABASE_URL`      | Yes         | —              | Primary Postgres connection URL                                   |
+| `DATABASE_READ_URL` | No          | —              | Optional replica for ordinary reads                               |
+| `REDIS_URL`         | No          | —              | Redis for queues and distributed locks (in-process fallback)      |
 | `PORT`              | No          | `3000`         | HTTP port                                                         |
 | `AUTH_SECRET`       | Conditional | —              | Required if auth enabled                                          |
 | `NODE_ENV`          | No          | `development`  | `development` \| `production` \| `test`                           |
@@ -568,7 +565,6 @@ Read directly from `process.env` (not part of the Zod schema):
 | `ENSURE_SCHEMA`                     | —       | `"true"` to run auth migrations, user migrations, `ensureAllTables` |
 | `PARCAE_ALLOW_CHECKSUM_DRIFT`       | —       | `"true"` to bypass migration checksum-drift errors                |
 | `PARCAE_DROP_OBSOLETE_COLUMNS`      | —       | `"true"` to drop columns no longer declared on a model           |
-| `PARCAE_LISTEN_NOTIFY`              | —       | `"false"` to disable the LISTEN/NOTIFY external-write poller (PG) |
 | `PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET` | `500` | Per-socket subscription cap                                       |
 | `PARCAE_REEVAL_CONCURRENCY`         | —       | Subscription re-eval concurrency override                          |
 </content>

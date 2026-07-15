@@ -84,10 +84,7 @@ export function attachEffectTracking(knex: Knex): {
     const kind = classifyStatement(sql);
     if (kind === "noise" || kind === "read") return;
     writes += 1;
-    // Prefer the raw driver response (q.response / q.context) set by the
-    // dialect's _query before Knex's post-processing — it's consistent
-    // across pg + sqlite for DML row counts. Fall back to the
-    // post-processed response for SQLite's "update returns plain N" path.
+    // Prefer the raw pg response captured before Knex post-processing.
     const rc = extractRowCount(response, q.response ?? q.context, sql);
     if (typeof rc === "number" && rc > 0) rowsAffected += rc;
   };

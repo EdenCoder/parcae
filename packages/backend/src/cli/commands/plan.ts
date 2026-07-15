@@ -12,6 +12,7 @@
 
 import type { Knex } from "knex";
 import { log } from "../../logger";
+import type { Engine } from "../../adapters/engine";
 import {
   classifyStatement,
 } from "../../adapters/migration-meta";
@@ -98,7 +99,7 @@ export async function run(
 async function captureSql(
   db: Knex,
   entry: MigrationEntry,
-  engine: "sqlite" | "postgres" | "alloydb",
+  engine: Engine,
 ): Promise<string[]> {
   const statements: string[] = [];
   const listener = (query: { sql?: string }) => {

@@ -5,10 +5,9 @@
  * - createClient() with Socket.IO transport
  * - ParcaeProvider for React context
  * - useQuery() for realtime data
- * - Suspense for lazy-loaded references (post.user)
+ * - Explicit ref expansion for post.user
  */
 
-import { Suspense } from 'react';
 import { createClient } from '@parcae/sdk';
 import { ParcaeProvider, useQuery } from '@parcae/sdk/react';
 import { Post } from '../models/Post';
@@ -22,7 +21,9 @@ const ClientPost = client.bind(Post);
 
 function PostList() {
   const { items: posts, loading } = useQuery(
-    ClientPost.where({ published: true }).orderBy('createdAt', 'desc'),
+    ClientPost.where({ published: true })
+      .orderBy('createdAt', 'desc')
+      .expand('user'),
   );
 
   if (loading) return <div>Loading...</div>;
@@ -33,9 +34,7 @@ function PostList() {
       {posts.map((post) => (
         <article key={post.id}>
           <h2>{post.title}</h2>
-          <Suspense fallback={<span>Loading author...</span>}>
-            <AuthorName post={post} />
-          </Suspense>
+          <AuthorName post={post} />
         </article>
       ))}
     </div>
@@ -43,8 +42,8 @@ function PostList() {
 }
 
 function AuthorName({ post }: { post: Post }) {
-  // post.user triggers a lazy-load via Suspense
-  return <span>By {post.user?.name ?? 'Anonymous'}</span>;
+  const user = typeof post.user === 'object' ? post.user : null;
+  return <span>By {user?.name ?? 'Anonymous'}</span>;
 }
 
 export default function App() {

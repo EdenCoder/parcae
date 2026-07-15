@@ -1,12 +1,11 @@
 /**
  * Tests for the migration() registration API and the Knex-backed runner.
  *
- * All tests run against an in-memory SQLite database so they're deterministic
- * and fast. Engine-specific behaviour (Postgres information_schema, etc.) is
- * tested at the integration level — here we verify the orchestration.
+ * Database-backed cases run against an isolated Postgres schema when
+ * PARCAE_TEST_DATABASE_URL is available.
  */
 
-import knexFactory, { type Knex } from "knex";
+import type { Knex } from "knex";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   MIGRATIONS_TABLE,
@@ -23,14 +22,12 @@ import {
   migration,
   type MigrationEntry,
 } from "../routing/migration";
-
-function sqlite(): Knex {
-  return knexFactory({
-    client: "better-sqlite3",
-    connection: { filename: ":memory:" },
-    useNullAsDefault: true,
-  });
-}
+import {
+  createPostgresTestDatabase,
+  describePostgres,
+  itPostgres,
+  type PostgresTestDatabase,
+} from "./postgres-test";
 
 describe("migration() registration", () => {
   beforeEach(() => clearMigrations());
@@ -108,20 +105,21 @@ describe("ParcaeMigrationSource", () => {
 
   it("returns entries verbatim", async () => {
     const entries = [makeEntry({ name: "a" }), makeEntry({ name: "b" })];
-    const source = new ParcaeMigrationSource(entries, "sqlite");
+    const source = new ParcaeMigrationSource(entries, "postgres");
     expect(await source.getMigrations([])).toEqual(entries);
     expect(source.getMigrationName(entries[0]!)).toBe("a");
   });
 
   it("forwards transaction config to Knex", async () => {
     const entry = makeEntry({ transaction: false });
-    const source = new ParcaeMigrationSource([entry], "sqlite");
+    const source = new ParcaeMigrationSource([entry], "postgres");
     const content = await source.getMigration(entry);
     expect(content.config).toEqual({ transaction: false });
   });
 
-  it("calls up() with a context including db + engine and writes a meta row", async () => {
-    const db = sqlite();
+  itPostgres("calls up() with a context including db + engine and writes a meta row", async () => {
+    const database = await createPostgresTestDatabase();
+    const { db } = database;
     try {
       let capturedCtx: Parameters<MigrationEntry["up"]>[0] | null = null;
       const entry = makeEntry({
@@ -152,19 +150,20 @@ describe("ParcaeMigrationSource", () => {
       expect(rows[0]!.ticket).toBe("T-1");
       expect(typeof rows[0]!.durationMs).toBe("number");
     } finally {
-      await db.destroy();
+      await database.close();
     }
   });
 
   it("throws from down() when no down handler provided", async () => {
     const entry = makeEntry({ name: "forward-only" });
-    const source = new ParcaeMigrationSource([entry], "sqlite");
+    const source = new ParcaeMigrationSource([entry], "postgres");
     const content = await source.getMigration(entry);
     await expect(content.down!({} as Knex)).rejects.toThrow(/forward-only/);
   });
 
-  it("invokes user-provided down() and deletes the meta row", async () => {
-    const db = sqlite();
+  itPostgres("invokes user-provided down() and deletes the meta row", async () => {
+    const database = await createPostgresTestDatabase();
+    const { db } = database;
     try {
       await db.schema.createTable("parcae_migration_meta", (t) => {
         t.string("name").primary();
@@ -185,7 +184,7 @@ describe("ParcaeMigrationSource", () => {
 
       const down = vi.fn(async () => {});
       const entry = makeEntry({ name: "reversible", down });
-      const source = new ParcaeMigrationSource([entry], "sqlite");
+      const source = new ParcaeMigrationSource([entry], "postgres");
       const content = await source.getMigration(entry);
       await content.down!(db);
       expect(down).toHaveBeenCalledTimes(1);
@@ -193,29 +192,31 @@ describe("ParcaeMigrationSource", () => {
       const rows = await db("parcae_migration_meta").select("*");
       expect(rows).toHaveLength(0);
     } finally {
-      await db.destroy();
+      await database.close();
     }
   });
 });
 
-describe("runMigrations", () => {
+describePostgres("runMigrations", () => {
   let db: Knex;
+  let database: PostgresTestDatabase;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     clearMigrations();
-    db = sqlite();
+    database = await createPostgresTestDatabase();
+    db = database.db;
   });
 
   afterEach(async () => {
     clearMigrations();
-    await db.destroy();
+    await database.close();
   });
 
   it("is a no-op with no registered migrations", async () => {
     const result = await runMigrations({
       db,
       entries: getMigrations(),
-      engine: "sqlite",
+      engine: "postgres",
     });
     expect(result).toEqual({ applied: [], total: 0 });
     expect(await db.schema.hasTable(MIGRATIONS_TABLE)).toBe(false);
@@ -235,7 +236,7 @@ describe("runMigrations", () => {
     const result = await runMigrations({
       db,
       entries: getMigrations(),
-      engine: "sqlite",
+      engine: "postgres",
     });
 
     expect(calls).toEqual(["first", "second"]);
@@ -254,12 +255,12 @@ describe("runMigrations", () => {
     await runMigrations({
       db,
       entries: getMigrations(),
-      engine: "sqlite",
+      engine: "postgres",
     });
     await runMigrations({
       db,
       entries: getMigrations(),
-      engine: "sqlite",
+      engine: "postgres",
     });
 
     expect(runs).toBe(1);
@@ -275,7 +276,7 @@ describe("runMigrations", () => {
     await runMigrations({
       db,
       entries: getMigrations(),
-      engine: "sqlite",
+      engine: "postgres",
     });
     expect(await db.schema.hasTable("parcae_migrations")).toBe(true);
     expect(await db.schema.hasTable("knex_migrations")).toBe(false);
@@ -293,7 +294,7 @@ describe("runMigrations", () => {
       runMigrations({
         db,
         entries: getMigrations(),
-        engine: "sqlite",
+        engine: "postgres",
       }),
     ).rejects.toThrow();
 
@@ -312,7 +313,7 @@ describe("runMigrations", () => {
       runMigrations({
         db,
         entries: getMigrations(),
-        engine: "sqlite",
+        engine: "postgres",
       }),
     ).rejects.toThrow();
 
@@ -331,7 +332,7 @@ describe("runMigrations", () => {
     });
     const entries: MigrationEntry[] = [mk(), mk()];
     await expect(
-      runMigrations({ db, entries, engine: "sqlite" }),
+      runMigrations({ db, entries, engine: "postgres" }),
     ).rejects.toThrow(/duplicate/);
   });
 
@@ -345,7 +346,7 @@ describe("runMigrations", () => {
     await runMigrations({
       db,
       entries: getMigrations(),
-      engine: "sqlite",
+      engine: "postgres",
     });
 
     const rows = await db("parcae_migration_meta").select("*");
@@ -361,7 +362,7 @@ describe("runMigrations", () => {
     await runMigrations({
       db,
       entries: getMigrations(),
-      engine: "sqlite",
+      engine: "postgres",
     });
 
     const rows = await db("parcae_migration_meta").select("*");
@@ -387,7 +388,7 @@ describe("runMigrations", () => {
     await runMigrations({
       db,
       entries: getMigrations(),
-      engine: "sqlite",
+      engine: "postgres",
     });
 
     const rows = await db("parcae_migration_meta").select("*");
@@ -415,7 +416,7 @@ describe("runMigrations", () => {
     await runMigrations({
       db,
       entries: getMigrations(),
-      engine: "sqlite",
+      engine: "postgres",
     });
 
     const rows = await db("parcae_migration_meta").select("*").orderBy("name");
@@ -441,10 +442,7 @@ describe("runMigrations", () => {
   });
 
   it("lets a migration opt out of the transaction", async () => {
-    // With transaction: false, a throw AFTER a successful DDL is not rolled
-    // back. Note: SQLite auto-commits DDL anyway, so this test primarily
-    // verifies that we pass through the config without crashing. Real
-    // non-transactional semantics are Postgres-only.
+    // With transaction: false, successful DDL is not wrapped in a transaction.
     migration(
       "001-no-tx",
       { transaction: false },
@@ -456,7 +454,7 @@ describe("runMigrations", () => {
     await runMigrations({
       db,
       entries: getMigrations(),
-      engine: "sqlite",
+      engine: "postgres",
     });
     expect(await db.schema.hasTable("no_tx")).toBe(true);
   });
@@ -512,7 +510,7 @@ describe("writeMetaRowWithRetry (non-tx meta atomicity)", () => {
   });
 });
 
-describe("MigrationContext.ensureModel", () => {
+describePostgres("MigrationContext.ensureModel", () => {
   class ProbeModel {
     static type = "probeitem";
     static __schema = {
@@ -522,20 +520,21 @@ describe("MigrationContext.ensureModel", () => {
   }
 
   let db: Knex;
+  let database: PostgresTestDatabase;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     clearMigrations();
-    db = sqlite();
+    database = await createPostgresTestDatabase();
+    db = database.db;
   });
 
   afterEach(async () => {
     clearMigrations();
-    await db.destroy();
+    await database.close();
   });
 
   it("creates model-declared columns when called from a migration", async () => {
     const adapter = new BackendAdapter({ read: db, write: db });
-    adapter.engine = "sqlite";
 
     migration("001-backfill-probe", async ({ db, ensureModel }) => {
       await ensureModel(ProbeModel as any);
@@ -551,7 +550,7 @@ describe("MigrationContext.ensureModel", () => {
     await runMigrations({
       db,
       entries: getMigrations(),
-      engine: "sqlite",
+      engine: "postgres",
       adapter,
     });
 
@@ -567,7 +566,6 @@ describe("MigrationContext.ensureModel", () => {
 
   it("is idempotent — re-running a migration that calls ensureModel is a no-op", async () => {
     const adapter = new BackendAdapter({ read: db, write: db });
-    adapter.engine = "sqlite";
 
     // Pre-create the table with the model's columns to mimic a schema that's
     // already been ensured. ensureModel() should detect and skip.
@@ -589,7 +587,7 @@ describe("MigrationContext.ensureModel", () => {
       runMigrations({
         db,
         entries: getMigrations(),
-        engine: "sqlite",
+        engine: "postgres",
         adapter,
       }),
     ).resolves.toBeDefined();
@@ -597,7 +595,6 @@ describe("MigrationContext.ensureModel", () => {
 
   it("rolls back ensureModel DDL when the migration fails inside its transaction", async () => {
     const adapter = new BackendAdapter({ read: db, write: db });
-    adapter.engine = "sqlite";
 
     migration("001-fail-after-ensure", async ({ ensureModel }) => {
       await ensureModel(ProbeModel as any);
@@ -610,7 +607,7 @@ describe("MigrationContext.ensureModel", () => {
       runMigrations({
         db,
         entries: getMigrations(),
-        engine: "sqlite",
+        engine: "postgres",
         adapter,
       }),
     ).rejects.toThrow(/boom/);
@@ -628,7 +625,7 @@ describe("MigrationContext.ensureModel", () => {
       runMigrations({
         db,
         entries: getMigrations(),
-        engine: "sqlite",
+        engine: "postgres",
         // adapter intentionally omitted
       }),
     ).rejects.toThrow(/ensureModel\(\) is unavailable/);

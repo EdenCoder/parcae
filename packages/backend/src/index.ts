@@ -13,8 +13,6 @@ export type { ParcaeApp, AppConfig } from "./app";
 export {
   parseConfig,
   configSchema,
-  isSqliteUrl,
-  sqliteFilename,
   resolveRuntimeFlags,
 } from "./config";
 export type { Config, RuntimeFlags } from "./config";
@@ -34,23 +32,21 @@ export { QueueService, addJobIfNotExists } from "./services/queue";
 export type { QueueConfig } from "./services/queue";
 export { QuerySubscriptionManager } from "./services/subscriptions";
 export type { QueryEmitEnvelope } from "./services/subscriptions";
-export { ChangeBus } from "./services/changeBus";
+export { ChangeBus, PARCAE_CHANNEL } from "./services/change-bus";
 export type {
   Change,
   ChangeOp,
-  ChangeSource,
   ChangeListener,
-} from "./services/changeBus";
-export {
-  ListenNotifyPoller,
-  PARCAE_CHANNEL,
-} from "./services/listenNotifyPoller";
+} from "./services/change-bus";
 export {
   ensureChangeTriggers,
+  verifyChangeTriggers,
   triggerFunctionSql,
   createTriggerSql,
+  PARCAE_CHANGE_CHANNEL,
   TRIGGER_FUNCTION_NAME,
-} from "./services/changeTriggers";
+  TRIGGER_FUNCTION_VERSION,
+} from "./services/change-triggers";
 export {
   withTransaction,
   getActiveTransactionFrame,
@@ -65,7 +61,6 @@ export {
   lock,
   getQueue,
   getPubSub,
-  getChangeBus,
   getIo,
   getRuntimeFlags,
   runWithRequestContext,

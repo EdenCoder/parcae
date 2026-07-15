@@ -6,8 +6,7 @@
  * `createApp().start()` cycle. The contract it implements:
  *
  *   1. Stop accepting new HTTP/socket connections (io.close + httpServer.close)
- *   2. Stop schedulers (crons.stop, listenNotify.stop) + cancel change-bus
- *      listener (offChange) + close the changeBus event emitter.
+ *   2. Stop schedulers and the Postgres change bus.
  *   3. Drain BullMQ workers with a bounded timeout (queue.close).
  *   4. Close PubSub Redis clients.
  *   5. Destroy Knex pools (writeDb first, readDb only when distinct).
@@ -46,13 +45,7 @@ function makeFakes() {
   };
   const cronA = { stop: vi.fn(() => note("cronA.stop")) };
   const cronB = { stop: vi.fn(() => note("cronB.stop")) };
-  const listenNotify = {
-    stop: vi.fn(async () => {
-      note("listenNotify.stop");
-    }),
-  };
-  const offChange = vi.fn(() => note("offChange"));
-  const changeBus = { close: vi.fn(() => note("changeBus.close")) };
+  const changeBus = { stop: vi.fn(async () => note("changeBus.stop")) };
   const queue = {
     close: vi.fn(async () => {
       note("queue.close");
@@ -88,8 +81,6 @@ function makeFakes() {
     httpServer,
     cronA,
     cronB,
-    listenNotify,
-    offChange,
     changeBus,
     queue,
     pubsub,
@@ -118,8 +109,6 @@ describe("shutdownResources", () => {
       io: f.io as any,
       httpServer: f.httpServer as any,
       crons: [f.cronA as any, f.cronB as any],
-      listenNotify: f.listenNotify as any,
-      offChange: f.offChange,
       changeBus: f.changeBus as any,
       queue: f.queue as any,
       pubsub: f.pubsub as any,
@@ -132,9 +121,7 @@ describe("shutdownResources", () => {
     expect(f.httpServer.close).toHaveBeenCalledTimes(1);
     expect(f.cronA.stop).toHaveBeenCalledTimes(1);
     expect(f.cronB.stop).toHaveBeenCalledTimes(1);
-    expect(f.listenNotify.stop).toHaveBeenCalledTimes(1);
-    expect(f.offChange).toHaveBeenCalledTimes(1);
-    expect(f.changeBus.close).toHaveBeenCalledTimes(1);
+    expect(f.changeBus.stop).toHaveBeenCalledTimes(1);
     expect(f.queue.close).toHaveBeenCalledTimes(1);
     expect(f.queue.forceClose).not.toHaveBeenCalled();
     expect(f.pubsub.close).toHaveBeenCalledTimes(1);
@@ -161,8 +148,6 @@ describe("shutdownResources", () => {
       io: f.io as any,
       httpServer: f.httpServer as any,
       crons: [f.cronA as any],
-      listenNotify: f.listenNotify as any,
-      offChange: f.offChange,
       changeBus: f.changeBus as any,
       queue: f.queue as any,
       pubsub: f.pubsub as any,
@@ -178,9 +163,7 @@ describe("shutdownResources", () => {
     expect(ix("io.close")).toBeLessThan(ix("httpServer.close"));
     expect(ix("httpServer.close")).toBeLessThan(ix("queue.close"));
     expect(ix("cronA.stop")).toBeLessThan(ix("queue.close"));
-    expect(ix("listenNotify.stop")).toBeLessThan(ix("queue.close"));
-    expect(ix("offChange")).toBeLessThan(ix("queue.close"));
-    expect(ix("changeBus.close")).toBeLessThan(ix("queue.close"));
+    expect(ix("changeBus.stop")).toBeLessThan(ix("queue.close"));
     expect(ix("queue.close")).toBeLessThan(ix("pubsub.close"));
     expect(ix("pubsub.close")).toBeLessThan(ix("auth.close"));
     expect(ix("auth.close")).toBeLessThan(ix("writeDb.destroy"));
@@ -190,8 +173,7 @@ describe("shutdownResources", () => {
 
   it("doesn't double-destroy readDb when readDb === writeDb", async () => {
     const f = makeFakes();
-    // Share the same fake — mirrors the SQLite case where writeDb and
-    // readDb are literally the same Knex instance.
+    // No read replica means both references point at the same Knex instance.
     await shutdownResources({
       writeDb: f.writeDb as any,
       readDb: f.writeDb as any,

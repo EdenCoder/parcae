@@ -1,18 +1,19 @@
 # Realtime Reference
 
 Parcae's realtime stack keeps `useQuery()` result sets live. A client subscribes to a
-query; whenever any row of the watched model type is written, the server re-evaluates
-the query, diffs it against the cached result, and emits surgical add/remove/update ops
-back to every subscribed socket. Diffing, coalescing, and ordering are all **server-side**;
-the client just applies the ops it receives.
+query; committed Postgres row changes refresh the affected cached row or expansion when
+safe, with a full scoped query fallback for membership and ordering changes. The server
+emits surgical add/remove/update ops to every subscribed socket. Diffing, coalescing, and
+ordering are all **server-side**; the client just applies the ops it receives.
 
 The pieces:
 
 - **`QuerySubscriptionManager`** (`services/subscriptions.ts`) — owns cached queries,
-  re-eval, diffing, coalescing, and the wire envelope.
-- **`ChangeBus`** (`services/changeBus.ts`) — cross-process model-change fan-out over PubSub.
-- **`PubSub`** (`services/pubsub.ts`) — Redis-backed event bus + distributed lock, with an
-  in-process fallback.
+  targeted refreshes, full re-evals, diffing, coalescing, and the wire envelope.
+- **`ChangeBus`** (`services/change-bus.ts`) — one dedicated Postgres LISTEN connection per
+  server process.
+- **Change triggers** (`services/change-triggers.ts`) — transactional row notifications for
+  every framework-managed model table.
 - **Socket.IO RPC bridge** (`app.ts` `io.on("connection")` + `socket-fake-res.ts`) — pipes
   socket frames through the same Polka HTTP handler as REST, plus the `hello`/`resync` protocol.
 - **`useQuery()`** (`packages/sdk/src/react/useQuery.ts`) — the client cache, ops application,
@@ -20,12 +21,13 @@ The pieces:
 
 ---
 
-## PubSub
+## PubSub and locks
 
 Source: `packages/backend/src/services/pubsub.ts`
 
-Redis-backed cross-process event bus + distributed lock. Falls back to an in-process
-`eventemitter3` `EventEmitter` (and `async-lock`) when no Redis URL is configured.
+Redis-backed application event bus and distributed lock. Falls back to an in-process
+`eventemitter3` `EventEmitter` (and `async-lock`) when no Redis URL is configured. Realtime
+model changes do not use this service.
 
 ### Architecture
 
@@ -76,56 +78,58 @@ in-process fallback. Useful for cron dedup.
 
 ## ChangeBus
 
-Source: `packages/backend/src/services/changeBus.ts`
+Source: `packages/backend/src/services/change-bus.ts`, `services/change-triggers.ts`
 
-`QuerySubscriptionManager` is per-process — a write on instance A never reaches a subscriber
-socket on instance B by itself. `ChangeBus` is the fan-out. It wraps `PubSub`, so the same
-code path works in single-process dev (in-memory) and multi-process production (Redis).
+Each server process opens a dedicated `pg.Client`, executes `LISTEN parcae_change`, validates
+notifications, and forwards them to its local `QuerySubscriptionManager`. PostgreSQL fans the
+same committed notification to every listening instance; Redis is not involved.
+
+`parcae_change_notify()` is installed as an `AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW`
+trigger on every framework-managed model table when `ENSURE_SCHEMA=true`. With schema
+management disabled, server startup performs a read-only catalog verification and fails with
+migration guidance when a trigger is missing. Models with `static managed = false` must install
+an equivalent trigger in their own migration.
 
 ### Change shape
 
 ```typescript
 type ChangeOp = "insert" | "update" | "delete";
-type ChangeSource = "hook" | "listen";
 
 interface Change {
   table: string;     // DB table name == pluralize(Model.type)
   op: ChangeOp;
-  id: string;        // row id
-  requestId: string; // per-write tag, used to dedup the LISTEN echo
-  source: ChangeSource;
+  id: string;
+  changedFields: string[] | null; // top-level UPDATE columns; null for legacy/unknown payloads
 }
 ```
 
-No `before`/`after` row data travels on the bus — subscribers re-query through scope to get
-the post-change view, which keeps payloads small.
+No row values travel on the channel. Subscribers query through the original scope and sanitizer,
+which keeps payloads small and preserves authorization. INSERT and DELETE carry an empty
+`changedFields` array; UPDATE computes changed top-level columns from `OLD` and `NEW`.
 
-### Dedup
+### Transaction and reconnect semantics
 
-Hook-path writes carry a freshly generated `requestId` (`newRequestId()` → `req_<generateId()>`).
-The bus holds a TTL `Map` (default `dedupTtlMs: 5000`) of recently-seen hook requestIds and
-drops any LISTEN/NOTIFY echo whose requestId matches — so a Parcae-originated write isn't
-dispatched twice. The default channel is `"parcae:change"`.
+PostgreSQL queues `NOTIFY` until commit, so rolled-back writes emit nothing. The adapter never
+publishes model changes, and there are no request ids, echo suppression, or transaction buffers.
+
+Notifications are non-durable. The bus reconnects with bounded exponential backoff; after a
+successful reconnect it calls `subscriptions.refreshAll()` so every local cache converges after
+the connection gap. Stopping the app cancels pending connects and reconnect timers.
 
 ### Wiring (in `app.ts`)
 
-`BackendAdapter._notifyChange(model, op)` is the single emit point (`op` is
-`insert | update | delete`):
-
-- **Single-process / no bus** — calls `subscriptions.onModelChange(ModelClass.type)` directly.
-- **Multi-process** — emits a `Change` onto the `ChangeBus` (`source: "hook"`), with the
-  `requestId` taken from the active transaction frame if one is open. The bus listener in
-  `app.ts` converts the table name back to a model type and calls `onModelChange`:
+At boot, `app.ts` records the exact `pluralize(type) → type` mapping (reverse pluralization is
+not safe for types such as `settings`). The listener passes complete change metadata to the
+manager:
 
 ```typescript
 changeBus.on((change) => {
-  const modelType = pluralize.singular(change.table);
-  subscriptions.onModelChange(modelType);
+  const modelType = modelTypeByTable.get(change.table);
+  if (!modelType) return;
+  subscriptions.onModelChange(modelType, change);
 });
+changeBus.onReconnect(() => subscriptions.refreshAll());
 ```
-
-The `LISTEN/NOTIFY` poller (Postgres only) captures external writes that bypass the adapter
-and emits Changes with `source: "listen"`; hook-path echoes are dropped by requestId.
 
 ---
 
@@ -155,7 +159,7 @@ Clients subscribe to the Socket.IO event `query:${hash}`.
 1. Compute the hash. Enforce the per-socket cap **before** the cache lookup (see below).
 2. Cache hit → add the socket to `subscribers`; if `steps` carry `.orderBy(false)` the
    channel's `emitOrder` is turned off for everyone (one opt-out poisons the channel).
-   `force: true` runs an inline `_reeval` so a drift-poll re-query converges in one round trip.
+   `force: true` runs an inline full re-eval so a drift-poll re-query converges in one round trip.
 3. Cache miss → execute the query, sanitize rows, store them in a `Map<id, row>` (iteration
    order is the DB return order), index by model type, and (if any `.expand(...)`) index by
    each expanded target type.
@@ -170,21 +174,26 @@ attack — not a legitimate case). Sized for SPA navigation given the SDK's ~60s
 Overridable via `ManagerOptions.maxSubscriptionsPerSocket` /
 `PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET`.
 
-### On model change → coalesced re-eval
+### On model change → coalesced targeted refresh
 
-`onModelChange(modelType)` schedules a re-eval for:
+`onModelChange(modelType, change)` routes work as follows:
 
-- every cached query directly watching that type (`typeIndex`), **and**
-- every cached query that expanded that type as a ref target (`expandTargetIndex`) — so a
-  `File` write refreshes inlined `file` rows in unrelated parent queries (v1 invalidation is
-  naive: any change to the target type wakes every subscriber that expanded it).
+- A safe UPDATE fetches only `change.id` through the original scoped query, on the primary.
+  If the row remains in the cache, only that row is sanitized, expanded, diffed, and emitted.
+- INSERT, DELETE, unknown `changedFields`, offsets, limited queries without stable ordering,
+  opaque SQL ordering, or changes to an explicit/search order field run a full re-eval.
+- If a targeted row enters or leaves query membership, the manager falls back to a full re-eval
+  so add/remove and limit-window effects remain correct.
+- Expanded-target changes rehydrate only cached parents whose raw ref id equals `change.id`.
+- Any targeted-read failure logs a warning and falls back to a full re-eval.
+- `refreshAll()` schedules full re-evaluation of every cache after LISTEN reconnect.
 
-Re-eval is **coalesced server-side** per cached query (not debounced on the client):
+Refresh work is **coalesced server-side** per cached query (not debounced on the client):
 
 - `DEFAULT_DEBOUNCE_MS = 25` — trailing debounce, reset on every incoming change.
 - `DEFAULT_MAX_WAIT_MS = 100` — armed on the first change of a window, never reset, so a
   sustained write loop still flushes at most every `maxWaitMs`.
-- While a re-eval is in flight, follow-up changes set a `needsFollowup` flag rather than
+- While a refresh is in flight, follow-up changes set a `needsFollowup` flag rather than
   queueing parallel runs; one extra cycle runs afterward.
 - Both windows at `0` fire synchronously (used by tests and by callers turning coalescing off).
 
@@ -199,13 +208,13 @@ class Asset extends Model {
 Either field may be set independently; defaults fill the rest.
 
 A `Semaphore` (default `reevalConcurrency: 8`, env `PARCAE_REEVAL_CONCURRENCY`) bounds how
-many `_reeval` operations hit the DB at once, so a write-storm on a hot table can't launch N
-parallel SELECTs.
+many targeted/full refresh operations hit the primary at once, so a write-storm on a hot table
+can't launch N parallel SELECTs.
 
 ### Diff + wire envelope
 
-`_reeval` re-executes the query, sanitizes rows into a new `Map<id, row>`, and diffs against
-the cached result:
+Full re-evaluation executes the query on the primary, sanitizes rows into a new `Map<id, row>`,
+and diffs against the cached result. Targeted refreshes produce the same operation shape:
 
 ```typescript
 type DiffOp =
@@ -238,17 +247,19 @@ is suppressed entirely.
 
 ### Emit fan-out
 
-With a room-aware backend, `_reeval` broadcasts once via `emitToRoom("query:${hash}", ...)`
+With a room-aware backend, each refresh broadcasts once via `emitToRoom("query:${hash}", ...)`
 (Socket.IO walks the room's socket set) — O(1) emits regardless of subscriber count. Without
 rooms it falls back to one `emitToSocket(socketId, ...)` per subscriber. In `app.ts` these
 map to `io.to(room).emit(...)` / `io.to(socketId).emit(...)`.
 
 ### Expand hydration
 
-`_execQuery` runs `query.clone().find()`, calls each model's `sanitize()`, and — when the
-subscription carried `.expand(...)` — builds an **ephemeral** `RefLoader` (re-eval fires
+`_execQuery` executes the compiled query through `BackendAdapter.executeSubscriptionQuery()`
+on the primary, calls each model's `sanitize()`, and — when the subscription carried
+`.expand(...)` — builds an **ephemeral** `RefLoader` (refreshes fire
 outside any request scope, so `getRefLoader()` is unavailable) and runs `hydrateExpansions`
-to inline linked rows. The only expanded ref in production today is `File` (no private fields).
+through `batchFindByTypeOnWrite()` to inline linked rows. Initial cache reads and subsequent
+refreshes therefore share the same primary-consistent expansion path.
 
 ### Teardown
 

@@ -31,7 +31,6 @@
     "@parcae/model": "workspace:*",
     "@sesamecare-oss/redlock": "^1.4.0",
     "async-lock": "^1.4.1",
-    "better-sqlite3": "^12.11.1",
     "body-parser": "^2.3.0",
     "bullmq": "^5.78.1",
     "compress-json": "^3.4.0",
@@ -51,7 +50,6 @@
   },
   "devDependencies": {
     "@types/async-lock": "^1.4.2",
-    "@types/better-sqlite3": "^7.6.13",
     "@types/body-parser": "^1.19.6",
     "@types/deep-equal": "^1.0.4",
     "@types/node": "^25.9.3",

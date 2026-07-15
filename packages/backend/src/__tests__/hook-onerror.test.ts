@@ -3,12 +3,15 @@
  * transactional semantics of BackendAdapter.save/remove/patch.
  */
 
-import knexFactory from "knex";
 import { Model } from "@parcae/model";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { BackendAdapter } from "../adapters/model";
 import type { HookContext } from "../routing/hook";
 import { clearHooks, hook } from "../routing/hook";
+import {
+  createPostgresTestDatabase,
+  describePostgres,
+} from "./postgres-test";
 
 // ─── Test fixtures ───────────────────────────────────────────────────────────
 
@@ -41,11 +44,8 @@ function makeModel(data: Record<string, unknown> = {}): any {
 }
 
 async function setupAdapter(): Promise<BackendAdapter> {
-  const knex = knexFactory({
-    client: "better-sqlite3",
-    connection: { filename: ":memory:" },
-    useNullAsDefault: true,
-  });
+  const database = await createPostgresTestDatabase();
+  const knex = database.db;
 
   await knex.schema.createTable("testitems", (t) => {
     t.string("id").primary();
@@ -53,23 +53,22 @@ async function setupAdapter(): Promise<BackendAdapter> {
     t.string("tmp");
     t.timestamp("createdAt").defaultTo(knex.fn.now());
     t.timestamp("updatedAt").defaultTo(knex.fn.now());
-    t.text("data");
+    t.jsonb("data");
   });
 
   const adapter = new BackendAdapter({ read: knex, write: knex });
-  adapter.engine = "sqlite";
-  // Keep a reference so the test can close it
   (adapter as any).__knex = knex;
+  (adapter as any).__database = database;
   return adapter;
 }
 
 async function teardown(adapter: BackendAdapter): Promise<void> {
-  await (adapter as any).__knex.destroy();
+  await (adapter as any).__database.close();
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
-describe("ctx.onError — compensating actions", () => {
+describePostgres("ctx.onError — compensating actions", () => {
   let adapter: BackendAdapter;
 
   beforeEach(async () => {

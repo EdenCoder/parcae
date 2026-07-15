@@ -90,18 +90,6 @@ describe("BackendAdapter.query() — server-side whereIn on JSON-array columns",
     expect(nativeWhereIn).toBeUndefined();
   });
 
-  it("SQLite: dispatches whereIn(arrayCol, vals) to LIKE containment SQL", () => {
-    const { adapter, calls } = createTestAdapter();
-    (adapter as any).engine = "sqlite";
-
-    adapter.query(PostArrayModel as any).whereIn("studios", ["s1"]);
-
-    const whereRaw = calls.find((c) => c.method === "whereRaw");
-    expect(whereRaw).toBeDefined();
-    expect(whereRaw!.args[0]).toContain("LIKE");
-    expect(whereRaw!.args[1]).toEqual(["studios", '%"s1"%']);
-  });
-
   it("falls through to native whereIn for scalar columns", () => {
     const { adapter, calls } = createTestAdapter();
     (adapter as any).engine = "postgres";
@@ -143,6 +131,16 @@ describe("BackendAdapter.query() — server-side whereIn on JSON-array columns",
 });
 
 describe("BackendAdapter.query() — aggregate terminals", () => {
+  it("maps clearLimit() to Knex clear('limit')", () => {
+    const { adapter, calls } = createTestAdapter();
+
+    adapter.query(PostArrayModel as any).limit(10).clearLimit();
+
+    expect(calls).toContainEqual({ method: "limit", args: [10] });
+    expect(calls).toContainEqual({ method: "clear", args: ["limit"] });
+    expect(calls.some((call) => call.method === "clearLimit")).toBe(false);
+  });
+
   it("count() clears limit and offset before aggregating", async () => {
     const cleared: string[] = [];
     const chain: any = {

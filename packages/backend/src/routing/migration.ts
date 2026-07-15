@@ -16,9 +16,7 @@
  * // migrations/20260401-rename-type-columns.ts
  * import { migration } from "@parcae/backend";
  *
- * migration("20260401-rename-type-columns", async ({ db, engine, log }) => {
- *   if (engine === "sqlite") return; // pg-only — information_schema
- *
+ * migration("20260401-rename-type-columns", async ({ db, log }) => {
  *   const { rows } = await db.raw(
  *     `SELECT 1 FROM information_schema.columns
  *      WHERE table_name = 'activities' AND column_name = 'type'`,
@@ -134,7 +132,7 @@ export interface MigrationContext {
    * remain correct even if a model class is later renamed or removed.
    */
   db: Knex;
-  /** Detected database engine. Use to gate engine-specific SQL. */
+  /** Detected Postgres engine. Use to gate AlloyDB-specific SQL. */
   engine: Engine;
   /** The Parcae logger. */
   log: typeof logger;

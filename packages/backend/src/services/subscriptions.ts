@@ -35,12 +35,13 @@ import {
 import fastJsonPatch from "fast-json-patch";
 import type { Operation } from "fast-json-patch";
 import { RefLoader } from "./ref-loader";
-import { getRefLoader } from "./context";
 import {
+  getWireRefId,
   hydrateExpansions,
   projectForWire,
   type ResolvedExpand,
 } from "./hydrate-expansions";
+import type { Change } from "./change-bus";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -98,6 +99,15 @@ interface CachedQuery {
    * caller actually wants.
    */
   emitOrder: boolean;
+  dependency: {
+    hasLimit: boolean;
+    hasOffset: boolean;
+    hasOpaqueOrder: boolean;
+    hasStableOrder: boolean;
+    orderFields: ReadonlySet<string>;
+  };
+  creationReconcile: Promise<void> | null;
+  needsCreationReconcile: boolean;
   /** Coalescing state, lazily initialised on first onModelChange. */
   coalesce: {
     /** Trailing debounce — reset on each onModelChange. */
@@ -111,6 +121,9 @@ interface CachedQuery {
      */
     inFlight: Promise<void> | null;
     needsFollowup: boolean;
+    full: boolean;
+    root: Map<string, Change>;
+    expand: Map<string, { modelType: string; change: Change }>;
     /** Override window from `Model.realtime` or manager default. */
     debounceMs: number;
     maxWaitMs: number;
@@ -260,6 +273,71 @@ function stableStringify(value: unknown): string {
   });
 }
 
+function dependencyPlan(
+  query: QueryChain<any>,
+  steps: readonly QueryStep[] | undefined,
+  sql: string,
+): CachedQuery["dependency"] {
+  const orderFields = new Set<string>();
+  const hasLimit = /\blimit\b/i.test(sql);
+  let hasOffset = /\boffset\b/i.test(sql);
+  for (const step of steps ?? []) {
+    if (step.method === "offset" && Number(step.args[0]) > 0) hasOffset = true;
+    if (step.method === "orderBy" && typeof step.args[0] === "string") {
+      orderFields.add(step.args[0]);
+    }
+    if (
+      step.method === "search" &&
+      typeof step.args[0] === "string" &&
+      step.args[0].trim().length > 0
+    ) {
+      const searchFields = query.__modelClass.searchFields ?? [];
+      for (const field of searchFields) orderFields.add(field);
+    }
+  }
+  const orderClause = sql.match(
+    /\border\s+by\s+(.+?)(?:\s+limit\b|\s+offset\b|$)/i,
+  )?.[1];
+  const parsedOrderFields = new Set<string>();
+  let hasOpaqueOrder = false;
+  if (orderClause) {
+    for (const term of orderClause.split(",")) {
+      const match = term.trim().match(
+        /^(?:(?:"[^"]+"|[a-zA-Z_]\w*)\.)?(?:"([^"]+)"|([a-zA-Z_]\w*))(?:\s+(?:asc|desc))?(?:\s+nulls\s+(?:first|last))?$/i,
+      );
+      const field = match?.[1] ?? match?.[2];
+      if (!field || !orderFields.has(field)) {
+        hasOpaqueOrder = true;
+        break;
+      }
+      parsedOrderFields.add(field);
+    }
+    if (parsedOrderFields.size !== orderFields.size) hasOpaqueOrder = true;
+    if (!parsedOrderFields.has("id")) hasOpaqueOrder = true;
+  }
+  return {
+    hasLimit,
+    hasOffset,
+    hasOpaqueOrder,
+    hasStableOrder:
+      Boolean(orderClause) &&
+      !hasOpaqueOrder &&
+      parsedOrderFields.has("id"),
+    orderFields,
+  };
+}
+
+function mergeChange(previous: Change | undefined, next: Change): Change {
+  if (!previous) return next;
+  const changedFields =
+    previous.changedFields === null || next.changedFields === null
+      ? null
+      : Array.from(
+          new Set([...previous.changedFields, ...next.changedFields]),
+        );
+  return { ...next, changedFields };
+}
+
 export function parsePositiveInteger(
   value: string | number | undefined,
   label: string,
@@ -386,13 +464,13 @@ export class QuerySubscriptionManager {
   private socketGenerations = new Map<string, number>();
   private pendingSockets = new Map<string, number>();
   private typeIndex = new Map<string, Set<string>>();
+  private changeRevisions = new Map<string, number>();
+  private refreshRevision = 0;
   /**
    * Secondary index from expanded-target-type → cached query hashes.
    * When a `File` row changes, every cached query that expanded
-   * `file` (regardless of which parent type) needs a re-eval so the
-   * inlined linked row stays fresh. v1 invalidation is naive: any
-   * change to the target type wakes every subscriber that expanded
-     * it, regardless of projection (field-aware invalidation is a follow-up).
+   * `file` can cheaply identify cached parents that reference that id.
+   * Field-aware projection filtering remains a follow-up.
    */
   private expandTargetIndex = new Map<string, Set<string>>();
 
@@ -458,7 +536,8 @@ export class QuerySubscriptionManager {
     // populated by every chain factory (`Model._query` → `lazyQuery`
     // server-side, the adapter's `query()` factory client-side).
     const modelType = query.__modelType;
-    const hash = hashFrom(query.exec().toSQL(), expand, user);
+    const compiled = query.exec().toSQL();
+    const hash = hashFrom(compiled, expand, user);
     const socketGeneration = this.socketGenerations.get(socketId) ?? 0;
 
     // Per-socket cap enforced BEFORE the cache lookup so a socket
@@ -505,6 +584,7 @@ export class QuerySubscriptionManager {
             user,
             expand,
             emitOrder: !orderOptedOut,
+            dependency: dependencyPlan(query, steps, compiled.sql),
           });
           this.creating.set(hash, creation);
         }
@@ -527,7 +607,16 @@ export class QuerySubscriptionManager {
       // Honour the most-restrictive emitOrder choice across all subscribers
       // sharing this hash.
       if (orderOptedOut) cached.emitOrder = false;
+      await this._reconcileCreation(cached);
       if (extra.force && !created) await this._forceReeval(cached);
+      if (
+        (this.socketGenerations.get(socketId) ?? 0) !== socketGeneration ||
+        !this.socketQueries.get(socketId)?.has(hash)
+      ) {
+        cached.subscribers.delete(socketId);
+        this._deleteCachedIfUnused(cached);
+        return { hash, items: [] };
+      }
 
       // When the IO backend supports rooms, join the socket so the
       // `_reeval` broadcast (`io.to(room).emit`) reaches it. Skipped on
@@ -564,18 +653,21 @@ export class QuerySubscriptionManager {
     user: SanitizerUser;
     expand: readonly ResolvedExpand[];
     emitOrder: boolean;
+    dependency: CachedQuery["dependency"];
   }): Promise<CachedQuery> {
-    const { hash, modelType, query, user, expand, emitOrder } = opts;
-    // The app's query-subscription helper hydrates the returned cached row
-    // objects in place with the request RefLoader. Deferring this initial pass
-    // avoids doing the same expansion twice; background re-evals still hydrate
-    // here because they have no request context.
-    const rows = await this._execQuery(
-      query,
-      expand,
-      user,
-      getRefLoader() === null,
+    const { hash, modelType, query, user, expand, emitOrder, dependency } = opts;
+    const watchedTypes = new Set([
+      modelType,
+      ...expand.map((entry) => entry.targetType),
+    ]);
+    const revisions = new Map(
+      [...watchedTypes].map((type) => [
+        type,
+        this.changeRevisions.get(type) ?? 0,
+      ]),
     );
+    const refreshRevision = this.refreshRevision;
+    const rows = await this._execQuery(query, expand, user);
     const result = new Map<string, Record<string, any>>();
     for (const row of rows) {
       const clean = dateSafeClone(row);
@@ -593,11 +685,17 @@ export class QuerySubscriptionManager {
       result,
       subscribers: new Set(),
       emitOrder,
+      dependency,
+      creationReconcile: null,
+      needsCreationReconcile: false,
       coalesce: {
         debounceTimer: null,
         maxWaitTimer: null,
         inFlight: null,
         needsFollowup: false,
+        full: false,
+        root: new Map(),
+        expand: new Map(),
         debounceMs: overrides.debounceMs ?? this.defaultDebounceMs,
         maxWaitMs: overrides.maxWaitMs ?? this.defaultMaxWaitMs,
       },
@@ -616,7 +714,39 @@ export class QuerySubscriptionManager {
       }
       bucket.add(hash);
     }
+    cached.needsCreationReconcile =
+      refreshRevision !== this.refreshRevision ||
+      [...revisions].some(
+        ([type, revision]) =>
+          (this.changeRevisions.get(type) ?? 0) !== revision,
+      );
     return cached;
+  }
+
+  private async _reconcileCreation(cached: CachedQuery): Promise<void> {
+    if (this._hasPendingRefresh(cached)) {
+      cached.needsCreationReconcile = true;
+    }
+    if (cached.creationReconcile) {
+      await cached.creationReconcile;
+      return;
+    }
+    if (!cached.needsCreationReconcile) return;
+    cached.needsCreationReconcile = false;
+    const reconciliation = this._forceReeval(cached);
+    cached.creationReconcile = reconciliation;
+    try {
+      await reconciliation;
+    } finally {
+      if (cached.creationReconcile === reconciliation) {
+        cached.creationReconcile = null;
+      }
+    }
+  }
+
+  private _hasPendingRefresh(cached: CachedQuery): boolean {
+    const c = cached.coalesce;
+    return c.full || c.root.size > 0 || c.expand.size > 0;
   }
 
   // ── Unsubscribe ────────────────────────────────────────────────────
@@ -684,51 +814,108 @@ export class QuerySubscriptionManager {
 
   // ── On Model Change ────────────────────────────────────────────────
 
-  /**
-   * A model of `modelType` was written somewhere. Schedule a debounced
-   * re-eval for every cached query watching this type.
-   *
-   * Same-tick bursts collapse into one re-eval (debounce reset). A
-   * sustained stream of changes still produces re-eval cycles at
-   * `maxWaitMs` intervals — clients never stall behind a write loop.
-   */
-  onModelChange(modelType: string): void {
-    // Primary path: direct subscribers to this model type.
+  /** Route one committed Postgres row change to affected local caches. */
+  onModelChange(modelType: string, change?: Change): void {
+    this.changeRevisions.set(
+      modelType,
+      (this.changeRevisions.get(modelType) ?? 0) + 1,
+    );
     const direct = this.typeIndex.get(modelType);
     if (direct) {
       for (const hash of direct) {
         const cached = this.queries.get(hash);
         if (!cached) continue;
-        this._scheduleReeval(cached);
+        if (!change || this._requiresFullReeval(cached, change)) {
+          this._scheduleFullReeval(cached);
+        } else {
+          this._scheduleRootRefresh(cached, change);
+        }
       }
     }
 
-    // Expand-aware cross-type invalidation: a `File` write wakes
-    // every cached query that expanded `file`, regardless of the
-    // parent model type. v1 is naive — no field-aware filtering —
-    // so a `File.blurhash` change re-emits even to subscribers that
-     // only projected `file.url`. This over-notifies but stays correct.
     const viaExpand = this.expandTargetIndex.get(modelType);
     if (!viaExpand || viaExpand.size === 0) return;
     for (const hash of viaExpand) {
-      // Skip queries we already woke through the direct index (a
-      // query whose parent type IS the changed type AND that expands
-      // the same type back into itself — pathological but possible).
-      if (direct?.has(hash)) continue;
       const cached = this.queries.get(hash);
       if (!cached) continue;
-      this._scheduleReeval(cached);
+      if (!change) {
+        this._scheduleFullReeval(cached);
+        continue;
+      }
+      const referencesRow = cached.expand.some(
+        (exp) =>
+          exp.targetType === modelType &&
+          [...cached.result.values()].some(
+            (row) => getWireRefId(row, exp.refField) === change.id,
+          ),
+      );
+      if (referencesRow) this._scheduleExpandRefresh(cached, modelType, change);
+    }
+  }
+
+  /** Reconcile every local cache after a non-durable LISTEN connection gap. */
+  refreshAll(): void {
+    this.refreshRevision++;
+    for (const cached of this.queries.values()) {
+      this._scheduleFullReeval(cached);
     }
   }
 
   // ── Re-evaluation ──────────────────────────────────────────────────
 
-  private _scheduleReeval(cached: CachedQuery): void {
+  private _requiresFullReeval(cached: CachedQuery, change: Change): boolean {
+    if (change.op !== "update") return true;
+    if (cached.dependency.hasOffset || cached.dependency.hasOpaqueOrder) {
+      return true;
+    }
+    if (
+      cached.dependency.hasLimit &&
+      !cached.dependency.hasStableOrder
+    ) {
+      return true;
+    }
+    if (change.changedFields === null) return true;
+    return change.changedFields.some(
+      (field) =>
+        field === "id" || cached.dependency.orderFields.has(field),
+    );
+  }
+
+  private _scheduleFullReeval(cached: CachedQuery): void {
+    cached.coalesce.full = true;
+    cached.coalesce.root.clear();
+    cached.coalesce.expand.clear();
+    this._schedule(cached);
+  }
+
+  private _scheduleRootRefresh(cached: CachedQuery, change: Change): void {
+    const c = cached.coalesce;
+    if (!c.full) c.root.set(change.id, mergeChange(c.root.get(change.id), change));
+    this._schedule(cached);
+  }
+
+  private _scheduleExpandRefresh(
+    cached: CachedQuery,
+    modelType: string,
+    change: Change,
+  ): void {
+    const c = cached.coalesce;
+    if (!c.full) {
+      const key = `${modelType}\0${change.id}`;
+      const previous = c.expand.get(key);
+      c.expand.set(key, {
+        modelType,
+        change: mergeChange(previous?.change, change),
+      });
+    }
+    this._schedule(cached);
+  }
+
+  private _schedule(cached: CachedQuery): void {
     if (this.queries.get(cached.hash) !== cached) return;
     const c = cached.coalesce;
+    if (cached.subscribers.size === 0) return;
 
-    // While a re-eval is in flight, just mark a follow-up so we run
-    // again on the next tick once it lands. Don't queue parallel runs.
     if (c.inFlight) {
       c.needsFollowup = true;
       return;
@@ -738,7 +925,7 @@ export class QuerySubscriptionManager {
     // tests that want predictable behaviour, and by call sites that
     // turn coalescing off via `Model.realtime`.
     if (c.debounceMs <= 0 && c.maxWaitMs <= 0) {
-      void this._runReeval(cached);
+      void this._runRefresh(cached);
       return;
     }
 
@@ -746,7 +933,7 @@ export class QuerySubscriptionManager {
     // fires first wins; both get cleared at that point.
     if (c.debounceTimer) clearTimeout(c.debounceTimer);
     c.debounceTimer = setTimeout(() => {
-      void this._runReeval(cached);
+      void this._runRefresh(cached);
     }, c.debounceMs);
 
     // Max-wait fires regardless. Only armed on the first signal of
@@ -754,12 +941,12 @@ export class QuerySubscriptionManager {
     // back indefinitely.
     if (!c.maxWaitTimer) {
       c.maxWaitTimer = setTimeout(() => {
-        void this._runReeval(cached);
+        void this._runRefresh(cached);
       }, c.maxWaitMs);
     }
   }
 
-  private _runReeval(cached: CachedQuery): Promise<void> {
+  private _runRefresh(cached: CachedQuery): Promise<void> {
     const c = cached.coalesce;
     if (c.debounceTimer) {
       clearTimeout(c.debounceTimer);
@@ -770,6 +957,12 @@ export class QuerySubscriptionManager {
       c.maxWaitTimer = null;
     }
 
+    const full = c.full;
+    const root = [...c.root.values()];
+    const expand = [...c.expand.values()];
+    c.full = false;
+    c.root.clear();
+    c.expand.clear();
     c.needsFollowup = false;
     const run = (async () => {
       // Bound the parallel DB hits across the whole manager. Without
@@ -778,17 +971,55 @@ export class QuerySubscriptionManager {
       // on the pool or starve unrelated handlers.
       await this.reevalSemaphore.acquire();
       try {
-        await this._reeval(cached);
+        let didFullReeval = full;
+        if (full) {
+          await this._reeval(cached);
+        } else {
+          for (const change of root) {
+            if (await this._refreshRoot(cached, change.id)) {
+              didFullReeval = true;
+              break;
+            }
+          }
+          if (!didFullReeval) {
+            for (const pending of expand) {
+              await this._refreshExpand(
+                cached,
+                pending.modelType,
+                pending.change,
+              );
+            }
+          }
+        }
       } catch (err) {
-        log.error(`subscriptions: re-eval failed for ${cached.hash}:`, err);
+        if (!full) {
+          log.warn(
+            `subscriptions: targeted refresh failed for ${cached.hash}; falling back to full re-eval`,
+            err,
+          );
+          try {
+            await this._reeval(cached);
+          } catch (fallbackError) {
+            log.error(
+              `subscriptions: fallback re-eval failed for ${cached.hash}:`,
+              fallbackError,
+            );
+          }
+        } else {
+          log.error(`subscriptions: re-eval failed for ${cached.hash}:`, err);
+        }
       } finally {
         this.reevalSemaphore.release();
         c.inFlight = null;
       }
-      if (c.needsFollowup) {
-        // A change arrived mid-re-eval. Schedule a follow-up so we
-        // converge against the latest world state.
-        this._scheduleReeval(cached);
+      if (
+        c.needsFollowup ||
+        c.full ||
+        c.root.size > 0 ||
+        c.expand.size > 0
+      ) {
+        c.needsFollowup = false;
+        this._schedule(cached);
       }
     })();
     c.inFlight = run;
@@ -809,12 +1040,15 @@ export class QuerySubscriptionManager {
    * If a re-eval is already in flight, wait for it to land and run a
    * fresh one: the in-flight run's DB read may predate the drift this
    * poll is asking about. Any timers armed by a follow-up are
-   * absorbed — `_runReeval` clears them on entry.
+   * absorbed — `_runRefresh` clears them on entry.
    */
   private async _forceReeval(cached: CachedQuery): Promise<void> {
     const c = cached.coalesce;
     while (c.inFlight) await c.inFlight;
-    await this._runReeval(cached);
+    c.full = true;
+    c.root.clear();
+    c.expand.clear();
+    await this._runRefresh(cached);
   }
 
   private _teardownCoalesce(cached: CachedQuery): void {
@@ -828,6 +1062,84 @@ export class QuerySubscriptionManager {
       c.maxWaitTimer = null;
     }
     c.needsFollowup = false;
+    c.full = false;
+    c.root.clear();
+    c.expand.clear();
+  }
+
+  /** Refresh one row through the original scoped query. Returns true on fallback. */
+  private async _refreshRoot(cached: CachedQuery, id: string): Promise<boolean> {
+    if (cached.subscribers.size === 0) return false;
+    const generation = cached.generation;
+    const query = cached.query
+      .clone()
+      .where("id", id)
+      .clearLimit();
+    const adapter = this._queryAdapter(cached.query);
+    const model = adapter?.executeSubscriptionQuery
+      ? (await adapter.executeSubscriptionQuery(query.limit(1)))[0] ?? null
+      : await query.first();
+    if (!this._isCurrent(cached, generation)) return false;
+
+    const previous = cached.result.get(id);
+    if (!model || !previous) {
+      if (model || previous) await this._reeval(cached);
+      return Boolean(model || previous);
+    }
+
+    const rows = [await projectForWire(model, cached.user)];
+    await this._hydrateRows(cached.query, rows, cached.expand, cached.user);
+    if (!this._isCurrent(cached, generation)) return false;
+    const data = dateSafeClone(rows[0]!);
+    const patch = stripVolatilePatchOps(fastJsonPatch.compare(previous, data));
+    cached.result.set(id, data);
+    if (patch.length > 0) {
+      this._emit(cached, { ops: [{ op: "update", id, patch }] });
+    }
+    return false;
+  }
+
+  /** Rehydrate only cached parents that point at the changed target row. */
+  private async _refreshExpand(
+    cached: CachedQuery,
+    modelType: string,
+    change: Change,
+  ): Promise<void> {
+    if (cached.subscribers.size === 0) return;
+    const generation = cached.generation;
+    const expand = cached.expand.filter(
+      (entry) => entry.targetType === modelType,
+    );
+    const rows = [...cached.result.values()]
+      .filter((row) =>
+        expand.some(
+          (entry) => getWireRefId(row, entry.refField) === change.id,
+        ),
+      )
+      .map((row) => dateSafeClone(row));
+    if (rows.length === 0) return;
+
+    await this._hydrateRows(cached.query, rows, expand, cached.user);
+    if (!this._isCurrent(cached, generation)) return;
+    const ops: DiffOp[] = [];
+    for (const data of rows) {
+      const previous = cached.result.get(data.id);
+      if (!previous) continue;
+      const patch = stripVolatilePatchOps(fastJsonPatch.compare(previous, data));
+      cached.result.set(data.id, data);
+      if (patch.length > 0) {
+        ops.push({ op: "update", id: data.id, patch });
+      }
+    }
+    if (ops.length > 0) this._emit(cached, { ops });
+  }
+
+  private _isCurrent(cached: CachedQuery, generation: number): boolean {
+    return (
+      cached.generation === generation &&
+      this.queries.get(cached.hash) === cached &&
+      cached.subscribers.size > 0
+    );
   }
 
   private async _reeval(cached: CachedQuery): Promise<void> {
@@ -839,13 +1151,7 @@ export class QuerySubscriptionManager {
       cached.expand,
       cached.user,
     );
-    if (
-      cached.generation !== generation ||
-      this.queries.get(cached.hash) !== cached ||
-      cached.subscribers.size === 0
-    ) {
-      return;
-    }
+    if (!this._isCurrent(cached, generation)) return;
     const newResult = new Map<string, Record<string, any>>();
     for (const row of rows) {
       const clean = dateSafeClone(row);
@@ -899,6 +1205,10 @@ export class QuerySubscriptionManager {
       ? { ops, order: newOrder }
       : { ops };
 
+    this._emit(cached, envelope);
+  }
+
+  private _emit(cached: CachedQuery, envelope: QueryEmitEnvelope): void {
     const event = `query:${cached.hash}`;
     if (this.emitToRoom) {
       // Single broadcast — Socket.IO walks the room's socket set and
@@ -918,9 +1228,12 @@ export class QuerySubscriptionManager {
     query: QueryChain<any>,
     expand: readonly ResolvedExpand[],
     user: SanitizerUser,
-    hydrateExpand = true,
   ): Promise<Record<string, any>[]> {
-    const models = await query.clone().find();
+    const cloned = query.clone();
+    const adapter = this._queryAdapter(query);
+    const models = adapter?.executeSubscriptionQuery
+      ? await adapter.executeSubscriptionQuery(cloned)
+      : await cloned.find();
     // `query.find()` returns `Promise<any[]>` (the chain's generic is
     // `any`); the projection runs `sanitize()` for every Model row
     // and falls back to `__data` for any non-Model row that snuck
@@ -931,7 +1244,17 @@ export class QuerySubscriptionManager {
       models.map((model) => projectForWire(model, user)),
     );
 
-    if (expand.length === 0 || !hydrateExpand) return wireRows;
+    await this._hydrateRows(query, wireRows, expand, user);
+    return wireRows;
+  }
+
+  private async _hydrateRows(
+    query: QueryChain<any>,
+    wireRows: Record<string, any>[],
+    expand: readonly ResolvedExpand[],
+    user: SanitizerUser,
+  ): Promise<void> {
+    if (expand.length === 0 || wireRows.length === 0) return;
 
     // Build an ephemeral RefLoader pointed at the adapter's batch
     // entrypoint. This runs OUTSIDE a request scope (re-eval fires
@@ -939,17 +1262,26 @@ export class QuerySubscriptionManager {
     // we can't reuse `getRefLoader()`. The per-reeval loader still
     // collapses every ref-id-per-row into one query per target
     // type via the same microtask batching.
-    const adapter = (query as any).__adapter as
-      | {
-          batchFindByType?: (type: string, ids: string[]) => Promise<Map<string, any>>;
-        }
-      | null;
-    if (!adapter?.batchFindByType) return wireRows;
-    const loader = new RefLoader((type, ids) =>
-      adapter.batchFindByType!(type, ids),
-    );
+    const adapter = this._queryAdapter(query);
+    const batch =
+      adapter?.batchFindByTypeOnWrite ?? adapter?.batchFindByType;
+    if (!batch) return;
+    const loader = new RefLoader((type, ids) => batch.call(adapter, type, ids));
     await hydrateExpansions(wireRows, expand, loader, user ?? undefined);
-    return wireRows;
+  }
+
+  private _queryAdapter(query: QueryChain<any>): {
+    batchFindByType?: (
+      type: string,
+      ids: string[],
+    ) => Promise<Map<string, any>>;
+    batchFindByTypeOnWrite?: (
+      type: string,
+      ids: string[],
+    ) => Promise<Map<string, any>>;
+    executeSubscriptionQuery?: (query: QueryChain<any>) => Promise<any[]>;
+  } | null {
+    return (query as any).__adapter ?? null;
   }
 
   // ── Stats ──────────────────────────────────────────────────────────

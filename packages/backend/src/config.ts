@@ -86,14 +86,23 @@ export const configSchema = z.object({
    * Database connection URL (required).
    *
    * Postgres: postgresql://localhost:5432/mydb
-   * SQLite:   sqlite:./data.db  or  sqlite::memory:
    */
-  DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
+  DATABASE_URL: z
+    .string()
+    .min(1, "DATABASE_URL is required")
+    .refine((url) => /^postgres(?:ql)?:\/\//.test(url), {
+      message: "DATABASE_URL must be a Postgres URL",
+    }),
 
-  /** Optional read-replica URL. Falls back to DATABASE_URL. Ignored for SQLite. */
-  DATABASE_READ_URL: z.string().optional(),
+  /** Optional Postgres read-replica URL. Falls back to DATABASE_URL. */
+  DATABASE_READ_URL: z
+    .string()
+    .refine((url) => /^postgres(?:ql)?:\/\//.test(url), {
+      message: "DATABASE_READ_URL must be a Postgres URL",
+    })
+    .optional(),
 
-  /** Redis URL. Optional — PubSub + Queue fall back to in-process if absent. */
+  /** Redis URL. Optional — queues and distributed locks degrade locally. */
   REDIS_URL: z.string().optional(),
 
   /** HTTP port. Default: 3000 */
@@ -252,29 +261,4 @@ export function parseConfig(
   }
 
   return result.data;
-}
-
-/**
- * Detect whether a DATABASE_URL points to SQLite.
- * Matches: sqlite:./path, sqlite::memory:, or bare .db/.sqlite file paths.
- */
-export function isSqliteUrl(url: string): boolean {
-  return (
-    url.startsWith("sqlite:") ||
-    url.endsWith(".db") ||
-    url.endsWith(".sqlite") ||
-    url.endsWith(".sqlite3") ||
-    url === ":memory:"
-  );
-}
-
-/**
- * Extract the SQLite filename from a DATABASE_URL.
- * sqlite:./data.db -> ./data.db
- * sqlite::memory:  -> :memory:
- * ./data.db        -> ./data.db
- */
-export function sqliteFilename(url: string): string {
-  if (url.startsWith("sqlite:")) return url.slice("sqlite:".length);
-  return url;
 }

@@ -3,9 +3,6 @@ import {
   QuerySubscriptionManager,
   parsePositiveInteger,
 } from "../services/subscriptions";
-import { runWithRequestContext } from "../services/context";
-import { RefLoader } from "../services/ref-loader";
-import { hydrateExpansions } from "../services/hydrate-expansions";
 
 // ─── Mock Data ───────────────────────────────────────────────────────────────
 
@@ -113,6 +110,62 @@ function createQuerySource(initialResults: Record<string, any>[] = []) {
   };
 }
 
+function createTrackedQuerySource(
+  modelType: string,
+  initialResults: Record<string, any>[],
+  options: { adapter?: any; sql?: string } = {},
+) {
+  let currentResults = initialResults;
+  let nextFirstError: Error | null = null;
+  const calls = { find: 0, first: [] as Array<string | null> };
+  const wrap = (item: Record<string, any>) => ({
+    __data: item,
+    sanitize: () => item,
+  });
+  const makeChain = (id: string | null = null): any => {
+    const chain: any = {
+      __adapter: options.adapter,
+      __modelClass: { type: modelType },
+      __modelType: modelType,
+      clearLimit: () => chain,
+      clone: () => makeChain(id),
+      exec: () => ({
+        toSQL: () => ({
+          sql: options.sql ?? `SELECT * FROM ${modelType}s`,
+          bindings: [],
+        }),
+      }),
+      find: async () => {
+        calls.find++;
+        return currentResults.map(wrap);
+      },
+      first: async () => {
+        calls.first.push(id);
+        if (nextFirstError) {
+          const error = nextFirstError;
+          nextFirstError = null;
+          throw error;
+        }
+        const item = currentResults.find((row) => row.id === id);
+        return item ? wrap(item) : null;
+      },
+      where: (field: string, value: unknown) =>
+        field === "id" ? makeChain(String(value)) : chain,
+    };
+    return chain;
+  };
+  return {
+    calls,
+    failNextFirst(error: Error) {
+      nextFirstError = error;
+    },
+    query: makeChain(),
+    setResults(results: Record<string, any>[]) {
+      currentResults = results;
+    },
+  };
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 describe("QuerySubscriptionManager", () => {
@@ -157,6 +210,30 @@ describe("QuerySubscriptionManager", () => {
       expect(sub.items).toHaveLength(2);
       expect(sub.items[0]).toEqual({ id: "p1", name: "Project 1" });
       expect(sub.items[1]).toEqual({ id: "p2", name: "Project 2" });
+    });
+
+    it("executes subscription cache reads through the primary adapter", async () => {
+      const find = vi.fn(async () => {
+        throw new Error("read replica should not be used");
+      });
+      const executeSubscriptionQuery = vi.fn(async () => [
+        { sanitize: () => row("p1", { name: "Primary" }) },
+      ]);
+      const query: any = {
+        __adapter: { executeSubscriptionQuery },
+        __modelType: "project",
+        clone: () => query,
+        exec: () => ({
+          toSQL: () => ({ sql: "SELECT primary", bindings: [] }),
+        }),
+        find,
+      };
+
+      const sub = await manager.subscribe({ socketId: "s1", query });
+
+      expect(sub.items).toEqual([row("p1", { name: "Primary" })]);
+      expect(executeSubscriptionQuery).toHaveBeenCalledWith(query);
+      expect(find).not.toHaveBeenCalled();
     });
 
     it("should deduplicate subscriptions with same query", async () => {
@@ -205,6 +282,44 @@ describe("QuerySubscriptionManager", () => {
       expect(a.hash).toBe(b.hash);
       expect(a.items).toEqual([row("p1")]);
       expect(manager.stats).toEqual({ queries: 1, subscribers: 2, sockets: 2 });
+    });
+
+    it("reconciles a change received while the initial cache is loading", async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let findCalls = 0;
+      const query: any = {
+        __modelType: "project",
+        exec: () => ({
+          toSQL: () => ({ sql: "SELECT creation-race", bindings: [] }),
+        }),
+        clone: () => query,
+        find: async () => {
+          findCalls++;
+          const result = row("p1", {
+            name: findCalls === 1 ? "before" : "after",
+          });
+          if (findCalls === 1) await gate;
+          return [{ sanitize: () => result }];
+        },
+      };
+
+      const subscribing = manager.subscribe({ socketId: "s1", query });
+      await Promise.resolve();
+      manager.onModelChange("project", {
+        table: "projects",
+        op: "update",
+        id: "p1",
+        changedFields: ["name"],
+      });
+      release();
+
+      await expect(subscribing).resolves.toMatchObject({
+        items: [row("p1", { name: "after" })],
+      });
+      expect(findCalls).toBe(2);
     });
 
     it("should sanitize cached subscriptions and re-evals with the request user", async () => {
@@ -275,9 +390,9 @@ describe("QuerySubscriptionManager", () => {
       expect(member.items).toEqual([{ id: "d1" }]);
     });
 
-    it("defers initial expansion to the request path instead of hydrating twice", async () => {
-      const backgroundBatch = vi.fn(async () => new Map());
-      const requestBatch = vi.fn(async () =>
+    it("hydrates initial expansions once through the primary adapter", async () => {
+      const readBatch = vi.fn(async () => new Map());
+      const writeBatch = vi.fn(async () =>
         new Map([
           [
             "f1",
@@ -289,7 +404,10 @@ describe("QuerySubscriptionManager", () => {
       );
       const query: any = {
         __modelType: "asset",
-        __adapter: { batchFindByType: backgroundBatch },
+        __adapter: {
+          batchFindByType: readBatch,
+          batchFindByTypeOnWrite: writeBatch,
+        },
         exec: () => ({
           toSQL: () => ({ sql: "SELECT expanded", bindings: [] }),
         }),
@@ -306,26 +424,20 @@ describe("QuerySubscriptionManager", () => {
           projection: null,
         },
       ];
-      const loader = new RefLoader(requestBatch);
-
-      await runWithRequestContext({ user: null, refLoader: loader }, async () => {
-        const sub = await manager.subscribe({
-          socketId: "s1",
-          query,
-          expand,
-        });
-        await hydrateExpansions(sub.items, expand, loader, null);
-        expect(sub.items).toEqual([
-          {
-            id: "a1",
-            file: { id: "f1", type: "file", url: "/one" },
-            $file: "f1",
-          },
-        ]);
+      const sub = await manager.subscribe({
+        socketId: "s1",
+        query,
+        expand,
       });
-
-      expect(backgroundBatch).not.toHaveBeenCalled();
-      expect(requestBatch).toHaveBeenCalledTimes(1);
+      expect(sub.items).toEqual([
+        {
+          id: "a1",
+          file: { id: "f1", type: "file", url: "/one" },
+          $file: "f1",
+        },
+      ]);
+      expect(readBatch).not.toHaveBeenCalled();
+      expect(writeBatch).toHaveBeenCalledTimes(1);
     });
 
     it("should create separate subscriptions for different queries", async () => {
@@ -918,6 +1030,258 @@ describe("QuerySubscriptionManager", () => {
 
       expect(emitted).toHaveLength(0);
     });
+
+    it("refreshes one updated root row without re-running the list query", async () => {
+      const tracked = createTrackedQuerySource("project", [
+        row("p1", { name: "A" }),
+        row("p2", { name: "B" }),
+      ]);
+      await manager.subscribe({ socketId: "s1", query: tracked.query });
+      tracked.setResults([
+        row("p1", { name: "A2" }),
+        row("p2", { name: "B" }),
+      ]);
+
+      manager.onModelChange("project", {
+        table: "projects",
+        op: "update",
+        id: "p1",
+        changedFields: ["name"],
+      });
+      await tick();
+
+      expect(tracked.calls).toEqual({ find: 1, first: ["p1"] });
+      expect(emitted[0]!.data).toEqual({
+        ops: [
+          {
+            op: "update",
+            id: "p1",
+            patch: [{ op: "replace", path: "/name", value: "A2" }],
+          },
+        ],
+      });
+    });
+
+    it("falls back to a full query when the changed row leaves membership", async () => {
+      const tracked = createTrackedQuerySource("project", [
+        row("p1", { name: "A" }),
+        row("p2", { name: "B" }),
+      ]);
+      await manager.subscribe({ socketId: "s1", query: tracked.query });
+      tracked.setResults([row("p2", { name: "B" })]);
+
+      manager.onModelChange("project", {
+        table: "projects",
+        op: "update",
+        id: "p1",
+        changedFields: ["status"],
+      });
+      await tick();
+
+      expect(tracked.calls).toEqual({ find: 2, first: ["p1"] });
+      expect(emitted[0]!.data.ops).toEqual([{ op: "remove", id: "p1" }]);
+    });
+
+    it("fully re-evaluates updates that can change explicit ordering", async () => {
+      const tracked = createTrackedQuerySource("project", [
+        row("p1", { rank: 1 }),
+        row("p2", { rank: 2 }),
+      ]);
+      await manager.subscribe({
+        socketId: "s1",
+        query: tracked.query,
+        steps: [{ method: "orderBy", args: ["rank", "asc"] }],
+      });
+      tracked.setResults([
+        row("p2", { rank: 2 }),
+        row("p1", { rank: 3 }),
+      ]);
+
+      manager.onModelChange("project", {
+        table: "projects",
+        op: "update",
+        id: "p1",
+        changedFields: ["rank"],
+      });
+      await tick();
+
+      expect(tracked.calls).toEqual({ find: 2, first: [] });
+      expect(emitted[0]!.data.order).toEqual(["p2", "p1"]);
+    });
+
+    it("fully re-evaluates limited queries without stable ordering", async () => {
+      const tracked = createTrackedQuerySource(
+        "project",
+        [row("p1", { name: "A" })],
+        { sql: "SELECT * FROM projects LIMIT 25" },
+      );
+      await manager.subscribe({ socketId: "s1", query: tracked.query });
+      tracked.setResults([row("p1", { name: "A2" })]);
+
+      manager.onModelChange("project", {
+        table: "projects",
+        op: "update",
+        id: "p1",
+        changedFields: ["name"],
+      });
+      await tick();
+
+      expect(tracked.calls).toEqual({ find: 2, first: [] });
+    });
+
+    it("fully re-evaluates a limited non-unique order", async () => {
+      const tracked = createTrackedQuerySource(
+        "project",
+        [row("p1", { name: "A", rank: 1 })],
+        {
+          sql: 'SELECT * FROM projects ORDER BY "rank" ASC LIMIT 25',
+        },
+      );
+      await manager.subscribe({
+        socketId: "s1",
+        query: tracked.query,
+        steps: [{ method: "orderBy", args: ["rank", "asc"] }],
+      });
+      tracked.setResults([row("p1", { name: "A2", rank: 1 })]);
+
+      manager.onModelChange("project", {
+        table: "projects",
+        op: "update",
+        id: "p1",
+        changedFields: ["name"],
+      });
+      await tick();
+
+      expect(tracked.calls).toEqual({ find: 2, first: [] });
+    });
+
+    it("targets a limited query with an id order tie-breaker", async () => {
+      const tracked = createTrackedQuerySource(
+        "project",
+        [row("p1", { name: "A", rank: 1 })],
+        {
+          sql: 'SELECT * FROM projects ORDER BY "rank" ASC, "id" ASC LIMIT 25',
+        },
+      );
+      await manager.subscribe({
+        socketId: "s1",
+        query: tracked.query,
+        steps: [
+          { method: "orderBy", args: ["rank", "asc"] },
+          { method: "orderBy", args: ["id", "asc"] },
+        ],
+      });
+      tracked.setResults([row("p1", { name: "A2", rank: 1 })]);
+
+      manager.onModelChange("project", {
+        table: "projects",
+        op: "update",
+        id: "p1",
+        changedFields: ["name"],
+      });
+      await tick();
+
+      expect(tracked.calls).toEqual({ find: 1, first: ["p1"] });
+    });
+
+    it("falls back to a full query when a targeted row read fails", async () => {
+      const tracked = createTrackedQuerySource("project", [
+        row("p1", { name: "A" }),
+      ]);
+      await manager.subscribe({ socketId: "s1", query: tracked.query });
+      tracked.setResults([row("p1", { name: "A2" })]);
+      tracked.failNextFirst(new Error("targeted read failed"));
+
+      manager.onModelChange("project", {
+        table: "projects",
+        op: "update",
+        id: "p1",
+        changedFields: ["name"],
+      });
+      await tick();
+
+      expect(tracked.calls).toEqual({ find: 2, first: ["p1"] });
+      expect(emitted[0]!.data.ops[0].patch).toEqual([
+        { op: "replace", path: "/name", value: "A2" },
+      ]);
+    });
+
+    it("rebuilds every cache after a LISTEN reconnect", async () => {
+      const tracked = createTrackedQuerySource("project", [
+        row("p1", { name: "A" }),
+      ]);
+      await manager.subscribe({ socketId: "s1", query: tracked.query });
+      tracked.setResults([row("p1", { name: "reconciled" })]);
+
+      manager.refreshAll();
+      await tick();
+
+      expect(tracked.calls).toEqual({ find: 2, first: [] });
+      expect(emitted[0]!.data.ops[0].patch).toEqual([
+        { op: "replace", path: "/name", value: "reconciled" },
+      ]);
+    });
+
+    it("rehydrates only cached parents referencing an updated expansion", async () => {
+      const files = new Map([
+        ["f1", { id: "f1", url: "before" }],
+        ["f2", { id: "f2", url: "other" }],
+      ]);
+      const loadFiles = async (_type: string, ids: string[]) =>
+        new Map(
+          ids.flatMap((id) => {
+            const file = files.get(id);
+            return file
+              ? [[id, { __data: file, sanitize: () => file }] as const]
+              : [];
+          }),
+        );
+      const adapter = {
+        batchFindByType: vi.fn(async () => new Map()),
+        batchFindByTypeOnWrite: vi.fn(loadFiles),
+      };
+      const tracked = createTrackedQuerySource(
+        "asset",
+        [row("a1", { file: "f1" }), row("a2", { file: "f2" })],
+        { adapter },
+      );
+      const expand: any = [
+        {
+          refField: "file",
+          targetType: "file",
+          targetClass: { type: "file" },
+          projection: null,
+        },
+      ];
+      await manager.subscribe({
+        socketId: "s1",
+        query: tracked.query,
+        expand,
+      });
+      adapter.batchFindByTypeOnWrite.mockClear();
+      files.set("f1", { id: "f1", url: "after" });
+
+      manager.onModelChange("file", {
+        table: "files",
+        op: "update",
+        id: "f1",
+        changedFields: ["url"],
+      });
+      await tick();
+
+      expect(tracked.calls).toEqual({ find: 1, first: [] });
+      expect(adapter.batchFindByType).not.toHaveBeenCalled();
+      expect(adapter.batchFindByTypeOnWrite).toHaveBeenCalledWith("file", [
+        "f1",
+      ]);
+      expect(emitted[0]!.data.ops).toEqual([
+        {
+          op: "update",
+          id: "a1",
+          patch: [{ op: "replace", path: "/file/url", value: "after" }],
+        },
+      ]);
+    });
   });
 
   // ── Minimal data transfer ──────────────────────────────────────────
@@ -1236,9 +1600,8 @@ describe("QuerySubscriptionManager", () => {
       // Both sockets share one cache entry.
       expect(manager.stats.queries).toBe(1);
 
-      // Simulate drift: an external write changes the row but the
-      // hook-path notification never arrived (e.g. cross-process
-      // event lost). The cache still thinks p1 is "A".
+      // Simulate drift: an external write changes the row while the
+      // LISTEN connection is unavailable. The cache still thinks p1 is "A".
       source.setResults([row("p1", { name: "A-drifted" })]);
 
       // s1 polls with force: true. The drift is detected, every
@@ -1474,7 +1837,7 @@ describe("parsePositiveInteger", () => {
 //
 // Three new contracts pinned here:
 //
-//   1. Re-eval semaphore — a burst of `_scheduleReeval` calls across N
+//   1. Re-eval semaphore — a burst of scheduled refreshes across N
 //      distinct cached queries does NOT launch N simultaneous DB
 //      round-trips. The manager caps in-flight re-evals at
 //      `reevalConcurrency` (default 8), so the worst-case pool load

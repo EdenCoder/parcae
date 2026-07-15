@@ -46,7 +46,7 @@ export interface MigrationMetaRow {
 
 /**
  * Create the meta table if it doesn't exist. Idempotent and race-safe —
- * `CREATE TABLE IF NOT EXISTS` is atomic in both Postgres and SQLite, so two
+ * `CREATE TABLE IF NOT EXISTS` is atomic in Postgres, so two
  * replicas booting simultaneously won't collide. Same treatment for the
  * additive column upgrades: the `hasColumn` → `alterTable` sequence is
  * wrapped in try/catch so the second caller's "duplicate column" is tolerated.
@@ -56,11 +56,7 @@ export interface MigrationMetaRow {
  * get `0` defaults for both — correct for "applied, effect unknown".
  */
 export async function ensureMetaTable(db: Knex): Promise<void> {
-  const dialect = (db.client?.config?.client as string | undefined) ?? "";
-  const isPg = dialect === "pg" || dialect === "pg-native";
-
-  if (isPg) {
-    await db.raw(`
+  await db.raw(`
       CREATE TABLE IF NOT EXISTS "${META_TABLE}" (
         "name"         VARCHAR(512) PRIMARY KEY,
         "checksum"     VARCHAR(64)  NOT NULL,
@@ -72,22 +68,6 @@ export async function ensureMetaTable(db: Knex): Promise<void> {
         "appliedAt"    VARCHAR(32)  NOT NULL
       )
     `);
-  } else {
-    // SQLite + better-sqlite3. Text columns suffice; SQLite doesn't enforce
-    // the length anyway.
-    await db.raw(`
-      CREATE TABLE IF NOT EXISTS "${META_TABLE}" (
-        "name"         TEXT    PRIMARY KEY,
-        "checksum"     TEXT    NOT NULL,
-        "description"  TEXT,
-        "ticket"       TEXT,
-        "durationMs"   INTEGER NOT NULL,
-        "writes"       INTEGER NOT NULL DEFAULT 0,
-        "rowsAffected" INTEGER NOT NULL DEFAULT 0,
-        "appliedAt"    TEXT    NOT NULL
-      )
-    `);
-  }
 
   // Additive upgrade — add newer columns to an existing meta table. The
   // try/catch tolerates the "duplicate column" a racing second caller hits
@@ -328,7 +308,7 @@ export function effectFromMeta(
 const WRITE_PREFIX =
   /^\s*(INSERT|UPDATE|DELETE|MERGE|ALTER|CREATE|DROP|TRUNCATE|VACUUM|REINDEX|COMMENT|GRANT|REVOKE|ANALYZE|REFRESH|CLUSTER|LOCK)\b/i;
 
-const READ_PREFIX = /^\s*(SELECT|WITH|VALUES|SHOW|EXPLAIN|PRAGMA|DESC|DESCRIBE)\b/i;
+const READ_PREFIX = /^\s*(SELECT|WITH|VALUES|SHOW|EXPLAIN)\b/i;
 
 const NOISE_PREFIX =
   /^\s*(BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE|SET|RESET|DEALLOCATE|DISCARD|LISTEN|UNLISTEN|NOTIFY|START TRANSACTION)\b/i;
@@ -340,9 +320,7 @@ export function classifyStatement(sql: string): StatementKind {
   if (NOISE_PREFIX.test(sql)) return "noise";
   if (WRITE_PREFIX.test(sql)) return "write";
   if (READ_PREFIX.test(sql)) return "read";
-  // Unknown statement — default to "write" so we don't hide effects in
-  // edge cases (e.g. dialect-specific statements we haven't listed above).
-  // Emit a debug line so dialect-specific additions are discoverable.
+  // Unknown statement — default to "write" so we don't hide effects.
   log.debug(
     `[parcae] unknown statement kind, counting as write: ${sql.slice(0, 120)}`,
   );
@@ -356,18 +334,12 @@ export function classifyStatement(sql: string): StatementKind {
  *
  *   pg DML           — response `{ rowCount: N, rows, command }` (via obj.response)
  *   pg post-process  — same as above
- *   sqlite update    — response is a plain `N` (sqlite processResponse collapses
- *                      update/del/counter into `ctx.changes`)
- *   sqlite insert    — response is `[lastID]` (1-element array → 1 row)
- *   sqlite raw       — response is `{ changes, lastInsertRowid }` (obj.response)
- *   sqlite DDL       — response is `undefined`
  *   SELECT           — response is an array of rows OR plain rows
  *
  * Rather than probe all those variants from a single arg, we accept both the
  * post-processed response AND the raw `obj.response` (set by the dialect's
- * `_query` before `processResponse`). The raw response is consistent enough
- * across dialects to extract a row count reliably; the post-processed value
- * is a fallback.
+   * `_query` before `processResponse`). The raw response is consistent enough
+   * to extract a row count reliably; the post-processed value is a fallback.
  *
  * Returns `null` when the count can't be determined — which the caller must
  * distinguish from `0` ("DDL or unknown, don't sum").
@@ -375,37 +347,21 @@ export function classifyStatement(sql: string): StatementKind {
 export function extractRowCount(
   postProcessed: unknown,
   raw?: unknown,
-  sql?: string,
+  _sql?: string,
 ): number | null {
   // Try the raw driver response first — it's the most consistent source.
   const fromRaw = readRowCount(raw);
   if (fromRaw !== null) return fromRaw;
-  // Fall back to the post-processed response for SQLite's UPDATE/DEL (plain
-  // number) and INSERT ([lastID]) shapes.
-  if (typeof postProcessed === "number") return postProcessed;
-  if (
-    Array.isArray(postProcessed) &&
-    sql &&
-    /^\s*INSERT\b/i.test(sql)
-  ) {
-    // SQLite insert returns [lastInsertRowId] — so every element is one row.
-    return postProcessed.length;
-  }
   return readRowCount(postProcessed);
 }
 
 function readRowCount(value: unknown): number | null {
   if (value === null || value === undefined) return null;
-  if (typeof value === "number") return value;
   if (typeof value !== "object") return null;
   const r = value as {
     rowCount?: number | null;
-    changes?: number;
-    affectedRows?: number;
   };
   if (typeof r.rowCount === "number") return r.rowCount;
-  if (typeof r.changes === "number") return r.changes;
-  if (typeof r.affectedRows === "number") return r.affectedRows;
   return null;
 }
 

@@ -12,7 +12,7 @@ description: >
 
 # Parcae
 
-Your class IS the schema, the API, and the type system. One `createApp()` call bootstraps persistence (Postgres, with SQLite and AlloyDB also supported via Knex), auto-CRUD REST routes, realtime Socket.IO subscriptions, background jobs, and authentication from your Model classes. No codegen, no dashboard — everything is TypeScript.
+Your class IS the schema, the API, and the type system. One `createApp()` call bootstraps Postgres persistence (including AlloyDB), auto-CRUD REST routes, realtime Socket.IO subscriptions, background jobs, and authentication from your Model classes. No codegen, no dashboard — everything is TypeScript.
 
 ## Packages
 
@@ -23,7 +23,7 @@ Your class IS the schema, the API, and the type system. One `createApp()` call b
 | Layer   | Package           | Purpose                                                                        |
 | ------- | ----------------- | ----------------------------------------------------------------------------- |
 | Model   | `@parcae/model`   | Universal base class; runs isomorphically on frontend and backend             |
-| Backend | `@parcae/backend` | Server: Polka + Socket.IO + Knex (Postgres/SQLite/AlloyDB) + BullMQ           |
+| Backend | `@parcae/backend` | Server: Polka + Socket.IO + Knex (Postgres/AlloyDB) + BullMQ                  |
 | SDK     | `@parcae/sdk`     | Client: Socket.IO transport (the only transport), React hooks, session gates  |
 
 `@parcae/model` is standalone; backend and SDK both depend on it. Auth packages depend on backend + model.

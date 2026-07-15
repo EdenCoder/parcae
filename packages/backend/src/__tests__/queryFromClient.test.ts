@@ -1135,13 +1135,11 @@ describe("BackendAdapter.queryFromClient", () => {
   //
   // The schema resolver collapses both `string[]` and arbitrary objects
   // into the same `"json"` ColumnType. queryFromClient additionally
-  // probes a fresh model instance and remembers which `json` columns
-  // are runtime arrays so it can dispatch `whereIn` correctly:
+  // dispatches JSON columns to Postgres containment SQL:
   //
-  //   - scalar / `{}` json columns → native `WHERE col IN (?, ?)`
-  //   - `string[]` json columns    → "array contains any of these"
-  //                                  via `@>` (Postgres) or LIKE
-  //                                  (SQLite). Without this, callers
+  //   - scalar columns → native `WHERE col IN (?, ?)`
+  //   - JSON columns   → "array contains any of these" via `@>`.
+  //                                  Without this, callers
   //                                  who write the natural
   //                                  `Scene.whereIn("tags", [tagId])`
   //                                  silently match nothing.
@@ -1195,29 +1193,6 @@ describe("BackendAdapter.queryFromClient", () => {
             : c.args[0] === "tags",
       );
       expect(nativeWhereIn).toBeUndefined();
-    });
-
-    it("emits LIKE containment SQL on SQLite for json-array columns", () => {
-      (adapter as any).engine = "sqlite";
-
-      const steps: QueryStep[] = [
-        { method: "whereIn", args: ["tags", ["a"]] },
-      ];
-
-      adapter.queryFromClient(
-        ProjectArrayModel as any,
-        { userId: "u1" },
-        steps,
-      );
-
-      const whereRaw = calls.find((c) => c.method === "whereRaw");
-      expect(whereRaw).toBeDefined();
-      expect(whereRaw!.args[0]).toContain("LIKE");
-      expect(whereRaw!.args[0]).not.toContain("@>");
-      // Surrounding quotes pin the LIKE to a literal JSON-array
-      // element — without them prefix/suffix collisions across ids
-      // would false-positive.
-      expect(whereRaw!.args[1]).toEqual(["tags", '%"a"%']);
     });
 
     it("falls through to native whereIn for scalar columns", () => {

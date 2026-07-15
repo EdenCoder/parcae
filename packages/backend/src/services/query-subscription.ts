@@ -21,9 +21,9 @@
  * count-short-circuit, the LIST handler's static and subscribed fetch
  * paths, and the socket-RPC resync handler.
  *
- * `runQuerySubscription` consumes a prep result, runs the subscribe +
- * hydrate handshake against `adapter.subscriptions`, and returns the
- * wire-ready row set. Two call sites use it: the LIST handler (when
+ * `runQuerySubscription` consumes a prep result, reads the primary-backed
+ * cache from `adapter.subscriptions`, and returns the wire-ready row set.
+ * Two call sites use it: the LIST handler (when
  * `req._socketId` is set AND the request didn't opt out via
  * `__subscribe: false`) and the socket-RPC `resync` handler (for
  * dynamic entries).
@@ -206,25 +206,10 @@ export async function runQuerySubscription(
       { socketId, query, expand: expandResolved, steps, user },
       { force },
     ),
-    countQuery.count(),
+    adapter.executeSubscriptionCount(countQuery),
   ]);
 
-  // Subscription items come pre-sanitised from `_execQuery`. Hydrate
-  // the request-side expansions for the immediate response; the
-  // manager handles the ongoing delta emissions itself, keyed on the
-  // same `expandResolved` spec.
-  const items = [...sub.items];
-  if (expandResolved.length > 0) {
-    const loader = getRefLoader();
-    if (loader) {
-      await hydrateExpansions(items, expandResolved, loader, user);
-    }
-    // No RefLoader → rows go out un-expanded. Only happens for code
-    // paths that bypass `runWithRequestContext`; the HTTP LIST path
-    // and the socket-RPC `resync` handler both install one.
-  }
-
-  return { items, hash: sub.hash, totalCount };
+  return { items: [...sub.items], hash: sub.hash, totalCount };
 }
 
 // ─── runQueryStatic ──────────────────────────────────────────────────────────

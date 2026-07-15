@@ -17,10 +17,5 @@
   "packageManager": "pnpm@10.4.1",
   "engines": {
     "node": ">=20.0.0"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "better-sqlite3"
-    ]
   }
 }

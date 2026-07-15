@@ -4,14 +4,18 @@
  * Verifies that queries like Result.whereIn("test.category", [...])
  * are rewritten into subqueries against the referenced model's table.
  *
- * Uses a real SQLite database to verify the SQL executes correctly.
+ * Uses an isolated Postgres schema to verify the SQL executes correctly.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import knex from "knex";
+import { it, expect, beforeAll, afterAll } from "vitest";
+import type { Knex } from "knex";
 import { Model } from "@parcae/model";
 import type { ModelConstructor, Ref, SchemaDefinition } from "@parcae/model";
 import { BackendAdapter } from "../packages/backend/src/adapters/model";
+import {
+  createPostgresTestDatabase,
+  describePostgres,
+} from "./postgres-test";
 
 // ─── Mock models ─────────────────────────────────────────────────────────────
 
@@ -31,7 +35,8 @@ class Result extends Model {
 
 // ─── Test setup ──────────────────────────────────────────────────────────────
 
-let db: ReturnType<typeof knex>;
+let database: Awaited<ReturnType<typeof createPostgresTestDatabase>>;
+let db: Knex;
 let adapter: BackendAdapter;
 let adapterNoRegistry: BackendAdapter;
 
@@ -48,29 +53,25 @@ const resultSchema: SchemaDefinition = {
 };
 
 beforeAll(async () => {
-  db = knex({
-    client: "better-sqlite3",
-    connection: { filename: ":memory:" },
-    useNullAsDefault: true,
-  });
+  if (!process.env.PARCAE_TEST_DATABASE_URL) return;
+  database = await createPostgresTestDatabase();
+  db = database.db;
 
   // Inject schemas onto model constructors (same as generateSchemas does)
   (Test as any).__schema = testSchema;
   (Result as any).__schema = resultSchema;
 
   adapter = new BackendAdapter({ read: db, write: db });
-  adapter.engine = "sqlite";
   adapter.registerModels([Test, Result] as unknown as ModelConstructor[]);
   Model.use(adapter);
 
   // A second adapter without registerModels — simulates missing registry
   adapterNoRegistry = new BackendAdapter({ read: db, write: db });
-  adapterNoRegistry.engine = "sqlite";
 
   // Create tables
   await db.schema.createTable("tests", (t) => {
     t.string("id").primary();
-    t.text("data");
+    t.jsonb("data");
     t.dateTime("createdAt");
     t.dateTime("updatedAt");
     t.string("category", 2048);
@@ -80,7 +81,7 @@ beforeAll(async () => {
 
   await db.schema.createTable("results", (t) => {
     t.string("id").primary();
-    t.text("data");
+    t.jsonb("data");
     t.dateTime("createdAt");
     t.dateTime("updatedAt");
     t.string("test", 2048);
@@ -108,12 +109,12 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  await db.destroy();
+  if (database) await database.close();
 });
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
-describe("Ref subquery: dot-notation via queryFromClient", () => {
+describePostgres("Ref subquery: dot-notation via queryFromClient", () => {
   it("whereIn('test.category', [...]) should filter results by referenced test category", async () => {
     const chain = adapter.queryFromClient(
       Result as unknown as ModelConstructor,
@@ -229,7 +230,7 @@ describe("Ref subquery: dot-notation via queryFromClient", () => {
   });
 });
 
-describe("Ref subquery: dot-notation via server-side query chain", () => {
+describePostgres("Ref subquery: dot-notation via server-side query chain", () => {
   it("whereIn('test.category', [...]) should work on direct query chain", async () => {
     const results = await adapter
       .query(Result as unknown as ModelConstructor)
@@ -251,7 +252,7 @@ describe("Ref subquery: dot-notation via server-side query chain", () => {
   });
 });
 
-describe("Ref subquery: schema cache simulation", () => {
+describePostgres("Ref subquery: schema cache simulation", () => {
   it("should work when ref target has __schema set (normal case)", async () => {
     // __schema is already set from beforeAll — this is the happy path
     expect((Test as any).__schema).toBeDefined();

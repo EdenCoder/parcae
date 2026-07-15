@@ -275,17 +275,15 @@ async function persistStories(
     sourceFindingKeys: JSON.stringify(r.sourceFindingKeys),
   }));
   await ctx.db.transaction(async (trx) => {
-    if (isPostgres(trx)) {
-      const identity = JSON.stringify([
-        ctx.org,
-        ctx.locale,
-        ctx.period.end.toISOString(),
-      ]);
-      await trx.raw(
-        "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
-        [identity],
-      );
-    }
+    const identity = JSON.stringify([
+      ctx.org,
+      ctx.locale,
+      ctx.period.end.toISOString(),
+    ]);
+    await trx.raw(
+      "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+      [identity],
+    );
 
     if (ctx.locale !== "und") {
       await trx(STORY_TABLE)
@@ -305,9 +303,4 @@ async function persistStories(
     }
   });
   return rows;
-}
-
-function isPostgres(db: Knex | Knex.Transaction): boolean {
-  const client = String(db.client.config.client ?? "");
-  return client === "pg" || client.includes("postgres");
 }

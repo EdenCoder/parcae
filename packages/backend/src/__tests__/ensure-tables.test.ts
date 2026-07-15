@@ -3,35 +3,29 @@
  *
  * The performance-critical change here (DOL-1039) is replacing the
  * previous O(models × columns) sequential `hasColumn` queries with a
- * single bulk introspection of `pragma_table_info` (SQLite) or
- * `information_schema.columns` (Postgres). The behavioral surface
+ * single bulk introspection of Postgres `information_schema.columns`.
+ * The behavioral surface
  * stays identical except for one new feature: when
  * `PARCAE_DROP_OBSOLETE_COLUMNS=true`, columns that exist in the DB
  * but are no longer declared on the model are dropped.
  *
- * Tests run against an in-memory SQLite database. Engine-specific
- * branches (Postgres-only DDL like `vector(768)`) are covered at the
- * integration level — here we verify the orchestration.
+ * Tests run against isolated Postgres schemas.
  */
 
-import knexFactory, { type Knex } from "knex";
+import type { Knex } from "knex";
 import {
   afterEach,
   beforeEach,
-  describe,
   expect,
   it,
   vi,
 } from "vitest";
 import { BackendAdapter } from "../adapters/model";
-
-function sqlite(): Knex {
-  return knexFactory({
-    client: "better-sqlite3",
-    connection: { filename: ":memory:" },
-    useNullAsDefault: true,
-  });
-}
+import {
+  createPostgresTestDatabase,
+  describePostgres,
+  type PostgresTestDatabase,
+} from "./postgres-test";
 
 /**
  * Builds a minimal `ModelConstructor`-shaped object suitable for
@@ -64,8 +58,7 @@ async function makeAdapter(db: Knex): Promise<BackendAdapter> {
     read: db,
     write: db,
   });
-  // SQLite path skips the Postgres-only LISTEN/NOTIFY trigger install.
-  await adapter.detectEngine("sqlite");
+  await adapter.detectEngine();
   return adapter as BackendAdapter;
 }
 
@@ -93,15 +86,17 @@ function captureQueries(db: Knex): { queries: string[]; stop: () => void } {
   };
 }
 
-describe("BackendAdapter.ensureAllTables — bulk schema introspection", () => {
+describePostgres("BackendAdapter.ensureAllTables — bulk schema introspection", () => {
   let db: Knex;
+  let database: PostgresTestDatabase;
 
-  beforeEach(() => {
-    db = sqlite();
+  beforeEach(async () => {
+    database = await createPostgresTestDatabase();
+    db = database.db;
   });
 
   afterEach(async () => {
-    await db.destroy();
+    await database.close();
   });
 
   it("creates tables for new models with the expected columns", async () => {
@@ -151,17 +146,10 @@ describe("BackendAdapter.ensureAllTables — bulk schema introspection", () => {
     const { queries } = captureQueries(db);
     await adapter.ensureAllTables(models);
 
-    // Knex's `hasColumn` on SQLite emits `PRAGMA table_info(...)` per
-    // call. The old code path called it once per (model, column) =
-    // O(models × columns) total. Bulk introspection should issue at
-    // most one such probe per table (or fewer if it joins through
-    // `sqlite_master`). For 2 models × 4+ columns each this would be
-    // 10+ probes under the old code; we cap at 4 — enough headroom
-    // for a bulk path that elects to do one PRAGMA per table.
-    const tableInfoProbes = queries.filter((q) =>
-      /PRAGMA table_info/i.test(q),
+    const columnProbes = queries.filter((q) =>
+      /information_schema\.columns/i.test(q),
     );
-    expect(tableInfoProbes.length).toBeLessThanOrEqual(4);
+    expect(columnProbes).toHaveLength(1);
   });
 
   it("respects externally-managed models — no introspection, no DDL", async () => {
@@ -177,25 +165,27 @@ describe("BackendAdapter.ensureAllTables — bulk schema introspection", () => {
   });
 });
 
-describe("BackendAdapter.ensureAllTables — obsolete columns", () => {
+describePostgres("BackendAdapter.ensureAllTables — obsolete columns", () => {
   let db: Knex;
+  let database: PostgresTestDatabase;
   const FLAG = "PARCAE_DROP_OBSOLETE_COLUMNS";
 
-  beforeEach(() => {
-    db = sqlite();
+  beforeEach(async () => {
+    database = await createPostgresTestDatabase();
+    db = database.db;
     delete process.env[FLAG];
   });
 
   afterEach(async () => {
     delete process.env[FLAG];
-    await db.destroy();
+    await database.close();
   });
 
   it("does not drop obsolete columns by default", async () => {
     // Pre-seed a table with an extra column.
     await db.schema.createTable("posts", (t) => {
       t.string("id").primary();
-      t.text("data");
+      t.jsonb("data");
       t.datetime("createdAt");
       t.datetime("updatedAt");
       t.string("tmp", 2048).nullable();
@@ -216,7 +206,7 @@ describe("BackendAdapter.ensureAllTables — obsolete columns", () => {
   it("logs a warning about obsolete columns at INFO level so operators can detect drift", async () => {
     await db.schema.createTable("posts", (t) => {
       t.string("id").primary();
-      t.text("data");
+      t.jsonb("data");
       t.datetime("createdAt");
       t.datetime("updatedAt");
       t.string("tmp", 2048).nullable();
@@ -248,7 +238,7 @@ describe("BackendAdapter.ensureAllTables — obsolete columns", () => {
   it("drops obsolete columns when PARCAE_DROP_OBSOLETE_COLUMNS=true", async () => {
     await db.schema.createTable("posts", (t) => {
       t.string("id").primary();
-      t.text("data");
+      t.jsonb("data");
       t.datetime("createdAt");
       t.datetime("updatedAt");
       t.string("tmp", 2048).nullable();
@@ -277,7 +267,7 @@ describe("BackendAdapter.ensureAllTables — obsolete columns", () => {
     // no longer declares searchFields — but we must not drop these.
     await db.schema.createTable("posts", (t) => {
       t.string("id").primary();
-      t.text("data");
+      t.jsonb("data");
       t.datetime("createdAt");
       t.datetime("updatedAt");
       t.string("tmp", 2048).nullable();
@@ -308,7 +298,7 @@ describe("BackendAdapter.ensureAllTables — obsolete columns", () => {
   it("ignores obsolete columns on externally-managed tables", async () => {
     await db.schema.createTable("externals", (t) => {
       t.string("id").primary();
-      t.text("data");
+      t.jsonb("data");
       t.string("created_by_outside_system", 2048);
     });
 

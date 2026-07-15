@@ -18,7 +18,6 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import knexFactory, { type Knex } from "knex";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { run as runMake } from "../cli/commands/make";
 import { run as runList } from "../cli/commands/list";
@@ -39,23 +38,19 @@ import {
 import type { MigrationHandler } from "../routing/migration";
 import { MIGRATIONS_TABLE } from "../adapters/migrations";
 import { META_TABLE, ensureMetaTable } from "../adapters/migration-meta";
+import {
+  createPostgresTestDatabase,
+  describePostgres,
+} from "./postgres-test";
 
 // ─── Test harness ────────────────────────────────────────────────────────────
 
 function tempDbFile(): string {
-  return join(mkdtempSync(join(tmpdir(), "parcae-cli-")), "test.db");
+  return mkdtempSync(join(tmpdir(), "parcae-cli-"));
 }
 
 function tempMigrationsDir(): string {
   return mkdtempSync(join(tmpdir(), "parcae-migs-"));
-}
-
-function sqlite(path: string): Knex {
-  return knexFactory({
-    client: "better-sqlite3",
-    connection: { filename: path },
-    useNullAsDefault: true,
-  });
 }
 
 /**
@@ -82,20 +77,21 @@ function registerAndWrite(
 }
 
 async function makeRuntime(
-  dbPath: string,
+  _dbPath: string,
   dir: string,
 ): Promise<CliRuntime> {
-  const db = sqlite(dbPath);
+  const database = await createPostgresTestDatabase();
+  const { db } = database;
   await ensureMetaTable(db);
   return {
     db,
-    engine: "sqlite",
+    engine: "postgres",
     entries: [...getMigrations()].sort((a, b) =>
       a.name.localeCompare(b.name),
     ),
     dir,
     tableName: MIGRATIONS_TABLE,
-    close: () => db.destroy(),
+    close: () => database.close(),
   };
 }
 
@@ -201,7 +197,7 @@ describe("migrate:make", () => {
 
 // ─── migrate:status / list / latest / plan lifecycle ───────────────────────
 
-describe("lifecycle: status / list / latest / plan", () => {
+describePostgres("lifecycle: status / list / latest / plan", () => {
   let dbPath: string;
   let dir: string;
   let rt: CliRuntime;
@@ -290,16 +286,12 @@ describe("lifecycle: status / list / latest / plan", () => {
     clearMigrations();
     registerAndWrite(dir, "20260101000000-kept", async () => {});
 
-    const rt2 = await makeRuntime(dbPath, dir);
-    try {
-      const lst = await runList([], {}, rt2);
-      const orphan = lst.data.migrations.find((m) =>
-        m.name.endsWith("orphan"),
-      );
-      expect(orphan?.state).toBe("orphan");
-    } finally {
-      await rt2.close();
-    }
+    const rt2 = { ...rt, entries: [...getMigrations()] };
+    const lst = await runList([], {}, rt2);
+    const orphan = lst.data.migrations.find((m) =>
+      m.name.endsWith("orphan"),
+    );
+    expect(orphan?.state).toBe("orphan");
   });
 
   it("list reports drift state when a file is edited after application", async () => {
@@ -357,7 +349,7 @@ describe("lifecycle: status / list / latest / plan", () => {
 
 // ─── migrate:baseline ───────────────────────────────────────────────────────
 
-describe("migrate:baseline", () => {
+describePostgres("migrate:baseline", () => {
   let dbPath: string;
   let dir: string;
   let rt: CliRuntime;
@@ -459,7 +451,7 @@ describe("migrate:baseline", () => {
 
 // ─── migrate:unlock ─────────────────────────────────────────────────────────
 
-describe("migrate:unlock", () => {
+describePostgres("migrate:unlock", () => {
   it("does not throw against a fresh DB (no lock table)", async () => {
     const dbPath = tempDbFile();
     const dir = tempMigrationsDir();
@@ -474,7 +466,7 @@ describe("migrate:unlock", () => {
 
 // ─── migrate:rollback ───────────────────────────────────────────────────────
 
-describe("migrate:rollback", () => {
+describePostgres("migrate:rollback", () => {
   let dbPath: string;
   let dir: string;
   let rt: CliRuntime;
@@ -653,4 +645,3 @@ describe("pgConnectionFromUrl", () => {
     expect(cfg.ssl).toBe(true);
   });
 });
-

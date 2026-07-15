@@ -123,12 +123,10 @@ export function clerk(config: ClerkConfig): AuthAdapter {
     operation: (trx: any) => Promise<T>,
   ): Promise<T> {
     return localAdapter.runInTransaction(async (trx) => {
-      if (isPostgres(trx)) {
-        await trx.raw(
-          "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
-          [`@parcae/auth-clerk:${id}`],
-        );
-      }
+      await trx.raw(
+        "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+        [`@parcae/auth-clerk:${id}`],
+      );
       return operation(trx);
     });
   }
@@ -429,11 +427,6 @@ export function clerk(config: ClerkConfig): AuthAdapter {
       return resolveSessionToken(token);
     },
   };
-}
-
-function isPostgres(db: any): boolean {
-  const client = String(db.client?.config?.client ?? "");
-  return client === "pg" || client.includes("postgres");
 }
 
 export default clerk;

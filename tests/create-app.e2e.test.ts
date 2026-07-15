@@ -1,12 +1,6 @@
 import { createServer as createNetServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
-import {
-  afterAll,
-  beforeAll,
-  describe,
-  expect,
-  it,
-} from 'vitest';
+import { afterAll, beforeAll, expect, it } from 'vitest';
 import { createApp } from '@parcae/backend';
 import type {
   AuthAdapter,
@@ -16,6 +10,10 @@ import type {
 import { createClient } from '@parcae/sdk';
 import type { ParcaeClient } from '@parcae/sdk';
 import { Document } from './models/document';
+import {
+  createPostgresTestDatabase,
+  describePostgres,
+} from './postgres-test';
 
 const TOKEN_A = 'tenant-a-token';
 const TOKEN_B = 'tenant-b-token';
@@ -94,7 +92,7 @@ const reservePort = async (): Promise<number> => {
   return address.port;
 };
 
-describe('createApp HTTP and SocketTransport integration', () => {
+describePostgres('createApp HTTP and SocketTransport integration', () => {
   const previousEnv = new Map<string, string | undefined>();
   const testsRoot = fileURLToPath(new URL('.', import.meta.url));
   let app: ParcaeApp;
@@ -104,6 +102,7 @@ describe('createApp HTTP and SocketTransport integration', () => {
   let createdA: WireDocument;
   let createdB: WireDocument;
   let isStopped = false;
+  let database: Awaited<ReturnType<typeof createPostgresTestDatabase>>;
 
   const request = async <T>(
     method: string,
@@ -126,7 +125,8 @@ describe('createApp HTTP and SocketTransport integration', () => {
 
   beforeAll(async () => {
     for (const key of TEST_ENV) previousEnv.set(key, process.env[key]);
-    process.env.DATABASE_URL = 'sqlite::memory:';
+    database = await createPostgresTestDatabase();
+    process.env.DATABASE_URL = database.url;
     process.env.ENSURE_SCHEMA = 'true';
     process.env.NODE_ENV = 'test';
     process.env.RUN_CRONS = 'false';
@@ -171,6 +171,7 @@ describe('createApp HTTP and SocketTransport integration', () => {
     clientA?.dispose();
     clientB?.dispose();
     if (app && !isStopped) await app.stop();
+    if (database) await database.close();
     for (const [key, value] of previousEnv) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;

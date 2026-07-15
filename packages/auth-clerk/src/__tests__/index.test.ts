@@ -228,7 +228,7 @@ function setupContext() {
     },
     {
       raw: vi.fn().mockResolvedValue(undefined),
-      client: { config: { client: "sqlite" } },
+      client: { config: { client: "pg" } },
     },
   );
   const userModel = {

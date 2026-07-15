@@ -232,7 +232,7 @@ type WireRow = Record<string, any>;
  * object should still resolve via the row's `$file` accessor or
  * its original id.
  */
-function rowRefId(row: WireRow, refField: string): string | null {
+export function getWireRefId(row: WireRow, refField: string): string | null {
   const dollar = row[`$${refField}`];
   if (typeof dollar === "string" && dollar.length > 0) return dollar;
   const direct = row[refField];
@@ -267,7 +267,7 @@ export async function projectForWire(
   for (const [field, column] of Object.entries(schema)) {
     if (typeof column !== "object" || column.kind !== "ref") continue;
     if (!Object.prototype.hasOwnProperty.call(row, field)) continue;
-    row[`$${field}`] = rowRefId(row, field);
+    row[`$${field}`] = getWireRefId(row, field);
   }
   return row;
 }
@@ -324,7 +324,7 @@ export async function hydrateExpansions(
     const idList: (string | null)[] = [];
     const promises: Promise<unknown>[] = [];
     for (const row of items) {
-      const id = rowRefId(row, exp.refField);
+      const id = getWireRefId(row, exp.refField);
       idList.push(id);
       promises.push(loader.load(exp.targetType, id));
     }
