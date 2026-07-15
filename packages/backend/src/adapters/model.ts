@@ -725,6 +725,14 @@ export class BackendAdapter implements ModelAdapter {
         } else {
           this._replaceOperationData(operationModel, persistedData);
         }
+        // Both merge paths refresh the snapshot to the just-persisted
+        // row, which would leave the after-hook diffing post against
+        // post. Restore the pre-save snapshot captured above so
+        // before/after set-diff hooks see the real transition. Not on
+        // create: create hooks diff from the created state itself.
+        if (!creating) {
+          (operationModel as any).__serverSnapshot = serverSnapshot;
+        }
         await this.runHooks(operationModel, action, "after", { cleanups });
         return persistedData;
       });
@@ -2290,6 +2298,17 @@ export class BackendAdapter implements ModelAdapter {
         structuredClone(data),
       );
       captured.__isNew = creating;
+      // hydrate() seeds `__serverSnapshot` from `data` — the POST-edit
+      // state — which would make every save-hook before/after diff a
+      // no-op. Carry the caller's pre-save snapshot instead; the
+      // caller's own snapshot only refreshes AFTER adapter.save()
+      // resolves, so at this point it still holds the row as last
+      // read from the DB. Skipped when creating: create hooks diff
+      // from the empty set, and the save→create alias must not see a
+      // phantom "before" state.
+      if (!creating && model.__serverSnapshot) {
+        captured.__serverSnapshot = model.__serverSnapshot;
+      }
       return captured;
     }
 

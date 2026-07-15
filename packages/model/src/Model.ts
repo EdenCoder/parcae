@@ -1059,6 +1059,15 @@ export class Model extends EventEmitter {
     return this[SYM_SNAPSHOT];
   }
 
+  /** @internal — adapter-only. `hydrate()` seeds the snapshot from the
+   * data it's given, which for a save's captured operation model is the
+   * POST-edit state; the backend adapter uses this to re-seed the
+   * captured model with the caller's true pre-save snapshot so save
+   * hooks can diff before → after. */
+  set __serverSnapshot(data: Readonly<Record<string, any>>) {
+    this[SYM_SNAPSHOT] = structuredClone(data) as Record<string, any>;
+  }
+
   // ── Dot-path Accessors ──────────────────────────────────────────────
 
   /**
