@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useRef, useState } from "react";
+import { Model } from "@parcae/model";
 import { createClient } from "../client";
 import type { ParcaeClient, ClientConfig } from "../client";
 import type { AuthClientAdapter } from "../auth-adapter";
@@ -16,6 +17,19 @@ export interface ParcaeProviderProps {
   /** Auth adapter — handles session resolution internally. */
   auth?: AuthClientAdapter;
   version?: string;
+  /**
+   * Bind this client's adapter as the default for every Model class —
+   * the frontend equivalent of the backend's `Model.use(adapter)` in
+   * createApp(). Static factories (`Project.create(...)`, terminal
+   * query methods on unbound classes) then work anywhere in the tree.
+   * Default `true`.
+   *
+   * The first mounted provider wins; a concurrent provider with a
+   * different client skips silently. Explicit `client.bind(Model)`
+   * and `useQuery` chain rebinding still take precedence for
+   * multi-client apps — pass `false` there to opt out entirely.
+   */
+  bindAdapter?: boolean;
   /**
    * socket.io transports list. Defaults to `["websocket"]`. Pass
    * `["polling"]` on runtimes without a WebSocket global.
@@ -44,6 +58,7 @@ const ClientProvider: React.FC<ClientProviderProps> = ({
   client,
   url,
   auth,
+  bindAdapter = true,
   children,
   onReady,
   onError,
@@ -52,6 +67,16 @@ const ClientProvider: React.FC<ClientProviderProps> = ({
   onReadyRef.current = onReady;
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
+
+  // ── Default model adapter ───────────────────────────────────────
+  // One global default per realm: the first provider to mount binds
+  // the base Model class, which every subclass resolves through the
+  // prototype walk in getBoundAdapter(). A second concurrent provider
+  // finds the binding already set and leaves it alone.
+  useEffect(() => {
+    if (!bindAdapter || Model.hasAdapter()) return;
+    Model.use(client.adapter);
+  }, [bindAdapter, client]);
 
   // ── Session lifecycle ───────────────────────────────────────────
   useEffect(() => {
