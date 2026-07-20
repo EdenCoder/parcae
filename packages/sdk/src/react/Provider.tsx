@@ -104,7 +104,12 @@ const ClientProvider: React.FC<ClientProviderProps> = ({
         lastStatus !== "pending" &&
         (nowUserId !== lastUserId || nowStatus !== lastStatus)
       ) {
-        _purgeCacheForUser(client, lastUserId);
+        // Passing the next identity lets the cache pool the
+        // anonymous → authenticated handoff (public data only) so
+        // mounted queries keep their items while they refetch,
+        // instead of flashing skeletons. Every other transition
+        // disposes outright — scoped data never crosses identities.
+        _purgeCacheForUser(client, lastUserId, nowUserId);
       }
       lastUserId = nowUserId;
       lastStatus = nowStatus;

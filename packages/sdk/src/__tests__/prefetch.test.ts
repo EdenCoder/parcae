@@ -449,4 +449,60 @@ describe("_purgeCacheForUser (session-transition cache eviction)", () => {
 
     expect(useQueryTest.getEntry(client, key)).toBeDefined();
   });
+
+  it("seeds the authenticated entry from the anonymous pool on sign-in (no skeleton flash)", async () => {
+    const session = makeSession(null);
+    session.resolve();
+    const chain = makeChain({
+      results: [{ id: "p1", title: "public" }],
+      queryHash: "h-anon",
+    });
+    const client = makeFakeClient(session) as unknown as ParcaeClient;
+    await prefetch(client, chain);
+    const anonKey = useQueryTest.buildKey("post", null, chain.__steps);
+    expect(useQueryTest.getEntry(client, anonKey)).toBeDefined();
+
+    // Sign-in: anonymous → authenticated pools the old entry instead
+    // of disposing it.
+    const { _purgeCacheForUser } = await import("../react/useQuery");
+    _purgeCacheForUser(client, null, "u1");
+    expect(useQueryTest.getEntry(client, anonKey)).toBeUndefined();
+
+    // The first mount under the new identity seeds from the pool:
+    // items present, loading false, and a background refetch still
+    // fires (chain is unset until the mount effect runs).
+    const authedKey = useQueryTest.buildKey("post", "u1", chain.__steps);
+    const release = useQueryTest.retain(client, authedKey, () => {});
+    const seeded = useQueryTest.getEntry(client, authedKey)!;
+    expect(seeded.items.map((item: any) => item.id)).toEqual(["p1"]);
+    expect(seeded.loading).toBe(false);
+    expect(seeded.chain).toBeNull();
+
+    useQueryTest.fetch(authedKey, chain, client);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(seeded.loading).toBe(false);
+    expect(seeded.items.map((item: any) => item.id)).toEqual(["p1"]);
+    release();
+  });
+
+  it("never seeds across scoped identities (sign-out / account switch)", async () => {
+    const session = makeSession("u1");
+    session.resolve();
+    const chain = makeChain({
+      results: [{ id: "secret" }],
+      queryHash: "h-u1",
+    });
+    const client = makeFakeClient(session) as unknown as ParcaeClient;
+    await prefetch(client, chain);
+
+    const { _purgeCacheForUser } = await import("../react/useQuery");
+    _purgeCacheForUser(client, "u1", "u2");
+
+    const otherKey = useQueryTest.buildKey("post", "u2", chain.__steps);
+    const release = useQueryTest.retain(client, otherKey, () => {});
+    const fresh = useQueryTest.getEntry(client, otherKey)!;
+    expect(fresh.items).toEqual([]);
+    expect(fresh.loading).toBe(true);
+    release();
+  });
 });

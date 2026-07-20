@@ -489,7 +489,7 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     release();
   });
 
-  it("clears and retries an entry omitted from a resync batch", async () => {
+  it("keeps stale items and retries an entry omitted from a resync batch", async () => {
     vi.useFakeTimers();
     const client = new FakeClient();
     const chain = makeChain({
@@ -506,8 +506,10 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     await vi.advanceTimersByTimeAsync(0);
 
     const entry = useQueryTest.getEntry(client as any, key)!;
-    expect(entry.items).toEqual([]);
-    expect(entry.loading).toBe(true);
+    // Stale-while-revalidate: the last good items stay on screen
+    // while the scheduled retry refetches — no skeleton flash.
+    expect(entry.items.map((item: any) => item.id)).toEqual(["stale"]);
+    expect(entry.loading).toBe(false);
     expect(entry.queryHash).toBeNull();
     expect(entry.retryTimer).not.toBeNull();
     expect(client.countSubs("query:old-hash")).toBe(0);
@@ -515,7 +517,7 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     release();
   });
 
-  it("clears and retries an incomplete resync entry", async () => {
+  it("keeps stale items and retries an incomplete resync entry", async () => {
     vi.useFakeTimers();
     const client = new FakeClient();
     const chain = makeChain({
@@ -532,8 +534,8 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     await vi.advanceTimersByTimeAsync(0);
 
     const entry = useQueryTest.getEntry(client as any, key)!;
-    expect(entry.items).toEqual([]);
-    expect(entry.loading).toBe(true);
+    expect(entry.items.map((item: any) => item.id)).toEqual(["stale"]);
+    expect(entry.loading).toBe(false);
     expect(entry.retryTimer).not.toBeNull();
     expect(client.send).toHaveBeenCalledWith(
       "unsubscribe:query",

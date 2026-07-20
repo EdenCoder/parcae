@@ -141,17 +141,98 @@ function disposeEntry(entry: CacheEntry, error?: Error): void {
   }
 }
 
+// ── Identity handoff ────────────────────────────────────────────────
+//
+// On sign-in (anonymous → authenticated) every cache key re-keys
+// because the userId is baked into it. Purging the old entries
+// outright sends every mounted `useQuery` back to `loading: true`
+// with empty items — the whole UI flashes skeletons. The anonymous
+// data is public, though, so the old entries are retired into a
+// short-lived pool keyed WITHOUT the identity segment; a fresh entry
+// created for the same model+steps seeds itself from the pool and
+// refetches in the background (stale-while-revalidate).
+//
+// Only the anonymous → authenticated direction is pooled: scoped
+// data must never seed another identity's view, so sign-out and
+// account switches still dispose + refetch from scratch.
+
+interface StaleEntry {
+  entry: CacheEntry;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+let stalePools = new WeakMap<ParcaeClient, Map<string, StaleEntry>>();
+const STALE_TTL = 30_000;
+
+/**
+ * Cache key minus its identity segment — `model:user:steps` becomes
+ * `model:*:steps`. Model types never contain `:`; the steps JSON sits
+ * after the second colon and is preserved verbatim (including the
+ * `:nosub` suffix), so static and dynamic variants never cross-seed.
+ */
+function stripIdentity(key: string): string {
+  const first = key.indexOf(":");
+  const second = key.indexOf(":", first + 1);
+  if (first < 0 || second < 0) return key;
+  return `${key.slice(0, first)}:*${key.slice(second)}`;
+}
+
+function retireToStalePool(client: ParcaeClient, entry: CacheEntry): void {
+  let pool = stalePools.get(client);
+  if (!pool) {
+    pool = new Map();
+    stalePools.set(client, pool);
+  }
+  // Detach live resources but keep the data for seeding.
+  entry.generation++;
+  detachSubscription(entry);
+  if (entry.gcTimer) clearTimeout(entry.gcTimer);
+  if (entry.retryTimer) clearTimeout(entry.retryTimer);
+  if (entry.pollTimer) clearTimeout(entry.pollTimer);
+  entry.gcTimer = null;
+  entry.retryTimer = null;
+  entry.pollTimer = null;
+  entry.fetchPromise = null;
+
+  const poolKey = stripIdentity(entry.key);
+  const existing = pool.get(poolKey);
+  if (existing) {
+    clearTimeout(existing.timer);
+    disposeEntry(existing.entry);
+  }
+  const timer = setTimeout(() => {
+    if (pool.get(poolKey)?.entry === entry) pool.delete(poolKey);
+    disposeEntry(entry);
+  }, STALE_TTL);
+  pool.set(poolKey, { entry, timer });
+}
+
+function takeStaleSeed(client: ParcaeClient, key: string): CacheEntry | null {
+  const pool = stalePools.get(client);
+  if (!pool) return null;
+  const poolKey = stripIdentity(key);
+  const stale = pool.get(poolKey);
+  if (!stale) return null;
+  pool.delete(poolKey);
+  clearTimeout(stale.timer);
+  disposeEntry(stale.entry);
+  return stale.entry;
+}
+
 function purgeCacheForUser(
   client: ParcaeClient,
   prevUserId: string | null,
+  nextUserId?: string | null,
 ): void {
   const cache = caches.get(client);
   if (!cache) return;
   const needle = `:${prevUserId ?? "anon"}:`;
+  const poolable = prevUserId === null && nextUserId != null;
   for (const [key, entry] of cache) {
     if (!key.includes(needle)) continue;
     cache.delete(key);
-    disposeEntry(entry, new Error("Query identity changed"));
+    if (poolable) retireToStalePool(client, entry);
+    else disposeEntry(entry, new Error("Query identity changed"));
   }
 }
 
@@ -235,6 +316,19 @@ function getOrCreate(
       opsListeners: new Set(),
       subscribe: resolved,
     };
+    // Seed from the identity handoff pool (anonymous → authenticated
+    // sign-in): keep rendering the previous public data while the
+    // mount effect refetches against the new identity, instead of
+    // flashing every list back to skeletons.
+    const stale = takeStaleSeed(client, key);
+    if (stale && stale.items.length > 0) {
+      e.items = stale.items;
+      e.mergedItems = stale.items;
+      e.totalCount = stale.totalCount;
+      e.loading = false;
+      e.version = stale.version;
+      e.hash = buildHash(e);
+    }
     cache.set(key, e);
   }
   return e;
@@ -626,21 +720,13 @@ function recoverResyncEntry(
   cacheKey: string,
   entry: CacheEntry,
   error: Error,
-  clear: boolean,
 ): void {
+  // Stale-while-revalidate: keep the last good items on screen while
+  // the retry refetches and reconciles. Blanking the entry here
+  // flashed every list back to skeletons on a reconnect hiccup.
   detachSubscription(entry);
-  if (clear) {
-    const hadItems = entry.items.length > 0 || entry.totalCount !== 0;
-    entry.items = EMPTY;
-    entry.totalCount = 0;
-    entry.loading = true;
-    entry.error = null;
-    if (hadItems) entry.version++;
-    notify(entry);
-  } else {
-    entry.error = error;
-    notify(entry);
-  }
+  entry.error = error;
+  notify(entry);
   entry.retryCount = 0;
   scheduleRetry(cacheKey, entry);
 }
@@ -788,7 +874,6 @@ export function _onResyncRequired(client: ParcaeClient): void {
             e.cacheKey,
             entry,
             new Error("Incomplete query resync response"),
-            true,
           );
           continue;
         }
@@ -833,7 +918,7 @@ export function _onResyncRequired(client: ParcaeClient): void {
       log.error("useQuery: resync failed:", error.message);
       for (const e of entries) {
         if (!isLive(e.entry) || e.entry.generation !== e.generation) continue;
-        recoverResyncEntry(e.cacheKey, e.entry, error, false);
+        recoverResyncEntry(e.cacheKey, e.entry, error);
       }
     });
 }
@@ -1243,14 +1328,16 @@ export async function prefetch<T>(
 export function _purgeCacheForUser(
   client: ParcaeClient,
   prevUserId: string | null,
+  nextUserId?: string | null,
 ): void {
-  purgeCacheForUser(client, prevUserId);
+  purgeCacheForUser(client, prevUserId, nextUserId);
 }
 
 /** @internal */
 export const __test = {
   resetCache(): void {
     caches = new WeakMap();
+    stalePools = new WeakMap();
   },
   getEntry(client: ParcaeClient, key: string): CacheEntry | undefined {
     return caches.get(client)?.get(key);
