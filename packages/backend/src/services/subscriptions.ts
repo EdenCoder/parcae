@@ -121,6 +121,13 @@ interface CachedQuery {
      */
     inFlight: Promise<void> | null;
     needsFollowup: boolean;
+    /**
+     * When the last re-eval started (ms epoch, 0 = never). Drives
+     * the leading edge in `_schedule`: a signal arriving at least
+     * `debounceMs` after the last run flushes immediately instead
+     * of waiting out the trailing window.
+     */
+    lastRunAt: number;
     full: boolean;
     root: Map<string, Change>;
     expand: Map<string, { modelType: string; change: Change }>;
@@ -693,6 +700,7 @@ export class QuerySubscriptionManager {
         maxWaitTimer: null,
         inFlight: null,
         needsFollowup: false,
+        lastRunAt: 0,
         full: false,
         root: new Map(),
         expand: new Map(),
@@ -929,6 +937,17 @@ export class QuerySubscriptionManager {
       return;
     }
 
+    // Leading edge: a signal arriving at least `debounceMs` after
+    // the last run flushes immediately — isolated writes (the common
+    // case: a job lifecycle's status flips are seconds apart) reach
+    // clients with zero artificial latency. Signals landing INSIDE
+    // the window fall through to the trailing timer below, so a
+    // burst still coalesces into one frame.
+    if (Date.now() - c.lastRunAt >= c.debounceMs) {
+      void this._runRefresh(cached);
+      return;
+    }
+
     // Reset the trailing debounce on every signal. Whichever timer
     // fires first wins; both get cleared at that point.
     if (c.debounceTimer) clearTimeout(c.debounceTimer);
@@ -956,6 +975,7 @@ export class QuerySubscriptionManager {
       clearTimeout(c.maxWaitTimer);
       c.maxWaitTimer = null;
     }
+    c.lastRunAt = Date.now();
 
     const full = c.full;
     const root = [...c.root.values()];
@@ -1062,6 +1082,7 @@ export class QuerySubscriptionManager {
       c.maxWaitTimer = null;
     }
     c.needsFollowup = false;
+    c.lastRunAt = 0;
     c.full = false;
     c.root.clear();
     c.expand.clear();

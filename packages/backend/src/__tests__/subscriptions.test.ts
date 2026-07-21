@@ -1463,6 +1463,32 @@ describe("QuerySubscriptionManager", () => {
   // ── Coalescing (debounce + max-wait) ──────────────────────────────
 
   describe("coalescing", () => {
+    it("flushes the first signal of a window on the leading edge", async () => {
+      const fast = new QuerySubscriptionManager(
+        (socketId, event, data) => {
+          emitted.push({ socketId, event, data });
+        },
+        { debounceMs: 200, maxWaitMs: 1000 },
+      );
+
+      source.setResults([row("p1", { name: "A" })]);
+      await fast.subscribe({
+        socketId: "s1",
+        query: source.query("project"),
+      });
+
+      // An isolated write reaches subscribers immediately — no
+      // 200ms trailing-debounce wait.
+      source.setResults([row("p1", { name: "B" })]);
+      fast.onModelChange("project");
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(emitted).toHaveLength(1);
+      expect(emitted[0]!.data.ops[0].patch).toEqual([
+        { op: "replace", path: "/name", value: "B" },
+      ]);
+    });
+
     it("collapses a burst of onModelChange into a single re-eval", async () => {
       // Use realistic windows so we observe coalescing in practice.
       const fast = new QuerySubscriptionManager(
@@ -1478,8 +1504,11 @@ describe("QuerySubscriptionManager", () => {
         query: source.query("project"),
       });
 
-      // Eight rapid signals in a row — only ONE re-eval should fire,
-      // and it should reflect the FINAL state of the source.
+      // Eight rapid signals in a row — only ONE emission should
+      // land, and it should reflect the FINAL state of the source.
+      // (The leading edge flushes the first signal immediately; the
+      // remaining seven coalesce into a trailing re-eval that finds
+      // no further diff and emits nothing.)
       source.setResults([row("p1", { name: "A8" })]);
       for (let i = 0; i < 8; i++) fast.onModelChange("project");
 
@@ -1569,17 +1598,27 @@ describe("QuerySubscriptionManager", () => {
         query: buildQuery({ realtime: { debounceMs: 200, maxWaitMs: 400 } }),
       });
 
+      // Leading edge: the first signal of a window flushes
+      // immediately, regardless of the override's debounce.
       resultsFor = [row("p1", { name: "B" })];
       m.onModelChange("project");
+      await new Promise((r) => setTimeout(r, 20));
+      expect(ownEmitted).toHaveLength(1);
 
-      // Under the default 100ms max-wait the re-eval would have fired
-      // already. Under the override (400ms) it has NOT.
+      // A second signal INSIDE the window coalesces through the
+      // override's trailing debounce (200ms) — under the default
+      // 25ms debounce it would have fired well before 120ms.
+      resultsFor = [row("p1", { name: "C" })];
+      m.onModelChange("project");
       await new Promise((r) => setTimeout(r, 120));
-      expect(ownEmitted).toHaveLength(0);
+      expect(ownEmitted).toHaveLength(1);
 
       // Wait through the override's debounce.
       await new Promise((r) => setTimeout(r, 200));
-      expect(ownEmitted).toHaveLength(1);
+      expect(ownEmitted).toHaveLength(2);
+      expect(ownEmitted[1]!.data.ops[0].patch).toEqual([
+        { op: "replace", path: "/name", value: "C" },
+      ]);
     });
   });
 
