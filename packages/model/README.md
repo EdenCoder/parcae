@@ -207,6 +207,7 @@ interface Transport {
 | `path`     | `string?`            | Custom API path. Defaults to `/v1/{type}s`.                         |
 | `scope`    | `ModelScope?`        | Row-level security rules.                                           |
 | `indexes`  | `IndexDefinition[]?` | Database index definitions.                                         |
+| `updateReadonlyFields` | `readonly string[]?` | Additional fields protected on PUT/PATCH but accepted on POST. |
 | `managed`  | `boolean`            | `false` for externally managed tables (e.g. auth). Default: `true`. |
 | `__schema` | `SchemaDefinition?`  | Resolved at startup by RTTIST. Maps properties to column types.     |
 
