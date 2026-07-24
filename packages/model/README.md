@@ -225,6 +225,7 @@ interface Transport {
 | `indexes`          | `IndexDefinition[]?` | Database index definitions.                                                        |
 | `searchFields`     | `string[]?`          | Fields to index for full-text + fuzzy search (weighted by order).                 |
 | `readonlyFields`   | `readonly string[]?` | Columns stripped from client request bodies before apply (server can still write).|
+| `updateReadonlyFields` | `readonly string[]?` | Additional columns protected on PUT/PATCH but accepted on POST.                |
 | `privateFields`    | `readonly string[]?` | Columns stripped from the default `sanitize()` projection (don't leak via GET).   |
 | `managed`          | `boolean`            | `false` for externally managed tables (e.g. auth). Default: `true`.               |
 | `__schema`         | `SchemaDefinition?`  | Resolved at startup by ts-morph. Maps properties to column types.                 |

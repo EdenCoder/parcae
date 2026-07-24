@@ -97,6 +97,10 @@ const SYSTEM_FIELDS: ReadonlySet<string> = new Set([
  * PATCH ops first-segment check.
  */
 const READONLY_CACHE = new WeakMap<ModelConstructor, ReadonlySet<string>>();
+const UPDATE_READONLY_CACHE = new WeakMap<
+  ModelConstructor,
+  ReadonlySet<string>
+>();
 
 function readonlyFieldsFor(modelClass: ModelConstructor): ReadonlySet<string> {
   const cached = READONLY_CACHE.get(modelClass);
@@ -121,6 +125,19 @@ function assertNumericColumn(modelClass: ModelConstructor, column: string): void
   }
 }
 
+function readonlyFieldsForUpdate(
+  modelClass: ModelConstructor,
+): ReadonlySet<string> {
+  const cached = UPDATE_READONLY_CACHE.get(modelClass);
+  if (cached) return cached;
+  const merged = new Set(readonlyFieldsFor(modelClass));
+  if (modelClass.updateReadonlyFields) {
+    for (const field of modelClass.updateReadonlyFields) merged.add(field);
+  }
+  UPDATE_READONLY_CACHE.set(modelClass, merged);
+  return merged;
+}
+
 /**
  * Strip framework-protected and model-protected fields from a client
  * body before they get mass-assigned onto a model instance. Returns
@@ -129,8 +146,8 @@ function assertNumericColumn(modelClass: ModelConstructor, column: string): void
 function stripReadonly(
   modelClass: ModelConstructor,
   data: Record<string, any>,
+  deny: ReadonlySet<string> = readonlyFieldsFor(modelClass),
 ): Record<string, any> {
-  const deny = readonlyFieldsFor(modelClass);
   const out: Record<string, any> = {};
   for (const [key, value] of Object.entries(data)) {
     if (key.startsWith("$") || deny.has(key)) continue;
@@ -451,11 +468,14 @@ export function registerModelRoutes(
             );
             if (!current) return null;
 
-            // Strip readonly fields BEFORE mass-assigning. The framework
-            // protects id/createdAt/updatedAt/type unconditionally; per-
-            // model `static readonlyFields` adds counter columns,
-            // ownership refs, and state-machine cols on top.
-            const data = stripReadonly(ModelClass, req.body || {});
+            // Strip readonly fields BEFORE mass-assigning. Per-model
+            // `updateReadonlyFields` supplements the fields protected on
+            // every write without affecting create-time input.
+            const data = stripReadonly(
+              ModelClass,
+              req.body || {},
+              readonlyFieldsForUpdate(ModelClass),
+            );
             for (const [key, value] of Object.entries(data)) {
               current[key] = value;
             }
@@ -532,7 +552,7 @@ export function registerModelRoutes(
           // The first path segment is the column (RFC 6902 paths
           // start with `/`, then column, then optional inner JSON
           // path); only top-level reads are protected.
-          const deny = readonlyFieldsFor(ModelClass);
+          const deny = readonlyFieldsForUpdate(ModelClass);
           for (const op of data.ops) {
             if (!op?.path || typeof op.path !== "string") continue;
             const column = op.path
