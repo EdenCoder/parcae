@@ -59,6 +59,66 @@ describe("clerk server adapter", () => {
     });
   });
 
+  it("reads the org role from the v2 JWT claim without calling the Clerk API", async () => {
+    mocks.verifyToken.mockResolvedValue({
+      sub: "user_1",
+      o: { id: "org_1", rol: "admin", slg: "acme" },
+    });
+    const ctx = setupContext();
+    ctx.rows.set("user_1", { id: "user_1" });
+    const auth = clerk(config);
+    await auth.setup(ctx);
+
+    await expect(auth.resolveToken("token")).resolves.toEqual({
+      user: {
+        id: "user_1",
+        orgId: "org_1",
+        orgRole: "org:admin",
+        orgSlug: "acme",
+      },
+    });
+    expect(mocks.memberships).not.toHaveBeenCalled();
+  });
+
+  it("passes an already-prefixed v1 org_role claim through unchanged", async () => {
+    mocks.verifyToken.mockResolvedValue({
+      sub: "user_1",
+      org_id: "org_1",
+      org_role: "org:freia_staff",
+    });
+    const ctx = setupContext();
+    ctx.rows.set("user_1", { id: "user_1" });
+    const auth = clerk(config);
+    await auth.setup(ctx);
+
+    await expect(auth.resolveToken("token")).resolves.toMatchObject({
+      user: { orgId: "org_1", orgRole: "org:freia_staff" },
+    });
+    expect(mocks.memberships).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the Clerk API at max page size when the JWT lacks a role claim", async () => {
+    mocks.verifyToken.mockResolvedValue({
+      sub: "user_1",
+      o: { id: "org_1" },
+    });
+    mocks.memberships.mockResolvedValue({
+      data: [{ organization: { id: "org_1" }, role: "org:clinician" }],
+    });
+    const ctx = setupContext();
+    ctx.rows.set("user_1", { id: "user_1" });
+    const auth = clerk(config);
+    await auth.setup(ctx);
+
+    await expect(auth.resolveToken("token")).resolves.toMatchObject({
+      user: { orgId: "org_1", orgRole: "org:clinician" },
+    });
+    expect(mocks.memberships).toHaveBeenCalledWith({
+      userId: "user_1",
+      limit: 500,
+    });
+  });
+
   it("denies a session when local provisioning fails", async () => {
     mocks.getUser.mockRejectedValue(new Error("Clerk unavailable"));
     const auth = clerk(config);
