@@ -39,15 +39,19 @@ export function createServer_(options: ServerOptions): ServerContext {
 
   // Create Polka app with body parsing + query string parsing
   const app = polka({
-    onError: (err: unknown, _req: any, res: any) => {
+    onError: (err: unknown, req: any, res: any) => {
       if (res.writableEnded || res.finished) return;
       const status = err instanceof ClientError ? err.status : 500;
       const message =
         err instanceof ClientError
           ? err.message
           : "An error occurred while processing your request";
-      log.error("[http] request failed:", err);
+      log.error("[http] request failed:", req.method, req.url, err);
       error(res, status, message);
+    },
+    onNoMatch: (req: any, res: any) => {
+      log.warn("[http] no route:", req.method, req.url);
+      error(res, 404, "Not found");
     },
   });
   app.use(
