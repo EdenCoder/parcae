@@ -149,13 +149,29 @@ export function clerk(config: ClerkConfig): AuthAdapter {
       const orgSlug =
         (payload as any).o?.slg ?? (payload as any).org_slug ?? null;
 
-      // The JWT doesn't include the role — resolve via Clerk API.
+      // Clerk v2 session tokens carry the role in `o.rol` (stripped of the
+      // `org:` prefix); v1 tokens carry `org_role` (prefixed). Prefer the
+      // verified JWT claim: it saves a Clerk API roundtrip per request, and
+      // the API fallback below is unreliable for users with many
+      // memberships. Normalise to the prefixed shape the membership API
+      // returns so consumers see one format.
       let orgRole: string | null = null;
-      if (orgId) {
+      const claimRole =
+        (payload as any).o?.rol ?? (payload as any).org_role ?? null;
+      if (orgId && typeof claimRole === "string" && claimRole) {
+        orgRole = claimRole.startsWith("org:")
+          ? claimRole
+          : `org:${claimRole}`;
+      } else if (orgId) {
+        // Tokens minted without a role claim: resolve via the Clerk API.
+        // Request the max page size; the default page (10) omits the
+        // active org's membership for users in more than 10 orgs, which
+        // silently downgraded them to no role at all.
         try {
           const memberships =
             await clerkClient.users.getOrganizationMembershipList({
               userId,
+              limit: 500,
             });
           const membership = memberships.data?.find(
             (m: any) => m.organization.id === orgId,
