@@ -91,13 +91,17 @@ export interface ModelConstructor<T = any> {
   /**
    * Additional field-level write protection for updates. Listed columns
    * remain writable through auto-CRUD `POST` routes, but are stripped from
-   * `PUT` bodies and rejected in `PATCH` operations.
+   * `PUT` bodies and rejected in `PATCH` operations. A resolver can vary the
+   * protected fields by request context, for example to let trusted staff
+   * reassign a relationship while keeping it immutable for the owning user.
    *
    * Use this for application-defined identifiers or relationships that are
    * set when a row is created and must not change afterward. Default (empty)
    * preserves the existing behavior for every field name.
    */
-  updateReadonlyFields?: readonly string[];
+  updateReadonlyFields?:
+    | readonly string[]
+    | ((ctx: ScopeContext) => readonly string[]);
   /**
    * Field-level read protection. Listed columns are stripped from
    * the default `sanitize()` projection so a column like

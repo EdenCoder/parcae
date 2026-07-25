@@ -51,6 +51,7 @@ import {
   type QueryChain,
   type SchemaDefinition,
   type PatchOp,
+  type ScopeContext,
 } from "./adapters/types";
 
 // ─── ID Generation ───────────────────────────────────────────────────────────
@@ -450,14 +451,17 @@ export class Model extends EventEmitter {
   /**
    * Additional fields protected only after a row has been created.
    * Auto-CRUD `POST` accepts these columns, while `PUT` strips them and
-   * `PATCH` rejects operations that target them. This lets applications
-   * define create-time identifiers or relationships without imposing any
+   * `PATCH` rejects operations that target them. A resolver can vary the
+   * protected fields by request context. This lets applications define
+   * create-time identifiers or relationships without imposing any
    * domain-specific field names at framework level.
    *
    * Server-side model writes are unaffected. Default is empty so existing
    * models remain backward-compatible.
    */
-  static readonly updateReadonlyFields: readonly string[] = [];
+  static readonly updateReadonlyFields:
+    | readonly string[]
+    | ((ctx: ScopeContext) => readonly string[]) = [];
   /**
    * Field-level read protection for the default `sanitize()`. Listed
    * columns are stripped from the response shape so a column like
