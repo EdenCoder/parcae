@@ -114,15 +114,28 @@ function readonlyFieldsFor(modelClass: ModelConstructor): ReadonlySet<string> {
 
 function readonlyFieldsForUpdate(
   modelClass: ModelConstructor,
+  ctx: ScopeContext,
 ): ReadonlySet<string> {
+  const configured = modelClass.updateReadonlyFields;
+  if (typeof configured === "function") {
+    const merged = new Set(readonlyFieldsFor(modelClass));
+    for (const field of configured(ctx)) merged.add(field);
+    return merged;
+  }
+
   const cached = UPDATE_READONLY_CACHE.get(modelClass);
   if (cached) return cached;
   const merged = new Set(readonlyFieldsFor(modelClass));
-  if (modelClass.updateReadonlyFields) {
-    for (const field of modelClass.updateReadonlyFields) merged.add(field);
+  if (configured) {
+    for (const field of configured) merged.add(field);
   }
   UPDATE_READONLY_CACHE.set(modelClass, merged);
   return merged;
+}
+
+function isReadonlyField(key: string, deny: ReadonlySet<string>): boolean {
+  if (deny.has(key)) return true;
+  return key.startsWith("$") && deny.has(key.slice(1));
 }
 
 /**
@@ -137,7 +150,7 @@ function stripReadonly(
 ): Record<string, any> {
   const out: Record<string, any> = {};
   for (const [key, value] of Object.entries(data)) {
-    if (key.startsWith("$") || deny.has(key)) continue;
+    if (isReadonlyField(key, deny)) continue;
     out[key] = value;
   }
   return out;
@@ -442,7 +455,7 @@ export function registerModelRoutes(
           const data = stripReadonly(
             ModelClass,
             req.body || {},
-            readonlyFieldsForUpdate(ModelClass),
+            readonlyFieldsForUpdate(ModelClass, ctx),
           );
           for (const [key, value] of Object.entries(data)) {
             item[key] = value;
@@ -512,11 +525,11 @@ export function registerModelRoutes(
           // The first path segment is the column (RFC 6902 paths
           // start with `/`, then column, then optional inner JSON
           // path); only top-level reads are protected.
-          const deny = readonlyFieldsForUpdate(ModelClass);
+          const deny = readonlyFieldsForUpdate(ModelClass, ctx);
           for (const op of data.ops) {
             if (!op?.path || typeof op.path !== "string") continue;
             const column = op.path.slice(1).split("/")[0];
-            if (column && (column.startsWith("$") || deny.has(column))) {
+            if (column && isReadonlyField(column, deny)) {
               return json(res, 403, {
                 result: null,
                 success: false,
