@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AddressInfo } from "node:net";
 import {
   createServer_,
+  log,
   type AuthSetupContext,
   type Config,
 } from "@parcae/backend";
@@ -121,10 +122,16 @@ describe("clerk server adapter", () => {
 
   it("denies a session when local provisioning fails", async () => {
     mocks.getUser.mockRejectedValue(new Error("Clerk unavailable"));
+    // The adapter is SUPPOSED to log here — provisioning failing is a
+    // real incident in production. Own the log rather than letting it
+    // leak to stderr, where a deliberate error path reads as a broken
+    // build for every workspace that merely has this package in it.
+    const logged = vi.spyOn(log, "error").mockImplementation(() => {});
     const auth = clerk(config);
     await auth.setup(setupContext());
 
     await expect(auth.resolveToken("token")).resolves.toBeNull();
+    expect(logged).toHaveBeenCalledOnce();
   });
 
   it("deduplicates concurrent local provisioning", async () => {
