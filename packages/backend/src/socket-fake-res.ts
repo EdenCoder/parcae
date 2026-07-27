@@ -29,6 +29,7 @@ export interface SocketEmitter {
 export function createSocketFakeRes(
   socket: SocketEmitter,
   requestId: string,
+  isSessionCurrent: () => boolean = () => true,
 ): any {
   // biome-ignore lint/suspicious/noExplicitAny: parsed JSON of any shape
   let responseBody: any = null;
@@ -46,6 +47,8 @@ export function createSocketFakeRes(
     },
     end(body?: string) {
       if (this.writableEnded) return;
+      this.writableEnded = true;
+      if (!isSessionCurrent()) return;
       if (body) {
         try {
           responseBody = JSON.parse(body);
@@ -54,10 +57,11 @@ export function createSocketFakeRes(
         }
       }
       const compressed = pako.gzip(
-        JSON.stringify(compress(responseBody ?? { result: null, success: true })),
+        JSON.stringify(
+          compress(responseBody ?? { result: null, success: true }),
+        ),
       );
       socket.emit(requestId, compressed);
-      this.writableEnded = true;
     },
   };
 }

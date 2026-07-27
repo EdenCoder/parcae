@@ -404,6 +404,8 @@ export interface QueryChain<T> {
   /** @internal */ __modelType: string;
   /** @internal */ __modelClass: ModelConstructor<T>;
   /** @internal */ __adapter: ModelAdapter;
+  /** @internal — adapter-free chain recorded by Model's static factories. */
+  __lazy?: boolean;
   /** @internal — true when `.withForceRefresh()` was applied. */
   __forceRefresh?: boolean;
   /** @internal — false when `.withSubscribe(false)` was applied. */

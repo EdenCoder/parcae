@@ -57,6 +57,28 @@ describe("SessionMachine", () => {
     expect(settled).toBe(true);
   });
 
+  it("reconciliation closes the session while retaining the prior owner for purge", async () => {
+    const s = new SessionMachine();
+    s.resolve("u1");
+    const notify = vi.fn();
+    s.subscribe(notify);
+
+    s.beginReconciliation();
+
+    expect(s.state).toMatchObject({ status: "pending", userId: "u1" });
+    let ready = false;
+    void s.ready.then(() => {
+      ready = true;
+    });
+    await Promise.resolve();
+    expect(ready).toBe(false);
+    expect(notify).toHaveBeenCalledOnce();
+
+    s.resolve("u2");
+    await s.ready;
+    expect(s.state).toMatchObject({ status: "authenticated", userId: "u2" });
+  });
+
   it("terminate() locks the machine — subsequent resolve() is ignored", () => {
     const s = new SessionMachine();
     s.resolve("u1");
@@ -75,5 +97,26 @@ describe("SessionMachine", () => {
     s.resolve("u2"); // 2
     s.terminate(); // 3
     expect(fn).toHaveBeenCalledTimes(3);
+  });
+
+  it("isolates a throwing listener so later boundary listeners always run", () => {
+    const s = new SessionMachine();
+    s.resolve("u1");
+    const throwing = vi.fn(() => {
+      throw new Error("prior-owner-phi");
+    });
+    const purgeAndClose = vi.fn();
+    s.subscribe(throwing);
+    s.subscribe(purgeAndClose);
+
+    expect(() => s.beginReconciliation()).not.toThrow();
+    expect(throwing).toHaveBeenCalledOnce();
+    expect(purgeAndClose).toHaveBeenCalledOnce();
+    expect(s.state).toMatchObject({ status: "pending", userId: "u1" });
+
+    expect(() => s.resolve("u2")).not.toThrow();
+    expect(throwing).toHaveBeenCalledTimes(2);
+    expect(purgeAndClose).toHaveBeenCalledTimes(2);
+    expect(s.state).toMatchObject({ status: "authenticated", userId: "u2" });
   });
 });

@@ -81,10 +81,23 @@ export class SessionMachine {
     this.state.status = nextStatus;
     this.state.userId = userId;
     this.state.version++;
-    log.debug(
-      userId ? `session: authenticated ${userId}` : "session: anonymous",
-    );
+    log.debug(userId ? "session: authenticated" : "session: anonymous");
     this._fireReady();
+    this._notify();
+  }
+
+  /**
+   * Start a logical authorization reconciliation while retaining the prior
+   * owner id long enough for consumers to purge owner-scoped state. New
+   * cache-keying work must wait for `ready` before reading that id.
+   */
+  beginReconciliation(): void {
+    if (this.state.status === "pending") return;
+    this.state.status = "pending";
+    this.state.version++;
+    this.ready = new Promise<void>((resolve) => {
+      this._resolveReady = resolve;
+    });
     this._notify();
   }
 
@@ -104,14 +117,7 @@ export class SessionMachine {
 
   /** @internal — exposed for diagnostics. */
   reset(): void {
-    if (this.state.status === "pending") return;
-    this.state.status = "pending";
-    this.state.userId = null;
-    this.state.version++;
-    this.ready = new Promise<void>((r) => {
-      this._resolveReady = r;
-    });
-    this._notify();
+    this.beginReconciliation();
   }
 
   private _fireReady(): void {
@@ -120,6 +126,14 @@ export class SessionMachine {
   }
 
   private _notify(): void {
-    for (const fn of this._listeners) fn();
+    for (const fn of [...this._listeners]) {
+      try {
+        fn();
+      } catch {
+        // A consumer listener must never block later safety listeners such as
+        // owner-cache purge and Provider closure at an auth boundary.
+        log.warn("session listener failed");
+      }
+    }
   }
 }

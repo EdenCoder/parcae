@@ -71,7 +71,7 @@ describe("useQuery cache key — where(callback) serialization", () => {
       searchSteps("Jane"),
       false,
     );
-    expect(dyn).toContain(":u1:");
+    expect(dyn).toContain('"u1"');
     expect(stat.endsWith(":nosub")).toBe(true);
     expect(dyn).not.toEqual(stat);
   });

@@ -5,17 +5,14 @@
  * authenticates, and queries data. No mocks.
  */
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createServer } from "node:http";
 import polka from "polka";
 import { Server as SocketServer } from "socket.io";
 import pako from "pako";
 import { compress } from "compress-json";
 import { Model } from "@parcae/model";
-import {
-  SocketTransport,
-  _resetSockets,
-} from "../packages/sdk/src/transports/socket";
+import { SocketTransport } from "../packages/sdk/src/transports/socket";
 
 // ─── Test server ─────────────────────────────────────────────────────────────
 
@@ -71,11 +68,12 @@ beforeAll(async () => {
   io.on("connection", (socket) => {
     let session: any = null;
 
-    socket.on("authenticate", (token: string, callback: any) => {
+    socket.on("hello", ({ token }: { token: string | null }, callback: any) => {
       if (token === TEST_TOKEN) {
         session = { userId: TEST_USER_ID };
         callback({ userId: TEST_USER_ID });
       } else {
+        session = null;
         callback({ userId: null });
       }
     });
@@ -144,11 +142,10 @@ afterAll(async () => {
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 describe("E2E: server + socket + auth + query", () => {
-  beforeEach(() => _resetSockets());
   it("should connect to the server", async () => {
     const transport = new SocketTransport({
       url: `http://localhost:${port}`,
-      token: null, // no auth
+      getToken: async () => null,
     });
 
     // Wait for connection
@@ -158,7 +155,8 @@ describe("E2E: server + socket + auth + query", () => {
     });
 
     expect(transport.isConnected).toBe(true);
-    expect(transport.auth.state.status).toBe("unauthenticated");
+    await transport.session.ready;
+    expect(transport.session.state.status).toBe("anonymous");
 
     transport.disconnect();
   });
@@ -166,14 +164,14 @@ describe("E2E: server + socket + auth + query", () => {
   it("should authenticate with valid token", async () => {
     const transport = new SocketTransport({
       url: `http://localhost:${port}`,
-      token: TEST_TOKEN,
+      getToken: async () => TEST_TOKEN,
     });
 
-    // Wait for auth to resolve
-    await transport.auth.ready;
+    // Wait for the server-confirmed hello to resolve
+    await transport.session.ready;
 
-    expect(transport.auth.state.status).toBe("authenticated");
-    expect(transport.auth.state.userId).toBe(TEST_USER_ID);
+    expect(transport.session.state.status).toBe("authenticated");
+    expect(transport.session.state.userId).toBe(TEST_USER_ID);
 
     transport.disconnect();
   });
@@ -181,13 +179,13 @@ describe("E2E: server + socket + auth + query", () => {
   it("should resolve unauthenticated with invalid token", async () => {
     const transport = new SocketTransport({
       url: `http://localhost:${port}`,
-      token: "wrong_token",
+      getToken: async () => "wrong_token",
     });
 
-    await transport.auth.ready;
+    await transport.session.ready;
 
-    expect(transport.auth.state.status).toBe("unauthenticated");
-    expect(transport.auth.state.userId).toBeNull();
+    expect(transport.session.state.status).toBe("anonymous");
+    expect(transport.session.state.userId).toBeNull();
 
     transport.disconnect();
   });
@@ -195,10 +193,10 @@ describe("E2E: server + socket + auth + query", () => {
   it("should make RPC calls via socket", async () => {
     const transport = new SocketTransport({
       url: `http://localhost:${port}`,
-      token: TEST_TOKEN,
+      getToken: async () => TEST_TOKEN,
     });
 
-    await transport.auth.ready;
+    await transport.session.ready;
 
     // This is the critical test — does transport.get() actually work?
     const result = await transport.get("/projects");
@@ -211,15 +209,19 @@ describe("E2E: server + socket + auth + query", () => {
     transport.disconnect();
   });
 
-  it("should block requests until auth resolves", async () => {
+  it("should block requests until the hello token resolves", async () => {
+    let resolveToken: (token: string) => void = () => undefined;
+    const token = new Promise<string>((resolve) => {
+      resolveToken = resolve;
+    });
     const transport = new SocketTransport({
       url: `http://localhost:${port}`,
-      token: undefined, // auth pending — will be set later
+      getToken: () => token,
     });
 
     let resolved = false;
 
-    // Start a request — it should block on auth.ready
+    // Start a request — it must wait for the current hello.
     const req = transport.get("/projects").then((r) => {
       resolved = true;
       return r;
@@ -229,8 +231,8 @@ describe("E2E: server + socket + auth + query", () => {
     await new Promise((r) => setTimeout(r, 100));
     expect(resolved).toBe(false);
 
-    // Now authenticate
-    await transport.authenticate(TEST_TOKEN);
+    // Resolve the token and let the handshake complete.
+    resolveToken(TEST_TOKEN);
 
     // Request should now complete
     const result = await req;
@@ -241,23 +243,24 @@ describe("E2E: server + socket + auth + query", () => {
   });
 
   it("should re-authenticate after token change", async () => {
+    let token: string | null = null;
     const transport = new SocketTransport({
       url: `http://localhost:${port}`,
-      token: null, // start unauthenticated
+      getToken: async () => token,
     });
 
-    await transport.auth.ready;
-    expect(transport.auth.state.status).toBe("unauthenticated");
+    await transport.session.ready;
+    expect(transport.session.state.status).toBe("anonymous");
 
-    // Now authenticate
-    const result = await transport.authenticate(TEST_TOKEN);
+    token = TEST_TOKEN;
+    const result = await transport.refreshSession();
     expect(result.userId).toBe(TEST_USER_ID);
-    expect(transport.auth.state.status).toBe("authenticated");
+    expect(transport.session.state.status).toBe("authenticated");
 
-    // Change to invalid token
-    const result2 = await transport.authenticate("bad_token");
+    token = "bad_token";
+    const result2 = await transport.refreshSession();
     expect(result2.userId).toBeNull();
-    expect(transport.auth.state.status).toBe("unauthenticated");
+    expect(transport.session.state.status).toBe("anonymous");
 
     transport.disconnect();
   });
@@ -265,25 +268,27 @@ describe("E2E: server + socket + auth + query", () => {
   it("should re-authenticate on reconnect", async () => {
     const transport = new SocketTransport({
       url: `http://localhost:${port}`,
-      token: TEST_TOKEN,
+      getToken: async () => TEST_TOKEN,
     });
 
-    await transport.auth.ready;
-    expect(transport.auth.state.status).toBe("authenticated");
-    expect(transport.auth.state.userId).toBe(TEST_USER_ID);
+    await transport.session.ready;
+    expect(transport.session.state.status).toBe("authenticated");
+    expect(transport.session.state.userId).toBe(TEST_USER_ID);
 
-    // Simulate disconnect — auth gate should reset to pending
+    // A wire disconnect does not silently change the confirmed identity.
     transport.disconnect();
     await new Promise((r) => setTimeout(r, 50));
-    expect(transport.auth.state.status).toBe("pending");
+    expect(transport.session.state.status).toBe("authenticated");
 
-    // Reconnect — should auto re-authenticate
+    // Reconnect triggers a fresh hello; wait for its resync signal rather
+    // than the already-resolved session.ready from the prior connection.
+    const reconciled = new Promise<void>((resolve) => {
+      transport.once("resync-required", () => resolve());
+    });
     await transport.reconnect();
-
-    // Wait for auth to resolve again
-    await transport.auth.ready;
-    expect(transport.auth.state.status).toBe("authenticated");
-    expect(transport.auth.state.userId).toBe(TEST_USER_ID);
+    await reconciled;
+    expect(transport.session.state.status).toBe("authenticated");
+    expect(transport.session.state.userId).toBe(TEST_USER_ID);
 
     // RPC should work after reconnect
     const result = await transport.get("/projects");

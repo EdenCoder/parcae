@@ -3,7 +3,7 @@
  * Tests that RPC calls work through body-parser + CORS + auth middleware.
  */
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createServer } from "node:http";
 import { parse as parseUrl } from "node:url";
 import { PassThrough } from "node:stream";
@@ -12,10 +12,7 @@ import bodyParser from "body-parser";
 import { Server as SocketServer } from "socket.io";
 import pako from "pako";
 import { compress } from "compress-json";
-import {
-  SocketTransport,
-  _resetSockets,
-} from "../packages/sdk/src/transports/socket";
+import { SocketTransport } from "../packages/sdk/src/transports/socket";
 
 let httpServer: ReturnType<typeof createServer>;
 let io: SocketServer;
@@ -96,7 +93,7 @@ beforeAll(async () => {
   io.on("connection", (socket) => {
     let session: any = null;
 
-    socket.on("authenticate", (token: string, cb: any) => {
+    socket.on("hello", ({ token }: { token: string | null }, cb: any) => {
       session = token === TOKEN ? { user: { id: USER_ID } } : null;
       cb({ userId: session?.user?.id ?? null });
     });
@@ -171,19 +168,12 @@ afterAll(async () => {
 });
 
 describe("E2E with middleware stack", () => {
-  beforeEach(() => {
-    _resetSockets();
-    // Suppress unhandled rejections from socket cache cleanup
-    process.removeAllListeners("unhandledRejection");
-    process.on("unhandledRejection", () => {});
-  });
-
   it("should fetch list through body-parser + CORS + auth middleware", async () => {
     const transport = new SocketTransport({
       url: `http://localhost:${port}`,
-      token: TOKEN,
+      getToken: async () => TOKEN,
     });
-    await transport.auth.ready;
+    await transport.session.ready;
 
     const result = await transport.get("/posts");
     expect(result.total).toBe(2);
@@ -196,9 +186,9 @@ describe("E2E with middleware stack", () => {
   it("should fetch single item with params", async () => {
     const transport = new SocketTransport({
       url: `http://localhost:${port}`,
-      token: TOKEN,
+      getToken: async () => TOKEN,
     });
-    await transport.auth.ready;
+    await transport.session.ready;
 
     const result = await transport.get("/posts/1");
     expect(result.id).toBe("1");
@@ -210,9 +200,9 @@ describe("E2E with middleware stack", () => {
   it("should handle 404", async () => {
     const transport = new SocketTransport({
       url: `http://localhost:${port}`,
-      token: TOKEN,
+      getToken: async () => TOKEN,
     });
-    await transport.auth.ready;
+    await transport.session.ready;
 
     await expect(transport.get("/posts/999")).rejects.toThrow("Not found");
 
@@ -223,9 +213,9 @@ describe("E2E with middleware stack", () => {
   it("should work unauthenticated", async () => {
     const transport = new SocketTransport({
       url: `http://localhost:${port}`,
-      token: null,
+      getToken: async () => null,
     });
-    await transport.auth.ready;
+    await transport.session.ready;
 
     const result = await transport.get("/posts");
     expect(result.posts).toHaveLength(2);

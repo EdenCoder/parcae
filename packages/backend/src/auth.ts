@@ -39,7 +39,7 @@ export interface AuthAdapter {
 
   /**
    * Resolve a bearer token to an authenticated session.
-   * Used for Socket.IO authentication via the `authenticate` event.
+   * Used for Socket.IO session binding via the `hello` handshake.
    */
   resolveToken(token: string): Promise<AuthSession | null>;
 

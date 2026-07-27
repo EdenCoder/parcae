@@ -63,9 +63,15 @@ export class ConnectionMachine {
     this.state.status = status;
     this.state.lastError = err;
     this.state.version++;
-    log.debug(
-      `connection: ${status}${err ? ` (${err.message})` : ""}`,
-    );
-    for (const fn of this._listeners) fn();
+    log.debug(`connection: ${status}${err ? " (error)" : ""}`);
+    for (const fn of [...this._listeners]) {
+      try {
+        fn();
+      } catch {
+        // Connection observers are untrusted consumer code. One callback
+        // must not prevent the transport from starting hello/reconnect work.
+        log.warn("connection listener failed");
+      }
+    }
   }
 }

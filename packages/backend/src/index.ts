@@ -96,6 +96,9 @@ export type {
   RouteOptions,
   RouteEntry,
   SocketContext,
+  SocketContextEmitter,
+  SocketContextSocket,
+  SocketContextServer,
   SocketHandler,
   SocketMiddleware,
   SocketEntry,
@@ -127,11 +130,7 @@ export type {
   CronEntry,
 } from "./routing/cron";
 
-export {
-  migration,
-  getMigrations,
-  clearMigrations,
-} from "./routing/migration";
+export { migration, getMigrations, clearMigrations } from "./routing/migration";
 export type {
   Engine,
   MigrationContext,

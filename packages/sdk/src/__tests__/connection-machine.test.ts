@@ -45,4 +45,17 @@ describe("ConnectionMachine", () => {
     c.disconnected(err);
     expect(c.state.lastError).toBe(err);
   });
+
+  it("isolates listeners so one throw cannot block later observers", () => {
+    const c = new ConnectionMachine();
+    const later = vi.fn();
+    c.subscribe(() => {
+      throw new Error("consumer failure");
+    });
+    c.subscribe(later);
+
+    expect(() => c.connected()).not.toThrow();
+    expect(later).toHaveBeenCalledOnce();
+    expect(c.state.status).toBe("connected");
+  });
 });

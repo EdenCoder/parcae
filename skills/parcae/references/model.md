@@ -61,9 +61,9 @@ Internal state uses Symbols so it never collides with data properties:
 There are exactly three ways to persist:
 
 ```typescript
-await post.save();           // (1) full-document upsert
-await post.patch(ops);       // (2) apply RFC 6902 ops locally + send them
-await post.flush();          // (3) diff snapshot vs current, send the delta as a patch
+await post.save(); // (1) full-document upsert
+await post.patch(ops); // (2) apply RFC 6902 ops locally + send them
+await post.flush(); // (3) diff snapshot vs current, send the delta as a patch
 ```
 
 ### `save()`
@@ -90,8 +90,8 @@ Both are **pure** — no I/O, no events, no persistence. Call `flush()` (or `pat
 
 ```typescript
 const url = project.get<string>("blocks.abc.image.url"); // pure read; undefined if any segment missing
-project.set("blocks.abc.image.url", "https://...");        // pure write; auto-vivifies intermediate objects
-await project.flush();                                     // now persist
+project.set("blocks.abc.image.url", "https://..."); // pure write; auto-vivifies intermediate objects
+await project.flush(); // now persist
 ```
 
 `set()` with a single-segment path is a plain top-level assignment; multi-segment paths walk and create missing intermediate objects (always objects, not arrays).
@@ -99,10 +99,10 @@ await project.flush();                                     // now persist
 ## Other Instance Methods
 
 ```typescript
-await post.remove();                  // delete; emits "removed"
-await post.refresh();                 // re-fetch via findById, merge via SYM_SERVER_MERGE
+await post.remove(); // delete; emits "removed"
+await post.refresh(); // re-fetch via findById, merge via SYM_SERVER_MERGE
 const safe = await post.sanitize(user); // projection safe to return from routes (honours privateFields)
-const raw = post.toJSON();            // internal projection — IGNORES privateFields; do NOT return from routes
+const raw = post.toJSON(); // internal projection — IGNORES privateFields; do NOT return from routes
 ```
 
 - `sanitize(user?)` — default projects every column except `static privateFields`, and injects `type`. The auto-CRUD GET routes call it on every row. Override for self-vs-other projections. `user` is passed but ignored by the default.
@@ -209,17 +209,26 @@ Without `.expand()`, ref columns serialize as raw id strings and the client must
 
 ## Reference Fields
 
-Properties typed as another `Model` get an accessor pair installed by `_apply()` (no Proxy on the Model itself; the *ref value* is a small Proxy):
+Properties typed as another `Model` get an accessor pair installed by `_apply()` (no Proxy on the Model itself; the _ref value_ is a small Proxy):
 
 ```typescript
-post.author       // lazy-loading ref proxy (memoized per raw id), or null
-post.author = u   // accepts a Model, an id string, or null; stores the raw id
-post.$author      // raw id string (no load); also settable
+post.author; // lazy-loading ref proxy (memoized per raw id), or null
+post.author = u; // accepts a Model, an id string, or null; stores the raw id
+post.$author; // raw id string (no load); also settable
 ```
 
-The ref proxy returns `.id` and `.type` **synchronously** (and handles `then` → `undefined`, `toJSON`, and `Symbol.toPrimitive` without loading). Most OTHER property reads before the row loads throw the pending `findById` promise (React Suspense). `ownKeys` / `has` / `getOwnPropertyDescriptor` restrict the visible surface to `{ id, type }`, so iteration / `isEqual` / DevTools expansion don't trip the lazy-load trap. Proxies are cached in `Model.__refCache`, a 30s-TTL map keyed `${type}:${id}`.
+The ref proxy returns `.id` and `.type` **synchronously** (and handles `then` → `undefined`, `toJSON`, and `Symbol.toPrimitive` without loading). Most OTHER property reads before the row loads throw the pending `findById` promise (React Suspense). `ownKeys` / `has` / `getOwnPropertyDescriptor` restrict the visible surface to `{ id, type }`, so iteration / `isEqual` / DevTools expansion don't trip the lazy-load trap.
+
+Ref proxies are cached per **adapter** in a `WeakMap<ModelAdapter, namespace>`, keyed by
+`JSON.stringify([type, id])` so delimiter collisions cannot alias identities. The 30-second
+TTL is sliding; expiry scrubs loaded data and fences any earlier in-flight load before a
+later read can reload. `Model.clearRefCache(adapter)` increments that adapter namespace's
+authorization generation and synchronously scrubs every still-reachable proxy. WeakRef is
+used when available; ES2019/PrimJS falls back to strongly tracked state bounded by the same
+TTL. Node timers are unref'd so a proxy cannot keep a CLI process alive.
 
 > **Gotchas.**
+>
 > - Never write `'id' in ref` — the ref proxy wraps `{}` and only whitelists `id`/`type` in its `has` trap (`'someOtherKey' in ref` is false). Read `ref.id` directly.
 > - `$field` raw-id accessors are reliable on the server (schema resolved at startup). On the dashboard/client the `$field` getter may be undefined if `__schema` wasn't populated for that model — read ref ids via a runtime shape check (a string id, or an object with `.id`) rather than relying on `$field`.
 
@@ -227,17 +236,20 @@ The ref proxy returns `.id` and `.type` **synchronously** (and handles `then` �
 
 ```typescript
 interface ModelAdapter {
-  createStore(data): Record<string, any>;                 // backend builds DB rows; unused on frontend
-  save(model): Promise<void>;                              // full-document upsert (no ChangeSet)
+  createStore(data): Record<string, any>; // backend builds DB rows; unused on frontend
+  save(model): Promise<void>; // full-document upsert (no ChangeSet)
   remove(model): Promise<void>;
   findById<T>(modelClass, id): Promise<T | null>;
   query<T>(modelClass): QueryChain<T>;
   queryFromClient?<T>(modelClass, scope, rawSteps): QueryChain<T>; // backend only; scope-first replay
-  patch(model, ops: PatchOp[]): Promise<void>;            // PATCH with RFC 6902 ops
+  patch(model, ops: PatchOp[]): Promise<void>; // PATCH with RFC 6902 ops
 }
 ```
 
-There is no `ChangeSet` and no three-way HTTP-method priority. The adapter is set globally via `Model.use(adapter)` and stored on `globalThis.__parcae_adapter` so multiple copies of `@parcae/model` (common with pnpm) share one adapter.
+There is no `ChangeSet` and no three-way HTTP-method priority. `Model.use(adapter)` sets the
+primary global adapter, but every created/hydrated Model instance retains the exact adapter
+that owns it. `Model.createWithAdapter(adapter, data)` is the explicit client-owned path;
+saves, lazy refs, and hydrated children continue through that instance adapter.
 
 ## FrontendAdapter
 
@@ -252,7 +264,12 @@ Source: `packages/model/src/adapters/client.ts`. Save is **2-way**:
 
 ## Query Chains Are Lazy
 
-Static query methods build a `lazyQuery()` chain that records `{ method, args }` steps without an adapter. The adapter resolves only when a terminal (`find` / `first` / `count`) runs (`Model.hasAdapter()` ? `getAdapter()` : `await waitForAdapter()`), so queries can be constructed in React component bodies before `ParcaeProvider` mounts. The frontend adapter serializes the same steps as `QueryStep[]` and ships them to the server; the backend replays them against a scoped Knex builder.
+Static query methods build a marked `lazyQuery()` chain that records `{ method, args }`
+steps without an adapter. The adapter resolves only when a terminal (`find` / `first` /
+`count`) runs (`Model.hasAdapter()` ? `getAdapter()` : `await waitForAdapter()`), so queries
+can be constructed in React component bodies before `ParcaeProvider` mounts. SDK
+client-aware query APIs detect that lazy marker (or a foreign adapter) and replay the
+recorded steps through the exact owning client's adapter before the terminal runs.
 
 ## Schema Resolution
 
@@ -260,16 +277,16 @@ Static query methods build a `lazyQuery()` chain that records `{ method, args }`
 
 ### Type Mapping (`PrimitiveColumnType`)
 
-| TypeScript                 | Column type | Postgres         |
-| -------------------------- | ----------- | ---------------- |
-| `string`                   | `"string"`  | VARCHAR(2048)    |
-| `string` (text annotation) | `"text"`    | TEXT             |
-| `number` (integer)         | `"integer"` | INTEGER          |
-| `number` (float)           | `"number"`  | DOUBLE PRECISION |
-| `boolean`                  | `"boolean"` | BOOLEAN          |
-| `Date`                     | `"datetime"`| TIMESTAMP        |
+| TypeScript                 | Column type               | Postgres                 |
+| -------------------------- | ------------------------- | ------------------------ |
+| `string`                   | `"string"`                | VARCHAR(2048)            |
+| `string` (text annotation) | `"text"`                  | TEXT                     |
+| `number` (integer)         | `"integer"`               | INTEGER                  |
+| `number` (float)           | `"number"`                | DOUBLE PRECISION         |
+| `boolean`                  | `"boolean"`               | BOOLEAN                  |
+| `Date`                     | `"datetime"`              | TIMESTAMP                |
 | `AnotherModel`             | `{ kind: "ref", target }` | VARCHAR (foreign key id) |
-| object / array             | `"json"`    | JSONB            |
+| object / array             | `"json"`                  | JSONB                    |
 
 > **Gotcha — inline union-literal alias resolves to JSONB.** Declare union-literal field types (`status: "a" | "b"`) in the SAME file as the model. Importing the alias from another workspace package can make the resolver treat it as opaque and fall back to JSONB instead of VARCHAR, producing `22P02 invalid input syntax for type json` in text-treating SQL. Keep a synced second definition rather than importing the type; verify with `information_schema.columns` (expect `character varying`).
 
@@ -281,4 +298,8 @@ When set, `ensureTable()` creates a generated `_search` tsvector column + GIN in
 
 ## GlobalThis Pattern
 
-The active adapter (plus its `__parcae_pending` / `__parcae_resolve` await helpers) lives on `globalThis` so it behaves correctly when multiple copies of `@parcae/model` coexist in the dependency tree (common in pnpm monorepos). The reference cache is **not** global — it's a private static `Model.__refCache` map.
+The primary adapter (plus its `__parcae_pending` / `__parcae_resolve` await helpers) lives
+on `globalThis` so it behaves correctly when multiple copies of `@parcae/model` coexist in
+the dependency tree (common in pnpm monorepos). Reference caches are **not** global: they
+are private adapter-keyed WeakMap namespaces, cleared independently at each client's
+authorization boundary.

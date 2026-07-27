@@ -118,7 +118,7 @@ GET    /v1/health         status, uptime, model count
 | ------------------------------------------------------- | ------------------------------------------------------------------- |
 | [`@parcae/model`](./packages/model)                     | Model base class, Proxy system, query builder, adapter interface    |
 | [`@parcae/backend`](./packages/backend)                 | createApp, auto-CRUD, hooks, jobs, PubSub, queue, schema resolution |
-| [`@parcae/sdk`](./packages/sdk)                         | Client SDK — Socket.IO and SSE transports, React hooks              |
+| [`@parcae/sdk`](./packages/sdk)                         | Client SDK — Socket.IO transport, sessions, React hooks             |
 | [`@parcae/auth-betterauth`](./packages/auth-betterauth) | Better Auth adapter — self-hosted, same Postgres                    |
 | [`@parcae/auth-clerk`](./packages/auth-clerk)           | Clerk adapter — external auth proxied to your User model            |
 
@@ -269,20 +269,31 @@ const app = createApp({
 });
 ```
 
-`req.session.user` is available in every route handler and scope. Socket.IO authenticates via the `authenticate` event. Implement the `AuthAdapter` interface to bring whatever you want.
+`req.session.user` is available in every route handler and scope. Socket.IO binds
+each connection through the server-confirmed `hello` handshake. Implement the
+`AuthAdapter` interface to bring whatever you want.
 
 ## Client SDK
 
-Two transports, same API. Socket.IO for bidirectional realtime, SSE for simpler infrastructure.
+The SDK uses Socket.IO for bidirectional realtime. WebSocket is the default
+Socket.IO transport; polling can be selected for runtimes without a WebSocket
+global.
 
 ```typescript
 import { createClient } from "@parcae/sdk";
 
-const client = createClient({ url: "http://localhost:3000" });
-// or: createClient({ url: "...", transport: "sse" })
+const client = createClient({
+  url: "http://localhost:3000",
+  getToken: async () => auth.getToken(), // null for anonymous
+});
 ```
 
-The client wires up `Model.use()` automatically — `Post.where(...)` just works on the frontend.
+The client wires up the realm's one primary `Model` adapter automatically —
+`Post.where(...)` just works on the frontend. The same exact URL/version may
+reuse that client; a different primary fails closed and must use
+`createIsolatedClient` / `withIsolatedClient`. Every client owns its physical
+socket. Session transitions are closed until the matching `hello`
+acknowledgement arrives.
 
 ## React
 

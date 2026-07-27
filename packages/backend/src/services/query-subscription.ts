@@ -8,8 +8,9 @@
  *   prepareClientQuery({ ModelClass, scopeResult, rawSteps, ... })
  *     → { query, countQuery, expandResolved, steps }
  *
- *   runQuerySubscription({ ...prep, socketId, user, force? })
- *     → { items, hash, totalCount }
+ *   runQuerySubscription({ ...prep, socketId, sessionLease, user, force? })
+ *     → { items, hash, totalCount, subscriptionCreated,
+ *          attachmentGeneration, attachmentOwnedByCaller }
  *
  *   runQueryStatic({ ...prep, user })
  *     → { items, totalCount }
@@ -21,9 +22,9 @@
  * count-short-circuit, the LIST handler's static and subscribed fetch
  * paths, and the socket-RPC resync handler.
  *
- * `runQuerySubscription` consumes a prep result, runs the subscribe +
- * hydrate handshake against `adapter.subscriptions`, and returns the
- * wire-ready row set. Two call sites use it: the LIST handler (when
+ * `runQuerySubscription` consumes a prep result, completes the fallible count
+ * before committing the manager subscription, and returns the manager's
+ * principal/session-scoped wire rows. Two call sites use it: the LIST handler (when
  * `req._socketId` is set AND the request didn't opt out via
  * `__subscribe: false`) and the socket-RPC `resync` handler (for
  * dynamic entries).
@@ -146,9 +147,15 @@ export interface RunQuerySubscriptionOptions {
   prep: PreparedClientQuery;
   /** Socket id the subscription is bound to. */
   socketId: string;
+  /** Unique identity for the currently reconciled socket session. */
+  sessionLease: string;
   /** Request user — passed to `hydrateExpansions` for `sanitize()`. */
   user: { id: string } | null;
   adapter: BackendAdapter;
+  /** Authorization guard checked at the subscription side-effect boundary. */
+  isSessionCurrent?: () => boolean;
+  /** Opaque batch identity used to make rollback ownership explicit. */
+  attachmentOwner?: object;
   /**
    * Force the subscription cache to re-execute against the DB. The
    * HTTP LIST handler sets this for `__forceRefresh: true` drift-poll
@@ -165,12 +172,27 @@ export interface RunQuerySubscriptionResult {
   hash: string;
   /** Filter-matched row count without limit/offset, for pagination UI. */
   totalCount: number;
+  /** Whether this call newly attached the socket to the cached query. */
+  subscriptionCreated: boolean;
+  /** Exact server attachment generation for transactional rollback. */
+  attachmentGeneration: number;
+  /** Whether the supplied transaction still owns rollback of this attachment. */
+  attachmentOwnedByCaller: boolean;
 }
 
 export async function runQuerySubscription(
   opts: RunQuerySubscriptionOptions,
 ): Promise<RunQuerySubscriptionResult> {
-  const { prep, socketId, user, adapter, force = false } = opts;
+  const {
+    prep,
+    socketId,
+    sessionLease,
+    user,
+    adapter,
+    isSessionCurrent,
+    attachmentOwner,
+    force = false,
+  } = opts;
 
   if (!adapter.subscriptions) {
     throw new Error(
@@ -182,30 +204,41 @@ export async function runQuerySubscription(
 
   const { query, countQuery, expandResolved, steps } = prep;
 
-  const [sub, totalCount] = await Promise.all([
-    adapter.subscriptions.subscribe(
-      { socketId, query, expand: expandResolved, steps },
-      { force },
-    ),
-    countQuery.count(),
-  ]);
-
-  // Subscription items come pre-sanitised from `_execQuery`. Hydrate
-  // the request-side expansions for the immediate response; the
-  // manager handles the ongoing delta emissions itself, keyed on the
-  // same `expandResolved` spec.
-  const items = [...sub.items];
-  if (expandResolved.length > 0) {
-    const loader = getRefLoader();
-    if (loader) {
-      await hydrateExpansions(items, expandResolved, loader, user);
-    }
-    // No RefLoader → rows go out un-expanded. Only happens for code
-    // paths that bypass `runWithRequestContext`; the HTTP LIST path
-    // and the socket-RPC `resync` handler both install one.
+  // Count is fallible and must complete before the subscription commit.
+  // Otherwise a rejected count can leave an orphaned cached PHI query that
+  // the caller never received and therefore cannot unsubscribe from.
+  const totalCount = await countQuery.count();
+  if (isSessionCurrent && !isSessionCurrent()) {
+    throw new Error("Socket session changed before subscription commit");
   }
+  const sub = await adapter.subscriptions.subscribe(
+    {
+      socketId,
+      sessionLease,
+      principal: user,
+      query,
+      expand: expandResolved,
+      steps,
+      isActive: isSessionCurrent,
+      attachmentOwner,
+    },
+    { force },
+  );
 
-  return { items, hash: sub.hash, totalCount };
+  // Subscription items come pre-sanitised and expansion-hydrated for the
+  // exact cached principal/session lease. Do not hydrate again here: that
+  // would duplicate ref I/O and risk diverging the initial result from
+  // subsequent realtime emissions.
+  const items = [...sub.items];
+
+  return {
+    items,
+    hash: sub.hash,
+    totalCount,
+    subscriptionCreated: sub.subscriptionCreated,
+    attachmentGeneration: sub.attachmentGeneration,
+    attachmentOwnedByCaller: sub.attachmentOwnedByCaller,
+  };
 }
 
 // ─── runQueryStatic ──────────────────────────────────────────────────────────
