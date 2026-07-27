@@ -2,10 +2,9 @@
  * Field-level write protection in auto-CRUD routes.
  *
  * The framework hardcodes `id` / `createdAt` / `updatedAt` / `type` as
- * server-controlled; per-model `static readonlyFields` adds counter
- * columns, ownership refs, state-machine cols. The auto-CRUD routes
- * strip those fields from incoming POST / PUT bodies and reject PATCH
- * ops that target them.
+ * server-controlled; per-model `static readonlyFields` adds counters and
+ * state-machine columns. `static updateReadonlyFields` adds application-defined
+ * fields that remain writable on create but become read-only on PUT/PATCH.
  *
  * These tests exercise the boundary at the route shim (without booting
  * a real DB) — they assert the strip / reject behavior happens BEFORE
@@ -216,6 +215,83 @@ describe("auto-CRUD readonlyFields", () => {
     expect(saved.$user).toBeUndefined();
   });
 
+  it("PUT preserves fields configured as update-only readonly", async () => {
+    const PlainPost: any = {
+      type: "plainpost",
+      scope: { update: () => () => {} },
+      readonlyFields: [] as readonly string[],
+      updateReadonlyFields: ["org", "patient", "user"] as readonly string[],
+    };
+    const { adapter, captured, setRow } = makeAdapterStub();
+    setRow({
+      id: "p1",
+      title: "old",
+      org: "org-original",
+      patient: "patient-original",
+      user: "user-original",
+    });
+    registerModelRoutes([PlainPost], adapter);
+
+    const route = findRoute("PUT", "/v1/plainposts/:id");
+    const res = makeRes();
+    await route!.handler!(
+      {
+        session: { user: { id: "u1" } },
+        params: { id: "p1" },
+        body: {
+          title: "new",
+          org: "org-attacker",
+          patient: "patient-attacker",
+          user: "user-attacker",
+        },
+      },
+      res as any,
+    );
+
+    expect(res.captured.status).toBe(200);
+    const saved = captured.saves[0]!;
+    expect(saved.title).toBe("new");
+    expect(saved.org).toBe("org-original");
+    expect(saved.patient).toBe("patient-original");
+    expect(saved.user).toBe("user-original");
+  });
+
+  it("PUT keeps conventional field names writable unless configured", async () => {
+    const PlainPost: any = {
+      type: "plainpost",
+      scope: { update: () => () => {} },
+      readonlyFields: [] as readonly string[],
+    };
+    const { adapter, captured, setRow } = makeAdapterStub();
+    setRow({
+      id: "p1",
+      org: "org-original",
+      patient: "patient-original",
+      user: "user-original",
+    });
+    registerModelRoutes([PlainPost], adapter);
+
+    const route = findRoute("PUT", "/v1/plainposts/:id");
+    const res = makeRes();
+    await route!.handler!(
+      {
+        params: { id: "p1" },
+        body: {
+          org: "org-new",
+          patient: "patient-new",
+          user: "user-new",
+        },
+      },
+      res as any,
+    );
+
+    expect(res.captured.status).toBe(200);
+    const saved = captured.saves[0]!;
+    expect(saved.org).toBe("org-new");
+    expect(saved.patient).toBe("patient-new");
+    expect(saved.user).toBe("user-new");
+  });
+
   it("PATCH rejects ops targeting readonly columns with 403", async () => {
     const Post = makePost();
     const { adapter, captured, setRow } = makeAdapterStub();
@@ -398,5 +474,69 @@ describe("auto-CRUD readonlyFields", () => {
     expect(res.captured.status).toBe(403);
     expect(res.captured.body.error).toContain("createdAt");
     expect(captured.patches).toHaveLength(0);
+  });
+
+  it("PATCH rejects fields configured as update-only readonly", async () => {
+    const PlainPost: any = {
+      type: "plainpost",
+      scope: { patch: () => () => {} },
+      readonlyFields: [] as readonly string[],
+      updateReadonlyFields: ["patient"] as readonly string[],
+    };
+    const { adapter, captured, setRow } = makeAdapterStub();
+    setRow({ id: "p1", patient: "patient-original" });
+    registerModelRoutes([PlainPost], adapter);
+
+    const route = findRoute("PATCH", "/v1/plainposts/:id");
+    const res = makeRes();
+    await route!.handler!(
+      {
+        session: { user: { id: "u1" } },
+        params: { id: "p1" },
+        body: {
+          ops: [
+            {
+              op: "replace",
+              path: "/patient",
+              value: "patient-attacker",
+            },
+          ],
+        },
+      },
+      res as any,
+    );
+
+    expect(res.captured.status).toBe(403);
+    expect(res.captured.body.error).toContain("patient");
+    expect(captured.patches).toHaveLength(0);
+  });
+
+  it("PATCH keeps conventional field names writable unless configured", async () => {
+    const PlainPost: any = {
+      type: "plainpost",
+      scope: { patch: () => () => {} },
+      readonlyFields: [] as readonly string[],
+    };
+    const { adapter, captured, setRow } = makeAdapterStub();
+    setRow({ id: "p1", user: "user-original" });
+    registerModelRoutes([PlainPost], adapter);
+
+    const route = findRoute("PATCH", "/v1/plainposts/:id");
+    const res = makeRes();
+    await route!.handler!(
+      {
+        params: { id: "p1" },
+        body: {
+          ops: [{ op: "replace", path: "/user", value: "user-new" }],
+        },
+      },
+      res as any,
+    );
+
+    expect(res.captured.status).toBe(200);
+    expect(captured.patches).toHaveLength(1);
+    expect(captured.patches[0]!.ops).toEqual([
+      { op: "replace", path: "/user", value: "user-new" },
+    ]);
   });
 });
