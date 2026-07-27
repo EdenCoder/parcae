@@ -21,7 +21,7 @@ import { Model } from "@parcae/model";
 import { EventEmitter } from "eventemitter3";
 
 // eslint-disable-next-line import/first
-import { __test as useQueryTest } from "../react/useQuery";
+import { __test as useQueryTest, _purgeCacheForUser } from "../react/useQuery";
 
 // ─── Fake Model class for the tests ─────────────────────────────────────────
 
@@ -41,6 +41,17 @@ interface SubscriptionRegistration {
 class FakeClient extends EventEmitter {
   /** Map of event → set of handlers. Mirrors `transport.subscribe`. */
   public subscriptions: SubscriptionRegistration[] = [];
+  public session = {
+    state: {
+      status: "authenticated" as const,
+      userId: "u1",
+      version: 1,
+    },
+    ready: Promise.resolve(),
+  };
+  public isConnected = true;
+  public needsSessionRefresh = false;
+  public send = vi.fn();
 
   subscribe(event: string, handler: (...args: any[]) => void): () => void {
     const entry = { event, handler };
@@ -348,6 +359,93 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     release();
   });
 
+  it("scrubs live snapshots immediately and blocks a late fetch after an auth boundary", async () => {
+    const client = new FakeClient();
+    const initial = makeChain({
+      results: [{ id: "p1", title: "patient secret" }],
+      queryHash: "h-initial",
+    });
+    const key = useQueryTest.buildKey("post", "u1", initial.__steps);
+    const onChange = vi.fn();
+    const release = useQueryTest.retain(key, onChange);
+    useQueryTest.fetch(key, initial, client as any);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const entry = useQueryTest.getEntry(key)!;
+    const renderedItems = entry.items;
+    entry.optimistic.push({ id: "optimistic-phi", title: "draft secret" });
+
+    let resolveLate: (items: any[]) => void = () => undefined;
+    const lateChain: any = {
+      ...initial,
+      find: () =>
+        new Promise<any[]>((resolve) => {
+          resolveLate = resolve;
+        }),
+    };
+    useQueryTest.fetch(key, lateChain, client as any);
+
+    _purgeCacheForUser(client as any, "u1");
+
+    expect(renderedItems).toHaveLength(0);
+    expect(entry.items).toHaveLength(0);
+    expect(entry.optimistic).toHaveLength(0);
+    expect(entry.ownerId).toBeNull();
+    expect(entry.ownerClient).toBeNull();
+    expect(entry.client).toBeNull();
+    expect(entry.refs).toBe(0);
+    expect(entry.listeners.size).toBe(0);
+    expect(onChange).toHaveBeenCalled();
+    expect(useQueryTest.getEntry(key)).toBeUndefined();
+    expect(client.countSubs("query:h-initial")).toBe(0);
+
+    const lateItems = [
+      Post.hydrate({} as any, { id: "late", title: "late patient secret" }),
+    ];
+    Object.defineProperty(lateItems, "__queryHash", { value: "h-late" });
+    resolveLate(lateItems);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(useQueryTest.getEntry(key)).toBeUndefined();
+    expect(client.countSubs("query:h-late")).toBe(0);
+    release();
+  });
+
+  it("does not let a consumer contaminate the shared empty sentinel", () => {
+    const firstClient = new FakeClient();
+    const secondClient = new FakeClient();
+    const steps = [{ method: "where", args: [{ status: "pending" }] }];
+    const firstKey = useQueryTest.buildKey(
+      "post",
+      "owner-a",
+      steps,
+      true,
+      firstClient as any,
+    );
+    const secondKey = useQueryTest.buildKey(
+      "post",
+      "owner-b",
+      steps,
+      true,
+      secondClient as any,
+    );
+    const releaseFirst = useQueryTest.retain(firstKey, () => {});
+    const releaseSecond = useQueryTest.retain(secondKey, () => {});
+    const firstItems = useQueryTest.getEntry(firstKey)!.items;
+    const secondItems = useQueryTest.getEntry(secondKey)!.items;
+
+    expect(() =>
+      firstItems.push({ id: "cross-owner-phi", title: "Patient secret" }),
+    ).toThrow();
+    expect(secondItems).toEqual([]);
+
+    _purgeCacheForUser(firstClient as any, "owner-a");
+    expect(secondItems).toEqual([]);
+    releaseFirst();
+    releaseSecond();
+  });
+
   // ── Subscription churn: re-fetch with the SAME hash doesn't re-sub ──
 
   it("a refetch that returns the same __queryHash doesn't churn the subscription", async () => {
@@ -396,16 +494,16 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(client.countSubs("query:h-gc")).toBe(1);
 
-    // Drop the only subscriber. The real hook's `subscribe` cleanup
-    // arms a GC timer at 60s that calls entry.dispose() and removes
-    // from the cache. The `__test.retain` helper mimics the
-    // refs-- behaviour but not the GC timer; for a complete test of
-    // subscription cleanup, we manually invoke the cache's GC path
-    // here by calling dispose + setting refs=0 explicitly the way
-    // the hook does.
+    // Drop the only subscriber. The shared release path arms the real
+    // 60-second GC timer, which detaches the local listener and sends one
+    // same-session server unsubscribe.
     release();
-    const entry = useQueryTest.getEntry(key)!;
-    entry.dispose?.();
+    await vi.advanceTimersByTimeAsync(60_000);
     expect(client.countSubs("query:h-gc")).toBe(0);
+    expect(client.send).toHaveBeenCalledTimes(1);
+    expect(client.send).toHaveBeenCalledWith("unsubscribe:query", {
+      hash: "h-gc",
+    });
+    expect(useQueryTest.getEntry(key)).toBeUndefined();
   });
 });

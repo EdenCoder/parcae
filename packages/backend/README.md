@@ -144,6 +144,29 @@ route.post("/v1/upload", requireAuth, rateLimit(100), async (req, res) => {
 
 Methods: `route.get`, `route.post`, `route.put`, `route.patch`, `route.delete`, `route.options`, `route.head`, `route.all`
 
+### Socket.IO events
+
+```typescript
+import { requireSocketAuth, route } from "@parcae/backend";
+
+route.on("chat:message", requireSocketAuth, async (ctx) => {
+  await ctx.socket.join(`chat:${ctx.session.user.id}`);
+  ctx.emit("chat:chunk", { delta: "hello" });
+});
+```
+
+Socket clients bind through the `hello` handshake. Starting a new handshake
+invalidates the previous session and awaits query/custom room cleanup before a
+new owner can be published.
+
+`ctx.socket`, `ctx.io`, and `ctx.emit` are session-fenced facades rather than
+raw Socket.IO objects. They preserve common room and emitter APIs, but output,
+chained emitters, and late acknowledgement callbacks from an earlier session
+become inert. Original acknowledgement handler closures are released at the
+boundary or disconnect even if Socket.IO is still waiting for a peer acknowledgement.
+`ctx.socket.join()` and `leave()` are asynchronous and tracked by the
+auth-boundary room cleanup.
+
 ### Route Options
 
 ```typescript
@@ -352,7 +375,12 @@ await addJobIfNotExists(queue.get(), "post:index", { postId: "abc" });
 
 ## QuerySubscriptionManager
 
-Manages realtime query subscriptions for connected clients. When a model changes, affected queries are re-evaluated and surgical diff ops (`add`, `remove`, `update`) are pushed to subscribers.
+Manages realtime query subscriptions for connected clients. Cached rows are
+scoped to the minimal sanitization principal and exact reconciled
+socket-session lease. When a model changes, affected queries are re-evaluated
+and surgical diff ops (`add`, `remove`, `update`) are pushed only to the exact
+current socket ids. Query-specific rooms are not retained across auth
+boundaries. Per-socket subscription and resync batch limits fail closed.
 
 ## Auth
 
@@ -387,7 +415,7 @@ const app = createApp({
 The `User` Model is always a real, managed Parcae Model. Auth adapters resolve identity and sync user data into it.
 
 - `req.session.user` available in route handlers and scopes
-- Socket.IO auth via `authenticate` event
+- Socket.IO session binding via the server-confirmed `hello` handshake
 - Implement `AuthAdapter` to bring your own provider
 
 ## Schema Generation
@@ -403,33 +431,33 @@ At startup, `createApp()` generates type metadata into `.parcae/` (gitignored, l
 
 Environment variables validated at startup via Zod. `.env` files are auto-loaded.
 
-| Variable            | Required | Default       | Description                                       |
-| ------------------- | -------- | ------------- | ------------------------------------------------- |
-| `DATABASE_URL`      | Yes      | --            | PostgreSQL connection string                      |
-| `DATABASE_READ_URL` | No       | --            | Read replica connection string                    |
-| `REDIS_URL`         | No       | --            | Redis for PubSub + Queue                          |
-| `PORT`              | No       | `3000`        | HTTP server port                                  |
-| `AUTH_SECRET`       | No       | --            | Session signing secret (required if auth enabled) |
-| `TRUSTED_ORIGINS`   | No       | --            | Comma-separated CORS origins                      |
-| `NODE_ENV`          | No       | `development` | `development` / `production` / `test`             |
-| `RUN_SERVER`        | No       | `true`        | Register CRUD / custom routes / Socket.IO         |
-| `RUN_HOOKS`         | No       | `true`        | Run model lifecycle hooks                         |
-| `RUN_JOBS`          | No       | `false`       | `true` / `false` / `"name1,name2"` (workers)      |
-| `RUN_CRONS`         | No       | follows JOBS  | `true` / `false` / `"name1,name2"` (schedulers)   |
-| `SERVER`            | No       | --            | _Deprecated alias for_ `RUN_SERVER`               |
+| Variable            | Required | Default       | Description                                                |
+| ------------------- | -------- | ------------- | ---------------------------------------------------------- |
+| `DATABASE_URL`      | Yes      | --            | PostgreSQL connection string                               |
+| `DATABASE_READ_URL` | No       | --            | Read replica connection string                             |
+| `REDIS_URL`         | No       | --            | Redis for PubSub + Queue                                   |
+| `PORT`              | No       | `3000`        | HTTP server port                                           |
+| `AUTH_SECRET`       | No       | --            | Session signing secret (required if auth enabled)          |
+| `TRUSTED_ORIGINS`   | No       | --            | Comma-separated CORS origins                               |
+| `NODE_ENV`          | No       | `development` | `development` / `production` / `test`                      |
+| `RUN_SERVER`        | No       | `true`        | Register CRUD / custom routes / Socket.IO                  |
+| `RUN_HOOKS`         | No       | `true`        | Run model lifecycle hooks                                  |
+| `RUN_JOBS`          | No       | `false`       | `true` / `false` / `"name1,name2"` (workers)               |
+| `RUN_CRONS`         | No       | follows JOBS  | `true` / `false` / `"name1,name2"` (schedulers)            |
+| `SERVER`            | No       | --            | _Deprecated alias for_ `RUN_SERVER`                        |
 | `DAEMON`            | No       | --            | _Deprecated: equivalent to_ `RUN_HOOKS=true RUN_JOBS=true` |
 
 ### Process roles
 
 The four `RUN_*` flags compose to give you useful process shapes:
 
-| Role            | `RUN_SERVER` | `RUN_HOOKS` | `RUN_JOBS` | `RUN_CRONS` | Use case                                     |
-| --------------- | ------------ | ----------- | ---------- | ----------- | -------------------------------------------- |
-| All-in-one      | `true`       | `true`      | `true`     | `true`      | Dev, single-process deploys                  |
-| API only        | `true`       | `true`      | `false`    | `false`     | Stateless HTTP/Socket.IO front-end           |
-| Worker only     | `false`      | `true`      | `true`     | `true`      | Dedicated BullMQ consumer + cron host        |
-| Named workers   | `false`      | `true`      | `panel,…`  | `false`     | Per-job-fleet routing (GPU, mailer, etc.)    |
-| Cron host       | `false`      | `true`      | `false`    | `true`      | Tiny process that only fires scheduled tasks |
+| Role          | `RUN_SERVER` | `RUN_HOOKS` | `RUN_JOBS` | `RUN_CRONS` | Use case                                     |
+| ------------- | ------------ | ----------- | ---------- | ----------- | -------------------------------------------- |
+| All-in-one    | `true`       | `true`      | `true`     | `true`      | Dev, single-process deploys                  |
+| API only      | `true`       | `true`      | `false`    | `false`     | Stateless HTTP/Socket.IO front-end           |
+| Worker only   | `false`      | `true`      | `true`     | `true`      | Dedicated BullMQ consumer + cron host        |
+| Named workers | `false`      | `true`      | `panel,…`  | `false`     | Per-job-fleet routing (GPU, mailer, etc.)    |
+| Cron host     | `false`      | `true`      | `false`    | `true`      | Tiny process that only fires scheduled tasks |
 
 `RUN_CRONS` defaults to follow `RUN_JOBS` (any process running jobs also
 schedules every cron). `/<version>/health` is always served regardless
@@ -492,22 +520,22 @@ Pre-0.8.2 versions enqueued every job into a single shared queue
 each job to its own queue. **Hard cutover** — no transitional worker
 drains the old queue.
 
-1. **Before deploying**, drain any in-flight jobs from the legacy
-   queue. The cheapest way is to let it idle until empty:
+1.  **Before deploying**, drain any in-flight jobs from the legacy
+    queue. The cheapest way is to let it idle until empty:
 
-       redis-cli LLEN bull:parcae:wait        # count waiting jobs
-       redis-cli LLEN bull:parcae:active      # in-flight
-       redis-cli ZCARD bull:parcae:delayed    # scheduled / retry-backoff
+        redis-cli LLEN bull:parcae:wait        # count waiting jobs
+        redis-cli LLEN bull:parcae:active      # in-flight
+        redis-cli ZCARD bull:parcae:delayed    # scheduled / retry-backoff
 
-   Or, if you don't care about the in-flight work, nuke it:
+    Or, if you don't care about the in-flight work, nuke it:
 
-       redis-cli --scan --pattern 'bull:parcae:*' | xargs redis-cli DEL
+        redis-cli --scan --pattern 'bull:parcae:*' | xargs redis-cli DEL
 
-2. **External Workers/Queues** in your codebase that referenced the
-   legacy queue name directly (e.g. `new Queue("parcae")`) need to
-   move to `new Queue("parcae-<jobname>")` (dash-separated — BullMQ
-   v5 rejects colons in queue names) or use `enqueue()` /
-   `queue.queueNameFor("<jobname>")` instead.
+2.  **External Workers/Queues** in your codebase that referenced the
+    legacy queue name directly (e.g. `new Queue("parcae")`) need to
+    move to `new Queue("parcae-<jobname>")` (dash-separated — BullMQ
+    v5 rejects colons in queue names) or use `enqueue()` /
+    `queue.queueNameFor("<jobname>")` instead.
 
 ## Exports
 

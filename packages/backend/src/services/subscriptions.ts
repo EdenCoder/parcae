@@ -34,11 +34,9 @@ import {
 } from "@parcae/model";
 import fastJsonPatch from "fast-json-patch";
 import type { Operation } from "fast-json-patch";
+import { ClientError } from "../helpers";
 import { RefLoader } from "./ref-loader";
-import {
-  hydrateExpansions,
-  type ResolvedExpand,
-} from "./hydrate-expansions";
+import { hydrateExpansions, type ResolvedExpand } from "./hydrate-expansions";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -46,6 +44,15 @@ type DiffOp =
   | { op: "add"; id: string; data: Record<string, any> }
   | { op: "remove"; id: string }
   | { op: "update"; id: string; patch: Operation[] };
+
+interface SubscriberAttachment {
+  generation: number;
+  /**
+   * Transaction that may roll this attachment back. `null` means another
+   * caller adopted it, so it must survive the original caller's rollback.
+   */
+  owner: object | null;
+}
 
 /** Wire envelope sent on `query:{hash}`. */
 export interface QueryEmitEnvelope {
@@ -57,7 +64,14 @@ export interface QueryEmitEnvelope {
 interface CachedQuery {
   hash: string;
   modelType: string;
-  query: QueryChain<any>;
+  query: QueryChain<any> | null;
+  /**
+   * Minimal immutable authorization principal used for every parent/ref
+   * projection. Never retain the full request user or AuthSession here.
+   */
+  principal: Readonly<{ id: string }> | null;
+  /** True after the final subscriber leaves and retained PHI is scrubbed. */
+  disposed: boolean;
   /**
    * Per-query ref expansions recorded by `.expand(...)`. Drives the
    * per-emit `hydrateExpansions` pass that inlines linked rows in
@@ -73,7 +87,8 @@ interface CachedQuery {
    * server-side source of truth for that ordering.
    */
   result: Map<string, Record<string, any>>;
-  subscribers: Set<string>;
+  /** socket id → current rollback ownership and generation fence. */
+  subscribers: Map<string, SubscriberAttachment>;
   /**
    * Whether to emit the `order` field on the wire envelope. `false`
    * when the query carries `.orderBy(false)` — consumers don't
@@ -108,6 +123,27 @@ interface CachedQuery {
 interface SubscriptionOptions {
   socketId: string;
   query: QueryChain<any>;
+  /**
+   * Stable identity for the reconciled socket authorization boundary.
+   * Production callers must change this whenever the socket's token/session
+   * is reconciled, even when the user id remains the same.
+   */
+  sessionLease?: string;
+  /** Minimal identity accepted by Model.sanitize(). */
+  principal?: { id: string } | null;
+  /**
+   * Optional authorization-boundary guard for socket-backed subscriptions.
+   * Checked immediately before every subscriber commit so async query work
+   * cannot attach an obsolete owner's subscription after the socket changes
+   * session.
+   */
+  isActive?: () => boolean;
+  /**
+   * Opaque transaction identity for rollback-safe batch attachment. Reuses
+   * with the same owner remain rollback-eligible; any other reuse adopts the
+   * attachment and clears that eligibility.
+   */
+  attachmentOwner?: object;
   /**
    * Per-query ref expansions recorded by `.expand(...)` on the
    * client. Subscriptions with different expand projections live as
@@ -174,29 +210,22 @@ interface ManagerOptions {
 }
 
 /**
- * Socket.IO backend hooks. The legacy form passes just `emitToSocket`
- * and the manager fans out re-eval envelopes via a per-subscriber
- * loop (one `io.to(socketId).emit(...)` per subscriber, N for N
- * subscribers).
- *
- * The room-aware form (DOL-1047) also supplies `emitToRoom`,
- * `joinRoom`, and `leaveRoom`. Every subscriber for a given cached
- * query joins the Socket.IO room `query:${hash}` at subscribe-time,
- * so re-eval can broadcast ONCE via `io.to(room).emit(...)` regardless
- * of how many sockets are listening. Substantial savings at scale
- * (100 subscribers per query: 100 emits → 1).
+ * Socket.IO backend hooks. A bare callback emits once per current logical
+ * subscriber. The object form may provide `emitToSockets` to target the exact
+ * current socket-id set in one adapter call. Query rooms are deliberately not
+ * used: asynchronous room leave can outlive an authorization boundary.
  */
 type EmitToSocket = (socketId: string, event: string, data: any) => void;
-type EmitToRoom = (room: string, event: string, data: any) => void;
-type JoinRoom = (socketId: string, room: string) => void;
-type LeaveRoom = (socketId: string, room: string) => void;
+type EmitToSockets = (
+  socketIds: readonly string[],
+  event: string,
+  data: any,
+) => void;
 
 interface IoBackend {
   emitToSocket: EmitToSocket;
-  /** Optional room broadcast. When present, used in place of per-socket emits. */
-  emitToRoom?: EmitToRoom;
-  joinRoom?: JoinRoom;
-  leaveRoom?: LeaveRoom;
+  /** Optional exact-target batch emit. */
+  emitToSockets?: EmitToSockets;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -204,6 +233,8 @@ interface IoBackend {
 function hashFrom(
   toSQL: { sql: string; bindings: any[] },
   expand: readonly ResolvedExpand[],
+  principalId: string | null,
+  sessionLease: string,
 ): string {
   // Expand projections are part of the cache key: a `.find()` with
   // and without `.expand("file")` returns different wire shapes and
@@ -224,6 +255,8 @@ function hashFrom(
     sql: toSQL.sql,
     bindings: toSQL.bindings,
     expand: expandKey,
+    principalId,
+    sessionLease,
   });
   return createHash("sha256").update(payload).digest("hex").slice(0, 16);
 }
@@ -294,8 +327,10 @@ function realtimeOverridesFor(query: QueryChain<any>): {
   const realtime = modelClass?.realtime;
   if (!realtime || typeof realtime !== "object") return {};
   const out: { debounceMs?: number; maxWaitMs?: number } = {};
-  if (typeof realtime.debounceMs === "number") out.debounceMs = realtime.debounceMs;
-  if (typeof realtime.maxWaitMs === "number") out.maxWaitMs = realtime.maxWaitMs;
+  if (typeof realtime.debounceMs === "number")
+    out.debounceMs = realtime.debounceMs;
+  if (typeof realtime.maxWaitMs === "number")
+    out.maxWaitMs = realtime.maxWaitMs;
   return out;
 }
 
@@ -323,11 +358,10 @@ function ordersEqual(a: string[], b: string[]): boolean {
  * `ManagerOptions.maxSubscriptionsPerSocket`.
  *
  * Hitting the cap is a runaway-render-loop mistake or an attack, not
- * a legitimate runtime case — log loudly and silently drop the new
- * subscription's items (the client gets an empty result for that
- * query, consistent with how an unsubscribed query reads).
+ * a legitimate runtime case — reject with a safe 429 ClientError.
+ * Fabricating an empty successful result would hide real records.
  */
-const DEFAULT_MAX_SUBSCRIPTIONS_PER_SOCKET = 500;
+export const DEFAULT_MAX_SUBSCRIPTIONS_PER_SOCKET = 500;
 
 const DEFAULT_DEBOUNCE_MS = 25;
 const DEFAULT_MAX_WAIT_MS = 100;
@@ -335,9 +369,43 @@ const DEFAULT_REEVAL_CONCURRENCY = 8;
 
 const EMPTY_EXPAND: readonly ResolvedExpand[] = Object.freeze([]);
 
+export function requirePositiveSafeInteger(
+  value: unknown,
+  label: string,
+): number {
+  const parsed =
+    typeof value === "string" && value.trim().length > 0
+      ? Number(value)
+      : value;
+  if (
+    typeof parsed !== "number" ||
+    !Number.isSafeInteger(parsed) ||
+    parsed <= 0
+  ) {
+    throw new Error(`${label} must be a positive safe integer`);
+  }
+  return parsed;
+}
+
+function requireNonNegativeSafeInteger(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${label} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
 export class QuerySubscriptionManager {
   private queries = new Map<string, CachedQuery>();
   private socketQueries = new Map<string, Set<string>>();
+  /**
+   * socket id → (query hash → in-flight subscribe count).
+   *
+   * Counts, rather than a Set, are required because concurrent same-hash
+   * subscribes share one quota slot. The slot must remain reserved until the
+   * final contender settles, even if the contender that created it fails.
+   */
+  private socketReservations = new Map<string, Map<string, number>>();
+  private nextAttachmentGeneration = 0;
   private typeIndex = new Map<string, Set<string>>();
   /**
    * Secondary index from expanded-target-type → cached query hashes.
@@ -351,37 +419,39 @@ export class QuerySubscriptionManager {
   private expandTargetIndex = new Map<string, Set<string>>();
 
   private emitToSocket: EmitToSocket;
-  private emitToRoom: EmitToRoom | null;
-  private joinRoom: JoinRoom | null;
-  private leaveRoom: LeaveRoom | null;
+  private emitToSockets: EmitToSockets | null;
   private defaultDebounceMs: number;
   private defaultMaxWaitMs: number;
   private reevalSemaphore: Semaphore;
   private maxSubscriptionsPerSocket: number;
 
   constructor(io: EmitToSocket | IoBackend, opts: ManagerOptions = {}) {
-    // Two shapes for backward compatibility. The legacy form (a bare
-    // function) is still used by every existing test fixture; the
-    // room-aware form is what `createApp()` wires in production.
+    // Two shapes for backward compatibility. The legacy bare function fans
+    // out one emit per subscriber; createApp uses exact-target batch emit.
     if (typeof io === "function") {
       this.emitToSocket = io;
-      this.emitToRoom = null;
-      this.joinRoom = null;
-      this.leaveRoom = null;
+      this.emitToSockets = null;
     } else {
       this.emitToSocket = io.emitToSocket;
-      this.emitToRoom = io.emitToRoom ?? null;
-      this.joinRoom = io.joinRoom ?? null;
-      this.leaveRoom = io.leaveRoom ?? null;
+      this.emitToSockets = io.emitToSockets ?? null;
     }
-    this.defaultDebounceMs = opts.debounceMs ?? DEFAULT_DEBOUNCE_MS;
-    this.defaultMaxWaitMs = opts.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
-    this.reevalSemaphore = new Semaphore(
-      Math.max(1, opts.reevalConcurrency ?? DEFAULT_REEVAL_CONCURRENCY),
+    this.defaultDebounceMs = requireNonNegativeSafeInteger(
+      opts.debounceMs ?? DEFAULT_DEBOUNCE_MS,
+      "Query subscription debounceMs",
     );
-    this.maxSubscriptionsPerSocket = Math.max(
-      1,
+    this.defaultMaxWaitMs = requireNonNegativeSafeInteger(
+      opts.maxWaitMs ?? DEFAULT_MAX_WAIT_MS,
+      "Query subscription maxWaitMs",
+    );
+    this.reevalSemaphore = new Semaphore(
+      requirePositiveSafeInteger(
+        opts.reevalConcurrency ?? DEFAULT_REEVAL_CONCURRENCY,
+        "Query subscription reevalConcurrency",
+      ),
+    );
+    this.maxSubscriptionsPerSocket = requirePositiveSafeInteger(
       opts.maxSubscriptionsPerSocket ?? DEFAULT_MAX_SUBSCRIPTIONS_PER_SOCKET,
+      "Query subscription maxSubscriptionsPerSocket",
     );
   }
 
@@ -390,25 +460,40 @@ export class QuerySubscriptionManager {
     return this.reevalSemaphore.inFlight;
   }
 
-  /** Resolve the room name for a cached query. Stable across re-evals. */
-  private _roomFor(hash: string): string {
-    return `query:${hash}`;
-  }
-
   // ── Subscribe ──────────────────────────────────────────────────────
 
   async subscribe(
     opts: SubscriptionOptions,
     extra: SubscribeExtraOptions = {},
-  ): Promise<{ hash: string; items: Record<string, any>[] }> {
-    const { socketId, query, steps } = opts;
+  ): Promise<{
+    hash: string;
+    items: Record<string, any>[];
+    subscriptionCreated: boolean;
+    attachmentGeneration: number;
+    attachmentOwnedByCaller: boolean;
+  }> {
+    const { socketId, query, steps, isActive, attachmentOwner } = opts;
+    const sessionLease = opts.sessionLease ?? socketId;
+    if (sessionLease.length === 0) {
+      throw new ClientError(
+        "A non-empty subscription session lease is required",
+      );
+    }
+    const principal = opts.principal
+      ? Object.freeze({ id: opts.principal.id })
+      : null;
     const expand = opts.expand ?? EMPTY_EXPAND;
     const orderOptedOut = orderEmissionDisabled(steps);
     // `__modelType` lives on the QueryChain interface as @internal —
     // populated by every chain factory (`Model._query` → `lazyQuery`
     // server-side, the adapter's `query()` factory client-side).
     const modelType = query.__modelType;
-    const hash = hashFrom(query.exec().toSQL(), expand);
+    const hash = hashFrom(
+      query.exec().toSQL(),
+      expand,
+      principal?.id ?? null,
+      sessionLease,
+    );
 
     // Per-socket cap enforced BEFORE the cache lookup so a socket
     // can't unlock new subscriptions by re-requesting an already-
@@ -417,136 +502,212 @@ export class QuerySubscriptionManager {
     // query across many sockets is fine and intentional.
     const existing = this.socketQueries.get(socketId);
     const alreadySubscribed = existing?.has(hash) ?? false;
+    let reservations = this.socketReservations.get(socketId);
+    const alreadyReserved = reservations?.has(hash) ?? false;
+    let distinctHashes = existing?.size ?? 0;
+    if (reservations) {
+      for (const reservedHash of reservations.keys()) {
+        if (!existing?.has(reservedHash)) distinctHashes++;
+      }
+    }
     if (
       !alreadySubscribed &&
-      (existing?.size ?? 0) >= this.maxSubscriptionsPerSocket
+      !alreadyReserved &&
+      distinctHashes >= this.maxSubscriptionsPerSocket
     ) {
       log.warn(
-        `subscriptions: socket ${socketId} hit the ${this.maxSubscriptionsPerSocket} subscription cap — refusing new query for ${modelType}`,
+        `subscriptions: per-socket cap ${this.maxSubscriptionsPerSocket} reached for ${modelType}`,
       );
-      return { hash, items: [] };
+      throw new ClientError("Realtime query subscription limit reached", 429);
     }
+    if (!reservations) {
+      reservations = new Map();
+      this.socketReservations.set(socketId, reservations);
+    }
+    reservations.set(hash, (reservations.get(hash) ?? 0) + 1);
 
-    let cached = this.queries.get(hash);
+    try {
+      let cached = this.queries.get(hash);
+      let rows: Record<string, any>[] | null = null;
 
-    if (cached) {
-      cached.subscribers.add(socketId);
-      // Honour the most-restrictive emitOrder choice across all
-      // subscribers sharing this hash: any single `orderBy(false)`
-      // opts the channel out for everyone. Subscribers that wanted
-      // order can't actually use it anyway if the SQL is identical.
-      if (orderOptedOut) cached.emitOrder = false;
-      // Drift-poll path: caller asked us to re-execute the cached
-      // query against the DB and diff to every subscriber. We run
-      // _reeval inline so the LIST response that follows returns
-      // the freshly-rebuilt items and the polling client converges
-      // in one round-trip. Other subscribers receive any drift ops
-      // through the normal `query:{hash}` channel.
-      if (extra.force) {
-        await this._reeval(cached);
+      // Drift-poll path: caller asked us to re-execute the cached query
+      // against the DB and diff to every subscriber.
+      if (cached && extra.force) await this._reeval(cached);
+
+      // A concurrent unsubscribe can remove a cached query while force re-eval
+      // is awaiting. A cache miss also lands here. Execute outside the maps,
+      // then re-read the winner before committing.
+      if (!this.queries.has(hash)) {
+        rows = await this._execQuery(query, expand, principal);
       }
-    } else {
-      const rows = await this._execQuery(query, expand);
-      const result = new Map<string, Record<string, any>>();
-      for (const row of rows) {
-        const clean = dateSafeClone(row);
-        result.set(clean.id, clean);
+      if (this.socketReservations.get(socketId) !== reservations) {
+        throw new Error("Socket subscriptions cleared before commit");
+      }
+      if (isActive && !isActive()) {
+        throw new Error("Socket session changed before subscription commit");
       }
 
-      const overrides = realtimeOverridesFor(query);
-      cached = {
-        hash,
-        modelType,
-        query,
-        expand,
-        result,
-        subscribers: new Set([socketId]),
-        emitOrder: !orderOptedOut,
-        coalesce: {
-          debounceTimer: null,
-          maxWaitTimer: null,
-          inFlight: false,
-          needsFollowup: false,
-          debounceMs: overrides.debounceMs ?? this.defaultDebounceMs,
-          maxWaitMs: overrides.maxWaitMs ?? this.defaultMaxWaitMs,
-        },
-      };
-      this.queries.set(hash, cached);
-
-      if (!this.typeIndex.has(modelType)) {
-        this.typeIndex.set(modelType, new Set());
-      }
-      this.typeIndex.get(modelType)!.add(hash);
-
-      // Cross-type invalidation index: whenever any of this query's
-      // expanded targets is written, this hash needs a re-eval.
-      for (const exp of expand) {
-        let bucket = this.expandTargetIndex.get(exp.targetType);
-        if (!bucket) {
-          bucket = new Set();
-          this.expandTargetIndex.set(exp.targetType, bucket);
+      cached = this.queries.get(hash);
+      if (!cached) {
+        const result = new Map<string, Record<string, any>>();
+        for (const row of rows ?? []) {
+          const clean = dateSafeClone(row);
+          result.set(clean.id, clean);
         }
-        bucket.add(hash);
+
+        const overrides = realtimeOverridesFor(query);
+        cached = {
+          hash,
+          modelType,
+          query,
+          principal,
+          disposed: false,
+          expand,
+          result,
+          subscribers: new Map(),
+          emitOrder: !orderOptedOut,
+          coalesce: {
+            debounceTimer: null,
+            maxWaitTimer: null,
+            inFlight: false,
+            needsFollowup: false,
+            debounceMs: overrides.debounceMs ?? this.defaultDebounceMs,
+            maxWaitMs: overrides.maxWaitMs ?? this.defaultMaxWaitMs,
+          },
+        };
+        this.queries.set(hash, cached);
+
+        if (!this.typeIndex.has(modelType)) {
+          this.typeIndex.set(modelType, new Set());
+        }
+        this.typeIndex.get(modelType)!.add(hash);
+
+        for (const exp of expand) {
+          let bucket = this.expandTargetIndex.get(exp.targetType);
+          if (!bucket) {
+            bucket = new Set();
+            this.expandTargetIndex.set(exp.targetType, bucket);
+          }
+          bucket.add(hash);
+        }
+      } else if (orderOptedOut) {
+        // Honour the most restrictive order preference among sharers.
+        cached.emitOrder = false;
+      }
+
+      const priorAttachment = cached.subscribers.get(socketId);
+      const subscribedAtCommit = priorAttachment !== undefined;
+      const attachmentGeneration = ++this.nextAttachmentGeneration;
+      const attachmentOwnedByCaller =
+        attachmentOwner !== undefined &&
+        (!priorAttachment || priorAttachment.owner === attachmentOwner);
+      cached.subscribers.set(socketId, {
+        generation: attachmentGeneration,
+        owner: attachmentOwnedByCaller ? attachmentOwner : null,
+      });
+      if (!this.socketQueries.has(socketId)) {
+        this.socketQueries.set(socketId, new Set());
+      }
+      this.socketQueries.get(socketId)!.add(hash);
+
+      return {
+        hash,
+        items: [...cached.result.values()],
+        subscriptionCreated: !subscribedAtCommit,
+        attachmentGeneration,
+        attachmentOwnedByCaller,
+      };
+    } finally {
+      const remaining = (reservations.get(hash) ?? 1) - 1;
+      if (remaining > 0) {
+        reservations.set(hash, remaining);
+      } else {
+        reservations.delete(hash);
+      }
+      if (
+        reservations.size === 0 &&
+        this.socketReservations.get(socketId) === reservations
+      ) {
+        this.socketReservations.delete(socketId);
       }
     }
-
-    if (!this.socketQueries.has(socketId)) {
-      this.socketQueries.set(socketId, new Set());
-    }
-    this.socketQueries.get(socketId)!.add(hash);
-
-    // When the IO backend supports rooms, join the socket so the
-    // `_reeval` broadcast (`io.to(room).emit`) reaches it. Skipped on
-    // re-subscribe: Socket.IO's `join` is idempotent but the call
-    // round-trips through the adapter, so guard on alreadySubscribed.
-    if (this.joinRoom && !alreadySubscribed) {
-      this.joinRoom(socketId, this._roomFor(hash));
-    }
-
-    return { hash, items: [...cached.result.values()] };
   }
 
   // ── Unsubscribe ────────────────────────────────────────────────────
 
-  unsubscribe(socketId: string, hash: string): void {
+  async unsubscribe(socketId: string, hash: string): Promise<void> {
+    this._unsubscribe(socketId, hash);
+  }
+
+  /**
+   * Roll back only the exact attachment created by a failed multi-query
+   * operation. A later LIST/resync reuse advances the generation and survives.
+   */
+  async unsubscribeIfAttachmentCurrent(
+    socketId: string,
+    hash: string,
+    attachmentGeneration: number,
+    attachmentOwner?: object,
+  ): Promise<void> {
     const cached = this.queries.get(hash);
-    if (!cached) return;
-
-    const wasSubscribed = cached.subscribers.delete(socketId);
-    this.socketQueries.get(socketId)?.delete(hash);
-
-    if (wasSubscribed && this.leaveRoom) {
-      this.leaveRoom(socketId, this._roomFor(hash));
+    const attachment = cached?.subscribers.get(socketId);
+    if (attachment?.generation !== attachmentGeneration) {
+      return;
     }
+    if (attachmentOwner !== undefined && attachment.owner !== attachmentOwner) {
+      return;
+    }
+    this._unsubscribe(socketId, hash);
+  }
 
-    if (cached.subscribers.size === 0) {
-      this._teardownCoalesce(cached);
-      this.queries.delete(hash);
-      this.typeIndex.get(cached.modelType)?.delete(hash);
-      for (const exp of cached.expand) {
-        this.expandTargetIndex.get(exp.targetType)?.delete(hash);
-      }
+  /**
+   * Relinquish rollback ownership after a batch has fully succeeded. The
+   * generation and token checks prevent an older batch from changing a newer
+   * attachment.
+   */
+  commitAttachmentOwner(
+    socketId: string,
+    hash: string,
+    attachmentGeneration: number,
+    attachmentOwner: object,
+  ): void {
+    const attachment = this.queries.get(hash)?.subscribers.get(socketId);
+    if (
+      attachment?.generation === attachmentGeneration &&
+      attachment.owner === attachmentOwner
+    ) {
+      attachment.owner = null;
     }
   }
 
-  unsubscribeAll(socketId: string): void {
+  private _unsubscribe(socketId: string, hash: string): void {
+    const cached = this.queries.get(hash);
+    if (!cached) return;
+
+    cached.subscribers.delete(socketId);
+    const socketHashes = this.socketQueries.get(socketId);
+    socketHashes?.delete(hash);
+    if (socketHashes?.size === 0) this.socketQueries.delete(socketId);
+
+    if (cached.subscribers.size === 0) {
+      this._disposeCached(cached);
+    }
+  }
+
+  async unsubscribeAll(socketId: string): Promise<void> {
+    // Detach old in-flight reservations immediately at an authorization
+    // boundary. Each subscribe closure still owns its old Map; its identity
+    // check in `finally` prevents it from deleting a new session's map.
+    this.socketReservations.delete(socketId);
     const hashes = this.socketQueries.get(socketId);
     if (!hashes) return;
 
     for (const hash of hashes) {
       const cached = this.queries.get(hash);
       if (!cached) continue;
-      const wasSubscribed = cached.subscribers.delete(socketId);
-      if (wasSubscribed && this.leaveRoom) {
-        this.leaveRoom(socketId, this._roomFor(hash));
-      }
+      cached.subscribers.delete(socketId);
       if (cached.subscribers.size === 0) {
-        this._teardownCoalesce(cached);
-        this.queries.delete(hash);
-        this.typeIndex.get(cached.modelType)?.delete(hash);
-        for (const exp of cached.expand) {
-          this.expandTargetIndex.get(exp.targetType)?.delete(hash);
-        }
+        this._disposeCached(cached);
       }
     }
 
@@ -595,6 +756,7 @@ export class QuerySubscriptionManager {
   // ── Re-evaluation ──────────────────────────────────────────────────
 
   private _scheduleReeval(cached: CachedQuery): void {
+    if (cached.disposed) return;
     const c = cached.coalesce;
 
     // While a re-eval is in flight, just mark a follow-up so we run
@@ -648,14 +810,15 @@ export class QuerySubscriptionManager {
     // on the pool or starve unrelated handlers (DOL-1047).
     await this.reevalSemaphore.acquire();
     try {
+      if (cached.disposed || cached.subscribers.size === 0) return;
       await this._reeval(cached);
-    } catch (err) {
-      log.error(`subscriptions: re-eval failed for ${cached.hash}:`, err);
+    } catch {
+      log.error("subscriptions: re-evaluation failed");
     } finally {
       this.reevalSemaphore.release();
       c.inFlight = false;
     }
-    if (c.needsFollowup) {
+    if (!cached.disposed && c.needsFollowup) {
       // A change arrived mid-re-eval. Schedule a follow-up so we
       // converge against the latest world state.
       this._scheduleReeval(cached);
@@ -675,10 +838,30 @@ export class QuerySubscriptionManager {
     c.needsFollowup = false;
   }
 
-  private async _reeval(cached: CachedQuery): Promise<void> {
-    if (cached.subscribers.size === 0) return;
+  private _disposeCached(cached: CachedQuery): void {
+    if (cached.disposed) return;
+    this._teardownCoalesce(cached);
+    if (this.queries.get(cached.hash) === cached) {
+      this.queries.delete(cached.hash);
+    }
+    this.typeIndex.get(cached.modelType)?.delete(cached.hash);
+    for (const exp of cached.expand) {
+      this.expandTargetIndex.get(exp.targetType)?.delete(cached.hash);
+    }
 
-    const rows = await this._execQuery(cached.query, cached.expand);
+    cached.disposed = true;
+    cached.result.clear();
+    cached.subscribers.clear();
+    cached.principal = null;
+    cached.query = null;
+  }
+
+  private async _reeval(cached: CachedQuery): Promise<void> {
+    const query = cached.query;
+    if (cached.disposed || cached.subscribers.size === 0 || !query) return;
+
+    const rows = await this._execQuery(query, cached.expand, cached.principal);
+    if (cached.disposed || cached.subscribers.size === 0) return;
     const newResult = new Map<string, Record<string, any>>();
     for (const row of rows) {
       const clean = dateSafeClone(row);
@@ -733,13 +916,12 @@ export class QuerySubscriptionManager {
       : { ops };
 
     const event = `query:${cached.hash}`;
-    if (this.emitToRoom) {
-      // Single broadcast — Socket.IO walks the room's socket set and
-      // emits to each transport in one pass. For N subscribers this
-      // is O(1) emits at the manager layer instead of O(N).
-      this.emitToRoom(this._roomFor(cached.hash), event, envelope);
+    const currentSubscribers = [...cached.subscribers.keys()];
+    if (currentSubscribers.length === 0) return;
+    if (this.emitToSockets) {
+      this.emitToSockets(currentSubscribers, event, envelope);
     } else {
-      for (const socketId of cached.subscribers) {
+      for (const socketId of currentSubscribers) {
         this.emitToSocket(socketId, event, envelope);
       }
     }
@@ -750,16 +932,28 @@ export class QuerySubscriptionManager {
   private async _execQuery(
     query: QueryChain<any>,
     expand: readonly ResolvedExpand[],
+    principal: Readonly<{ id: string }> | null,
   ): Promise<Record<string, any>[]> {
     const models = await query.clone().find();
     // `query.find()` returns `Promise<any[]>` (the chain's generic is
-    // `any`); the projection runs `sanitize()` for every Model row
-    // and falls back to `__data` for any non-Model row that snuck
-    // through (defensive — the default `sanitize` is now on Model
-    // itself, so the fallback is effectively unreachable for real
-    // model classes).
+    // `any`), but realtime rows must still cross the Model sanitizer. Never
+    // fall back to `__data`: an invalid custom sanitizer returning undefined
+    // must fail closed rather than expose the raw row.
     const wireRows = await Promise.all(
-      models.map((m: any) => m.sanitize?.() ?? m.__data ?? m),
+      models.map(async (m: any) => {
+        if (typeof m?.sanitize !== "function") {
+          throw new Error("Realtime query row is missing sanitize()");
+        }
+        const sanitized = await m.sanitize(principal ?? undefined);
+        if (
+          !sanitized ||
+          typeof sanitized !== "object" ||
+          Array.isArray(sanitized)
+        ) {
+          throw new Error("Model sanitize() must return an object");
+        }
+        return sanitized as Record<string, any>;
+      }),
     );
 
     if (expand.length === 0) return wireRows;
@@ -770,21 +964,17 @@ export class QuerySubscriptionManager {
     // we can't reuse `getRefLoader()`. The per-reeval loader still
     // collapses every ref-id-per-row into one query per target
     // type via the same microtask batching.
-    const adapter = (query as any).__adapter as
-      | {
-          batchFindByType?: (type: string, ids: string[]) => Promise<Map<string, any>>;
-        }
-      | null;
+    const adapter = (query as any).__adapter as {
+      batchFindByType?: (
+        type: string,
+        ids: string[],
+      ) => Promise<Map<string, any>>;
+    } | null;
     if (!adapter?.batchFindByType) return wireRows;
     const loader = new RefLoader((type, ids) =>
       adapter.batchFindByType!(type, ids),
     );
-    // No request user available outside a request scope. Privacy-
-    // sensitive refs (e.g. expanding a `user` ref with private
-    // fields) would need to opt in via subscription-time user
-    // carriage — out of scope for v1 since the only expanded ref in
-    // anger right now is `File`, which has no `privateFields`.
-    await hydrateExpansions(wireRows, expand, loader, null);
+    await hydrateExpansions(wireRows, expand, loader, principal);
     return wireRows;
   }
 

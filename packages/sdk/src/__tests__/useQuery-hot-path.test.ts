@@ -37,6 +37,18 @@ class FakeClient extends EventEmitter {
     event: string;
     handler: (...args: any[]) => void;
   }> = [];
+  public session = {
+    state: {
+      status: "authenticated" as const,
+      userId: "u1",
+      version: 1,
+    },
+    ready: Promise.resolve(),
+  };
+  public isConnected = true;
+  public needsSessionRefresh = false;
+
+  send(): void {}
 
   subscribe(event: string, handler: (...args: any[]) => void): () => void {
     const entry = { event, handler };

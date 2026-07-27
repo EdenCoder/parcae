@@ -28,20 +28,20 @@ await app.start({ port: 3000, dev: true });
 
 ### AppConfig (full option set)
 
-| Option                   | Type                                  | Notes                                                                          |
-| ------------------------ | ------------------------------------- | ------------------------------------------------------------------------------ |
-| `models`                 | `ModelConstructor[] \| string`        | Array, or a dir scanned for exports with a non-empty `static type`.            |
-| `controllers`            | `string?`                             | Dir of route files. Not auto-defaulted — pass it explicitly.                   |
-| `hooks`                  | `string?`                             | Dir of hook files. Not auto-defaulted.                                         |
-| `jobs`                   | `string?`                             | Dir of job files. Not auto-defaulted.                                          |
-| `crons`                  | `string?`                             | Dir of cron files. Not auto-defaulted.                                         |
-| `migrations`             | `string?`                             | Dir of migration files; discovered before the DB connection opens.            |
-| `auth`                   | `AuthAdapter?`                        | Opt-in.                                                                         |
-| `version`                | `string?`                             | Default `"v1"`.                                                                 |
-| `root`                   | `string?`                             | Default `process.cwd()`.                                                        |
-| `modelsPath`             | `string?`                             | Where `reflect.config.json` lives (RTTIST type gen). Auto-detected if unset.   |
-| `onAuthenticatedRequest` | `(req, session, res) => void\|Promise`| Post-auth, pre-dispatch hook. See below.                                        |
-| `maxSubscriptionsPerSocket` | `number?`                          | Default 500. Env `PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET` overrides.              |
+| Option                      | Type                                   | Notes                                                                        |
+| --------------------------- | -------------------------------------- | ---------------------------------------------------------------------------- |
+| `models`                    | `ModelConstructor[] \| string`         | Array, or a dir scanned for exports with a non-empty `static type`.          |
+| `controllers`               | `string?`                              | Dir of route files. Not auto-defaulted — pass it explicitly.                 |
+| `hooks`                     | `string?`                              | Dir of hook files. Not auto-defaulted.                                       |
+| `jobs`                      | `string?`                              | Dir of job files. Not auto-defaulted.                                        |
+| `crons`                     | `string?`                              | Dir of cron files. Not auto-defaulted.                                       |
+| `migrations`                | `string?`                              | Dir of migration files; discovered before the DB connection opens.           |
+| `auth`                      | `AuthAdapter?`                         | Opt-in.                                                                      |
+| `version`                   | `string?`                              | Default `"v1"`.                                                              |
+| `root`                      | `string?`                              | Default `process.cwd()`.                                                     |
+| `modelsPath`                | `string?`                              | Where `reflect.config.json` lives (RTTIST type gen). Auto-detected if unset. |
+| `onAuthenticatedRequest`    | `(req, session, res) => void\|Promise` | Post-auth, pre-dispatch hook. See below.                                     |
+| `maxSubscriptionsPerSocket` | `number?`                              | Default 500. Env `PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET` overrides.            |
 
 Directory options are **not** auto-defaulted to conventional paths — every directory you want scanned must be passed.
 
@@ -53,7 +53,7 @@ Directory options are **not** auto-defaulted to conventional paths — every dir
 1. Discover models (array or directory scan via `discoverModels` — picks up any export with a non-empty `static type`).
 2. Generate `.parcae/` schemas (RTTIST/ts-morph, with caching).
 3. Discover migrations (if `migrations` set) — registered via `migration()`, before the DB opens.
-4. Connect database (Knex; Postgres pool min 2 / max 10, optional read replica via `DATABASE_READ_URL`; or SQLite via `better-sqlite3`).
+4. Connect database (Knex; Postgres pool min 2 / max 25 by default, optional read replica via `DATABASE_READ_URL`; or SQLite via `better-sqlite3`).
 5. Connect Redis: `PubSub` and `QueueService` (queue name from `JOB_QUEUE_NAME`, default `"parcae"`). Falls back to in-process implementations when `REDIS_URL` is unset. Wired into `enqueue()` / `lock()` via `_setServices`.
 6. Create `ChangeBus` (model-change fan-out over PubSub).
 7. Create `BackendAdapter`, `registerModels`, `Model.use(adapter)`; detect engine (sqlite / postgres / alloydb).
@@ -82,7 +82,7 @@ A single binary runs in different roles by env. `resolveRuntimeFlags` produces `
 - **`RUN_SERVER`** (default `true`) — register CRUD routes, custom routes, Socket.IO RPC. When false the server still binds `PORT` and serves `/{version}/health` only.
 - **`RUN_HOOKS`** (default `true`) — invoke model lifecycle hooks. When false, hook files are still imported (side effects fire) but the adapter skips calling them.
 - **`RUN_JOBS`** (default `false`) — `true` = start a worker for every registered job; `false` = none (enqueue still works, jobs wait); `"a,b,c"` = only those job names.
-- **`RUN_CRONS`** (default *follows `RUN_JOBS`*: `true` if `RUN_JOBS != false`, else `false`) — `true` / `false` / `"a,b,c"` name-list, same syntax as `RUN_JOBS`.
+- **`RUN_CRONS`** (default _follows `RUN_JOBS`_: `true` if `RUN_JOBS != false`, else `false`) — `true` / `false` / `"a,b,c"` name-list, same syntax as `RUN_JOBS`.
 
 `SERVER` and `DAEMON` are **deprecated** (legacy bool env). `RUN_*` wins when both are set; using a legacy var logs a deprecation warning. `DAEMON=true` historically meant hooks+jobs; note `DAEMON` never controlled hooks (they default on regardless).
 
@@ -147,15 +147,21 @@ migration(
   "20260401000000-rename-type-columns",
   { description: "Legacy type columns -> typed names", ticket: "FRE-200" },
   async ({ db, engine }) => {
-    if (engine === "sqlite") return;                  // pg-only guard
-    await db.raw(`ALTER TABLE activities RENAME COLUMN "type" TO "activityType"`);
+    if (engine === "sqlite") return; // pg-only guard
+    await db.raw(
+      `ALTER TABLE activities RENAME COLUMN "type" TO "activityType"`,
+    );
   },
 );
 
 // Opt out of the default transaction (e.g. CREATE INDEX CONCURRENTLY)
-migration("20260402000000-concurrent-idx", { transaction: false }, async ({ db }) => {
-  await db.raw(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ...`);
-});
+migration(
+  "20260402000000-concurrent-idx",
+  { transaction: false },
+  async ({ db }) => {
+    await db.raw(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ...`);
+  },
+);
 ```
 
 - State lives in `parcae_migrations` (Knex) + `parcae_migration_meta` (Parcae); written atomically inside each migration's transaction.
@@ -210,14 +216,14 @@ Source: `packages/backend/src/adapters/routes.ts`
 
 Any model with a `static scope` gets REST endpoints automatically (per scope key present). The path is `model.path` if set, else `/{version}/{pluralize(type)}`.
 
-| Method   | Route                              | Scope key        | Description                            |
-| -------- | ---------------------------------- | ---------------- | -------------------------------------- |
-| `GET`    | `/v1/{pluralize(type)}`            | `read`           | List (paginated, sortable, filterable) |
-| `GET`    | `/v1/{pluralize(type)}/:id`        | `read`           | Get one                                |
-| `POST`   | `/v1/{pluralize(type)}`            | `create`         | Create                                 |
-| `PUT`    | `/v1/{pluralize(type)}/:id`        | `update`         | Full update                            |
-| `DELETE` | `/v1/{pluralize(type)}/:id`        | `delete`         | Delete                                 |
-| `PATCH`  | `/v1/{pluralize(type)}/:id`        | `patch` ?? `update` | Atomic JSON Patch                   |
+| Method   | Route                       | Scope key           | Description                            |
+| -------- | --------------------------- | ------------------- | -------------------------------------- |
+| `GET`    | `/v1/{pluralize(type)}`     | `read`              | List (paginated, sortable, filterable) |
+| `GET`    | `/v1/{pluralize(type)}/:id` | `read`              | Get one                                |
+| `POST`   | `/v1/{pluralize(type)}`     | `create`            | Create                                 |
+| `PUT`    | `/v1/{pluralize(type)}/:id` | `update`            | Full update                            |
+| `DELETE` | `/v1/{pluralize(type)}/:id` | `delete`            | Delete                                 |
+| `PATCH`  | `/v1/{pluralize(type)}/:id` | `patch` ?? `update` | Atomic JSON Patch                      |
 
 **Pluralization is real.** Routes, table names, and the list-response collection key are all derived via `pluralize(static type)` on both the backend (`adapters/routes.ts`, `adapters/model.ts`) and the SDK (`client.ts`). So `category → categories`, `person → people`, and a type already ending in `s` is not double-pluralized. The old naive `type + "s"` (and the backend/SDK split-brain it caused) is gone; there's a regression test at `model/src/__tests__/collection-name.test.ts`.
 
@@ -295,10 +301,16 @@ route.get("/v1/stats", async (req, res) => {
 });
 
 // With middleware + priority (lower = attaches first)
-route.post("/v1/upload", requireAuth, rateLimit(100), async (req, res) => {
-  // req.session available after auth middleware
-  ok(res, { uploaded: true });
-}, { priority: 50 });
+route.post(
+  "/v1/upload",
+  requireAuth,
+  rateLimit(100),
+  async (req, res) => {
+    // req.session available after auth middleware
+    ok(res, { uploaded: true });
+  },
+  { priority: 50 },
+);
 
 // All HTTP methods
 route.get(path, ...handlers);
@@ -324,7 +336,32 @@ route.on("chat:message", requireSocketAuth, async (ctx) => {
 });
 ```
 
-Registered once per connection. `requireSocketAuth` is the socket equivalent of an auth gate. Middleware chains run via `runSocketChain` (call `next()` to proceed).
+Registered once per connection. `requireSocketAuth` is the socket equivalent of
+an auth gate. Middleware chains run via `runSocketChain` (call `next()` to
+proceed).
+
+`ctx.socket`, `ctx.io`, and `ctx.emit` are session-fenced compatibility
+facades, not raw Socket.IO handles. They expose the common emitter chain
+(`to`/`in`/`except`/`timeout`/`volatile`/`emit`) and selected socket metadata
+and room methods. Output created by an old handler, including chained emitters
+and late acknowledgement callbacks, becomes inert after a newer `hello`
+starts. Original acknowledgement handler closures are synchronously released
+at the boundary or disconnect even if Socket.IO retains its transport wrapper
+while waiting for the peer.
+
+The facade handshake is a frozen allowlist containing only non-sensitive
+`secure`, `xdomain`, and `issued` metadata; it never exposes raw headers,
+cookies, auth/query payloads, URL, or address. Its `rooms` property is a
+boundary-aware read-only live view: a retained view or iterator becomes empty
+as soon as its session is invalidated.
+
+`ctx.socket.join()` and `leave()` return `Promise<void>`. Every custom
+room mutation is registered with the socket's room manager. Query subscriptions
+do not use custom rooms; they target exact current socket ids. A new `hello`
+invalidates the previous session synchronously, tears down its query state,
+and awaits removal of every non-intrinsic room before resolving the new token
+or acknowledging the client. Cleanup failure rejects the boundary and
+disconnects the socket rather than exposing the next owner to prior rooms.
 
 ### Controller Class (marker only)
 
@@ -476,7 +513,10 @@ export default cron("daily-digest", "0 7 * * *", async ({ data }) => {
 });
 
 // Allow overlapping ticks (rare), and pin a timezone:
-cron("metrics", "*/10 * * * * *", handler, { overlap: true, timezone: "America/New_York" });
+cron("metrics", "*/10 * * * * *", handler, {
+  overlap: true,
+  timezone: "America/New_York",
+});
 ```
 
 ### Signature
@@ -504,7 +544,7 @@ route.get("/v1/search", async (req, res) => {
   const results = await searchAll(adapter, req.query.q, {
     models: [Project, User],
     scope: { user: req.session?.user },
-    limit: 20,   // default 10
+    limit: 20, // default 10
   });
   ok(res, { results, query: req.query.q });
 });
@@ -516,34 +556,35 @@ Searches across models in parallel, applies each model's `scope.read`, returns a
 
 Environment variables validated at startup via Zod (`configSchema`):
 
-| Variable            | Required    | Default        | Description                                                       |
-| ------------------- | ----------- | -------------- | ----------------------------------------------------------------- |
-| `DATABASE_URL`      | Yes         | —              | Postgres or SQLite (`sqlite:...`, `:memory:`, `*.db`) connection  |
-| `DATABASE_READ_URL` | No          | —              | Read replica (ignored for SQLite)                                 |
-| `REDIS_URL`         | No          | —              | Redis for PubSub + Queue (in-process fallback if absent)          |
-| `PORT`              | No          | `3000`         | HTTP port                                                         |
-| `AUTH_SECRET`       | Conditional | —              | Required if auth enabled                                          |
-| `NODE_ENV`          | No          | `development`  | `development` \| `production` \| `test`                           |
-| `RUN_SERVER`        | No          | `true`         | Register CRUD/custom routes + Socket.IO RPC                       |
-| `RUN_HOOKS`         | No          | `true`         | Invoke model lifecycle hooks                                      |
-| `RUN_JOBS`          | No          | `false`        | Start BullMQ workers: `true` / `false` / `"name1,name2"`          |
-| `RUN_CRONS`         | No          | follows `RUN_JOBS` | Schedule crons: `true` / `false` / `"name1,name2"`           |
-| `JOB_QUEUE_NAME`    | No          | `parcae`       | Base name for per-job BullMQ queues                               |
-| `SERVER`            | No          | —              | **@deprecated** — use `RUN_SERVER` (RUN_SERVER wins)              |
-| `DAEMON`            | No          | —              | **@deprecated** — use `RUN_HOOKS`/`RUN_JOBS` (those win)          |
-| `TRUSTED_ORIGINS`   | No          | —              | Comma-separated CORS origins                                      |
-| `BACKEND_URL`       | No          | —              | For auth callbacks                                                |
-| `FRONTEND_URL`      | No          | —              | Frontend URL                                                      |
+| Variable            | Required    | Default            | Description                                                      |
+| ------------------- | ----------- | ------------------ | ---------------------------------------------------------------- |
+| `DATABASE_URL`      | Yes         | —                  | Postgres or SQLite (`sqlite:...`, `:memory:`, `*.db`) connection |
+| `DATABASE_READ_URL` | No          | —                  | Read replica (ignored for SQLite)                                |
+| `REDIS_URL`         | No          | —                  | Redis for PubSub + Queue (in-process fallback if absent)         |
+| `PORT`              | No          | `3000`             | HTTP port                                                        |
+| `AUTH_SECRET`       | Conditional | —                  | Required if auth enabled                                         |
+| `NODE_ENV`          | No          | `development`      | `development` \| `production` \| `test`                          |
+| `RUN_SERVER`        | No          | `true`             | Register CRUD/custom routes + Socket.IO RPC                      |
+| `RUN_HOOKS`         | No          | `true`             | Invoke model lifecycle hooks                                     |
+| `RUN_JOBS`          | No          | `false`            | Start BullMQ workers: `true` / `false` / `"name1,name2"`         |
+| `RUN_CRONS`         | No          | follows `RUN_JOBS` | Schedule crons: `true` / `false` / `"name1,name2"`               |
+| `JOB_QUEUE_NAME`    | No          | `parcae`           | Base name for per-job BullMQ queues                              |
+| `SERVER`            | No          | —                  | **@deprecated** — use `RUN_SERVER` (RUN_SERVER wins)             |
+| `DAEMON`            | No          | —                  | **@deprecated** — use `RUN_HOOKS`/`RUN_JOBS` (those win)         |
+| `TRUSTED_ORIGINS`   | No          | —                  | Comma-separated CORS origins                                     |
+| `BACKEND_URL`       | No          | —                  | For auth callbacks                                               |
+| `FRONTEND_URL`      | No          | —                  | Frontend URL                                                     |
 
 Read directly from `process.env` (not part of the Zod schema):
 
-| Variable                            | Default | Description                                                        |
-| ----------------------------------- | ------- | ----------------------------------------------------------------- |
-| `ENSURE_SCHEMA`                     | —       | `"true"` to run auth migrations, user migrations, `ensureAllTables` |
-| `PARCAE_ALLOW_CHECKSUM_DRIFT`       | —       | `"true"` to bypass migration checksum-drift errors                |
-| `PARCAE_DROP_OBSOLETE_COLUMNS`      | —       | `"true"` to drop columns no longer declared on a model           |
-| `PARCAE_LISTEN_NOTIFY`              | —       | `"false"` to disable the LISTEN/NOTIFY external-write poller (PG) |
-| `PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET` | `500` | Per-socket subscription cap                                       |
-| `PARCAE_REEVAL_CONCURRENCY`         | —       | Subscription re-eval concurrency override                          |
+| Variable                              | Default | Description                                                         |
+| ------------------------------------- | ------- | ------------------------------------------------------------------- |
+| `ENSURE_SCHEMA`                       | —       | `"true"` to run auth migrations, user migrations, `ensureAllTables` |
+| `PARCAE_ALLOW_CHECKSUM_DRIFT`         | —       | `"true"` to bypass migration checksum-drift errors                  |
+| `PARCAE_DROP_OBSOLETE_COLUMNS`        | —       | `"true"` to drop columns no longer declared on a model              |
+| `PARCAE_LISTEN_NOTIFY`                | —       | `"false"` to disable the LISTEN/NOTIFY external-write poller (PG)   |
+| `PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET` | `500`   | Per-socket subscription cap                                         |
+| `PARCAE_REEVAL_CONCURRENCY`           | —       | Subscription re-eval concurrency override                           |
+
 </content>
 </invoke>

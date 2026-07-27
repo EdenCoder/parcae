@@ -13,6 +13,11 @@ import pako from "pako";
 import { compress } from "compress-json";
 import pluralize from "pluralize";
 import { createSocketFakeRes } from "./socket-fake-res";
+import {
+  createSessionFencedEmitter,
+  createSessionFencedSocket,
+  SocketSessionRoomManager,
+} from "./socket-session-facade";
 import { Model } from "@parcae/model";
 import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
 import { log } from "./logger";
@@ -38,7 +43,11 @@ import { registerModelRoutes } from "./adapters/routes";
 import { PubSub } from "./services/pubsub";
 import { QueueService } from "./services/queue";
 import { RefLoader } from "./services/ref-loader";
-import { QuerySubscriptionManager } from "./services/subscriptions";
+import {
+  DEFAULT_MAX_SUBSCRIPTIONS_PER_SOCKET,
+  QuerySubscriptionManager,
+  requirePositiveSafeInteger,
+} from "./services/subscriptions";
 import { ChangeBus } from "./services/changeBus";
 import { ListenNotifyPoller } from "./services/listenNotifyPoller";
 import {
@@ -64,6 +73,7 @@ import { discoverMigrations } from "./adapters/migration-discovery";
 import type { AuthAdapter, AuthSession } from "./auth";
 import knex from "knex";
 import { shutdownResources } from "./shutdown";
+import { SocketSessionReconciler } from "./socket-session-reconciler";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -327,8 +337,9 @@ function startCron(entry: CronEntry, pubsub: PubSub): Cron {
 
 // ─── Socket helpers ──────────────────────────────────────────────────────────
 
-async function resyncQueries(
+async function runResyncQueries(
   socketId: string,
+  sessionLease: string,
   socketSession: AuthSession | null,
   entries: Array<{
     key: string;
@@ -339,43 +350,225 @@ async function resyncQueries(
   }>,
   adapter: BackendAdapter,
   registry: Map<string, ModelConstructor>,
-): Promise<Array<{ key: string; hash: string | null; items: any[]; totalCount: number }>> {
-  const results: Array<{ key: string; hash: string | null; items: any[]; totalCount: number }> = [];
+  isSessionCurrent: () => boolean,
+): Promise<
+  Array<{
+    key: string;
+    hash: string | null;
+    items: any[];
+    totalCount: number;
+    authorized: boolean;
+  }>
+> {
+  const results: Array<{
+    key: string;
+    hash: string | null;
+    items: any[];
+    totalCount: number;
+    authorized: boolean;
+  }> = [];
+  const denied = (key: string) => ({
+    key,
+    hash: null,
+    items: [],
+    totalCount: 0,
+    authorized: false,
+  });
   const user = socketSession?.user ?? null;
-  for (const entry of entries) {
-    const ModelClass = registry.get(entry.modelType);
-    if (!ModelClass) continue;
-    const scope = (ModelClass as any).scope;
-    if (!scope?.read) continue;
+  const attachmentOwner = Object.freeze({});
+  const committedAttachments = new Map<string, number>();
+  try {
+    for (const entry of entries) {
+      if (!isSessionCurrent()) {
+        throw new Error("Session changed during resync");
+      }
+      const ModelClass = registry.get(entry.modelType);
+      if (!ModelClass) {
+        results.push(denied(entry.key));
+        continue;
+      }
+      const scope = (ModelClass as any).scope;
+      if (!scope?.read) {
+        results.push(denied(entry.key));
+        continue;
+      }
 
-    const scopeResult = scope.read({ user, params: {}, data: {} } as any);
-    if (!scopeResult) continue;
+      const scopeResult = scope.read({ user, params: {}, data: {} } as any);
+      if (!scopeResult) {
+        results.push(denied(entry.key));
+        continue;
+      }
 
-    const prep = prepareClientQuery({
-      ModelClass,
-      scopeResult,
-      rawSteps: entry.steps,
-      modelByType: registry,
-      adapter,
-    });
+      const prep = prepareClientQuery({
+        ModelClass,
+        scopeResult,
+        rawSteps: entry.steps,
+        modelByType: registry,
+        adapter,
+      });
 
-    if (entry.subscribe === false) {
-      const { items, totalCount } = await runQueryStatic({ prep, user, adapter });
-      results.push({ key: entry.key, hash: null, items, totalCount });
-      continue;
+      if (entry.subscribe === false) {
+        const { items, totalCount } = await runQueryStatic({
+          prep,
+          user,
+          adapter,
+        });
+        if (!isSessionCurrent()) {
+          throw new Error("Session changed during resync");
+        }
+        results.push({
+          key: entry.key,
+          hash: null,
+          items,
+          totalCount,
+          authorized: true,
+        });
+        continue;
+      }
+
+      if (!adapter.subscriptions) {
+        results.push(denied(entry.key));
+        continue;
+      }
+
+      const {
+        items,
+        hash,
+        totalCount,
+        attachmentGeneration,
+        attachmentOwnedByCaller,
+      } = await runQuerySubscription({
+        prep,
+        socketId,
+        sessionLease,
+        user,
+        adapter,
+        isSessionCurrent,
+        attachmentOwner,
+      });
+      if (attachmentOwnedByCaller) {
+        // Duplicate hashes inside this batch are one logical attachment.
+        // Track its latest generation so rollback can remove the exact
+        // attachment this batch created.
+        committedAttachments.set(hash, attachmentGeneration);
+      } else {
+        // Another caller adopted the attachment. This batch must not reclaim
+        // and remove it, even if one of its duplicate entries follows.
+        committedAttachments.delete(hash);
+      }
+      if (!isSessionCurrent()) {
+        throw new Error("Session changed during resync");
+      }
+      results.push({
+        key: entry.key,
+        hash,
+        items,
+        totalCount,
+        authorized: true,
+      });
     }
-
-    if (!adapter.subscriptions) continue;
-
-    const { items, hash, totalCount } = await runQuerySubscription({
-      prep,
-      socketId,
-      user,
-      adapter,
-    });
-    results.push({ key: entry.key, hash, items, totalCount });
+  } catch (error) {
+    if (adapter.subscriptions) {
+      await Promise.allSettled(
+        [...committedAttachments].map(([hash, attachmentGeneration]) =>
+          adapter.subscriptions!.unsubscribeIfAttachmentCurrent(
+            socketId,
+            hash,
+            attachmentGeneration,
+            attachmentOwner,
+          ),
+        ),
+      );
+    }
+    throw error;
+  }
+  if (adapter.subscriptions) {
+    for (const [hash, attachmentGeneration] of committedAttachments) {
+      adapter.subscriptions.commitAttachmentOwner(
+        socketId,
+        hash,
+        attachmentGeneration,
+        attachmentOwner,
+      );
+    }
   }
   return results;
+}
+
+/**
+ * Resync is transactional per adapter/socket. A second overlapping batch is
+ * rejected instead of queued, including after a same-socket session rotation:
+ * an unbounded queue behind one stalled DB call would retain every request
+ * payload and callback.
+ */
+const activeResyncs = new WeakMap<BackendAdapter, Set<string>>();
+
+async function withExclusiveResync<T>(
+  adapter: BackendAdapter,
+  socketId: string,
+  work: () => Promise<T>,
+): Promise<T> {
+  let active = activeResyncs.get(adapter);
+  if (!active) {
+    active = new Set();
+    activeResyncs.set(adapter, active);
+  }
+  if (active.has(socketId)) {
+    throw new ClientError("Resync already in progress", 409);
+  }
+  active.add(socketId);
+  try {
+    return await work();
+  } finally {
+    active.delete(socketId);
+    if (active.size === 0 && activeResyncs.get(adapter) === active) {
+      activeResyncs.delete(adapter);
+    }
+  }
+}
+
+export async function resyncQueries(
+  socketId: string,
+  sessionLease: string,
+  socketSession: AuthSession | null,
+  entries: Array<{
+    key: string;
+    modelType: string;
+    steps: unknown[];
+    queryHash?: string | null;
+    subscribe?: boolean;
+  }>,
+  adapter: BackendAdapter,
+  registry: Map<string, ModelConstructor>,
+  isSessionCurrent: () => boolean,
+  maxEntries = DEFAULT_MAX_SUBSCRIPTIONS_PER_SOCKET,
+): Promise<
+  Array<{
+    key: string;
+    hash: string | null;
+    items: any[];
+    totalCount: number;
+    authorized: boolean;
+  }>
+> {
+  requirePositiveSafeInteger(maxEntries, "Resync query limit");
+  if (!Array.isArray(entries)) {
+    throw new ClientError("Invalid resync query list");
+  }
+  if (entries.length > maxEntries) {
+    throw new ClientError("Resync query limit exceeded", 429);
+  }
+  return withExclusiveResync(adapter, socketId, () =>
+    runResyncQueries(
+      socketId,
+      sessionLease,
+      socketSession,
+      entries,
+      adapter,
+      registry,
+      isSessionCurrent,
+    ),
+  );
 }
 
 // ─── createApp ───────────────────────────────────────────────────────────────
@@ -505,7 +698,10 @@ export function createApp(config: AppConfig): ParcaeApp {
       log.info("PubSub ready");
 
       log.info("Connecting Queue...");
-      const queue = new QueueService({ url: envConfig.REDIS_URL, name: envConfig.JOB_QUEUE_NAME || "parcae" });
+      const queue = new QueueService({
+        url: envConfig.REDIS_URL,
+        name: envConfig.JOB_QUEUE_NAME || "parcae",
+      });
       await queue.building;
       log.info("Queue ready");
 
@@ -593,43 +789,33 @@ export function createApp(config: AppConfig): ParcaeApp {
       _setIo(server.io);
 
       // ── Step 9: Set up QuerySubscriptionManager ────────────────────
-      // The IO backend wires Socket.IO rooms (DOL-1047): every
-      // subscriber for a given cached query joins `query:${hash}` at
-      // subscribe time so re-eval can broadcast ONCE via `io.to(room)`
-      // instead of N times via `io.to(socketId)`. The legacy
-      // `emitToSocket` is still provided as a fallback for any path
-      // that doesn't have a room (e.g. force-refresh on a query the
-      // socket hasn't joined yet).
-      const reevalConcurrency = process.env.PARCAE_REEVAL_CONCURRENCY
-        ? Math.max(1, Number(process.env.PARCAE_REEVAL_CONCURRENCY))
-        : undefined;
-      const maxSubscriptionsPerSocket = process.env
-        .PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET
-        ? Math.max(
-            1,
-            Number(process.env.PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET),
-          )
-        : config.maxSubscriptionsPerSocket;
+      // Re-evaluation targets the exact current logical subscriber ids.
+      // Query rooms are intentionally avoided because asynchronous room
+      // leave can outlive a socket authorization boundary.
+      const reevalConcurrency =
+        process.env.PARCAE_REEVAL_CONCURRENCY !== undefined
+          ? requirePositiveSafeInteger(
+              process.env.PARCAE_REEVAL_CONCURRENCY,
+              "PARCAE_REEVAL_CONCURRENCY",
+            )
+          : undefined;
+      const maxSubscriptionsPerSocket =
+        process.env.PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET !== undefined
+          ? requirePositiveSafeInteger(
+              process.env.PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET,
+              "PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET",
+            )
+          : config.maxSubscriptionsPerSocket;
+      const resyncEntryLimit =
+        maxSubscriptionsPerSocket ?? DEFAULT_MAX_SUBSCRIPTIONS_PER_SOCKET;
       const subscriptions = new QuerySubscriptionManager(
         {
           emitToSocket: (socketId, event, data) => {
             server?.io.to(socketId).emit(event, data);
           },
-          emitToRoom: (room, event, data) => {
-            server?.io.to(room).emit(event, data);
-          },
-          joinRoom: (socketId, room) => {
-            const socket = server?.io.sockets.sockets.get(socketId);
-            // The socket may have disconnected between the HTTP
-            // subscribe call landing and this hook firing. Skip
-            // silently — the room broadcast won't reach a missing
-            // socket either way, and `unsubscribe` will GC the
-            // cached query when its subscriber count hits zero.
-            socket?.join(room);
-          },
-          leaveRoom: (socketId, room) => {
-            const socket = server?.io.sockets.sockets.get(socketId);
-            socket?.leave(room);
+          emitToSockets: (socketIds, event, data) => {
+            if (socketIds.length === 0) return;
+            server?.io.to([...socketIds]).emit(event, data);
           },
         },
         {
@@ -752,12 +938,12 @@ export function createApp(config: AppConfig): ParcaeApp {
             try {
               const result = hook(req, req.session ?? null, res);
               if (result instanceof Promise) {
-                result.catch((err: unknown) => {
-                  log.warn(`[onAuthenticatedRequest] async error: ${err}`);
+                result.catch(() => {
+                  log.warn("[onAuthenticatedRequest] async handler failed");
                 });
               }
-            } catch (err) {
-              log.warn(`[onAuthenticatedRequest] error: ${err}`);
+            } catch {
+              log.warn("[onAuthenticatedRequest] handler failed");
             }
             // If the hook wrote a response synchronously (e.g. a step-up
             // gate calling `error(res, 403, ...)`), short-circuit. Async
@@ -849,7 +1035,8 @@ export function createApp(config: AppConfig): ParcaeApp {
       const routes = getRoutes();
       if (flags.server) {
         for (const entry of routes) {
-          const method = entry.method.toLowerCase() as keyof typeof server.polka;
+          const method =
+            entry.method.toLowerCase() as keyof typeof server.polka;
           if (typeof server.polka[method] === "function") {
             const handlers = [...entry.middlewares, entry.handler];
             (server.polka[method] as any)(entry.path, ...handlers);
@@ -1019,7 +1206,9 @@ export function createApp(config: AppConfig): ParcaeApp {
         }
         if (teardown) teardown.crons = startedCrons;
         if (scheduled.length > 0) {
-          log.info(`Scheduled ${scheduled.length} cron(s): ${scheduled.join(", ")}`);
+          log.info(
+            `Scheduled ${scheduled.length} cron(s): ${scheduled.join(", ")}`,
+          );
         }
         if (skipped.length > 0) {
           log.info(
@@ -1039,215 +1228,346 @@ export function createApp(config: AppConfig): ParcaeApp {
       // clients should be hitting the worker URL anyway.
       const modelsByType = new Map(models.map((m) => [m.type, m]));
 
-      if (flags.server) server.io.on("connection", (socket) => {
-        let socketSession: any = null;
+      if (flags.server)
+        server.io.on("connection", (socket) => {
+          const socketSession = new SocketSessionReconciler<AuthSession>();
+          const socketRooms = new SocketSessionRoomManager(socket as any);
 
-        // ── RPC: pipe socket calls through Polka's HTTP handler ─────
-        socket.on(
-          "call",
-          async (
-            requestId: string,
-            method: string,
-            path: string,
-            data: any,
-          ) => {
-            try {
-              // Parse query string from path
-              const [pathname, qs] = path.split("?");
-              const query: Record<string, any> = {};
-              if (qs) {
-                for (const pair of qs.split("&")) {
-                  const [k, v] = pair.split("=");
-                  if (k)
-                    query[decodeURIComponent(k)] = v
-                      ? decodeURIComponent(v)
-                      : "";
-                }
-              }
-
-              // Merge URL query params with socket data for GET requests
-              const mergedQuery =
-                method.toUpperCase() === "GET" ? { ...query, ...data } : query;
-
-              // Build fake req that Polka's handler can process.
-              // NOTE: Polka's handler unconditionally overwrites req.query
-              // with querystring.parse(info.query), which destroys complex
-              // objects (like __query arrays). We stash the real query in
-              // _socketQuery so middleware can restore it.
-              const fakeReq: any = {
-                method: method.toUpperCase(),
-                url: path,
-                headers: {
-                  ...socket.handshake.headers,
-                  "content-type": "application/json",
-                },
-                body: data,
-                query: mergedQuery,
-                _socketQuery: mergedQuery,
-                params: {},
-                session: socketSession,
-                _socketRpc: true, // marker: skip auth middleware resolution
-                _socketId: socket.id,
-                _parsedUrl: { pathname, query: qs || "", _raw: path },
-              };
-
-              // Build fake res that captures the response. See
-              // `socket-fake-res.ts` for the full contract — short
-              // version: a step-up gate that writes 403 to res via
-              // `error(res, 403, …)` sets `writableEnded`, which the
-              // `onAuthenticatedRequest` polka middleware checks to
-              // short-circuit. `writeHead`/`end` are idempotent so a
-              // late write from a downstream handler can't clobber the
-              // first response.
-              const fakeRes = createSocketFakeRes(socket, requestId);
-
-              // Run through Polka's full handler (includes middleware, auth, auto-CRUD, custom routes)
-              (server!.polka as any).handler(fakeReq, fakeRes);
-            } catch (err: any) {
-              log.error(`[socket] RPC error:`, err);
-              const compressed = pako.gzip(
-                JSON.stringify(
-                  compress({
+          // ── RPC: pipe socket calls through Polka's HTTP handler ─────
+          socket.on(
+            "call",
+            async (
+              requestId: string,
+              method: string,
+              path: string,
+              data: any,
+            ) => {
+              const sessionSnapshot = socketSession.capture();
+              if (!sessionSnapshot) {
+                const unavailable = createSocketFakeRes(socket, requestId);
+                unavailable.writeHead(409);
+                unavailable.end(
+                  JSON.stringify({
                     result: null,
                     success: false,
-                    error:
+                    error: "Socket session is not reconciled",
+                  }),
+                );
+                return;
+              }
+              const sessionOperation = sessionSnapshot.operation;
+              const isSessionCurrent = () =>
+                socketSession.isOperationCurrent(sessionOperation);
+              try {
+                // Parse query string from path
+                const [pathname, qs] = path.split("?");
+                const query: Record<string, any> = {};
+                if (qs) {
+                  for (const pair of qs.split("&")) {
+                    const [k, v] = pair.split("=");
+                    if (k)
+                      query[decodeURIComponent(k)] = v
+                        ? decodeURIComponent(v)
+                        : "";
+                  }
+                }
+
+                // Merge URL query params with socket data for GET requests
+                const mergedQuery =
+                  method.toUpperCase() === "GET"
+                    ? { ...query, ...data }
+                    : query;
+
+                // Build fake req that Polka's handler can process.
+                // NOTE: Polka's handler unconditionally overwrites req.query
+                // with querystring.parse(info.query), which destroys complex
+                // objects (like __query arrays). We stash the real query in
+                // _socketQuery so middleware can restore it.
+                const fakeReq: any = {
+                  method: method.toUpperCase(),
+                  url: path,
+                  headers: {
+                    ...socket.handshake.headers,
+                    "content-type": "application/json",
+                  },
+                  body: data,
+                  query: mergedQuery,
+                  _socketQuery: mergedQuery,
+                  params: {},
+                  session: sessionSnapshot.session,
+                  _socketRpc: true, // marker: skip auth middleware resolution
+                  _socketId: socket.id,
+                  _socketSessionActive: isSessionCurrent,
+                  _socketSessionLease: `${socket.id}:${sessionOperation}`,
+                  _parsedUrl: { pathname, query: qs || "", _raw: path },
+                };
+
+                // Build fake res that captures the response. See
+                // `socket-fake-res.ts` for the full contract — short
+                // version: a step-up gate that writes 403 to res via
+                // `error(res, 403, …)` sets `writableEnded`, which the
+                // `onAuthenticatedRequest` polka middleware checks to
+                // short-circuit. `writeHead`/`end` are idempotent so a
+                // late write from a downstream handler can't clobber the
+                // first response.
+                const fakeRes = createSocketFakeRes(
+                  socket,
+                  requestId,
+                  isSessionCurrent,
+                );
+
+                // Run through Polka's full handler (includes middleware, auth, auto-CRUD, custom routes)
+                (server!.polka as any).handler(fakeReq, fakeRes);
+              } catch (err: any) {
+                log.error("[socket] RPC failed");
+                const compressed = pako.gzip(
+                  JSON.stringify(
+                    compress({
+                      result: null,
+                      success: false,
+                      error:
+                        err instanceof ClientError
+                          ? err.message
+                          : "An error occurred while processing your request",
+                    }),
+                  ),
+                );
+                if (isSessionCurrent()) {
+                  socket.emit(requestId, compressed);
+                }
+              }
+            },
+          );
+
+          // ── Hello / resync — session + reconnect protocol ─────────
+          //
+          // `hello` runs once per (re)connection: client sends its
+          // bearer token, server resolves the session, and binds it to
+          // this socket. The transport invokes this exactly once per
+          // socket; reconnects get a fresh `hello` automatically.
+          //
+          // `resync` is the batched reconnect refetch. The client hands
+          // us its live cache entries; we re-evaluate each query
+          // against the DB and re-bind subscriptions on the new socket
+          // id. One round trip restores N queries.
+          socket.on(
+            "hello",
+            async (payload: { token?: string | null }, callback: any) => {
+              const token = payload?.token ?? null;
+              try {
+                const result = await socketSession.reconcile(async () => {
+                  // `reconcile()` invalidates the prior session synchronously.
+                  // Do not publish or acknowledge the next owner until all
+                  // asynchronous adapter room work from the prior owner has
+                  // settled and every prior room has been left.
+                  const unsubscribePriorQueries = subscriptions.unsubscribeAll(
+                    socket.id,
+                  );
+                  await Promise.all([
+                    unsubscribePriorQueries,
+                    socketRooms.clearForBoundary(),
+                  ]);
+                  if (authAdapter && token) {
+                    try {
+                      return await authAdapter.resolveToken(token);
+                    } catch {
+                      return null;
+                    }
+                  }
+                  return null;
+                });
+                callback?.(
+                  result.applied
+                    ? {
+                        userId: result.session?.user?.id ?? null,
+                        stale: false,
+                      }
+                    : { userId: null, stale: true },
+                );
+              } catch {
+                socketSession.invalidate();
+                log.error("[socket] auth-boundary room cleanup failed");
+                callback?.({ userId: null, stale: true });
+                socket.disconnect(true);
+              }
+            },
+          );
+
+          socket.on(
+            "resync",
+            async (
+              payload: {
+                queries?: Array<{
+                  key: string;
+                  modelType: string;
+                  steps: unknown[];
+                  queryHash?: string | null;
+                  /**
+                   * `false` when the client mounted the matching
+                   * `useQuery` with `{ subscribe: false }`. Forwarded
+                   * to `resyncQueries`, which takes the
+                   * `runQueryStatic` path for these entries.
+                   */
+                  subscribe?: boolean;
+                }>;
+              },
+              callback: any,
+            ) => {
+              const rawEntries = payload?.queries;
+              if (rawEntries !== undefined && !Array.isArray(rawEntries)) {
+                callback?.({
+                  success: false,
+                  error: "Invalid resync query list",
+                });
+                return;
+              }
+              const entries = rawEntries ?? [];
+              if (entries.length > resyncEntryLimit) {
+                callback?.({
+                  success: false,
+                  error: "Resync query limit exceeded",
+                });
+                return;
+              }
+              const sessionSnapshot = socketSession.capture();
+              if (!sessionSnapshot) {
+                callback?.({
+                  success: false,
+                  error: "Session is not reconciled",
+                });
+                return;
+              }
+              const sessionOperation = sessionSnapshot.operation;
+              const isSessionCurrent = () =>
+                socketSession.isOperationCurrent(sessionOperation);
+              try {
+                if (entries.length === 0) {
+                  callback?.({ success: true, results: [] });
+                  return;
+                }
+                // Install request context for static resync expansions.
+                // Subscribed queries hydrate inside their principal-scoped
+                // manager cache; `subscribe:false` uses the request RefLoader.
+                const user = sessionSnapshot.session?.user ?? null;
+                const refLoader = new RefLoader((type, ids) =>
+                  adapter.batchFindByType(type, ids),
+                );
+                const results = await runWithRequestContext(
+                  { user, refLoader },
+                  () =>
+                    resyncQueries(
+                      socket.id,
+                      `${socket.id}:${sessionOperation}`,
+                      sessionSnapshot.session,
+                      entries,
+                      adapter,
+                      modelsByType,
+                      isSessionCurrent,
+                      resyncEntryLimit,
+                    ),
+                );
+                const acknowledged = socketSession.runIfOperationCurrent(
+                  sessionOperation,
+                  () => {
+                    callback?.({ success: true, results });
+                  },
+                );
+                if (!acknowledged) {
+                  callback?.({ success: false, error: "Session changed" });
+                }
+              } catch (err: any) {
+                if (!isSessionCurrent()) {
+                  callback?.({ success: false, error: "Session changed" });
+                  return;
+                }
+                log.error("[socket] resync failed");
+                callback?.({
+                  success: false,
+                  error:
+                    err instanceof ClientError ? err.message : "Resync failed",
+                });
+              }
+            },
+          );
+
+          // ── route.on() — custom Socket.IO event handlers ──────────
+          const socketHandlers = getSocketHandlers();
+          for (const entry of socketHandlers) {
+            socket.on(entry.event, async (data: any) => {
+              const sessionSnapshot = socketSession.capture();
+              if (!sessionSnapshot) {
+                socket.emit("error", {
+                  event: entry.event,
+                  message: "Session is not reconciled",
+                });
+                return;
+              }
+              const sessionOperation = sessionSnapshot.operation;
+              const isSessionCurrent = () =>
+                socketSession.isOperationCurrent(sessionOperation);
+              const sessionSocket = createSessionFencedSocket(
+                socket as any,
+                isSessionCurrent,
+                socketRooms,
+              );
+              const ctx: SocketContext = {
+                socket: sessionSocket,
+                io: createSessionFencedEmitter(
+                  server!.io as any,
+                  isSessionCurrent,
+                  socketRooms,
+                ),
+                data,
+                session: sessionSnapshot.session,
+                socketId: socket.id,
+                emit: (event: string, ...args: any[]) => {
+                  sessionSocket.emit(event, ...args);
+                },
+              };
+              try {
+                await runSocketChain(entry.middlewares, entry.handler, ctx);
+              } catch (err: any) {
+                log.error("[socket] custom event handler failed");
+                if (isSessionCurrent()) {
+                  sessionSocket.emit("error", {
+                    event: entry.event,
+                    message:
                       err instanceof ClientError
                         ? err.message
-                        : "An error occurred while processing your request",
-                  }),
-                ),
-              );
-              socket.emit(requestId, compressed);
-            }
-          },
-        );
-
-        // ── Hello / resync — session + reconnect protocol ─────────
-        //
-        // `hello` runs once per (re)connection: client sends its
-        // bearer token, server resolves the session, and binds it to
-        // this socket. The transport invokes this exactly once per
-        // socket; reconnects get a fresh `hello` automatically.
-        //
-        // `resync` is the batched reconnect refetch. The client hands
-        // us its live cache entries; we re-evaluate each query
-        // against the DB and re-bind subscriptions on the new socket
-        // id. One round trip restores N queries.
-        socket.on(
-          "hello",
-          async (payload: { token?: string | null }, callback: any) => {
-            const token = payload?.token ?? null;
-            if (authAdapter && token) {
-              try {
-                socketSession = await authAdapter.resolveToken(token);
-              } catch {
-                socketSession = null;
+                        : "An error occurred",
+                  });
+                }
               }
-            } else {
-              socketSession = null;
-            }
-            callback?.({ userId: socketSession?.user?.id ?? null });
-          },
-        );
+            });
+          }
 
-        socket.on(
-          "resync",
-          async (
-            payload: {
-              queries?: Array<{
-                key: string;
-                modelType: string;
-                steps: unknown[];
-                queryHash?: string | null;
-                /**
-                 * `false` when the client mounted the matching
-                 * `useQuery` with `{ subscribe: false }`. Forwarded
-                 * to `resyncQueries`, which takes the
-                 * `runQueryStatic` path for these entries.
-                 */
-                subscribe?: boolean;
-              }>;
-            },
-            callback: any,
-          ) => {
-            const entries = payload?.queries ?? [];
-            if (entries.length === 0) {
-              callback?.({ success: true, results: [] });
+          // Query subscriptions
+          socket.on("unsubscribe:query", async (data: any) => {
+            const sessionOperation = socketSession.capture()?.operation;
+            if (
+              sessionOperation === undefined ||
+              typeof data?.hash !== "string"
+            ) {
               return;
             }
-            // Install a request-scoped context so `runQuerySubscription`
-            // → `hydrateExpansions` → `getRefLoader()` finds a loader.
-            // Without this, `.expand("file")` projections silently
-            // no-op on every reconnect and the editor's pre-hydrated
-            // ref proxies snap to null. Mirrors the Polka middleware
-            // at server.polka.use(...) that wraps every HTTP request.
-            const user = socketSession?.user ?? null;
-            const refLoader = new RefLoader((type, ids) =>
-              adapter.batchFindByType(type, ids),
-            );
             try {
-              const results = await runWithRequestContext(
-                { user, refLoader },
-                () =>
-                  resyncQueries(
-                    socket.id,
-                    socketSession,
-                    entries,
-                    adapter,
-                    modelsByType,
-                  ),
-              );
-              callback?.({ success: true, results });
-            } catch (err: any) {
-              log.error("[socket] resync failed:", err);
-              callback?.({
-                success: false,
-                error:
-                  err instanceof ClientError
-                    ? err.message
-                    : "Resync failed",
-              });
-            }
-          },
-        );
-
-        // ── route.on() — custom Socket.IO event handlers ──────────
-        const socketHandlers = getSocketHandlers();
-        for (const entry of socketHandlers) {
-          socket.on(entry.event, async (data: any) => {
-            const ctx: SocketContext = {
-              socket,
-              io: server!.io,
-              data,
-              session: socketSession,
-              socketId: socket.id,
-              emit: (event: string, ...args: any[]) =>
-                socket.emit(event, ...args),
-            };
-            try {
-              await runSocketChain(entry.middlewares, entry.handler, ctx);
-            } catch (err: any) {
-              log.error(`[socket] ${entry.event} error:`, err);
-              socket.emit("error", {
-                event: entry.event,
-                message:
-                  err instanceof ClientError
-                    ? err.message
-                    : "An error occurred",
-              });
+              await subscriptions.unsubscribe(socket.id, data.hash);
+            } catch {
+              if (!socketSession.isOperationCurrent(sessionOperation)) return;
+              socketSession.invalidate();
+              socket.disconnect(true);
             }
           });
-        }
 
-        // Query subscriptions
-        socket.on("unsubscribe:query", (data: any) => {
-          subscriptions.unsubscribe(socket.id, data.hash);
+          socket.on("disconnect", () => {
+            socketSession.invalidate();
+            socketRooms.invalidateSessionOutputs();
+            void socketRooms.clearForBoundary().catch(() => {
+              log.warn("[socket] disconnect room cleanup failed");
+            });
+            void subscriptions.unsubscribeAll(socket.id).catch(() => undefined);
+          });
         });
-
-        socket.on("disconnect", () => {
-          subscriptions.unsubscribeAll(socket.id);
-        });
-      });
 
       // ── Step 17: Start listening ───────────────────────────────────
       // ALWAYS bind to PORT, even on worker-only processes (RUN_SERVER=false).

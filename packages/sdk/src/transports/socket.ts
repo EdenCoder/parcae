@@ -30,18 +30,14 @@ import { ConnectionMachine } from "../connection-machine";
 import { log } from "../log";
 
 const DEFAULT_TIMEOUT = 120_000;
+const HANDSHAKE_CANCELLED = Symbol("handshake-cancelled");
+const ANONYMOUS_TOKEN_RESOLVER = async (): Promise<null> => null;
 
 const uid = new ShortId({ length: 10 });
-const SOCKETS = new Map<string, any>();
 
-/** @internal — test-only. Clears the cached socket map between tests. */
+/** @internal — retained as a test compatibility no-op; sockets are not pooled. */
 export function _resetSockets(): void {
-  for (const socket of SOCKETS.values()) {
-    try {
-      socket.removeAllListeners?.();
-    } catch {}
-  }
-  SOCKETS.clear();
+  // Each transport owns its socket, so there is no global registry to clear.
 }
 
 export interface SocketTransportConfig {
@@ -79,7 +75,10 @@ export interface ResyncEntry {
   key: string;
   modelType: string;
   steps: unknown[];
-  /** Last-known queryHash, so the server can skip resending unchanged subscriptions. */
+  /**
+   * Last-known query hash carried for protocol continuity. The current server
+   * still re-authorizes and re-evaluates every resync entry.
+   */
   queryHash?: string | null;
   /**
    * `false` when the matching `useQuery` was mounted with
@@ -94,6 +93,12 @@ export interface ResyncEntry {
 /** Wire shape for a single resolved entry coming back from the server. */
 export interface ResyncResult {
   key: string;
+  /**
+   * `false` means the requested model/query is unavailable to the current
+   * session. The SDK scrubs the prior result in place and drops its listener.
+   * Absent is accepted as `true` for compatibility with older backends.
+   */
+  authorized?: boolean;
   /**
    * `null` for static (`subscribe: false`) entries — no subscription
    * was registered server-side, so there's no hash to attach a
@@ -113,9 +118,40 @@ export class SocketTransport extends EventEmitter implements Transport {
   private url: string;
   private version: string;
   private getToken: () => Promise<string | null>;
+  private tokenResolverRevision = 0;
+  private reconciledTokenResolverRevision = 0;
+  private tokenResolverLease: object | null = null;
+  private sessionOperationGeneration = 0;
+  private sessionBoundaryGeneration = 0;
+  private authorizationGeneration = 0;
+  private handshakeAttemptGeneration = 0;
+  private sessionReadyForEvents = false;
+  private hasResolvedSession = false;
   private inflight = new Map<string, Promise<any>>();
+  private pendingCalls = new Map<string, (error: Error) => void>();
+  private pendingResyncs = new Set<(error: Error) => void>();
+  private pendingConnectionWaits = new Set<(error: Error) => void>();
+  private pendingEventAcknowledgements = new Map<
+    symbol,
+    (...args: any[]) => void
+  >();
+  private subscriptions = new Map<
+    string,
+    Map<
+      (...args: any[]) => void,
+      { authorization: number; wrapper: (...args: any[]) => void }
+    >
+  >();
   /** Resolves when the most recent `hello` ack lands. */
   private helloReady: Promise<void> = Promise.resolve();
+  private pendingHandshake: {
+    attempt: number;
+    cancel: () => void;
+  } | null = null;
+  private pendingTermination: {
+    operation: number;
+    cancel: () => void;
+  } | null = null;
 
   constructor(config: SocketTransportConfig) {
     super();
@@ -124,25 +160,19 @@ export class SocketTransport extends EventEmitter implements Transport {
     this.getToken = config.getToken;
 
     const socketPath = config.path ?? "/ws";
-    const transports = config.transports ?? ["websocket"];
-    const extraHeaders = config.extraHeaders;
-    // Headers are part of the pool key: two transports to the same URL
-    // with different headers must not share a handshake.
-    const socketKey =
-      `${this.url}:${socketPath}:${transports.join(",")}` +
-      (extraHeaders ? `:${JSON.stringify(extraHeaders)}` : "");
-
-    if (SOCKETS.has(socketKey)) {
-      this.socket = SOCKETS.get(socketKey);
-    } else {
-      this.socket = SocketIO(this.url, {
-        path: socketPath,
-        transports,
-        withCredentials: true,
-        ...(extraHeaders ? { extraHeaders } : {}),
-      });
-      SOCKETS.set(socketKey, this.socket);
-    }
+    const transports = [...(config.transports ?? ["websocket"])];
+    const extraHeaders = config.extraHeaders
+      ? { ...config.extraHeaders }
+      : undefined;
+    // Client caching owns reuse. Each transport gets one physical socket so
+    // independent API versions/auth resolvers cannot overwrite or disconnect
+    // one another's server session.
+    this.socket = SocketIO(this.url, {
+      path: socketPath,
+      transports,
+      withCredentials: true,
+      ...(extraHeaders ? { extraHeaders } : {}),
+    });
 
     this.connection.connecting();
 
@@ -155,6 +185,14 @@ export class SocketTransport extends EventEmitter implements Transport {
     this.socket.on("disconnect", () => {
       // Critical: disconnect does NOT touch session.
       // Session is identity; identity outlives any single socket.
+      this._cancelPendingHandshake();
+      this._cancelPendingTermination();
+      this.sessionBoundaryGeneration++;
+      this.sessionReadyForEvents = false;
+      this._cancelPendingDataOperations(
+        new Error("Parcae connection closed during request"),
+      );
+      this._clearEventAcknowledgements();
       this.connection.disconnected();
       this.emit("disconnected");
     });
@@ -172,18 +210,135 @@ export class SocketTransport extends EventEmitter implements Transport {
 
   // ── Hello / resync handshake ─────────────────────────────────────
 
-  private async _handshake(): Promise<void> {
-    let resolveHello!: () => void;
-    this.helloReady = new Promise<void>((r) => {
-      resolveHello = r;
+  private _handshake(): Promise<void> {
+    this._cancelPendingHandshake();
+    this._cancelPendingTermination();
+    const handshakeAttempt = ++this.handshakeAttemptGeneration;
+    this.sessionBoundaryGeneration++;
+    this.sessionReadyForEvents = false;
+    const operationGeneration = this.sessionOperationGeneration;
+    let cancel: () => void = () => undefined;
+    const cancelled = new Promise<typeof HANDSHAKE_CANCELLED>((resolve) => {
+      cancel = () => resolve(HANDSHAKE_CANCELLED);
+    });
+    const pending = { attempt: handshakeAttempt, cancel };
+    this.pendingHandshake = pending;
+    const result = this._performHandshake(
+      operationGeneration,
+      handshakeAttempt,
+      cancelled,
+    ).finally(() => {
+      if (this.pendingHandshake === pending) {
+        this.pendingHandshake = null;
+      }
+    });
+    this.helloReady = result;
+    return result;
+  }
+
+  private _cancelPendingHandshake(): void {
+    const pending = this.pendingHandshake;
+    if (!pending) return;
+    this.handshakeAttemptGeneration++;
+    this.pendingHandshake = null;
+    pending.cancel();
+  }
+
+  private _cancelPendingTermination(): void {
+    const pending = this.pendingTermination;
+    if (!pending) return;
+    this.pendingTermination = null;
+    pending.cancel();
+  }
+
+  private _cancelPendingDataOperations(error: Error): void {
+    const calls = [...this.pendingCalls.values()];
+    const resyncs = [...this.pendingResyncs];
+    this.inflight.clear();
+    for (const cancel of calls) cancel(error);
+    for (const cancel of resyncs) cancel(error);
+  }
+
+  private _cancelPendingConnectionWaits(error: Error): void {
+    for (const cancel of [...this.pendingConnectionWaits]) cancel(error);
+  }
+
+  private _clearEventAcknowledgements(): void {
+    this.pendingEventAcknowledgements.clear();
+  }
+
+  private _beginAuthorizationBoundary(): void {
+    this._cancelPendingDataOperations(
+      new Error("Parcae request cancelled by an authorization boundary"),
+    );
+    this._cancelPendingConnectionWaits(
+      new Error(
+        "Parcae connection wait cancelled by an authorization boundary",
+      ),
+    );
+    this._clearEventAcknowledgements();
+    this._clearSubscriptions();
+    this.authorizationGeneration++;
+    this.sessionBoundaryGeneration++;
+    this.sessionReadyForEvents = false;
+    this.session.beginReconciliation();
+  }
+
+  private async _emitHello(
+    token: string | null,
+    cancelled: Promise<typeof HANDSHAKE_CANCELLED>,
+  ): Promise<any | typeof HANDSHAKE_CANCELLED> {
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const acknowledgement = new Promise<any>((resolve, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error("Parcae hello timeout")),
+        DEFAULT_TIMEOUT,
+      );
+      this.socket.emit("hello", { token }, resolve);
     });
 
-    let token: string | null = null;
     try {
-      token = await this.getToken();
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      log.warn(`hello: token resolution failed (${error.message})`);
+      return await Promise.race([acknowledgement, cancelled]);
+    } finally {
+      if (timeout !== null) clearTimeout(timeout);
+    }
+  }
+
+  private async _performHandshake(
+    operationGeneration: number,
+    handshakeAttempt: number,
+    cancelled: Promise<typeof HANDSHAKE_CANCELLED>,
+  ): Promise<void> {
+    if (
+      operationGeneration !== this.sessionOperationGeneration ||
+      handshakeAttempt !== this.handshakeAttemptGeneration
+    ) {
+      return;
+    }
+
+    // A reconnect after explicit sign-out must never consult the previously
+    // installed resolver. The disconnected server-side socket is already gone;
+    // bind the new socket anonymously and keep the machine terminated until an
+    // explicit refreshSession() begins a new sign-in.
+    if (this.session.state.status === "terminated") {
+      await this._emitHello(null, cancelled);
+      return;
+    }
+
+    const resolverRevision = this.tokenResolverRevision;
+    const getToken = this.getToken;
+    const tokenResult = getToken().then(
+      (token) => ({ kind: "token" as const, token }),
+      (error) => ({ kind: "error" as const, error }),
+    );
+    const resolvedToken = await Promise.race([tokenResult, cancelled]);
+    if (resolvedToken === HANDSHAKE_CANCELLED) return;
+    if (resolvedToken.kind === "error") {
+      const error =
+        resolvedToken.error instanceof Error
+          ? resolvedToken.error
+          : new Error(String(resolvedToken.error));
+      log.warn("hello: token resolution failed");
       this.emit("error", error);
       // Keep SessionMachine pending / unchanged. A failed token read is
       // not proof of an anonymous session; it usually means the auth
@@ -192,25 +347,64 @@ export class SocketTransport extends EventEmitter implements Transport {
       // :anon: and turn transient infra failure into 403 storms.
       throw error;
     }
+    const token = resolvedToken.token;
+
+    // Sign-out invalidates token resolution already in flight. Never emit a
+    // token obtained before the termination boundary.
+    if (
+      operationGeneration !== this.sessionOperationGeneration ||
+      handshakeAttempt !== this.handshakeAttemptGeneration
+    ) {
+      return;
+    }
 
     const t0 = performance.now();
-    return new Promise<void>((resolve) => {
-      this.socket.emit("hello", { token }, (response: any) => {
-        const ms = (performance.now() - t0).toFixed(0);
-        const userId = response?.userId ?? null;
-        log.debug(
-          `hello: ${userId ? `userId=${userId}` : "anonymous"} (${ms}ms)`,
-        );
-        this.session.resolve(userId);
-        resolveHello();
-        // Resync runs after every successful hello. Consumers track
-        // their own cache state and decide whether they have anything
-        // to ask the server about; the transport just publishes the
-        // signal once per handshake.
-        this.emit("resync-required");
-        resolve();
-      });
-    });
+    const response = await this._emitHello(token, cancelled);
+    if (
+      response === HANDSHAKE_CANCELLED ||
+      operationGeneration !== this.sessionOperationGeneration ||
+      handshakeAttempt !== this.handshakeAttemptGeneration
+    ) {
+      return;
+    }
+    if (response?.stale === true) {
+      throw new Error("Parcae hello was superseded before reconciliation");
+    }
+
+    const ms = (performance.now() - t0).toFixed(0);
+    const userId = response?.userId ?? null;
+    const previousStatus = this.session.state.status;
+    const previousUserId = this.session.state.userId;
+    log.debug(`hello: ${userId ? "authenticated" : "anonymous"} (${ms}ms)`);
+    if (this.hasResolvedSession && previousStatus === "pending") {
+      // A session listener can run re-entrantly from beginReconciliation().
+      // Any raw subscription registered in that pending window belongs to no
+      // confirmed owner and must not become active for this hello result.
+      this._clearSubscriptions();
+    }
+    if (previousStatus !== "pending" && previousUserId !== userId) {
+      this._clearEventAcknowledgements();
+      this._clearSubscriptions();
+      this.authorizationGeneration++;
+    }
+    this.session.resolve(userId);
+    this.hasResolvedSession = true;
+    // Session listeners run synchronously and may start a newer refresh or
+    // terminate the session. The superseded hello must not reopen raw events,
+    // mark its resolver reconciled, or publish a resync signal afterward.
+    if (
+      operationGeneration !== this.sessionOperationGeneration ||
+      handshakeAttempt !== this.handshakeAttemptGeneration
+    ) {
+      return;
+    }
+    this.sessionReadyForEvents = true;
+    this.reconciledTokenResolverRevision = resolverRevision;
+    // Resync runs after every successful hello. Consumers track
+    // their own cache state and decide whether they have anything
+    // to ask the server about; the transport just publishes the
+    // signal once per handshake.
+    this.emit("resync-required");
   }
 
   /**
@@ -221,22 +415,113 @@ export class SocketTransport extends EventEmitter implements Transport {
   async resync(entries: ResyncEntry[]): Promise<ResyncResult[]> {
     if (entries.length === 0) return [];
     await this.helloReady;
+    if (
+      !this.sessionReadyForEvents ||
+      this.session.state.status === "terminated"
+    ) {
+      throw new Error("Parcae resync requires a reconciled session");
+    }
+    const operationGeneration = this.sessionOperationGeneration;
+    const boundaryGeneration = this.sessionBoundaryGeneration;
+    const resolverRevision = this.tokenResolverRevision;
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error("resync timeout"));
+      let settled = false;
+      let timeout: ReturnType<typeof setTimeout> | null = null;
+      const finish = (
+        outcome:
+          | { status: "resolved"; value: ResyncResult[] }
+          | { status: "rejected"; error: Error },
+      ) => {
+        if (settled) return;
+        settled = true;
+        if (timeout) clearTimeout(timeout);
+        this.pendingResyncs.delete(cancel);
+        if (outcome.status === "resolved") resolve(outcome.value);
+        else reject(outcome.error);
+      };
+      const cancel = (error: Error) => finish({ status: "rejected", error });
+      this.pendingResyncs.add(cancel);
+      timeout = setTimeout(() => {
+        cancel(new Error("resync timeout"));
       }, DEFAULT_TIMEOUT);
       this.socket.emit("resync", { queries: entries }, (response: any) => {
-        clearTimeout(timeout);
-        if (response?.success === false) {
-          reject(new Error(response?.error || "resync failed"));
+        if (settled) return;
+        if (
+          operationGeneration !== this.sessionOperationGeneration ||
+          boundaryGeneration !== this.sessionBoundaryGeneration ||
+          resolverRevision !== this.tokenResolverRevision
+        ) {
+          cancel(
+            new Error("Parcae resync response discarded after session change"),
+          );
           return;
         }
-        resolve(response?.results ?? []);
+        if (response?.success === false) {
+          cancel(new Error(response?.error || "resync failed"));
+          return;
+        }
+        finish({ status: "resolved", value: response?.results ?? [] });
       });
     });
   }
 
   // ── Public API ───────────────────────────────────────────────────
+
+  get needsSessionRefresh(): boolean {
+    return this.reconciledTokenResolverRevision < this.tokenResolverRevision;
+  }
+
+  updateTokenResolver(getToken: () => Promise<string | null>): void {
+    if (this.tokenResolverLease) {
+      throw new Error("Parcae token resolver is owned by an active Provider");
+    }
+    this._replaceTokenResolver(getToken, true);
+  }
+
+  get hasTokenResolverLease(): boolean {
+    return this.tokenResolverLease !== null;
+  }
+
+  acquireTokenResolverLease(
+    lease: object,
+    getToken: () => Promise<string | null>,
+  ): void {
+    if (this.tokenResolverLease && this.tokenResolverLease !== lease) {
+      throw new Error(
+        "Parcae token resolver is owned by another active Provider",
+      );
+    }
+    const sameLease = this.tokenResolverLease === lease;
+    this.tokenResolverLease = lease;
+    this._replaceTokenResolver(
+      getToken,
+      !sameLease || this.getToken !== getToken,
+    );
+  }
+
+  releaseTokenResolverLease(lease: object): boolean {
+    if (this.tokenResolverLease === lease) {
+      this.tokenResolverLease = null;
+      // The globally cached client outlives its Provider. Drop the resolver
+      // closure immediately so the unmounted auth adapter/token state cannot
+      // remain strongly reachable through this transport.
+      this._replaceTokenResolver(ANONYMOUS_TOKEN_RESOLVER, true);
+      return true;
+    }
+    return false;
+  }
+
+  private _replaceTokenResolver(
+    getToken: () => Promise<string | null>,
+    forceReconciliation: boolean,
+  ): void {
+    if (!forceReconciliation && this.getToken === getToken) return;
+    this._cancelPendingHandshake();
+    this._cancelPendingTermination();
+    this.getToken = getToken;
+    this.tokenResolverRevision++;
+    this._beginAuthorizationBoundary();
+  }
 
   /**
    * Token rotation / explicit sign-in. Triggers a fresh hello on the
@@ -249,21 +534,138 @@ export class SocketTransport extends EventEmitter implements Transport {
    * the same SDK client is reused across multiple user identities.
    */
   async refreshSession(): Promise<{ userId: string | null }> {
+    // A caller-requested refresh is an authorization boundary even when the
+    // resolver function and resulting user id are unchanged (for example an
+    // organization/role change carried by a rotated token).
+    this._cancelPendingHandshake();
+    this._cancelPendingTermination();
+    this._beginAuthorizationBoundary();
+    return this._refreshSession(true);
+  }
+
+  /** Wait for the latest resolver/hello boundary without creating a new one. */
+  async awaitSessionReconciled(): Promise<{ userId: string | null }> {
+    return this._refreshSession(false);
+  }
+
+  private async _refreshSession(
+    allowTerminatedReset: boolean,
+  ): Promise<{ userId: string | null }> {
+    const operationGeneration = this.sessionOperationGeneration;
     if (this.session.state.status === "terminated") {
+      if (!allowTerminatedReset) {
+        throw new Error("Parcae session is terminated");
+      }
       this.session.reset();
     }
-    await this._handshake();
-    return { userId: this.session.state.userId };
+
+    const assertOperationActive = () => {
+      if (
+        operationGeneration !== this.sessionOperationGeneration ||
+        this.session.state.status === "terminated"
+      ) {
+        throw new Error("Parcae session was terminated during reconciliation");
+      }
+    };
+
+    while (true) {
+      assertOperationActive();
+      if (!this.socket.connected) {
+        await this._waitForConnection();
+        continue;
+      }
+
+      if (
+        this.sessionReadyForEvents &&
+        this.session.state.status !== "pending" &&
+        this.session.state.status !== "terminated" &&
+        !this.needsSessionRefresh &&
+        this.pendingHandshake === null
+      ) {
+        return { userId: this.session.state.userId };
+      }
+
+      const reconciliation =
+        this.pendingHandshake === null ? this._handshake() : this.helloReady;
+      await reconciliation;
+    }
+  }
+
+  private async _waitForConnection(): Promise<void> {
+    if (this.socket.connected) return;
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const timeout = setTimeout(() => {
+        finish(() =>
+          reject(new Error("Parcae connection timeout during reconciliation")),
+        );
+      }, DEFAULT_TIMEOUT);
+      const cancel = (error: Error) => finish(() => reject(error));
+      const onConnect = () => {
+        finish(resolve);
+      };
+      const onError = (error: Error) => {
+        finish(() => reject(error));
+      };
+      const cleanup = () => {
+        clearTimeout(timeout);
+        this.socket.off("connect", onConnect);
+        this.socket.off("connect_error", onError);
+        this.pendingConnectionWaits.delete(cancel);
+      };
+      const finish = (settle: () => void) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        settle();
+      };
+      this.pendingConnectionWaits.add(cancel);
+      this.socket.once("connect", onConnect);
+      this.socket.once("connect_error", onError);
+      this.socket.connect();
+    });
   }
 
   /** Explicit sign-out. Marks the session terminated and drops the socket auth. */
   async terminateSession(): Promise<void> {
+    this._cancelPendingHandshake();
+    this._cancelPendingTermination();
+    this._clearEventAcknowledgements();
+    this._clearSubscriptions();
+    this.sessionOperationGeneration++;
+    this.sessionBoundaryGeneration++;
+    this.authorizationGeneration++;
+    this.sessionReadyForEvents = false;
+    this._cancelPendingDataOperations(
+      new Error("Parcae request cancelled because the session terminated"),
+    );
+    this._cancelPendingConnectionWaits(
+      new Error(
+        "Parcae reconciliation cancelled because the session terminated",
+      ),
+    );
     this.session.terminate();
-    if (this.socket.connected) {
-      await new Promise<void>((resolve) => {
-        this.socket.emit("hello", { token: null }, () => resolve());
-      });
+    if (!this.socket.connected) {
+      this.helloReady = Promise.resolve();
+      return;
     }
+
+    const operation = this.sessionOperationGeneration;
+    let cancel: () => void = () => undefined;
+    const cancelled = new Promise<typeof HANDSHAKE_CANCELLED>((resolve) => {
+      cancel = () => resolve(HANDSHAKE_CANCELLED);
+    });
+    const pending = { operation, cancel };
+    this.pendingTermination = pending;
+    const termination = this._emitHello(null, cancelled)
+      .then(() => undefined)
+      .finally(() => {
+        if (this.pendingTermination === pending) {
+          this.pendingTermination = null;
+        }
+      });
+    this.helloReady = termination;
+    await termination;
   }
 
   get isConnected(): boolean {
@@ -278,48 +680,61 @@ export class SocketTransport extends EventEmitter implements Transport {
     data: any = {},
     options?: RequestOptions,
   ): Promise<any> {
-    // Wait for the first hello to land — guarantees the socket is
-    // authenticated before the call goes out. Subsequent calls don't
-    // re-await because `helloReady` resolves once and stays resolved
-    // until the next reconnect kicks a new handshake.
-    await this.helloReady;
+    const requestSessionGeneration = this.sessionOperationGeneration;
+    const requestAuthorizationGeneration = this.authorizationGeneration;
+    const assertRequestSessionActive = () => {
+      if (
+        requestSessionGeneration !== this.sessionOperationGeneration ||
+        requestAuthorizationGeneration !== this.authorizationGeneration ||
+        this.session.state.status === "terminated"
+      ) {
+        throw new Error(
+          "Parcae authorization changed before the RPC could be sent",
+        );
+      }
+    };
 
-    if (!this.socket.connected) {
-      await new Promise<void>((resolve, reject) => {
-        if (this.socket.connected) return resolve();
-        const timeout = setTimeout(() => {
-          cleanup();
-          reject(new Error("Connection timeout"));
-        }, DEFAULT_TIMEOUT);
-        const onConnect = () => {
-          cleanup();
-          resolve();
-        };
-        const onError = (err: Error) => {
-          cleanup();
-          reject(err);
-        };
-        const cleanup = () => {
-          clearTimeout(timeout);
-          this.socket.off("connect", onConnect);
-          this.socket.off("connect_error", onError);
-        };
-        this.socket.once("connect", onConnect);
-        this.socket.once("connect_error", onError);
-      });
-      await this.helloReady;
+    assertRequestSessionActive();
+
+    // Always pass through the full readiness gate. `needsSessionRefresh`
+    // alone is insufficient: an explicit same-resolver refresh marks the
+    // session pending before installing its next hello promise, and a
+    // synchronous session listener can re-enter `get()` in that interval.
+    // `_refreshSession` observes `sessionReadyForEvents` and starts/joins the
+    // current hello before this RPC is allowed onto the wire.
+    let cancelReadiness: (error: Error) => void = () => undefined;
+    const readinessCancelled = new Promise<never>((_resolve, reject) => {
+      cancelReadiness = reject;
+    });
+    this.pendingConnectionWaits.add(cancelReadiness);
+    try {
+      await Promise.race([this._refreshSession(false), readinessCancelled]);
+    } finally {
+      this.pendingConnectionWaits.delete(cancelReadiness);
     }
+    assertRequestSessionActive();
 
     const upper = method.toUpperCase();
     if (upper === "GET") {
-      const dedupeKey = `${path}:${JSON.stringify(data)}`;
+      const dedupeKey =
+        `${this.sessionOperationGeneration}:` +
+        `${this.sessionBoundaryGeneration}:${path}:` +
+        JSON.stringify(data);
       const existing = this.inflight.get(dedupeKey);
       if (existing) return existing;
       const req = this._call(method, path, data, options);
       this.inflight.set(dedupeKey, req);
       req.then(
-        () => this.inflight.delete(dedupeKey),
-        () => this.inflight.delete(dedupeKey),
+        () => {
+          if (this.inflight.get(dedupeKey) === req) {
+            this.inflight.delete(dedupeKey);
+          }
+        },
+        () => {
+          if (this.inflight.get(dedupeKey) === req) {
+            this.inflight.delete(dedupeKey);
+          }
+        },
       );
       return req;
     }
@@ -333,48 +748,74 @@ export class SocketTransport extends EventEmitter implements Transport {
     data: any,
     options?: RequestOptions,
   ): Promise<any> {
+    const callSessionOperationGeneration = this.sessionOperationGeneration;
+    const callSessionBoundaryGeneration = this.sessionBoundaryGeneration;
+    const callTokenResolverRevision = this.tokenResolverRevision;
     const id = uid.rnd();
     const t0 = performance.now();
-    const fullPath = `/${this.version}${path}`;
     const timeoutMs = options?.timeout ?? DEFAULT_TIMEOUT;
-    log.debug(`→ ${method.toUpperCase()} ${fullPath}`);
+    log.debug(`RPC ${method.toUpperCase()}: sent`);
 
     return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (
+        outcome:
+          | { status: "resolved"; value: unknown }
+          | { status: "rejected"; error: unknown },
+      ) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        this.socket.off(id, onResponse);
+        this.pendingCalls.delete(id);
+        if (outcome.status === "resolved") resolve(outcome.value);
+        else reject(outcome.error);
+      };
+      const cancel = (error: Error) => finish({ status: "rejected", error });
       const timeout = setTimeout(() => {
-        this.socket.off(id);
         log.debug(
-          `✗ ${method.toUpperCase()} ${fullPath} timeout (${(timeoutMs / 1000).toFixed(0)}s)`,
+          `RPC ${method.toUpperCase()}: timeout (${(timeoutMs / 1000).toFixed(0)}s)`,
         );
-        reject(new Error(`RPC timeout: ${method} ${path}`));
+        cancel(new Error(`RPC timeout: ${method} ${path}`));
       }, timeoutMs);
 
-      this.socket.once(id, (msg: any) => {
-        clearTimeout(timeout);
+      const onResponse = (msg: any) => {
+        if (
+          callSessionOperationGeneration !== this.sessionOperationGeneration ||
+          callSessionBoundaryGeneration !== this.sessionBoundaryGeneration ||
+          callTokenResolverRevision !== this.tokenResolverRevision
+        ) {
+          cancel(
+            new Error(
+              `RPC response discarded after Parcae session changed: ${method} ${path}`,
+            ),
+          );
+          return;
+        }
         const ms = (performance.now() - t0).toFixed(0);
         try {
           const uncompressed = pako.ungzip(msg, { to: "string" });
           const parsed = decompress(JSON.parse(uncompressed));
           if (parsed.success) {
-            log.debug(`← ${method.toUpperCase()} ${fullPath} (${ms}ms)`);
-            resolve(parsed.result);
+            log.debug(`RPC ${method.toUpperCase()}: success (${ms}ms)`);
+            finish({ status: "resolved", value: parsed.result });
           } else {
-            log.debug(
-              `✗ ${method.toUpperCase()} ${fullPath} (${ms}ms) ${parsed.error || parsed.message}`,
-            );
-            reject(
-              new Error(
+            log.debug(`RPC ${method.toUpperCase()}: rejected (${ms}ms)`);
+            finish({
+              status: "rejected",
+              error: new Error(
                 parsed.message || parsed.error || `${method} ${path} failed`,
               ),
-            );
+            });
           }
         } catch (err) {
-          log.debug(
-            `✗ ${method.toUpperCase()} ${fullPath} (${ms}ms) parse error`,
-          );
-          reject(err);
+          log.debug(`RPC ${method.toUpperCase()}: parse error (${ms}ms)`);
+          finish({ status: "rejected", error: err });
         }
-      });
+      };
 
+      this.pendingCalls.set(id, cancel);
+      this.socket.once(id, onResponse);
       this.socket.emit(
         "call",
         id,
@@ -410,19 +851,138 @@ export class SocketTransport extends EventEmitter implements Transport {
   }
 
   subscribe(event: string, handler: (...args: any[]) => void): () => void {
-    this.socket.on(event, handler);
-    return () => this.socket.off(event, handler);
+    if (
+      this.session.state.status === "terminated" ||
+      (this.hasResolvedSession &&
+        (!this.sessionReadyForEvents ||
+          this.needsSessionRefresh ||
+          this.session.state.status === "pending"))
+    ) {
+      throw new Error("Parcae raw subscriptions require a reconciled session");
+    }
+
+    let eventSubscriptions = this.subscriptions.get(event);
+    if (!eventSubscriptions) {
+      eventSubscriptions = new Map();
+      this.subscriptions.set(event, eventSubscriptions);
+    }
+
+    const existing = eventSubscriptions.get(handler);
+    if (existing) {
+      this.socket.off(event, existing.wrapper);
+    }
+
+    const subscription = {
+      authorization: this.authorizationGeneration,
+      wrapper: (...args: any[]) => {
+        if (
+          this.sessionReadyForEvents &&
+          !this.needsSessionRefresh &&
+          subscription.authorization === this.authorizationGeneration
+        ) {
+          handler(...args);
+        }
+      },
+    };
+    eventSubscriptions.set(handler, subscription);
+    this.socket.on(event, subscription.wrapper);
+
+    return () => {
+      this.socket.off(event, subscription.wrapper);
+      if (eventSubscriptions?.get(handler) === subscription) {
+        eventSubscriptions.delete(handler);
+        if (eventSubscriptions.size === 0) {
+          this.subscriptions.delete(event);
+        }
+      }
+    };
+  }
+
+  private _clearSubscriptions(): void {
+    for (const [event, eventSubscriptions] of this.subscriptions) {
+      for (const { wrapper } of eventSubscriptions.values()) {
+        this.socket.off(event, wrapper);
+      }
+    }
+    this.subscriptions.clear();
   }
 
   unsubscribe(event: string, handler?: (...args: any[]) => void): void {
-    this.socket.off(event, handler);
+    const eventSubscriptions = this.subscriptions.get(event);
+    if (!handler) {
+      if (!eventSubscriptions) return;
+      for (const { wrapper } of eventSubscriptions.values()) {
+        this.socket.off(event, wrapper);
+      }
+      this.subscriptions.delete(event);
+      return;
+    }
+
+    const subscription = eventSubscriptions?.get(handler);
+    if (!subscription) return;
+    this.socket.off(event, subscription.wrapper);
+    eventSubscriptions?.delete(handler);
+    if (eventSubscriptions?.size === 0) {
+      this.subscriptions.delete(event);
+    }
   }
 
   send(event: string, ...args: any[]): void {
-    this.socket.emit(event, ...args);
+    if (
+      !this.socket.connected ||
+      !this.sessionReadyForEvents ||
+      this.needsSessionRefresh ||
+      this.session.state.status === "pending" ||
+      this.session.state.status === "terminated"
+    ) {
+      throw new Error(
+        "Parcae raw events require a connected, reconciled session",
+      );
+    }
+    const guardedArgs = [...args];
+    const acknowledgement = guardedArgs.at(-1);
+    let acknowledgementId: symbol | null = null;
+    if (typeof acknowledgement === "function") {
+      acknowledgementId = Symbol("socket-event-ack");
+      const authorizationGeneration = this.authorizationGeneration;
+      this.pendingEventAcknowledgements.set(acknowledgementId, acknowledgement);
+      guardedArgs[guardedArgs.length - 1] = (...ackArgs: any[]) => {
+        const active = this.pendingEventAcknowledgements.get(
+          acknowledgementId!,
+        );
+        this.pendingEventAcknowledgements.delete(acknowledgementId!);
+        if (
+          active &&
+          authorizationGeneration === this.authorizationGeneration &&
+          this.sessionReadyForEvents &&
+          !this.needsSessionRefresh
+        ) {
+          active(...ackArgs);
+        }
+      };
+    }
+
+    try {
+      const emitted = this.socket.emit(event, ...guardedArgs);
+      if (!emitted && acknowledgementId) {
+        this.pendingEventAcknowledgements.delete(acknowledgementId);
+      }
+    } catch (error) {
+      if (acknowledgementId) {
+        this.pendingEventAcknowledgements.delete(acknowledgementId);
+      }
+      throw error;
+    }
   }
 
   disconnect(): void {
+    this._cancelPendingDataOperations(
+      new Error("Parcae client disconnected during request"),
+    );
+    this._cancelPendingConnectionWaits(
+      new Error("Parcae client disconnected during reconciliation"),
+    );
+    this._clearEventAcknowledgements();
     this.socket.disconnect();
   }
 

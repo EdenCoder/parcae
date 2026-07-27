@@ -3,11 +3,11 @@
 Source: `packages/sdk/src/`
 
 The SDK is the browser/React-side client for a Parcae backend. There is exactly one
-transport — `SocketTransport` (Socket.IO over WebSocket). It owns three orthogonal
-concerns: the socket, a `ConnectionMachine` (is the wire usable?), and a
-`SessionMachine` (who is the user?). Connection and session lifetimes are
-independent — a TCP blip never signs anyone out, and a sign-out never drops the
-socket.
+transport implementation — `SocketTransport` (Socket.IO, normally over WebSocket,
+with polling available for runtimes without a WebSocket global). It owns three
+orthogonal concerns: the socket, a `ConnectionMachine` (is the wire usable?), and
+a `SessionMachine` (who is the user?). Connection and session lifetimes are
+independent — a TCP blip never signs anyone out.
 
 ## createClient()
 
@@ -18,8 +18,9 @@ import { createClient } from "@parcae/sdk";
 
 const client = createClient({
   url: "http://localhost:3000",
-  version: "v1",            // optional, defaults to "v1"
-  getToken: async () => {   // REQUIRED — return the bearer token, or null for anonymous
+  version: "v1", // optional, defaults to "v1"
+  getToken: async () => {
+    // REQUIRED — return the bearer token, or null for anonymous
     return localStorage.getItem("token");
   },
 });
@@ -28,18 +29,31 @@ const client = createClient({
 ```typescript
 interface ClientConfig {
   url: string;
-  version?: string;                       // default "v1"
+  version?: string; // default "v1"
   getToken: () => Promise<string | null>; // required; null = anonymous
+  transports?: ("websocket" | "polling")[]; // default ["websocket"]
+  extraHeaders?: Record<string, string>; // Node / React Native
 }
 ```
 
 - `getToken` is **required**. It is called once before the initial `hello` and again on
   every reconnect / token rotation. Returning `null` means an anonymous session.
-- **Idempotent**: returns a cached client for the same `${url}:${version ?? "v1"}` key.
-  The cache lives on `globalThis.__parcae_clients` (a `Map`) so multiple copies of the
-  package share one client.
+- **One primary per realm**: returns a cached client for the same structured `(url, version)`
+  identity. The collision-resistant serialized key lives in
+  `globalThis.__parcae_clients` (a `Map`) for reuse within the loaded SDK module.
+  A different URL/version fails before creating another primary socket; use
+  `createIsolatedClient` / `withIsolatedClient` for that work.
+- Cached reuse requires the exact original `transports` and `extraHeaders` values.
+  The SDK stores a private immutable defensive snapshot and fails closed when they
+  differ. A cached client from a different/hot-reloaded SDK module cannot prove that
+  private configuration and therefore requires a full reload.
+- Each cached client owns its physical socket. Sockets are not pooled across client,
+  version, or auth-resolver boundaries.
 - Calls `Model.use(new FrontendAdapter(transport))` automatically, wiring the model
-  layer to this transport.
+  layer to this primary transport. Every client also owns a private adapter:
+  client-aware `useQuery`/`prefetch` replay lazy or foreign-adapter chains through
+  that exact client. Isolated clients do not replace the global Model adapter, so
+  direct static Model terminal calls outside those APIs still use the primary.
 - There is **no** `transport` option — `SocketTransport` is hard-wired.
 
 ### ParcaeClient surface
@@ -50,22 +64,22 @@ interface ParcaeClient {
   session: SessionMachine;
   connection: ConnectionMachine;
 
-  get(path, data?, options?): Promise<any>;    // RequestOptions: { timeout?: number }
+  get(path, data?, options?): Promise<any>; // RequestOptions: { timeout?: number }
   post(path, data?, options?): Promise<any>;
   put(path, data?, options?): Promise<any>;
   patch(path, data?, options?): Promise<any>;
   delete(path, data?, options?): Promise<any>;
 
-  subscribe(event, handler): () => void;       // returns an unsubscribe fn
+  subscribe(event, handler): () => void; // returns an unsubscribe fn
   unsubscribe(event, handler?): void;
-  send(event, ...args): void;                  // raw socket.emit
+  send(event, ...args): void; // raw socket.emit
   on(event, handler): void;
   off(event, handler?): void;
 
-  readonly isConnected: boolean;               // connection.status === "connected"
+  readonly isConnected: boolean; // connection.status === "connected"
 
-  refreshSession(): Promise<{ userId: string | null }>;  // sign-in / token rotation
-  terminateSession(): Promise<void>;                       // explicit sign-out
+  refreshSession(): Promise<{ userId: string | null }>; // sign-in / token rotation
+  terminateSession(): Promise<void>; // explicit sign-out
   resync(entries: ResyncEntry[]): Promise<ResyncResult[]>; // batched subscription restore
 
   disconnect(): void;
@@ -84,18 +98,24 @@ as `GET /v1/posts`.
 
 Source: `packages/sdk/src/transports/socket.ts` (exported as `SocketTransport`)
 
-- Socket.IO, **WebSocket transport only** (`transports: ["websocket"]`), with
-  `withCredentials: true`. Default socket path is **`/ws`** (overridable via the
+- Socket.IO with `withCredentials: true`. `transports` defaults to
+  `["websocket"]`; callers may select `["polling"]` or
+  `["polling", "websocket"]`. Default socket path is **`/ws`** (overridable via the
   internal `path` config; `createClient` does not expose it).
-- **Socket pooling**: one shared socket per `${url}:${path}` via a module-level
-  `SOCKETS` Map.
+- Every `SocketTransport` owns one physical socket. Client caching, not transport
+  pooling, owns reuse.
 - **Handshake**: on `connect`, emits `"hello"` with `{ token }` (token from
-  `getToken()`); the server acks `{ userId }`. The transport calls
-  `session.resolve(userId)` and resolves an internal `helloReady` promise. Every
-  successful hello also emits a `"resync-required"` event.
+  `getToken()`); the server acks `{ userId }`. Only the latest started handshake may
+  resolve the session. Superseded token reads and hello acknowledgements are ignored.
+  Every successful current hello also emits a `"resync-required"` event.
 - **All requests `await helloReady`** before going out, guaranteeing the socket is
-  authenticated first. `helloReady` resolves once and stays resolved until the next
-  reconnect kicks a fresh handshake.
+  authenticated first. Reconnect, explicit refresh, termination, and resolver
+  replacement establish new authorization generations.
+- **Authorization boundaries actively cancel old work**: pending RPC, resync, and
+  connection-wait promises reject; raw subscription wrappers are detached and released;
+  late callbacks and acknowledgements cannot cross into the new session. An ordinary
+  same-owner network reconnect preserves subscriptions, but a reconnect that confirms a
+  different owner releases them before publishing that owner.
 - If `getToken()` throws, the handshake aborts and re-throws — the session stays
   `pending` (a failed token read is treated as transient infra failure, **not** as an
   anonymous session, to avoid 403 storms).
@@ -104,8 +124,8 @@ Source: `packages/sdk/src/transports/socket.ts` (exported as `SocketTransport`)
 - **Response decode**: `pako.ungzip(msg, { to: "string" })` → `JSON.parse` →
   `compress-json` `decompress()`. Resolves `parsed.result` when `parsed.success`,
   otherwise rejects with `parsed.message || parsed.error`.
-- **GET deduplication**: in-flight GETs are coalesced by `${path}:${JSON.stringify(data)}`
-  via an `inflight` Map.
+- **GET deduplication**: in-flight GETs are coalesced by current session-operation
+  generation, auth-boundary generation, path, and serialized data via an `inflight` Map.
 - **Timeout**: `DEFAULT_TIMEOUT` is **120_000 ms** (120 s) for RPC calls and resync,
   overridable per call via `options.timeout`.
 - **Disconnect does NOT touch session state.** Only `connection` transitions on socket
@@ -124,13 +144,15 @@ interface ResyncEntry {
   key: string;
   modelType: string;
   steps: unknown[];
-  queryHash?: string | null;   // last-known hash; server can skip unchanged subs
+  queryHash?: string | null; // last-known hash; server still re-evaluates the entry
+  subscribe?: boolean; // false = static fetch, no realtime listener
 }
 interface ResyncResult {
   key: string;
-  hash: string;
+  hash: string | null; // null for subscribe:false
   items: any[];
   totalCount: number;
+  authorized?: boolean; // false = explicit fail-closed denial
 }
 ```
 
@@ -141,7 +163,7 @@ Wire shape: emits `"resync"` with `{ queries: entries }`, acks `{ results }`. Re
 
 Source: `packages/sdk/src/session-machine.ts`
 
-*Who is this user?* Identity-only. Lifetime is the token's lifetime, not the socket's.
+_Who is this user?_ Identity-only. Lifetime is the token's lifetime, not the socket's.
 Plain listener `Set` + monotonic `version` — **no Valtio**.
 
 ```typescript
@@ -150,32 +172,36 @@ type SessionStatus = "pending" | "anonymous" | "authenticated" | "terminated";
 interface SessionState {
   status: SessionStatus;
   userId: string | null;
-  version: number;        // bumped on every change
+  version: number; // bumped on every change
 }
 
 class SessionMachine {
-  state: SessionState;          // initial { status: "pending", userId: null, version: 0 }
-  ready: Promise<void>;         // resolves the first time status leaves "pending"
+  state: SessionState; // initial { status: "pending", userId: null, version: 0 }
+  ready: Promise<void>; // resolves when the current reconciliation leaves "pending"
   subscribe(fn: () => void): () => void;
-  resolve(userId: string | null): void;  // → "authenticated" (userId) or "anonymous" (null)
-  terminate(): void;                       // → "terminated" (explicit sign-out)
-  reset(): void;                           // → "pending" (internal/diagnostic; re-arms ready)
+  beginReconciliation(): void; // → "pending", retains prior userId for purge
+  resolve(userId: string | null): void; // → "authenticated" (userId) or "anonymous" (null)
+  terminate(): void; // → "terminated" (explicit sign-out)
+  reset(): void; // → "pending" (internal/diagnostic; re-arms ready)
 }
 ```
 
+- `beginReconciliation()` closes the session while retaining the previous `userId` so
+  owner-scoped caches can be purged synchronously. It re-arms `ready` on every boundary,
+  including same-user token/role rotation.
 - `resolve()` is a no-op when status is `terminated`, and no-ops (no notify) when the
   result confirms the current `(status, userId)`.
 - `terminate()` is sticky: once terminated, `resolve()` is ignored until `reset()`.
   `refreshSession()` in the transport calls `reset()` first if the session was
   terminated, supporting sign-out → sign-in-again on a reused client.
-- Only three callers mutate session: the transport's `hello` ack, the auth adapter's
-  `onChange`, and `terminate()`. Socket connect/disconnect/error never touch it.
+- The transport and Provider establish explicit reconciliation/termination boundaries.
+  Socket disconnect/error never silently select a different identity.
 
 ## ConnectionMachine
 
 Source: `packages/sdk/src/connection-machine.ts`
 
-*Is the wire usable right now?* Pure transport-state. No identity, no Valtio.
+_Is the wire usable right now?_ Pure transport-state. No identity, no Valtio.
 
 ```typescript
 type ConnectionStatus = "idle" | "connecting" | "connected" | "disconnected";
@@ -184,11 +210,11 @@ interface ConnectionState {
   status: ConnectionStatus;
   lastError: Error | null;
   version: number;
-  lastConnectedAt: number | null;   // wall-clock ms of last "connected"
+  lastConnectedAt: number | null; // wall-clock ms of last "connected"
 }
 
 class ConnectionMachine {
-  state: ConnectionState;          // initial { status: "idle", ... }
+  state: ConnectionState; // initial { status: "idle", ... }
   subscribe(fn: () => void): () => void;
   connecting(): void;
   connected(): void;
@@ -206,7 +232,7 @@ the client's `getToken` from it.
 ```typescript
 interface AuthClientAdapter {
   init(baseUrl: string): void;
-  getToken(): Promise<string | null>;                 // null = anonymous
+  getToken(): Promise<string | null>; // null = anonymous
   onChange(callback: (token: string | null) => void): () => void;
 }
 ```
@@ -230,9 +256,9 @@ import { betterAuth } from "@parcae/auth-betterauth/client";
 
 <ParcaeProvider
   url="http://localhost:3000"
-  auth={betterAuth()}          // AuthClientAdapter (optional; omitted = anonymous)
+  auth={betterAuth()} // AuthClientAdapter (optional; omitted = anonymous)
   version="v1"
-  onReady={(client) => {}}     // fires once when the session leaves "pending"
+  onReady={(client) => {}} // fires once when the session leaves "pending"
   onError={(err) => {}}
 >
   <App />
@@ -241,31 +267,37 @@ import { betterAuth } from "@parcae/auth-betterauth/client";
 
 ```typescript
 interface ParcaeProviderProps {
-  client?: ParcaeClient;       // pre-created client (overrides url/auth/version)
-  url?: string;                // required unless `client` is given
+  client?: ParcaeClient; // pre-created; auth may still bind/reconcile it
+  url?: string; // required unless `client` is given
   auth?: AuthClientAdapter;
-  version?: string;            // default "v1"
+  version?: string; // default "v1"
+  transports?: ("websocket" | "polling")[];
+  extraHeaders?: Record<string, string>;
   children: React.ReactNode;
   onReady?: (client: ParcaeClient) => void;
   onError?: (error: Error) => void;
 }
 ```
 
-There is **no** `transport` prop. The Provider:
+There is **no** pluggable transport implementation prop. `transports` selects
+Socket.IO's WebSocket/polling modes. The Provider:
 
 - Builds `getToken` from the `auth` adapter (`auth.init(url)` then `auth.getToken()`), or
-  uses a `() => null` no-op when no adapter is given, and creates the client via
-  `createClient` (or uses the `client` prop directly).
-- **The session-lifecycle effect below only runs when an `auth` adapter is supplied**
-  (`if (!auth) return`). With `auth` omitted (anonymous), `onReady` never fires and none of
-  the `onChange` routing or cache-purge happens.
-- Fires `onReady(client)` exactly once, the first time `session.status` leaves
-  `"pending"`.
+  uses a `() => null` no-op when no adapter is given. An internal client is created only
+  after a committed layout effect (or the `client` prop is used directly), so abandoned
+  renders cannot open sockets or replace the Model adapter.
+- Runs the session lifecycle for authenticated and anonymous clients. Children remain
+  unmounted until the current session is server-confirmed; `onReady(client)` fires once
+  for that mounted Provider when it opens.
 - Subscribes to `auth.onChange`: non-null token → `refreshSession()`, null →
   `terminateSession()`.
-- Purges the per-user `useQuery` cache for the previous user whenever the session `userId`
-  changes away from a non-null value — i.e. on a user switch **and** on sign-out
-  (non-null → null).
+- Acquires the cached client's resolver lease only after React commits. An active owner
+  prevents direct callers or another Provider from replacing its token resolver.
+- Closes at every pending/terminated boundary and synchronously purges the exact previous
+  `(client, owner)` query cache, including the anonymous `null` owner and same-user
+  token/role rotation.
+- On owned unmount, purges the current owner, terminates the session, releases the resolver
+  lease, and disconnects the physical socket.
 - Listens for `"resync-required"` and drives `useQuery`'s batched resync; forwards
   transport `"error"` events to `onError`.
 
@@ -282,14 +314,17 @@ const { items, loading, error, total, refetch } = useQuery(
 ```typescript
 function useQuery<T>(
   chain: QueryChain<T> | null | undefined,
-  options?: { poll?: number },   // drift-refetch interval ms; default 60_000, 0 disables
+  options?: {
+    poll?: number; // drift-refetch interval ms; default 60_000, 0 disables
+    subscribe?: boolean; // default true; false = static fetch
+  },
 ): UseQueryResult<T>;
 
 interface UseQueryResult<T> {
   items: T[];
   loading: boolean;
   error: Error | null;
-  total: number;                                  // server total before limit/offset
+  total: number; // server total before limit/offset
   refetch: () => void;
   addOptimistic: (item: T | Record<string, any>) => T;
   removeOptimistic: (item: T | string) => void;
@@ -308,18 +343,21 @@ at 10,000 as a safety net).
 
 **How it works:**
 
-1. Waits for the session to resolve: while `session.status === "pending"` the query is
-   inert (`loading: true`, no fetch). Once it resolves it builds the cache key
-   `modelType:userId:JSON(steps)` (anonymous userId → `anon`).
-2. Calls `chain.find()` for the initial data.
+1. Waits for the current session reconciliation: while
+   `session.status === "pending"` the query is inert (`loading: true`, no fetch).
+   Once resolved it builds an opaque structured key from the exact client instance,
+   exact owner (`string | null`), model type, serialized steps, and subscribed/static
+   mode.
+2. Replays a lazy or foreign-adapter chain through the exact owning client's adapter,
+   then calls `find()` for the initial data.
 3. The backend response carries `__queryHash` (and `__totalCount`). The hook subscribes
    to the `query:<hash>` socket event.
 4. The server streams diff ops. The op shape is:
    ```typescript
    type QueryOp =
-     | { op: "add";    id: string; data: Record<string, any> }
+     | { op: "add"; id: string; data: Record<string, any> }
      | { op: "remove"; id: string }
-     | { op: "update"; id: string; patch: Operation[] };  // RFC 6902 JSON Patch
+     | { op: "update"; id: string; patch: Operation[] }; // RFC 6902 JSON Patch
    ```
    Update patches are RFC 6902 JSON Patch applied via `fast-json-patch`. An optional
    `order: string[]` envelope reorders rows.
@@ -329,11 +367,24 @@ at 10,000 as a safety net).
    still re-renders (the entry's version bumps and its snapshot hash changes), so for
    field-level reactivity in a row, read the fields through `useModel(item)` (or
    `useModelAtomic`) rather than relying on the parent's `useQuery` re-render.
-6. Uses `useSyncExternalStore` for tear-safe rendering, backed by a global query cache
+6. Uses `useSyncExternalStore` for tear-safe rendering, backed by a client-scoped query cache
    with **ref-counting and a 60 s GC timeout** after the last subscriber unmounts.
-7. On reconnect the Provider calls the batched `resync` RPC to restore subscriptions for
-   all live entries in one round trip.
-8. Failed fetches retry up to 3 times with backoff (`[1s, 3s, 10s]`).
+   Session observation also purges direct-client prefetch entries on reconciliation,
+   termination, or owner change.
+7. Purging an exact `(client, owner)` pair scrubs PHI-bearing arrays/fields in place,
+   removes entries synchronously, and then isolates listener/disposer failures.
+   Fetch/retry/subscription/resync continuations verify the entry is still active before
+   committing, so disposed entries cannot be repopulated.
+8. On reconnect the Provider calls the batched `resync` RPC only for that client's live
+   entries, restoring subscriptions in one round trip without touching another backend.
+   Denied (`authorized: false`), missing, or failed results scrub previous arrays in place
+   and detach listeners rather than preserving stale PHI. A later mount or prefetch
+   refetches a denied dynamic entry after its hash is cleared.
+9. Failed fetches retry up to 3 times with backoff (`[1s, 3s, 10s]`).
+
+Final-reference GC sends one `unsubscribe:query` only while the same owner and session
+version are still reconciled. Boundary cleanup never sends a prior hash through the
+replacement session.
 
 **Skip / conditional:** pass `null`/`undefined` to skip:
 `useQuery(userId ? Post.where({ user: userId }) : null)`.
@@ -357,12 +408,16 @@ data already present.
 function prefetch<T>(
   client: ParcaeClient,
   chain: QueryChain<T>,
-  options?: { waitForSession?: boolean },  // default true → await client.session.ready
+  options?: { waitForSession?: boolean; subscribe?: boolean },
 ): Promise<T[]>;
 ```
 
-Builds the same `modelType:userId:JSON(steps)` cache key, takes a ref on the entry, and
-resolves once the first fetch settles. Throws if the chain has no `__modelType`.
+By default it waits for the client's current server-confirmed reconciliation before it
+reads the owner or cache. `waitForSession: false` is accepted only when the session is
+already anonymous/authenticated; pending or terminated sessions reject. It builds the
+same structured client/owner/model/steps/mode cache key, takes a ref on the entry, and
+resolves once the first fetch settles. An authorization purge rejects pending prefetch
+instead of returning an empty result. Throws if the chain has no `__modelType`.
 
 ### useApi / useSDK
 
@@ -439,12 +494,20 @@ lack the model EventEmitter surface (no-op subscription).
 
 Source: `packages/sdk/src/react/useSocket.ts`
 
-Raw Socket.IO access over the existing authenticated connection.
+Custom Socket.IO events over the existing session-fenced connection. Each listener
+captures its authorization generation, so a callback registered under one session
+cannot run after an auth boundary.
 
 ```tsx
 const socket = useSocket(); // { emit, on, off }
 
-useEffect(() => socket.on("chat:chunk", (d) => {/* ... */}), []);
+useEffect(
+  () =>
+    socket.on("chat:chunk", (d) => {
+      /* ... */
+    }),
+  [],
+);
 socket.emit("chat:message", { text: "hello" });
 ```
 
@@ -490,10 +553,10 @@ import { Authenticated, Unauthenticated, SessionLoading } from "@parcae/sdk/reac
 Each gate reads `useSession()` (the `SessionMachine` status, **not** Valtio) and accepts
 a `fallback` prop (default `null`):
 
-| Component        | Renders `children` when status is | else renders `fallback` |
-| ---------------- | --------------------------------- | ----------------------- |
-| `Authenticated`  | `"authenticated"`                 | `fallback`              |
-| `Unauthenticated`| `"anonymous"`                     | `fallback`              |
-| `SessionLoading` | `"pending"`                       | `fallback`              |
+| Component         | Renders `children` when status is | else renders `fallback` |
+| ----------------- | --------------------------------- | ----------------------- |
+| `Authenticated`   | `"authenticated"`                 | `fallback`              |
+| `Unauthenticated` | `"anonymous"`                     | `fallback`              |
+| `SessionLoading`  | `"pending"`                       | `fallback`              |
 
 The export is `SessionLoading` (there is no `AuthLoading`).

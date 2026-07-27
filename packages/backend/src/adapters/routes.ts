@@ -229,11 +229,7 @@ async function projectForWire(
  * client. Caller picks the `where` label that goes into the server
  * log line for triage.
  */
-function respondWithError(
-  res: any,
-  err: unknown,
-  where: string,
-): void {
+function respondWithError(res: any, err: unknown, where: string): void {
   if (err instanceof ClientError) {
     json(res, err.status, {
       result: null,
@@ -242,7 +238,7 @@ function respondWithError(
     });
     return;
   }
-  log.error(`[routes] ${where} error:`, err);
+  log.error(`[routes] ${where} failed`);
   json(res, 500, {
     result: null,
     success: false,
@@ -281,281 +277,307 @@ export function registerModelRoutes(
     // ── GET /path — list ───────────────────────────────────────────
 
     if (scope.read) {
-      route.get(path, async (req: any, res: any) => {
-        const ctx = buildScopeContext(req, res);
-        const scopeResult = scope.read!(ctx);
-        if (!scopeResult) return forbidden(res);
+      route.get(
+        path,
+        async (req: any, res: any) => {
+          const ctx = buildScopeContext(req, res);
+          const scopeResult = scope.read!(ctx);
+          if (!scopeResult) return forbidden(res);
 
-        const data = req.query || {};
-        const rawSteps = data.__query ?? [];
+          const data = req.query || {};
+          const rawSteps = data.__query ?? [];
 
-        try {
-          const prep = prepareClientQuery({
-            ModelClass,
-            scopeResult,
-            rawSteps,
-            modelByType,
-            adapter,
-          });
+          try {
+            const prep = prepareClientQuery({
+              ModelClass,
+              scopeResult,
+              rawSteps,
+              modelByType,
+              adapter,
+            });
 
-          if (data.__count === "true" || data.__count === true) {
-            const total = await prep.query.count();
-            return json(res, 200, { result: { total }, success: true });
-          }
+            if (data.__count === "true" || data.__count === true) {
+              const total = await prep.query.count();
+              return json(res, 200, { result: { total }, success: true });
+            }
 
-          // `__subscribe: false` is the client's static-query opt-out
-          // — set by `useQuery({ subscribe: false })` and `prefetch(...,
-          // { subscribe: false })`. The wire request short-circuits
-          // the subscribe branch below, falls through to
-          // `runQueryStatic`, and the response omits `__queryHash`
-          // so the SDK never attaches a `query:${hash}` listener.
-          const wantsSubscription = !(
-            data.__subscribe === false || data.__subscribe === "false"
-          );
+            // `__subscribe: false` is the client's static-query opt-out
+            // — set by `useQuery({ subscribe: false })` and `prefetch(...,
+            // { subscribe: false })`. The wire request short-circuits
+            // the subscribe branch below, falls through to
+            // `runQueryStatic`, and the response omits `__queryHash`
+            // so the SDK never attaches a `query:${hash}` listener.
+            const wantsSubscription = !(
+              data.__subscribe === false || data.__subscribe === "false"
+            );
 
-          // Socket-RPC LIST → subscribe to query-level change
-          // notifications. The subscription manager re-evals on model
-          // changes and emits surgical add/remove/update ops to this
-          // socket. `__forceRefresh: true` is the client's drift-poll
-          // hook — periodic refetches set it so we re-execute the
-          // cached query against the DB and emit any drift ops to
-          // every subscriber on the same hash. Without it, repeated
-          // LIST calls just hand back the cached row set.
-          const socketId = req._socketId;
-          if (socketId && adapter.subscriptions && wantsSubscription) {
-            const force =
-              data.__forceRefresh === true || data.__forceRefresh === "true";
-            const { items, hash, totalCount } = await runQuerySubscription({
+            // Socket-RPC LIST → subscribe to query-level change
+            // notifications. The subscription manager re-evals on model
+            // changes and emits surgical add/remove/update ops to this
+            // socket. `__forceRefresh: true` is the client's drift-poll
+            // hook — periodic refetches set it so we re-execute the
+            // cached query against the DB and emit any drift ops to
+            // every subscriber on the same hash. Without it, repeated
+            // LIST calls just hand back the cached row set.
+            const socketId = req._socketId;
+            if (socketId && adapter.subscriptions && wantsSubscription) {
+              const force =
+                data.__forceRefresh === true || data.__forceRefresh === "true";
+              const { items, hash, totalCount } = await runQuerySubscription({
+                prep,
+                socketId,
+                sessionLease: req._socketSessionLease,
+                user: ctx.user ?? null,
+                adapter,
+                isSessionCurrent: req._socketSessionActive,
+                force,
+              });
+
+              json(res, 200, {
+                result: {
+                  total: items.length,
+                  totalCount,
+                  __queryHash: hash,
+                  [pluralize(type)]: items,
+                },
+                success: true,
+              });
+              return;
+            }
+
+            // Static path — no subscription, no realtime. Used for the
+            // non-socket fetch fallback and for socket requests that
+            // opted out via `__subscribe: false`. The pipeline (plain
+            // find + sanitise + expand hydrate) is shared with the
+            // socket-RPC resync handler so the two paths can't drift
+            // apart again (see DOL-1095 / DOL-1148).
+            const { items, totalCount } = await runQueryStatic({
               prep,
-              socketId,
               user: ctx.user ?? null,
               adapter,
-              force,
             });
 
             json(res, 200, {
               result: {
                 total: items.length,
                 totalCount,
-                __queryHash: hash,
                 [pluralize(type)]: items,
               },
               success: true,
             });
-            return;
+          } catch (err) {
+            respondWithError(res, err, `GET ${path}`);
           }
-
-          // Static path — no subscription, no realtime. Used for the
-          // non-socket fetch fallback and for socket requests that
-          // opted out via `__subscribe: false`. The pipeline (plain
-          // find + sanitise + expand hydrate) is shared with the
-          // socket-RPC resync handler so the two paths can't drift
-          // apart again (see DOL-1095 / DOL-1148).
-          const { items, totalCount } = await runQueryStatic({
-            prep,
-            user: ctx.user ?? null,
-            adapter,
-          });
-
-          json(res, 200, {
-            result: {
-              total: items.length,
-              totalCount,
-              [pluralize(type)]: items,
-            },
-            success: true,
-          });
-        } catch (err) {
-          respondWithError(res, err, `GET ${path}`);
-        }
-      }, { priority: AUTO_CRUD_PRIORITY });
+        },
+        { priority: AUTO_CRUD_PRIORITY },
+      );
       count++;
     }
 
     // ── GET /path/:id — get one ────────────────────────────────────
 
     if (scope.read) {
-      route.get(`${path}/:id`, async (req: any, res: any) => {
-        try {
-          const ctx = buildScopeContext(req, res);
-          const scopeResult = scope.read!(ctx);
-          if (!scopeResult) return forbidden(res);
+      route.get(
+        `${path}/:id`,
+        async (req: any, res: any) => {
+          try {
+            const ctx = buildScopeContext(req, res);
+            const scopeResult = scope.read!(ctx);
+            if (!scopeResult) return forbidden(res);
 
-          const item = await findByIdOrTmp(
-            adapter,
-            ModelClass,
-            req.params.id,
-            scopeResult,
-          );
-          if (!item) return notFound(res, type);
+            const item = await findByIdOrTmp(
+              adapter,
+              ModelClass,
+              req.params.id,
+              scopeResult,
+            );
+            if (!item) return notFound(res, type);
 
-          json(res, 200, {
-            result: await projectForWire(item, ctx.user),
-            success: true,
-          });
-        } catch (err) {
-          respondWithError(res, err, `GET ${path}/:id`);
-        }
-      }, { priority: AUTO_CRUD_PRIORITY });
+            json(res, 200, {
+              result: await projectForWire(item, ctx.user),
+              success: true,
+            });
+          } catch (err) {
+            respondWithError(res, err, `GET ${path}/:id`);
+          }
+        },
+        { priority: AUTO_CRUD_PRIORITY },
+      );
       count++;
     }
 
     // ── POST /path — create ────────────────────────────────────────
 
     if (scope.create) {
-      route.post(path, async (req: any, res: any) => {
-        try {
-          const ctx = buildScopeContext(req, res);
-          const scopeData = scope.create!(ctx);
-          if (!scopeData) return forbidden(res);
+      route.post(
+        path,
+        async (req: any, res: any) => {
+          try {
+            const ctx = buildScopeContext(req, res);
+            const scopeData = scope.create!(ctx);
+            if (!scopeData) return forbidden(res);
 
-          // 1. Strip readonly fields from the client body — counters,
-          //    ownership refs, state-machine cols (see Model.readonlyFields).
-          // 2. Merge in the scope-provided overrides last so a malicious
-          //    body can't override e.g. `user: ctx.user.id`.
-          const body = stripReadonly(ModelClass, req.body || {});
-          const data = { ...body, ...scopeData };
-          const item = Model.create.call(
-            ModelClass,
-            data,
-          ) as unknown as RouteModelRow;
-          await item.save();
+            // 1. Strip readonly fields from the client body — counters,
+            //    ownership refs, state-machine cols (see Model.readonlyFields).
+            // 2. Merge in the scope-provided overrides last so a malicious
+            //    body can't override e.g. `user: ctx.user.id`.
+            const body = stripReadonly(ModelClass, req.body || {});
+            const data = { ...body, ...scopeData };
+            const item = Model.create.call(
+              ModelClass,
+              data,
+            ) as unknown as RouteModelRow;
+            await item.save();
 
-          json(res, 201, {
-            result: await projectForWire(item, ctx.user),
-            success: true,
-          });
-        } catch (err) {
-          respondWithError(res, err, `POST ${path}`);
-        }
-      }, { priority: AUTO_CRUD_PRIORITY });
+            json(res, 201, {
+              result: await projectForWire(item, ctx.user),
+              success: true,
+            });
+          } catch (err) {
+            respondWithError(res, err, `POST ${path}`);
+          }
+        },
+        { priority: AUTO_CRUD_PRIORITY },
+      );
       count++;
     }
 
     // ── PUT /path/:id — update ─────────────────────────────────────
 
     if (scope.update) {
-      route.put(`${path}/:id`, async (req: any, res: any) => {
-        try {
-          const ctx = buildScopeContext(req, res);
-          const scopeResult = scope.update!(ctx);
-          if (!scopeResult) return forbidden(res);
+      route.put(
+        `${path}/:id`,
+        async (req: any, res: any) => {
+          try {
+            const ctx = buildScopeContext(req, res);
+            const scopeResult = scope.update!(ctx);
+            if (!scopeResult) return forbidden(res);
 
-          const item = await findByIdOrTmp(
-            adapter,
-            ModelClass,
-            req.params.id,
-            scopeResult,
-          );
-          if (!item) return notFound(res, type);
+            const item = await findByIdOrTmp(
+              adapter,
+              ModelClass,
+              req.params.id,
+              scopeResult,
+            );
+            if (!item) return notFound(res, type);
 
-          // Strip readonly fields BEFORE mass-assigning. Per-model
-          // `updateReadonlyFields` supplements the fields protected on
-          // every write without affecting create-time input.
-          const data = stripReadonly(
-            ModelClass,
-            req.body || {},
-            readonlyFieldsForUpdate(ModelClass, ctx),
-          );
-          for (const [key, value] of Object.entries(data)) {
-            item[key] = value;
+            // Strip readonly fields BEFORE mass-assigning. Per-model
+            // `updateReadonlyFields` supplements the fields protected on
+            // every write without affecting create-time input.
+            const data = stripReadonly(
+              ModelClass,
+              req.body || {},
+              readonlyFieldsForUpdate(ModelClass, ctx),
+            );
+            for (const [key, value] of Object.entries(data)) {
+              item[key] = value;
+            }
+
+            await item.save();
+
+            json(res, 200, {
+              result: await projectForWire(item, ctx.user),
+              success: true,
+            });
+          } catch (err) {
+            respondWithError(res, err, `PUT ${path}/:id`);
           }
-
-          await item.save();
-
-          json(res, 200, {
-            result: await projectForWire(item, ctx.user),
-            success: true,
-          });
-        } catch (err) {
-          respondWithError(res, err, `PUT ${path}/:id`);
-        }
-      }, { priority: AUTO_CRUD_PRIORITY });
+        },
+        { priority: AUTO_CRUD_PRIORITY },
+      );
       count++;
     }
 
     // ── DELETE /path/:id — delete ──────────────────────────────────
 
     if (scope.delete) {
-      route.delete(`${path}/:id`, async (req: any, res: any) => {
-        try {
-          const ctx = buildScopeContext(req, res);
-          const scopeResult = scope.delete!(ctx);
-          if (!scopeResult) return forbidden(res);
+      route.delete(
+        `${path}/:id`,
+        async (req: any, res: any) => {
+          try {
+            const ctx = buildScopeContext(req, res);
+            const scopeResult = scope.delete!(ctx);
+            if (!scopeResult) return forbidden(res);
 
-          const item = await findByIdOrTmp(
-            adapter,
-            ModelClass,
-            req.params.id,
-            scopeResult,
-          );
-          if (!item) return notFound(res, type);
+            const item = await findByIdOrTmp(
+              adapter,
+              ModelClass,
+              req.params.id,
+              scopeResult,
+            );
+            if (!item) return notFound(res, type);
 
-          await item.remove();
+            await item.remove();
 
-          json(res, 200, { result: { id: req.params.id }, success: true });
-        } catch (err) {
-          respondWithError(res, err, `DELETE ${path}/:id`);
-        }
-      }, { priority: AUTO_CRUD_PRIORITY });
+            json(res, 200, { result: { id: req.params.id }, success: true });
+          } catch (err) {
+            respondWithError(res, err, `DELETE ${path}/:id`);
+          }
+        },
+        { priority: AUTO_CRUD_PRIORITY },
+      );
       count++;
     }
 
     // ── PATCH /path/:id — atomic JSON Patch ────────────────────────
 
     if (scope.patch || scope.update) {
-      route.patch(`${path}/:id`, async (req: any, res: any) => {
-        try {
-          const ctx = buildScopeContext(req, res);
-          const scopeResult = (scope.patch ?? scope.update)!(ctx);
-          if (!scopeResult) return forbidden(res);
+      route.patch(
+        `${path}/:id`,
+        async (req: any, res: any) => {
+          try {
+            const ctx = buildScopeContext(req, res);
+            const scopeResult = (scope.patch ?? scope.update)!(ctx);
+            if (!scopeResult) return forbidden(res);
 
-          const data = req.body || {};
-          if (!Array.isArray(data.ops) || data.ops.length === 0) {
-            return json(res, 400, {
-              result: null,
-              success: false,
-              error: "ops array required",
-            });
-          }
-
-          // Reject the whole batch if any op targets a readonly
-          // column — fail loud rather than silently dropping ops so
-          // the client knows its expected mutation didn't apply.
-          // The first path segment is the column (RFC 6902 paths
-          // start with `/`, then column, then optional inner JSON
-          // path); only top-level reads are protected.
-          const deny = readonlyFieldsForUpdate(ModelClass, ctx);
-          for (const op of data.ops) {
-            if (!op?.path || typeof op.path !== "string") continue;
-            const column = op.path.slice(1).split("/")[0];
-            if (column && isReadonlyField(column, deny)) {
-              return json(res, 403, {
+            const data = req.body || {};
+            if (!Array.isArray(data.ops) || data.ops.length === 0) {
+              return json(res, 400, {
                 result: null,
                 success: false,
-                error: `Field "${column}" is read-only`,
+                error: "ops array required",
               });
             }
+
+            // Reject the whole batch if any op targets a readonly
+            // column — fail loud rather than silently dropping ops so
+            // the client knows its expected mutation didn't apply.
+            // The first path segment is the column (RFC 6902 paths
+            // start with `/`, then column, then optional inner JSON
+            // path); only top-level reads are protected.
+            const deny = readonlyFieldsForUpdate(ModelClass, ctx);
+            for (const op of data.ops) {
+              if (!op?.path || typeof op.path !== "string") continue;
+              const column = op.path.slice(1).split("/")[0];
+              if (column && isReadonlyField(column, deny)) {
+                return json(res, 403, {
+                  result: null,
+                  success: false,
+                  error: `Field "${column}" is read-only`,
+                });
+              }
+            }
+
+            const item = await findByIdOrTmp(
+              adapter,
+              ModelClass,
+              req.params.id,
+              scopeResult,
+            );
+            if (!item) return notFound(res, type);
+
+            await adapter.patch(item, data.ops);
+
+            json(res, 200, {
+              result: await projectForWire(item, ctx.user),
+              success: true,
+            });
+          } catch (err) {
+            respondWithError(res, err, `PATCH ${path}/:id`);
           }
-
-          const item = await findByIdOrTmp(
-            adapter,
-            ModelClass,
-            req.params.id,
-            scopeResult,
-          );
-          if (!item) return notFound(res, type);
-
-          await adapter.patch(item, data.ops);
-
-          json(res, 200, {
-            result: await projectForWire(item, ctx.user),
-            success: true,
-          });
-        } catch (err) {
-          respondWithError(res, err, `PATCH ${path}/:id`);
-        }
-      }, { priority: AUTO_CRUD_PRIORITY });
+        },
+        { priority: AUTO_CRUD_PRIORITY },
+      );
       count++;
     }
   }

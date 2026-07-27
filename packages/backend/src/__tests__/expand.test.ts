@@ -27,13 +27,7 @@
  */
 
 import knexFactory, { type Knex } from "knex";
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  it,
-} from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Model } from "@parcae/model";
 import { BackendAdapter } from "../adapters/model";
 import { RefLoader } from "../services/ref-loader";
@@ -87,7 +81,7 @@ async function makeAdapter(db: Knex): Promise<BackendAdapter> {
   return adapter as BackendAdapter;
 }
 
-const REGISTRY: ReadonlyMap<string, any> = new Map([
+const REGISTRY: ReadonlyMap<string, any> = new Map<string, any>([
   ["file", FileM],
   ["asset", AssetM],
 ]);
@@ -110,11 +104,41 @@ describe("expand — integration through BackendAdapter + RefLoader", () => {
   it("embeds the linked File row in the LIST payload in ONE batched query", async () => {
     // Seed: 5 files, 5 assets each referencing one.
     const fileRows = [
-      { id: "f1", data: "{}", url: "https://cdn/1", mime: "image/png", bytes: 0 },
-      { id: "f2", data: "{}", url: "https://cdn/2", mime: "image/png", bytes: 0 },
-      { id: "f3", data: "{}", url: "https://cdn/3", mime: "image/png", bytes: 0 },
-      { id: "f4", data: "{}", url: "https://cdn/4", mime: "image/png", bytes: 0 },
-      { id: "f5", data: "{}", url: "https://cdn/5", mime: "image/png", bytes: 0 },
+      {
+        id: "f1",
+        data: "{}",
+        url: "https://cdn/1",
+        mime: "image/png",
+        bytes: 0,
+      },
+      {
+        id: "f2",
+        data: "{}",
+        url: "https://cdn/2",
+        mime: "image/png",
+        bytes: 0,
+      },
+      {
+        id: "f3",
+        data: "{}",
+        url: "https://cdn/3",
+        mime: "image/png",
+        bytes: 0,
+      },
+      {
+        id: "f4",
+        data: "{}",
+        url: "https://cdn/4",
+        mime: "image/png",
+        bytes: 0,
+      },
+      {
+        id: "f5",
+        data: "{}",
+        url: "https://cdn/5",
+        mime: "image/png",
+        bytes: 0,
+      },
     ];
     await db("files").insert(fileRows);
     await db("assets").insert([
@@ -135,44 +159,39 @@ describe("expand — integration through BackendAdapter + RefLoader", () => {
     const refLoader = new RefLoader((type, ids) =>
       adapter.batchFindByType(type, ids),
     );
-    await runWithRequestContext(
-      { user: null, refLoader },
-      async () => {
-        // Validate + resolve expand. (parse is pure, validate hits
-        // the registry.)
-        const expand = validateExpandSpecs(
-          parseExpandSpecs(["file"]),
-          AssetM as any,
-          REGISTRY as Map<string, any>,
-        );
-        // Run the SQL query.
-        const items = await adapter.query(AssetM).find();
-        // Sanitize to wire shape (mirrors `projectForWire`).
-        const wireItems = await Promise.all(
-          items.map((m: any) => m.sanitize()),
-        );
-        // Hydrate expansions in place.
-        await hydrateExpansions(wireItems, expand, refLoader, null);
+    await runWithRequestContext({ user: null, refLoader }, async () => {
+      // Validate + resolve expand. (parse is pure, validate hits
+      // the registry.)
+      const expand = validateExpandSpecs(
+        parseExpandSpecs(["file"]),
+        AssetM as any,
+        REGISTRY as Map<string, any>,
+      );
+      // Run the SQL query.
+      const items = await adapter.query(AssetM).find();
+      // Sanitize to wire shape (mirrors `projectForWire`).
+      const wireItems = await Promise.all(items.map((m: any) => m.sanitize()));
+      // Hydrate expansions in place.
+      await hydrateExpansions(wireItems, expand, refLoader, null);
 
-        // Each row got the embedded File.
-        for (const row of wireItems) {
-          expect(row.file).toMatchObject({
-            type: "file",
-            url: expect.stringMatching(/^https:\/\/cdn\//),
-          });
-          // The raw id is preserved as $<ref> per the DOL-148 contract.
-          expect(row.$file).toBe(row.file.id);
-        }
+      // Each row got the embedded File.
+      for (const row of wireItems) {
+        expect(row.file).toMatchObject({
+          type: "file",
+          url: expect.stringMatching(/^https:\/\/cdn\//),
+        });
+        // The raw id is preserved as $<ref> per the DOL-148 contract.
+        expect(row.$file).toBe(row.file.id);
+      }
 
-        // Exactly ONE batched `SELECT … WHERE "id" in (?, ?, ?, ?, ?)`
-        // — the whole point. Before .expand(), this was 5 separate
-        // `WHERE id = ?` round-trips.
-        const fileLookups = sql.filter((s) =>
-          /from\s+["`]?files["`]?/i.test(s) && /\bin\s*\(/i.test(s),
-        );
-        expect(fileLookups).toHaveLength(1);
-      },
-    );
+      // Exactly ONE batched `SELECT … WHERE "id" in (?, ?, ?, ?, ?)`
+      // — the whole point. Before .expand(), this was 5 separate
+      // `WHERE id = ?` round-trips.
+      const fileLookups = sql.filter(
+        (s) => /from\s+["`]?files["`]?/i.test(s) && /\bin\s*\(/i.test(s),
+      );
+      expect(fileLookups).toHaveLength(1);
+    });
   });
 
   it("rejects expand on a non-ref field with a ClientError", () => {
@@ -260,7 +279,12 @@ describe("expand — subscription manager integration", () => {
       mime: "image/png",
       bytes: 0,
     });
-    await db("assets").insert({ id: "a1", data: "{}", kind: "image", file: "f1" });
+    await db("assets").insert({
+      id: "a1",
+      data: "{}",
+      kind: "image",
+      file: "f1",
+    });
 
     const expand = validateExpandSpecs(
       parseExpandSpecs(["file"]),
@@ -291,7 +315,12 @@ describe("expand — subscription manager integration", () => {
       mime: "image/png",
       bytes: 0,
     });
-    await db("assets").insert({ id: "a1", data: "{}", kind: "image", file: "f1" });
+    await db("assets").insert({
+      id: "a1",
+      data: "{}",
+      kind: "image",
+      file: "f1",
+    });
 
     const withExpand = await manager.subscribe({
       socketId: "s1",
@@ -323,7 +352,12 @@ describe("expand — subscription manager integration", () => {
       mime: "image/png",
       bytes: 0,
     });
-    await db("assets").insert({ id: "a1", data: "{}", kind: "image", file: "f1" });
+    await db("assets").insert({
+      id: "a1",
+      data: "{}",
+      kind: "image",
+      file: "f1",
+    });
 
     const expand = validateExpandSpecs(
       parseExpandSpecs(["file"]),
@@ -352,7 +386,8 @@ describe("expand — subscription manager integration", () => {
     expect(emitted.length).toBeGreaterThan(0);
     const last = emitted[emitted.length - 1]!;
     expect(last.event).toMatch(/^query:/);
-    const ops = (last.data as { ops: Array<{ op: string; patch?: any[] }> }).ops;
+    const ops = (last.data as { ops: Array<{ op: string; patch?: any[] }> })
+      .ops;
     expect(ops.length).toBeGreaterThan(0);
     // The change shows up as a patch op against `/file/url`.
     const updateOp = ops.find((o) => o.op === "update");

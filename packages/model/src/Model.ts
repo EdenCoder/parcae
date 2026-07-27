@@ -76,6 +76,35 @@ const SYM_FLUSH_INFLIGHT = Symbol("parcae:flushInflight");
 /** A queued trailing flush() promise that will run after the current in-flight finishes. Multiple concurrent callers during an in-flight share this one. */
 const SYM_FLUSH_TRAILING = Symbol("parcae:flushTrailing");
 
+interface RefProxyState {
+  loaded: any;
+  loading: Promise<any> | null;
+  cacheKey: string | null;
+  refId: string | null;
+  invalidated: boolean;
+  loadRevision: number;
+  expiryTimer: ReturnType<typeof setTimeout> | null;
+  reference: { deref(): RefProxyState | undefined } | null;
+}
+
+interface RefCacheNamespace {
+  generation: number;
+  entries: Map<string, { value: any; expires: number }>;
+  proxies: Set<{ deref(): RefProxyState | undefined }>;
+}
+
+function scrubRefProxyState(state: RefProxyState): void {
+  if (state.expiryTimer) clearTimeout(state.expiryTimer);
+  state.loaded = null;
+  state.loading = null;
+  state.cacheKey = null;
+  state.refId = null;
+  state.invalidated = true;
+  state.loadRevision++;
+  state.expiryTimer = null;
+  state.reference = null;
+}
+
 /**
  * Atomically merge server-authoritative data onto this instance.
  *
@@ -140,10 +169,10 @@ function flushPendingChangeEmits(): void {
   for (const model of drain) {
     try {
       model.emit("change");
-    } catch (err) {
+    } catch {
       // Listeners must not break sibling listeners. Surface but
       // keep draining.
-      console.error("[parcae] change listener threw", err);
+      console.error("[parcae] change listener failed");
     }
   }
 }
@@ -266,6 +295,7 @@ function lazyQuery<T>(
   chain.__modelType = modelClass.type;
   chain.__modelClass = modelClass;
   chain.__adapter = null;
+  chain.__lazy = true;
 
   return chain as QueryChain<T>;
 }
@@ -557,7 +587,26 @@ export class Model extends EventEmitter {
     this: ModelConstructor<T>,
     data?: Record<string, any>,
   ): WithRefs<T> {
-    const instance = new this(Model.getAdapter(), data);
+    return Model.createWithAdapter.call(
+      this,
+      Model.getAdapter(),
+      data,
+    ) as WithRefs<T>;
+  }
+
+  /**
+   * Create against an explicit adapter. Multi-client SDK paths use this
+   * instead of the realm-global adapter so an optimistic model cannot save to
+   * whichever backend happened to create a client most recently.
+   *
+   * @internal
+   */
+  static createWithAdapter<T extends Model>(
+    this: ModelConstructor<T>,
+    adapter: ModelAdapter,
+    data?: Record<string, any>,
+  ): WithRefs<T> {
+    const instance = new this(adapter, data);
     applyInstance(instance);
     markNew(instance, true);
     return instance as WithRefs<T>;
@@ -1369,11 +1418,41 @@ export class Model extends EventEmitter {
 
   // ── Reference Proxy ──────────────────────────────────────────────────
 
-  private static __refCache = new Map<
-    string,
-    { value: any; expires: number }
-  >();
+  private static __refCaches = new WeakMap<ModelAdapter, RefCacheNamespace>();
   private static REF_CACHE_TTL = 30_000; // 30 seconds
+
+  private static _refCacheFor(adapter: ModelAdapter): RefCacheNamespace {
+    let cache = Model.__refCaches.get(adapter);
+    if (!cache) {
+      cache = { generation: 0, entries: new Map(), proxies: new Set() };
+      Model.__refCaches.set(adapter, cache);
+    }
+    return cache;
+  }
+
+  /**
+   * Drop every reference proxy cached for one adapter and invalidate the
+   * generation captured by already-returned proxies. A late lazy-load
+   * completion from the prior generation is therefore unable to repopulate
+   * the cache or expose its result after an authorization boundary.
+   */
+  static clearRefCache(adapter: ModelAdapter): void {
+    const cache = Model.__refCaches.get(adapter);
+    if (!cache) return;
+    cache.generation++;
+    for (const proxyRef of cache.proxies) {
+      const state = proxyRef.deref();
+      if (!state) continue;
+      scrubRefProxyState(state);
+    }
+    cache.proxies.clear();
+    cache.entries.clear();
+  }
+
+  /** @internal Resolve the adapter captured by a hydrated/created instance. */
+  static getInstanceAdapter(model: Model): ModelAdapter {
+    return model[SYM_ADAPTER];
+  }
 
   /**
    * Pre-hydrated ref proxy — same shape as `_createRefProxy` but
@@ -1381,8 +1460,8 @@ export class Model extends EventEmitter {
    * and never fires `findById` / throws Suspense.
    *
    * Used by `_apply` when the wire payload included a `.expand(...)`
-   * inline object for this ref field. The cache slot for
-   * `${type}:${id}` is overwritten so a sibling read of the same
+   * inline object for this ref field. The cache slot for the structured
+   * `[type, id]` tuple is overwritten so a sibling read of the same
    * ref id elsewhere on the same instance (or across instances
    * within the 30s TTL) reuses this same hydrated proxy rather
    * than a stale lazy one.
@@ -1399,8 +1478,16 @@ export class Model extends EventEmitter {
     refId: string,
     loadedInstance: Model,
   ): any {
-    const proxy = this._buildRefProxy(targetClass, refId, loadedInstance);
-    Model.__refCache.set(`${targetClass.type}:${refId}`, {
+    const adapter = this[SYM_ADAPTER];
+    const cache = Model._refCacheFor(adapter);
+    const proxy = this._buildRefProxy(
+      targetClass,
+      refId,
+      loadedInstance,
+      adapter,
+      cache,
+    );
+    cache.entries.set(JSON.stringify([targetClass.type, refId]), {
       value: proxy,
       expires: Date.now() + Model.REF_CACHE_TTL,
     });
@@ -1408,12 +1495,14 @@ export class Model extends EventEmitter {
   }
 
   private _createRefProxy(targetClass: ModelConstructor, refId: string): any {
-    const cacheKey = `${targetClass.type}:${refId}`;
-    const cached = Model.__refCache.get(cacheKey);
+    const adapter = this[SYM_ADAPTER];
+    const cache = Model._refCacheFor(adapter);
+    const cacheKey = JSON.stringify([targetClass.type, refId]);
+    const cached = cache.entries.get(cacheKey);
     if (cached && cached.expires > Date.now()) return cached.value;
-    if (cached) Model.__refCache.delete(cacheKey);
+    if (cached) cache.entries.delete(cacheKey);
 
-    const proxy = this._buildRefProxy(targetClass, refId, null);
+    const proxy = this._buildRefProxy(targetClass, refId, null, adapter, cache);
     return proxy;
   }
 
@@ -1433,28 +1522,103 @@ export class Model extends EventEmitter {
     targetClass: ModelConstructor,
     refId: string,
     initialLoaded: Model | null,
+    adapter: ModelAdapter,
+    cache: RefCacheNamespace,
   ): any {
-    let loaded: any = initialLoaded;
-    let loading: Promise<any> | null = null;
-    const cacheKey = `${targetClass.type}:${refId}`;
+    const state: RefProxyState = {
+      loaded: initialLoaded,
+      loading: null,
+      cacheKey: JSON.stringify([targetClass.type, refId]),
+      refId,
+      invalidated: false,
+      loadRevision: 0,
+      expiryTimer: null,
+      reference: null,
+    };
+    const WeakRefConstructor = (globalThis as any).WeakRef as
+      | (new (value: RefProxyState) => {
+          deref(): RefProxyState | undefined;
+        })
+      | undefined;
+    const generation = cache.generation;
+
+    const expire = (): void => {
+      const expiredKey = state.cacheKey;
+      const reference = state.reference;
+      if (state.expiryTimer) clearTimeout(state.expiryTimer);
+      state.loaded = null;
+      state.loading = null;
+      state.loadRevision++;
+      state.expiryTimer = null;
+      state.reference = null;
+      if (expiredKey && cache.entries.get(expiredKey)?.value === proxy) {
+        cache.entries.delete(expiredKey);
+      }
+      if (reference) cache.proxies.delete(reference);
+    };
+
+    const ensureTracked = (): void => {
+      if (state.reference) return;
+      const stateReference = WeakRefConstructor
+        ? new WeakRefConstructor(state)
+        : {
+            // PrimJS currently targets ES2019 and has no WeakRef. The sliding
+            // cache TTL below bounds this strong fallback; authorization clear
+            // still scrubs it synchronously while it can retain loaded PHI.
+            deref: () => state,
+          };
+      state.reference = stateReference;
+      cache.proxies.add(stateReference);
+    };
+
+    const touch = (): void => {
+      ensureTracked();
+      if (state.expiryTimer) clearTimeout(state.expiryTimer);
+      state.expiryTimer = setTimeout(expire, Model.REF_CACHE_TTL);
+      (state.expiryTimer as any).unref?.();
+      if (state.cacheKey) {
+        const cached = cache.entries.get(state.cacheKey);
+        if (cached) cached.expires = Date.now() + Model.REF_CACHE_TTL;
+      }
+    };
+
+    const assertCurrent = (): void => {
+      if (state.invalidated || cache.generation !== generation) {
+        scrubRefProxyState(state);
+        throw new Error(
+          "Model reference invalidated by an authorization boundary",
+        );
+      }
+    };
 
     const proxy = new Proxy({} as any, {
       get(_target, prop) {
-        if (prop === "id") return refId;
-        if (prop === "type") return targetClass.type;
         if (prop === "then") return undefined;
+        assertCurrent();
+        touch();
+        if (prop === "id") return state.refId;
+        if (prop === "type") return targetClass.type;
         if (prop === "toJSON")
-          return () => ({ id: refId, type: targetClass.type });
-        if (prop === Symbol.toPrimitive) return () => refId;
+          return () => ({ id: state.refId, type: targetClass.type });
+        if (prop === Symbol.toPrimitive) return () => state.refId;
 
-        if (loaded) return (loaded as any)[prop];
+        if (state.loaded) return (state.loaded as any)[prop];
 
-        if (!loading) {
-          loading = Model.getAdapter()
-            .findById(targetClass, refId)
+        if (!state.loading) {
+          const loadRevision = ++state.loadRevision;
+          state.loading = adapter
+            .findById(targetClass, state.refId!)
             .then((result) => {
-              loaded = result;
-              Model.__refCache.set(cacheKey, {
+              if (
+                state.invalidated ||
+                cache.generation !== generation ||
+                !state.cacheKey ||
+                state.loadRevision !== loadRevision
+              ) {
+                return null;
+              }
+              state.loaded = result;
+              cache.entries.set(state.cacheKey, {
                 value: proxy,
                 expires: Date.now() + Model.REF_CACHE_TTL,
               });
@@ -1463,7 +1627,7 @@ export class Model extends EventEmitter {
         }
 
         // React Suspense integration — throw the pending promise.
-        throw loading;
+        throw state.loading;
       },
       // ── Iteration safety (DOL-1045) ──────────────────────────────
       //
@@ -1478,12 +1642,16 @@ export class Model extends EventEmitter {
       // synchronously — `{id, type}` — so iteration sees a tidy
       // 2-key stub and stays clear of the lazy-load path.
       ownKeys(): ArrayLike<string | symbol> {
+        assertCurrent();
+        touch();
         return ["id", "type"];
       },
       getOwnPropertyDescriptor(_target, prop) {
+        assertCurrent();
+        touch();
         if (prop === "id") {
           return {
-            value: refId,
+            value: state.refId,
             writable: false,
             enumerable: true,
             configurable: true,
@@ -1500,10 +1668,13 @@ export class Model extends EventEmitter {
         return undefined;
       },
       has(_target, prop) {
+        assertCurrent();
+        touch();
         return prop === "id" || prop === "type";
       },
     });
 
+    touch();
     return proxy;
   }
 }

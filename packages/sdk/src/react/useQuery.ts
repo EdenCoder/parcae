@@ -3,6 +3,7 @@
 import { Model, SYM_SERVER_MERGE, generateId } from "@parcae/model";
 import { applyPatch, type Operation } from "fast-json-patch";
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+import { _getClientModelAdapter } from "../client";
 import type { ParcaeClient } from "../client";
 import { log } from "../log";
 import { useParcae } from "./context";
@@ -14,6 +15,7 @@ interface QueryChain<T> {
   __modelType?: string;
   __modelClass?: any;
   __adapter?: any;
+  __lazy?: boolean;
   /** Returns a sibling chain whose `.find()` sends `__forceRefresh: true`. */
   withForceRefresh?: () => QueryChain<T>;
   /** Returns a sibling chain whose `.find()` sends `__subscribe: false`. */
@@ -54,6 +56,12 @@ interface UseQueryResult<T> {
 // ── Cache ────────────────────────────────────────────────────────────────────
 
 interface CacheEntry {
+  /** Exact owner captured when the cache key was built (`null` = anonymous). */
+  ownerId: string | null;
+  /** Exact SDK client/backend namespace that owns this entry. */
+  ownerClient: ParcaeClient | null;
+  /** Permanently invalidated entries reject every late async continuation. */
+  disposed: boolean;
   items: any[];
   optimistic: any[];
   mergedItems: any[];
@@ -84,25 +92,119 @@ interface CacheEntry {
 }
 
 const cache = new Map<string, CacheEntry>();
+const clientIdentities = new WeakMap<object, number>();
+const observedClients = new WeakSet<object>();
+let nextClientIdentity = 1;
 const GC_DELAY = 60_000;
-const EMPTY: any[] = [];
+const EMPTY = Object.freeze([]) as unknown as any[];
 const INITIAL_HASH = "L";
 
+function clearArrayInPlace(array: any[]): void {
+  try {
+    array.length = 0;
+  } catch {
+    // A consumer may have frozen a returned snapshot. The entry reference is
+    // still replaced and listeners are invalidated below.
+  }
+}
+
 /**
- * Drop every cache entry whose key was generated for a different user
- * than `currentUserId`. Used on session transitions (sign-out → null;
- * user switch → new userId).
+ * Scrub and detach every cache entry owned by the supplied resolved session.
+ * Anonymous (`null`) is a real owner and is purged on auth boundaries too.
  */
-function purgeCacheForUser(prevUserId: string | null): void {
-  if (prevUserId === null) return;
-  const needle = `:${prevUserId}:`;
+function purgeCacheForUser(
+  ownerClient: ParcaeClient,
+  ownerId: string | null,
+): void {
+  const modelAdapter = _getClientModelAdapter(ownerClient);
+  if (modelAdapter) Model.clearRefCache(modelAdapter);
+
+  const notifications: Array<() => void> = [];
+  const disposers: Array<() => void> = [];
   for (const [key, entry] of cache) {
-    if (!key.includes(needle)) continue;
-    entry.dispose?.();
+    if (entry.ownerClient !== ownerClient || entry.ownerId !== ownerId)
+      continue;
+    notifications.push(...entry.listeners);
+    entry.disposed = true;
+    if (entry.dispose) disposers.push(entry.dispose);
+    entry.dispose = null;
     if (entry.gcTimer) clearTimeout(entry.gcTimer);
     if (entry.retryTimer) clearTimeout(entry.retryTimer);
+    entry.gcTimer = null;
+    entry.retryTimer = null;
+
+    // Clear arrays in place so already-returned hook snapshots stop retaining
+    // or displaying the old owner's models before React commits its next
+    // render. Then remove all remaining entry references.
+    if (entry.items !== EMPTY) clearArrayInPlace(entry.items);
+    clearArrayInPlace(entry.optimistic);
+    if (entry.mergedItems !== EMPTY && entry.mergedItems !== entry.items) {
+      clearArrayInPlace(entry.mergedItems);
+    }
+    entry.items = EMPTY;
+    entry.optimistic = [];
+    entry.mergedItems = EMPTY;
+    entry.mergedKey = "0:0";
+    entry.loading = false;
+    entry.error = new Error(
+      "Parcae query invalidated by an authorization boundary",
+    );
+    entry.queryHash = null;
+    entry.totalCount = 0;
+    entry.chain = null;
+    entry.client = null;
+    entry.ownerClient = null;
+    entry.ownerId = null;
+    entry.retryCount = 0;
+    entry.refs = 0;
+    entry.listeners.clear();
+    entry.opsListeners.clear();
+    entry.version++;
+    entry.hash = INITIAL_HASH;
     cache.delete(key);
   }
+
+  for (const dispose of disposers) {
+    try {
+      dispose();
+    } catch {
+      log.warn("useQuery: cache subscription disposal failed");
+    }
+  }
+
+  // Scrub every matching entry before notifying. Isolate callbacks so one
+  // consumer cannot prevent later cache entries from being invalidated.
+  for (const listener of notifications) {
+    try {
+      listener();
+    } catch {
+      log.warn("useQuery: cache invalidation listener failed");
+    }
+  }
+}
+
+function observeClientSession(client: ParcaeClient): void {
+  if (observedClients.has(client)) return;
+  if (!client.session || typeof client.session.subscribe !== "function") return;
+  observedClients.add(client);
+  let lastResolvedOwner = client.session.state.userId;
+
+  client.session.subscribe(() => {
+    const { status, userId } = client.session.state;
+    if (status === "pending") {
+      purgeCacheForUser(client, lastResolvedOwner);
+      return;
+    }
+    if (status === "terminated") {
+      purgeCacheForUser(client, lastResolvedOwner);
+      lastResolvedOwner = null;
+      return;
+    }
+    if (userId !== lastResolvedOwner) {
+      purgeCacheForUser(client, lastResolvedOwner);
+      lastResolvedOwner = userId;
+    }
+  });
 }
 
 const MAX_RETRIES = 3;
@@ -143,7 +245,25 @@ export function getMergedItems(entry: CacheEntry): any[] {
   return merged;
 }
 
-function getOrCreate(key: string, subscribe?: boolean): CacheEntry {
+function ownerFromKey(key: string): string | null {
+  const encoded = key.endsWith(":nosub") ? key.slice(0, -":nosub".length) : key;
+  const parsed = JSON.parse(encoded) as unknown;
+  if (
+    !Array.isArray(parsed) ||
+    parsed.length !== 4 ||
+    (parsed[2] !== null && typeof parsed[2] !== "string")
+  ) {
+    throw new Error("Invalid Parcae query cache key");
+  }
+  return parsed[2];
+}
+
+function getOrCreate(
+  key: string,
+  subscribe?: boolean,
+  ownerClient?: ParcaeClient,
+): CacheEntry {
+  if (ownerClient) observeClientSession(ownerClient);
   let e = cache.get(key);
   if (!e) {
     // Derive from the key suffix when not passed explicitly. Lets
@@ -153,6 +273,9 @@ function getOrCreate(key: string, subscribe?: boolean): CacheEntry {
     // from being re-created with the wrong mode.
     const resolved = subscribe ?? !key.endsWith(":nosub");
     e = {
+      ownerId: ownerFromKey(key),
+      ownerClient: ownerClient ?? null,
+      disposed: false,
       items: EMPTY,
       optimistic: [],
       mergedItems: EMPTY,
@@ -175,15 +298,49 @@ function getOrCreate(key: string, subscribe?: boolean): CacheEntry {
       subscribe: resolved,
     };
     cache.set(key, e);
+  } else if (!e.ownerClient && ownerClient) {
+    e.ownerClient = ownerClient;
   }
   return e;
 }
 
+function isEntryActive(key: string, entry: CacheEntry): boolean {
+  return !entry.disposed && cache.get(key) === entry;
+}
+
+function scheduleEntryGc(key: string, entry: CacheEntry): void {
+  if (entry.gcTimer) clearTimeout(entry.gcTimer);
+  entry.gcTimer = setTimeout(() => {
+    if (!isEntryActive(key, entry)) return;
+    entry.dispose?.();
+    entry.dispose = null;
+    cache.delete(key);
+  }, GC_DELAY);
+}
+
+function releaseEntryRef(key: string, entry: CacheEntry): void {
+  if (entry.disposed) return;
+  entry.refs--;
+  if (entry.refs > 0) return;
+  if (entry.retryTimer) {
+    clearTimeout(entry.retryTimer);
+    entry.retryTimer = null;
+  }
+  scheduleEntryGc(key, entry);
+}
+
 function notify(e: CacheEntry): void {
+  if (e.disposed) return;
   const next = buildHash(e);
   if (next !== e.hash) {
     e.hash = next;
-    for (const fn of e.listeners) fn();
+    for (const fn of [...e.listeners]) {
+      try {
+        fn();
+      } catch {
+        log.warn("useQuery: cache listener failed");
+      }
+    }
   }
 }
 
@@ -324,7 +481,8 @@ function applyOps(
     }
     if (!existing) continue;
 
-    const pendingPaths: ReadonlySet<string> | undefined = existing.__patchingPaths;
+    const pendingPaths: ReadonlySet<string> | undefined =
+      existing.__patchingPaths;
     const filtered =
       pendingPaths && pendingPaths.size > 0
         ? patches.filter((p) => !pendingPaths.has(p.path))
@@ -454,13 +612,96 @@ function drainOptimistic(serverItems: any[], entry: CacheEntry): void {
   );
 }
 
-function resolveAdapter(chain: QueryChain<any>): any {
-  return chain.__adapter ?? (Model.hasAdapter() ? Model.getAdapter() : null);
+function resolveAdapter(chain: QueryChain<any>, client: ParcaeClient): any {
+  return (
+    _getClientModelAdapter(client) ??
+    chain.__adapter ??
+    (Model.hasAdapter() ? Model.getAdapter() : null)
+  );
+}
+
+function bindChainToClient(
+  chain: QueryChain<any>,
+  client: ParcaeClient,
+): QueryChain<any> {
+  const adapter = _getClientModelAdapter(client);
+  if (!adapter || !chain.__modelClass) return chain;
+  if (!chain.__lazy && chain.__adapter === adapter) return chain;
+
+  let bound = adapter.query(chain.__modelClass) as QueryChain<any>;
+  for (const step of chain.__steps ?? []) {
+    const method = (bound as any)[step?.method];
+    if (typeof method !== "function") {
+      throw new Error("Parcae query contains an unsupported step");
+    }
+    bound = method(...(step?.args ?? []));
+  }
+  return bound;
+}
+
+function createOptimisticInstance<T>(
+  chain: QueryChain<T>,
+  client: ParcaeClient,
+  item: T | Record<string, any>,
+): T {
+  const adapter = resolveAdapter(chain, client);
+  if (!adapter) {
+    throw new Error("Parcae optimistic model has no client adapter");
+  }
+
+  if (item instanceof Model) {
+    if (Model.getInstanceAdapter(item) !== adapter) {
+      throw new Error("Parcae optimistic model belongs to a different client");
+    }
+    return item as T;
+  }
+
+  const ModelClass = chain.__modelClass;
+  if (!ModelClass || typeof ModelClass.createWithAdapter !== "function") {
+    return item as T;
+  }
+  return ModelClass.createWithAdapter(adapter, item) as T;
+}
+
+function querySubscriptionDisposer(
+  client: ParcaeClient,
+  hash: string,
+  unsubscribeLocal: () => void,
+): () => void {
+  const ownerId = client.session.state.userId;
+  const sessionVersion = client.session.state.version;
+  let disposed = false;
+
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    try {
+      unsubscribeLocal();
+    } finally {
+      const { status, userId, version } = client.session.state;
+      if (
+        typeof client.send !== "function" ||
+        client.isConnected === false ||
+        client.needsSessionRefresh === true ||
+        (status !== "anonymous" && status !== "authenticated") ||
+        userId !== ownerId ||
+        version !== sessionVersion
+      ) {
+        return;
+      }
+      try {
+        client.send("unsubscribe:query", { hash });
+      } catch {
+        log.warn("useQuery: server subscription disposal failed");
+      }
+    }
+  };
 }
 
 // ── Fetch + subscribe ───────────────────────────────────────────────────────
 
 function scheduleRetry(key: string, entry: CacheEntry): void {
+  if (!isEntryActive(key, entry)) return;
   if (entry.retryCount >= MAX_RETRIES) return;
   if (!entry.chain || !entry.client) return;
   if (entry.refs <= 0) return;
@@ -469,6 +710,7 @@ function scheduleRetry(key: string, entry: CacheEntry): void {
     RETRY_DELAYS[Math.min(entry.retryCount, RETRY_DELAYS.length - 1)]!;
   entry.retryTimer = setTimeout(() => {
     entry.retryTimer = null;
+    if (!isEntryActive(key, entry)) return;
     if (entry.refs <= 0 || !entry.chain || !entry.client) return;
     entry.retryCount++;
     doFetch(key, entry, entry.chain, entry.client);
@@ -490,17 +732,29 @@ function doFetch(
   entry.error = null;
   notify(entry);
 
-  let fetchChain: QueryChain<any> = chain;
+  let fetchChain: QueryChain<any>;
+  try {
+    fetchChain = bindChainToClient(chain, client);
+  } catch {
+    entry.error = new Error("Parcae query could not bind to its client");
+    entry.loading = false;
+    notify(entry);
+    return;
+  }
   if (opts.force && typeof fetchChain.withForceRefresh === "function") {
     fetchChain = fetchChain.withForceRefresh();
   }
-  if (entry.subscribe === false && typeof fetchChain.withSubscribe === "function") {
+  if (
+    entry.subscribe === false &&
+    typeof fetchChain.withSubscribe === "function"
+  ) {
     fetchChain = fetchChain.withSubscribe(false);
   }
 
   fetchChain
     .find()
     .then((result: any[]) => {
+      if (!isEntryActive(key, entry)) return;
       const hash = (result as any).__queryHash;
       const prevItems = entry.items;
       entry.items = reconcile(entry.items, result, entry);
@@ -526,9 +780,10 @@ function doFetch(
         entry.dispose?.();
         entry.queryHash = hash;
 
-        const adapter = resolveAdapter(chain);
+        const adapter = resolveAdapter(chain, client);
 
         const unsub = client.subscribe(`query:${hash}`, (payload: unknown) => {
+          if (!isEntryActive(key, entry)) return;
           const parsed = normalizeOpsPayload(payload);
           if (!parsed) return;
           const { ops, order } = parsed;
@@ -556,16 +811,19 @@ function doFetch(
           for (const listener of entry.opsListeners) {
             try {
               listener(ops);
-            } catch {}
+            } catch {
+              log.warn("useQuery: operation listener failed");
+            }
           }
         });
-        entry.dispose = unsub;
+        entry.dispose = querySubscriptionDisposer(client, hash, unsub);
       }
 
       notify(entry);
     })
     .catch((err: Error) => {
-      log.error("useQuery: error", err.message);
+      if (!isEntryActive(key, entry)) return;
+      log.error("useQuery: fetch failed");
       entry.error = err;
       entry.loading = false;
       notify(entry);
@@ -574,6 +832,43 @@ function doFetch(
 }
 
 // ── Resync handler ──────────────────────────────────────────────────────────
+
+function failClosedResyncEntry(
+  cacheKey: string,
+  entry: CacheEntry,
+  error: Error | null,
+): void {
+  if (!isEntryActive(cacheKey, entry)) return;
+
+  const dispose = entry.dispose;
+  entry.dispose = null;
+  if (dispose) {
+    try {
+      dispose();
+    } catch {
+      log.warn("useQuery: resync subscription disposal failed");
+    }
+  }
+  if (entry.retryTimer) clearTimeout(entry.retryTimer);
+  entry.retryTimer = null;
+
+  if (entry.items !== EMPTY) clearArrayInPlace(entry.items);
+  clearArrayInPlace(entry.optimistic);
+  if (entry.mergedItems !== EMPTY && entry.mergedItems !== entry.items) {
+    clearArrayInPlace(entry.mergedItems);
+  }
+  entry.items = EMPTY;
+  entry.optimistic = [];
+  entry.mergedItems = EMPTY;
+  entry.mergedKey = "0:0";
+  entry.queryHash = null;
+  entry.totalCount = 0;
+  entry.loading = false;
+  entry.error = error;
+  entry.retryCount = 0;
+  entry.version++;
+  notify(entry);
+}
 
 /**
  * Called by ParcaeProvider after the transport's hello handshake
@@ -585,6 +880,7 @@ function doFetch(
 export function _onResyncRequired(client: ParcaeClient): void {
   const entries: {
     cacheKey: string;
+    entry: CacheEntry;
     modelType: string;
     steps: unknown[];
     queryHash: string | null;
@@ -592,12 +888,14 @@ export function _onResyncRequired(client: ParcaeClient): void {
   }[] = [];
 
   for (const [cacheKey, entry] of cache) {
+    if (entry.client !== client) continue;
     if (entry.refs <= 0) continue;
     if (!entry.chain) continue;
     const modelType = entry.chain.__modelType;
     if (!modelType) continue;
     entries.push({
       cacheKey,
+      entry,
       modelType,
       steps: entry.chain.__steps ?? [],
       queryHash: entry.queryHash,
@@ -625,10 +923,25 @@ export function _onResyncRequired(client: ParcaeClient): void {
       for (const e of entries) {
         const result = byKey.get(e.cacheKey);
         const entry = cache.get(e.cacheKey);
-        if (!entry || !result) continue;
+        if (!entry || entry !== e.entry || entry.disposed) continue;
+        if (!result) {
+          failClosedResyncEntry(
+            e.cacheKey,
+            entry,
+            new Error("Parcae resync response omitted a cache entry"),
+          );
+          continue;
+        }
+        if (result.authorized === false) {
+          failClosedResyncEntry(e.cacheKey, entry, null);
+          continue;
+        }
 
         const items = result.items as any[];
-        const adapter = entry.chain ? resolveAdapter(entry.chain) : null;
+        const adapter =
+          entry.chain && entry.client
+            ? resolveAdapter(entry.chain, entry.client)
+            : null;
         const ModelClass = entry.chain?.__modelClass;
         const hydrated = ModelClass
           ? items.map((row) => ModelClass.hydrate(adapter, row))
@@ -644,6 +957,17 @@ export function _onResyncRequired(client: ParcaeClient): void {
         entry.loading = false;
         entry.error = null;
         entry.retryCount = 0;
+
+        if (!result.hash && entry.queryHash) {
+          const dispose = entry.dispose;
+          entry.dispose = null;
+          entry.queryHash = null;
+          try {
+            dispose?.();
+          } catch {
+            log.warn("useQuery: resync subscription disposal failed");
+          }
+        }
 
         // The server may have rebuilt a fresh subscription on the new
         // socket — wire it up if the hash changed. The old listener
@@ -665,6 +989,7 @@ export function _onResyncRequired(client: ParcaeClient): void {
           const unsub = subClient.subscribe(
             `query:${result.hash}`,
             (payload: unknown) => {
+              if (!isEntryActive(e.cacheKey, entry)) return;
               const parsed = normalizeOpsPayload(payload);
               if (!parsed) return;
               const { ops, order } = parsed;
@@ -692,18 +1017,31 @@ export function _onResyncRequired(client: ParcaeClient): void {
               for (const listener of entry.opsListeners) {
                 try {
                   listener(ops);
-                } catch {}
+                } catch {
+                  log.warn("useQuery: operation listener failed");
+                }
               }
             },
           );
-          entry.dispose = unsub;
+          entry.dispose = querySubscriptionDisposer(
+            subClient,
+            result.hash,
+            unsub,
+          );
         }
 
         notify(entry);
       }
     })
-    .catch((err) => {
-      log.error("useQuery: resync failed:", err.message);
+    .catch(() => {
+      for (const { cacheKey, entry } of entries) {
+        failClosedResyncEntry(
+          cacheKey,
+          entry,
+          new Error("Parcae query resync failed"),
+        );
+      }
+      log.error("useQuery: resync failed");
     });
 }
 
@@ -773,10 +1111,26 @@ function buildKey(
   userId: string | null,
   steps: any[] | undefined,
   subscribe = true,
+  client?: ParcaeClient,
 ): string | null {
   if (!modelType) return null;
+  let clientIdentity = 0;
+  if (client) {
+    const existing = clientIdentities.get(client);
+    if (existing) {
+      clientIdentity = existing;
+    } else {
+      clientIdentity = nextClientIdentity++;
+      clientIdentities.set(client, clientIdentity);
+    }
+  }
   const subPart = subscribe === false ? ":nosub" : "";
-  return `${modelType}:${userId ?? "anon"}:${serializeStepsForKey(steps)}${subPart}`;
+  return `${JSON.stringify([
+    clientIdentity,
+    modelType,
+    userId,
+    serializeStepsForKey(steps),
+  ])}${subPart}`;
 }
 
 export function useQuery<T>(
@@ -791,11 +1145,13 @@ export function useQuery<T>(
   // Hold off building a key until the session has resolved. Identity
   // is required for both correctness (queries scope by user) and key
   // stability (we can't change keys mid-flight just because the
-  // session is still pending). Once the session resolves (anonymous
-  // or authenticated), the key is final until userId changes.
-  const sessionReady = sessionStatus !== "pending";
+  // session is still pending). Any authorization boundary makes the
+  // key null and synchronously purges the exact prior client/owner
+  // entry, including same-owner token or role rotation.
+  const sessionReady =
+    sessionStatus === "anonymous" || sessionStatus === "authenticated";
   const key = sessionReady
-    ? buildKey(chain?.__modelType, userId, chain?.__steps, subscribe)
+    ? buildKey(chain?.__modelType, userId, chain?.__steps, subscribe, client)
     : null;
 
   const chainRef = useRef(chain);
@@ -808,7 +1164,7 @@ export function useQuery<T>(
   const subscribeToCache = useCallback(
     (onChange: () => void) => {
       if (!key) return () => {};
-      const e = getOrCreate(key, subscribe);
+      const e = getOrCreate(key, subscribe, client);
       e.refs++;
       e.listeners.add(onChange);
       if (e.gcTimer) {
@@ -817,17 +1173,7 @@ export function useQuery<T>(
       }
       return () => {
         e.listeners.delete(onChange);
-        e.refs--;
-        if (e.refs <= 0) {
-          if (e.retryTimer) {
-            clearTimeout(e.retryTimer);
-            e.retryTimer = null;
-          }
-          e.gcTimer = setTimeout(() => {
-            e.dispose?.();
-            cache.delete(key);
-          }, GC_DELAY);
-        }
+        releaseEntryRef(key, e);
       };
     },
     [key],
@@ -846,7 +1192,7 @@ export function useQuery<T>(
     const currentChain = chainRef.current;
     if (!currentChain) return;
 
-    const entry = getOrCreate(key, subscribe);
+    const entry = getOrCreate(key, subscribe, client);
     entry.retryCount = 0;
     if (entry.retryTimer) {
       clearTimeout(entry.retryTimer);
@@ -929,7 +1275,8 @@ export function useQuery<T>(
     const k = keyRef.current;
     const currentChain = chainRef.current;
     if (!k || !currentChain) return;
-    const entry = getOrCreate(k);
+    const entry = cache.get(k);
+    if (!entry || entry.disposed) return;
     entry.retryCount = 0;
     if (entry.retryTimer) {
       clearTimeout(entry.retryTimer);
@@ -941,17 +1288,15 @@ export function useQuery<T>(
   const addOptimistic = useCallback((item: T | Record<string, any>): T => {
     const k = keyRef.current;
     if (!k) return item as T;
-    const entry = getOrCreate(k);
-    const ModelClass = chainRef.current?.__modelClass;
-
-    let instance: any;
-    if (item instanceof Model) {
-      instance = item;
-    } else if (ModelClass) {
-      instance = ModelClass.create(item);
-    } else {
-      instance = item;
-    }
+    const entry = cache.get(k);
+    if (!entry || entry.disposed) return item as T;
+    const currentChain = chainRef.current;
+    if (!currentChain) return item as T;
+    const instance: any = createOptimisticInstance(
+      currentChain,
+      clientRef.current,
+      item,
+    );
 
     if (!instance.tmp) instance.tmp = generateId();
 
@@ -1062,7 +1407,18 @@ export async function prefetch<T>(
   const subscribe = options.subscribe !== false;
 
   if (waitForSession) {
-    await client.session.ready;
+    if (client.awaitSessionReconciled) {
+      await client.awaitSessionReconciled();
+    } else {
+      await client.session.ready;
+    }
+  } else if (
+    client.session.state.status !== "anonymous" &&
+    client.session.state.status !== "authenticated"
+  ) {
+    throw new Error(
+      "prefetch: waitForSession:false requires an already-reconciled session",
+    );
   }
 
   const userId = client.session.state.userId;
@@ -1072,10 +1428,16 @@ export async function prefetch<T>(
       "prefetch: chain has no __modelType — was it built from a real Model class?",
     );
   }
-  const key = buildKey(modelType, userId, (chain as any).__steps, subscribe);
+  const key = buildKey(
+    modelType,
+    userId,
+    (chain as any).__steps,
+    subscribe,
+    client,
+  );
   if (!key) throw new Error("prefetch: failed to build cache key");
 
-  const entry = getOrCreate(key, subscribe);
+  const entry = getOrCreate(key, subscribe, client);
 
   entry.refs++;
   if (entry.gcTimer) {
@@ -1087,13 +1449,7 @@ export async function prefetch<T>(
     let settled = false;
 
     const release = () => {
-      entry.refs--;
-      if (entry.refs <= 0) {
-        entry.gcTimer = setTimeout(() => {
-          entry.dispose?.();
-          cache.delete(key);
-        }, GC_DELAY);
-      }
+      releaseEntryRef(key, entry);
     };
 
     const settle = (value: T[] | Error) => {
@@ -1129,21 +1485,28 @@ export async function prefetch<T>(
 
     entry.listeners.add(onChange);
 
-    if (!entry.chain) {
+    if (
+      !entry.chain ||
+      (subscribe && !entry.loading && entry.queryHash === null)
+    ) {
       doFetch(key, entry, chain as any, client);
     }
   });
 }
 
 /** @internal — exposed so the Provider can drive evictions. */
-export function _purgeCacheForUser(prevUserId: string | null): void {
-  purgeCacheForUser(prevUserId);
+export function _purgeCacheForUser(
+  client: ParcaeClient,
+  prevUserId: string | null,
+): void {
+  purgeCacheForUser(client, prevUserId);
 }
 
 /** @internal */
 export const __test = {
   resetCache(): void {
     for (const entry of cache.values()) {
+      entry.disposed = true;
       entry.dispose?.();
       if (entry.gcTimer) clearTimeout(entry.gcTimer);
       if (entry.retryTimer) clearTimeout(entry.retryTimer);
@@ -1158,8 +1521,15 @@ export const __test = {
     userId: string | null,
     steps: unknown[],
     subscribe = true,
+    client?: ParcaeClient,
   ): string {
-    return buildKey(modelType, userId, steps as any[], subscribe) as string;
+    return buildKey(
+      modelType,
+      userId,
+      steps as any[],
+      subscribe,
+      client,
+    ) as string;
   },
   fetch(
     key: string,
@@ -1167,25 +1537,28 @@ export const __test = {
     client: ParcaeClient,
     subscribe?: boolean,
   ): CacheEntry {
-    const entry = getOrCreate(key, subscribe);
+    const entry = getOrCreate(key, subscribe, client);
     doFetch(key, entry, chain, client);
     return entry;
   },
-  retain(
-    key: string,
-    onChange: () => void,
-    subscribe?: boolean,
-  ): () => void {
+  retain(key: string, onChange: () => void, subscribe?: boolean): () => void {
     const entry = getOrCreate(key, subscribe);
     entry.refs++;
     entry.listeners.add(onChange);
     return () => {
       entry.listeners.delete(onChange);
-      entry.refs--;
+      releaseEntryRef(key, entry);
     };
   },
   getMergedItems(entry: CacheEntry): any[] {
     return getMergedItems(entry);
+  },
+  createOptimistic<T>(
+    chain: QueryChain<T>,
+    client: ParcaeClient,
+    item: T | Record<string, any>,
+  ): T {
+    return createOptimisticInstance(chain, client, item);
   },
   onResyncRequired(client: ParcaeClient): void {
     _onResyncRequired(client);

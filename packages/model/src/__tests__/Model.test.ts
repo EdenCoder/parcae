@@ -424,9 +424,7 @@ describe("Model", () => {
       expect(blocks).toBeTypeOf("object");
       expect(Array.isArray(blocks)).toBe(false); // /blocks/abc → object
       expect(Array.isArray(blocks.abc.shots)).toBe(true); // /shots/0 → array
-      expect(blocks.abc.shots[0].panel.url).toBe(
-        "https://example.test/p.png",
-      );
+      expect(blocks.abc.shots[0].panel.url).toBe("https://example.test/p.png");
     });
 
     it("still vivifies non-numeric next segments as plain objects", async () => {
@@ -479,9 +477,7 @@ describe("Model", () => {
       // must remain an object lookup. If the regex were `/\d/`
       // (contains-digit) instead of `/^\d+$/` (all-digits),
       // `blocks.b1` would wrongly vivify as `[]`.
-      await post.patch([
-        { op: "add", path: "/blocks/b1/text", value: "hi" },
-      ]);
+      await post.patch([{ op: "add", path: "/blocks/b1/text", value: "hi" }]);
       const blocks = (post as any).blocks;
       expect(Array.isArray(blocks)).toBe(false);
       expect(blocks.b1.text).toBe("hi");
@@ -509,10 +505,7 @@ describe("Model", () => {
       ]);
       const tags = (post as any).tags;
       expect(Array.isArray(tags)).toBe(true);
-      expect(tags).toEqual([
-        { text: "a", role: "primary" },
-        { text: "b" },
-      ]);
+      expect(tags).toEqual([{ text: "a", role: "primary" }, { text: "b" }]);
     });
   });
 
@@ -576,10 +569,7 @@ describe("Model", () => {
       // safe shape over the wire.
       class Account extends Model {
         static type = "account" as const;
-        static readonly privateFields = [
-          "passwordHash",
-          "resetToken",
-        ] as const;
+        static readonly privateFields = ["passwordHash", "resetToken"] as const;
         email: string = "";
         passwordHash: string = "";
         resetToken: string = "";
@@ -805,6 +795,265 @@ describe("Model", () => {
         expect(first === second).toBe(true);
       });
 
+      it("namespaces hydrated refs by adapter so clients cannot share rows", () => {
+        const otherAdapter = createMockAdapter();
+        const first = Article.hydrate(adapter, {
+          title: "first",
+          author: { id: "shared", name: "First client" },
+        });
+        const second = Article.hydrate(otherAdapter, {
+          title: "second",
+          author: { id: "shared", name: "Second client" },
+        });
+
+        expect(first.author === second.author).toBe(false);
+        expect((first.author as any).name).toBe("First client");
+        expect((second.author as any).name).toBe("Second client");
+      });
+
+      it("uses structured ref keys so type/id delimiters cannot collide", () => {
+        class ColonTarget extends Model {
+          static override type = "a:b" as const;
+          name = "";
+        }
+        class PlainTarget extends Model {
+          static override type = "a" as const;
+          name = "";
+        }
+        class ColonHolder extends Model {
+          static override type = "colon-holder" as const;
+          static override __schema = {
+            ref: { kind: "ref", target: ColonTarget },
+          } as any;
+          declare ref: ColonTarget;
+        }
+        class PlainHolder extends Model {
+          static override type = "plain-holder" as const;
+          static override __schema = {
+            ref: { kind: "ref", target: PlainTarget },
+          } as any;
+          declare ref: PlainTarget;
+        }
+
+        const colon = ColonHolder.hydrate(adapter, {
+          ref: { id: "c", name: "colon type" },
+        });
+        const plain = PlainHolder.hydrate(adapter, {
+          ref: { id: "b:c", name: "colon id" },
+        });
+
+        expect((colon.ref as any).name).toBe("colon type");
+        expect((plain.ref as any).name).toBe("colon id");
+        expect(colon.ref === (plain.ref as any)).toBe(false);
+      });
+
+      it("invalidates and scrubs an already-returned hydrated proxy", () => {
+        const article = Article.hydrate(adapter, {
+          title: "x",
+          author: { id: "patient-ref", name: "Patient secret" },
+        });
+        const retained = article.author;
+        expect((retained as any).name).toBe("Patient secret");
+
+        Model.clearRefCache(adapter);
+
+        expect(() => (retained as any).name).toThrow(
+          "Model reference invalidated by an authorization boundary",
+        );
+        expect(() => (retained as any).id).toThrow(
+          "Model reference invalidated by an authorization boundary",
+        );
+      });
+
+      it("scrubs refs on runtimes without WeakRef", () => {
+        const originalWeakRef = (globalThis as any).WeakRef;
+        try {
+          (globalThis as any).WeakRef = undefined;
+          const article = Article.hydrate(adapter, {
+            title: "x",
+            author: { id: "patient-ref", name: "Patient secret" },
+          });
+          const retained = article.author;
+          expect((retained as any).name).toBe("Patient secret");
+
+          Model.clearRefCache(adapter);
+
+          expect(() => (retained as any).name).toThrow(
+            "Model reference invalidated by an authorization boundary",
+          );
+        } finally {
+          (globalThis as any).WeakRef = originalWeakRef;
+        }
+      });
+
+      it("bounds strong ref tracking by TTL without WeakRef", async () => {
+        const originalWeakRef = (globalThis as any).WeakRef;
+        vi.useFakeTimers();
+        try {
+          (globalThis as any).WeakRef = undefined;
+          adapter.findById = vi.fn(async () =>
+            Author.hydrate(adapter, {
+              id: "patient-ref",
+              name: "Reloaded patient",
+            }),
+          ) as any;
+          const article = Article.hydrate(adapter, {
+            title: "x",
+            author: { id: "patient-ref", name: "Patient secret" },
+          });
+          const retained = article.author;
+          const namespace = (Model as any).__refCaches.get(adapter);
+          expect(namespace.proxies.size).toBe(1);
+
+          await vi.advanceTimersByTimeAsync(30_000);
+
+          expect(namespace.proxies.size).toBe(0);
+          expect(namespace.entries.size).toBe(0);
+          let reload: Promise<unknown> | null = null;
+          try {
+            void (retained as any).name;
+          } catch (error) {
+            reload = error as Promise<unknown>;
+          }
+          expect(reload).not.toBeNull();
+          await reload;
+          expect((retained as any).name).toBe("Reloaded patient");
+          expect(adapter.findById).toHaveBeenCalledOnce();
+        } finally {
+          vi.useRealTimers();
+          (globalThis as any).WeakRef = originalWeakRef;
+        }
+      });
+
+      it("fences a lazy load that completes after its ref proxy expires", async () => {
+        vi.useFakeTimers();
+        try {
+          const resolvers: Array<(value: Author) => void> = [];
+          adapter.findById = vi.fn(
+            () =>
+              new Promise<Author>((resolve) => {
+                resolvers.push(resolve);
+              }),
+          ) as any;
+          const article = Article.hydrate(adapter, {
+            title: "x",
+            author: "patient-ref",
+          });
+          const retained = article.author;
+
+          let priorLoad: Promise<unknown> | null = null;
+          try {
+            void (retained as any).name;
+          } catch (error) {
+            priorLoad = error as Promise<unknown>;
+          }
+          await vi.advanceTimersByTimeAsync(30_000);
+          resolvers[0]!(
+            Author.hydrate(adapter, {
+              id: "patient-ref",
+              name: "Expired late secret",
+            }),
+          );
+          await priorLoad;
+
+          let freshLoad: Promise<unknown> | null = null;
+          try {
+            void (retained as any).name;
+          } catch (error) {
+            freshLoad = error as Promise<unknown>;
+          }
+          expect(adapter.findById).toHaveBeenCalledTimes(2);
+          resolvers[1]!(
+            Author.hydrate(adapter, {
+              id: "patient-ref",
+              name: "Fresh projection",
+            }),
+          );
+          await freshLoad;
+          expect((retained as any).name).toBe("Fresh projection");
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it("does not let an older proxy expiry delete its replacement", async () => {
+        vi.useFakeTimers();
+        try {
+          const firstArticle = Article.hydrate(adapter, {
+            title: "first",
+            author: { id: "patient-ref", name: "First projection" },
+          });
+          expect((firstArticle.author as any).name).toBe("First projection");
+          const namespace = (Model as any).__refCaches.get(adapter);
+          const cacheKey = JSON.stringify(["author", "patient-ref"]);
+
+          await vi.advanceTimersByTimeAsync(10_000);
+          namespace.entries.delete(cacheKey);
+          const replacementArticle = Article.hydrate(adapter, {
+            title: "replacement",
+            author: { id: "patient-ref", name: "Replacement projection" },
+          });
+          const replacement = replacementArticle.author;
+          expect((replacement as any).name).toBe("Replacement projection");
+
+          await vi.advanceTimersByTimeAsync(20_000);
+
+          expect(namespace.entries.get(cacheKey)?.value).toBe(replacement);
+          expect((replacement as any).name).toBe("Replacement projection");
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it("fences a late lazy load after the adapter cache is cleared", async () => {
+        let resolveLoad: (value: Author) => void = () => undefined;
+        const findById = vi.fn(
+          () =>
+            new Promise<Author>((resolve) => {
+              resolveLoad = resolve;
+            }),
+        );
+        adapter.findById = findById as any;
+        const article = Article.hydrate(adapter, {
+          title: "x",
+          author: "patient-ref",
+        });
+        const retained = article.author;
+
+        let loading: Promise<unknown> | null = null;
+        try {
+          void (retained as any).name;
+        } catch (error) {
+          loading = error as Promise<unknown>;
+        }
+        expect(loading).not.toBeNull();
+        Model.clearRefCache(adapter);
+        resolveLoad(
+          Author.hydrate(adapter, {
+            id: "patient-ref",
+            name: "Late patient secret",
+          }),
+        );
+        await loading;
+
+        expect(() => (retained as any).name).toThrow(
+          "Model reference invalidated by an authorization boundary",
+        );
+
+        const fresh = Article.hydrate(adapter, {
+          title: "fresh",
+          author: "patient-ref",
+        });
+        try {
+          void (fresh.author as any).name;
+        } catch (error) {
+          if (!(error && typeof (error as any).then === "function")) {
+            throw error;
+          }
+        }
+        expect(findById).toHaveBeenCalledTimes(2);
+      });
+
       it("falls through to lazy load when the field is reassigned to a bare string id", () => {
         const findByIdSpy = vi.fn(async (_cls: any, _id: string) => null);
         const oldFindById = adapter.findById;
@@ -818,8 +1067,8 @@ describe("Model", () => {
           expect((article.author as any).name).toBe("Alice");
           expect(findByIdSpy).not.toHaveBeenCalled();
           // Reassign to a different id — must shed the pre-hydrated
-          // proxy. The Model __refCache is module-scoped and keyed
-          // by `${type}:${id}`; even if a prior test cached "a2",
+          // proxy. The Model ref cache is adapter-scoped and keyed
+          // by a structured [type,id] tuple; even if a prior test cached "a2",
           // the reassignment invalidates the instance-level cache
           // and a new read mints a fresh lazy proxy.
           article.author = "a2" as any;

@@ -38,7 +38,9 @@ Redis-backed cross-process event bus + distributed lock. Falls back to an in-pro
   connections are up.
 
 ```typescript
-const off = pubsub.on("some:event", (a, b) => { /* ... */ });
+const off = pubsub.on("some:event", (a, b) => {
+  /* ... */
+});
 pubsub.emit("some:event", a, b);
 off(); // unsubscribe
 ```
@@ -66,7 +68,9 @@ try {
 
 ```typescript
 const won = await pubsub.tryLock(`cron:tick:${ts}`, 60_000); // SET NX EX
-if (won) { /* only one contender per key+window runs */ }
+if (won) {
+  /* only one contender per key+window runs */
+}
 ```
 
 `SET NX EX` semantics with Redis (auto-released on TTL); a per-key expiry `Map` in the
@@ -89,9 +93,9 @@ type ChangeOp = "insert" | "update" | "delete";
 type ChangeSource = "hook" | "listen";
 
 interface Change {
-  table: string;     // DB table name == pluralize(Model.type)
+  table: string; // DB table name == pluralize(Model.type)
   op: ChangeOp;
-  id: string;        // row id
+  id: string; // row id
   requestId: string; // per-write tag, used to dedup the LISTEN echo
   source: ChangeSource;
 }
@@ -133,24 +137,31 @@ and emits Changes with `source: "listen"`; hook-path echoes are dropped by reque
 
 Source: `packages/backend/src/services/subscriptions.ts`
 
-The heart of realtime list updates. Caches each distinct query once and shares it across all
-sockets that ask for it (subscribers are a ref-counted `Set<socketId>`).
+The heart of realtime list updates. Cached results are scoped to the SQL, expand shape,
+minimal sanitization principal, and exact reconciled socket-session lease. They are never
+reused across authorization boundaries, including same-user role/token rotation.
 
 ### Subscription hash
 
-A subscription is keyed by `hashFrom(query.exec().toSQL(), expand)`:
+A subscription is keyed by `hashFrom(query.exec().toSQL(), expand, principalId, sessionLease)`:
 
-- SHA-256 of `JSON.stringify({ sql, bindings, expand })`, truncated to **16 hex chars**.
+- SHA-256 of `JSON.stringify({ sql, bindings, expand, principalId, sessionLease })`,
+  truncated to **16 hex chars**.
 - `sql` + `bindings` come from the query chain's `toSQL()`.
 - `expand` is a sorted key derived from `.expand(...)` projections (per-ref projection field
   lists are sorted so caller argument order doesn't matter). A `.find()` and a
   `.find().expand("file")` therefore hash differently and never share a cache entry.
+- `principalId` is the only user field retained by the cache and is passed to every parent
+  and expanded-ref `sanitize()` call.
+- `sessionLease` changes on every socket reconciliation. Production uses the socket id plus
+  the reconciler operation, so a delayed prior-session re-eval cannot target its replacement.
 
 Clients subscribe to the Socket.IO event `query:${hash}`.
 
 ### Subscribe
 
-`subscribe({ socketId, query, expand?, steps? }, { force? })` → `{ hash, items }`.
+`subscribe({ socketId, sessionLease, principal, query, expand?, steps? }, { force? })`
+→ `{ hash, items, subscriptionCreated }`.
 
 1. Compute the hash. Enforce the per-socket cap **before** the cache lookup (see below).
 2. Cache hit → add the socket to `subscribers`; if `steps` carry `.orderBy(false)` the
@@ -159,16 +170,18 @@ Clients subscribe to the Socket.IO event `query:${hash}`.
 3. Cache miss → execute the query, sanitize rows, store them in a `Map<id, row>` (iteration
    order is the DB return order), index by model type, and (if any `.expand(...)`) index by
    each expanded target type.
-4. Join the Socket.IO room `query:${hash}` (room-aware backend).
-5. Return `{ hash, items: [...cached.result.values()] }`.
+4. Return the cached rows and whether this call newly attached the socket. There is no
+   query-room membership; re-eval targets the exact current logical socket-id set.
 
 ### Per-socket subscription cap
 
 `DEFAULT_MAX_SUBSCRIPTIONS_PER_SOCKET = 500` distinct hashes per socket. Hitting it logs a
-warning and silently returns an empty result for the new query (a runaway-render loop or an
-attack — not a legitimate case). Sized for SPA navigation given the SDK's ~60s GC keep-warm.
+generic warning and rejects with a safe **429** `ClientError`; it never fabricates a successful
+empty clinical result. Sized for SPA navigation given the SDK's ~60s GC keep-warm.
 Overridable via `ManagerOptions.maxSubscriptionsPerSocket` /
-`PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET`.
+`PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET`. Direct options and environment overrides must be
+positive safe integers; invalid values fail startup rather than disabling the cap or
+deadlocking the re-eval semaphore.
 
 ### On model change → coalesced re-eval
 
@@ -238,23 +251,33 @@ is suppressed entirely.
 
 ### Emit fan-out
 
-With a room-aware backend, `_reeval` broadcasts once via `emitToRoom("query:${hash}", ...)`
-(Socket.IO walks the room's socket set) — O(1) emits regardless of subscriber count. Without
-rooms it falls back to one `emitToSocket(socketId, ...)` per subscriber. In `app.ts` these
-map to `io.to(room).emit(...)` / `io.to(socketId).emit(...)`.
+`_reeval` snapshots the current logical subscriber ids only after its async query finishes.
+The app sends one exact-target batch through `io.to(socketIds).emit(...)`; the legacy bare
+callback form falls back to one `emitToSocket(socketId, ...)` per current subscriber.
+Query-specific Socket.IO rooms are deliberately not used because asynchronous room leave
+can outlive an authorization boundary. Custom route rooms remain separately session-fenced.
 
 ### Expand hydration
 
-`_execQuery` runs `query.clone().find()`, calls each model's `sanitize()`, and — when the
+`_execQuery` runs `query.clone().find()`, calls each model's `sanitize(principal)`, and — when the
 subscription carried `.expand(...)` — builds an **ephemeral** `RefLoader` (re-eval fires
 outside any request scope, so `getRefLoader()` is unavailable) and runs `hydrateExpansions`
-to inline linked rows. The only expanded ref in production today is `File` (no private fields).
+with that same principal to inline linked rows. Initial subscribed results and later re-evals
+therefore use one authorization-scoped projection pipeline; there is no second request-side
+hydration pass that can mutate cached row aliases. Realtime rows without `sanitize()`, or
+whose custom sanitizer returns a non-object, fail closed; this path never falls back to raw
+`__data`.
 
 ### Teardown
 
-`unsubscribe(socketId, hash)` / `unsubscribeAll(socketId)` remove the socket, leave the room,
-and — when the last subscriber leaves — tear down coalescing timers and drop the cached query
-from all indexes. `disconnect` calls `unsubscribeAll`.
+`unsubscribe(socketId, hash)` / `unsubscribeAll(socketId)` remove the socket and — when the
+last subscriber leaves — tear down coalescing timers and drop the cached query from all
+indexes. `disconnect` calls `unsubscribeAll`. The SDK sends `unsubscribe:query` only while
+the same owner/session version is still reconciled; boundary cleanup relies on hello's
+server-side `unsubscribeAll` and never sends a stale-session unsubscribe. Boundary cleanup
+also detaches the old reservation map immediately, so a stalled old-session query cannot
+consume the new session's per-socket quota; old completions are identity-fenced from the new
+map and abort before attachment.
 
 ---
 
@@ -269,9 +292,11 @@ the HTTP LIST handler and the socket `resync` handler share one code path:
   `{ query, countQuery, expandResolved, steps }`. Pure step manipulation: normalises raw
   steps (array or JSON string), peels `.expand(...)` off the SQL replay, and builds a parallel
   count chain with `limit`/`offset` stripped.
-- **`runQuerySubscription({ prep, socketId, user, adapter, force? })`** →
-  `{ items, hash, totalCount }`. Runs `adapter.subscriptions.subscribe(...)` and
-  `countQuery.count()` in parallel, then hydrates request-side expansions on the returned items.
+- **`runQuerySubscription({ prep, socketId, sessionLease, user, adapter, force? })`** →
+  `{ items, hash, totalCount, subscriptionCreated, attachmentGeneration,
+attachmentOwnedByCaller }`. Completes the fallible count before committing a subscription,
+  then returns the manager's single principal/session-scoped projection. Generation plus
+  owner identity makes batch rollback conditional on that exact owned commit.
 
 Consolidating these fixed a reconnect bug where `resync` served un-expanded rows
 (`.expand("file")` projections snapping to `null` on every reconnect).
@@ -283,12 +308,14 @@ The auto-CRUD LIST route (`adapters/routes.ts`) returns, for a socket-bound requ
 ```jsonc
 {
   "result": {
-    "total": 12,              // items.length on this page
-    "totalCount": 137,        // filter-matched count, ignoring limit/offset
+    "total": 12, // items.length on this page
+    "totalCount": 137, // filter-matched count, ignoring limit/offset
     "__queryHash": "a1b2c3d4e5f60718",
-    "<pluralize(type)>": [ /* items */ ]   // e.g. "projectAssets": [...]
+    "<pluralize(type)>": [
+      /* items */
+    ], // e.g. "projectAssets": [...]
   },
-  "success": true
+  "success": true,
 }
 ```
 
@@ -304,7 +331,7 @@ names) — **not** `type + "s"`. The non-socket fetch fallback returns the same 
 Source: `packages/backend/src/app.ts` (`server.io.on("connection")`), `socket-fake-res.ts`
 
 Socket calls are piped through Polka's HTTP handler using fake req/res objects, so socket and
-REST traffic run through the *same* middleware, auth, auto-CRUD, and custom routes — one route
+REST traffic run through the _same_ middleware, auth, auto-CRUD, and custom routes — one route
 definition serves both transports.
 
 ```typescript
@@ -312,13 +339,16 @@ socket.on("call", async (requestId, method, path, data) => {
   const fakeReq = {
     method: method.toUpperCase(),
     url: path,
-    headers: { ...socket.handshake.headers, "content-type": "application/json" },
+    headers: {
+      ...socket.handshake.headers,
+      "content-type": "application/json",
+    },
     body: data,
-    query: mergedQuery,        // URL query merged with `data` for GET
+    query: mergedQuery, // URL query merged with `data` for GET
     _socketQuery: mergedQuery, // real query stashed; Polka clobbers req.query
-    session: socketSession,    // per-socket session from the `hello` handshake
-    _socketRpc: true,          // marker: skip auth-middleware token resolution
-    _socketId: socket.id,      // LIST handler keys the subscription on this
+    session: socketSession, // per-socket session from the `hello` handshake
+    _socketRpc: true, // marker: skip auth-middleware token resolution
+    _socketId: socket.id, // LIST handler keys the subscription on this
     _parsedUrl: { pathname, query: qs || "", _raw: path },
   };
   const fakeRes = createSocketFakeRes(socket, requestId);
@@ -339,18 +369,25 @@ socket.on("call", async (requestId, method, path, data) => {
 1. Client connects via Socket.IO.
 2. Client emits **`hello`** with `{ token }` (once per (re)connection; reconnects get a fresh
    `hello` automatically).
-3. Server calls `authAdapter.resolveToken(token)` and binds the result to a per-socket
-   `socketSession` (a closure variable, not `socket.session`). A missing/failed token leaves
-   it `null` (anonymous).
-4. Server acks `{ userId }` — the resolved user id, or `null` when anonymous.
-5. The SDK's session machine transitions to `authenticated` / `anonymous`.
+3. Starting `hello` synchronously invalidates the prior socket-session generation and query
+   state. It removes every prior query subscription and awaits pending custom-room mutations
+   before removing non-intrinsic custom rooms. Cleanup failure disconnects the socket and
+   does not publish a new session.
+4. Server calls `authAdapter.resolveToken(token)` and commits the result only if this is
+   still the newest started `hello`. A missing token or failed provider resolution is
+   bound as anonymous, never as an authenticated session.
+5. Server acks `{ userId, stale: false }` for the applied generation. A superseded
+   callback receives only `{ userId: null, stale: true }`; it never reveals the newer
+   session. The SDK rejects stale acknowledgements and ignores superseded token reads
+   before transitioning its session machine to `authenticated` / `anonymous`.
 
 (There is no `authenticate` event and no `auth.ready` gate — that was old behavior.)
 
 ### Reconnect / resync
 
-On reconnect, the SDK fires `_onResyncRequired(client)`, which batches **every** live
-`useQuery` cache entry (`refs > 0`, has a chain) into **one** `resync` RPC:
+On reconnect, the SDK fires `_onResyncRequired(client)`, which batches that exact
+client's live `useQuery` cache entries (`refs > 0`, has a chain) into **one**
+`resync` RPC:
 
 ```typescript
 client.resync([{ key, modelType, steps, queryHash }, ...]);
@@ -358,16 +395,33 @@ client.resync([{ key, modelType, steps, queryHash }, ...]);
 
 The server's `resync` handler:
 
-1. Installs a request-scoped context (`runWithRequestContext` with a fresh `RefLoader`) so
+1. Rejects malformed or oversized batches before query preparation/DB work. The entry limit
+   matches the configured per-socket subscription cap and also covers `subscribe: false`.
+2. Installs a request-scoped context (`runWithRequestContext` with a fresh `RefLoader`) so
    expansion hydration works outside an HTTP request.
-2. For each entry, re-runs `ModelClass.scope.read(...)`, then `prepareClientQuery` +
+3. For each entry, re-runs `ModelClass.scope.read(...)`, then `prepareClientQuery` +
    `runQuerySubscription` against the **new** socket id — re-evaluating each query and
    re-binding its subscription on the reconnected socket.
-3. Acks `{ success: true, results: [{ key, hash, items, totalCount }] }`.
+4. Returns one result per input. Scope/model/subscription denial is explicit as
+   `{ authorized: false, hash: null, items: [], totalCount: 0 }`.
+5. Acks `{ success: true, results }` only if the socket-session generation is still current.
+   If a later batch entry fails, earlier attachments created by that batch roll back. The
+   same adapter/socket rejects an overlapping resync (including after a same-socket session
+   rotation) instead of retaining an unbounded queue behind a stalled query. Each batch has
+   an opaque attachment-owner token:
+   duplicate hashes remain rollback-eligible, while a concurrent LIST reuse permanently
+   adopts the attachment so the failed batch cannot remove it. Rollback removes only the
+   latest exact attachment still owned by that batch; a successful batch relinquishes its
+   token immediately.
 
 The client reconciles each result back into its cache and, if the hash changed, disposes the
-old `query:${oldHash}` listener and subscribes to the new one. This is what re-hydrates
-`.expand(...)` projections after a reconnect.
+old `query:${oldHash}` listener and subscribes to the new one. Each continuation verifies
+that the same cache entry is still active, so an authorization purge cannot be undone by a
+late resync response. This is what re-hydrates `.expand(...)` projections after a
+reconnect. Denied, omitted, or failed results scrub all prior arrays in place and detach
+listeners; a throwing consumer callback cannot prevent sibling entries from being scrubbed.
+A later mount or prefetch refetches a denied dynamic entry whose subscription hash was
+cleared, rather than waiting on the terminal cache state.
 
 Other socket events on the connection: `unsubscribe:query` (`{ hash }` →
 `subscriptions.unsubscribe`), `disconnect` (`subscriptions.unsubscribeAll`), and any
@@ -379,12 +433,15 @@ Other socket events on the connection: `unsubscribe:query` (`{ hash }` →
 
 Source: `packages/sdk/src/react/useQuery.ts`
 
-A module-level `Map` cache, keyed by `${modelType}:${userId ?? "anon"}:${JSON.stringify(steps)}`.
-Entries are ref-counted and shared across components issuing the same query.
+A module-level `Map` cache with an opaque structured identity containing the exact client
+instance, exact owner (`string | null`), model type, serialized steps, and
+subscribed/static mode. Entries are ref-counted and shared only when that complete identity
+matches.
 
 ### Lifecycle
 
-1. **Fetch** — `doFetch` calls `chain.find()`. The result array carries `__queryHash` and
+1. **Fetch** — `doFetch` replays lazy/foreign-adapter chains through the exact owning
+   client's adapter, then calls `find()`. The result array carries `__queryHash` and
    `__totalCount`. Items are reconciled into the entry (`SYM_SERVER_MERGE` updates existing
    model instances in place; membership changes flip the array identity).
 2. **Subscribe** — once a `__queryHash` arrives (and differs from the entry's current hash),
@@ -415,7 +472,14 @@ the tab is hidden or the transport is disconnected.
 
 - Ref-counted; `GC_DELAY = 60_000`ms after the last subscriber unmounts before the entry is
   disposed and deleted (cheap back-navigation; keeps subscriptions warm).
-- `_purgeCacheForUser(prevUserId)` drops every entry keyed for a previous user on a session
-  transition (sign-out / user switch).
+- `_purgeCacheForUser(client, prevUserId)` synchronously scrubs and removes the exact
+  `(client, owner)` entries on every authorization boundary, including anonymous and
+  same-owner token/role rotation. It clears timers, listeners, optimistic/server arrays,
+  errors, chain references, and client/owner references before isolated notifications and
+  disposers run.
+- Fetch, retry, subscription, prefetch, and resync continuations commit only while their
+  original entry is still active.
 - Failed fetches retry up to `MAX_RETRIES = 3` times with `[1s, 3s, 10s]` backoff.
-- `prefetch(client, chain)` warms an entry outside React.
+- `prefetch(client, chain)` waits for the current server-confirmed reconciliation before
+  reading the owner. Direct clients are observed too, so their prefetched entries purge on
+  reconciliation, termination, or owner change.

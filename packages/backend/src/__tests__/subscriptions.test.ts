@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { QuerySubscriptionManager } from "../services/subscriptions";
+import {
+  QuerySubscriptionManager,
+  requirePositiveSafeInteger,
+} from "../services/subscriptions";
 
 // ─── Mock Data ───────────────────────────────────────────────────────────────
 
@@ -96,9 +99,150 @@ describe("QuerySubscriptionManager", () => {
     );
   });
 
+  describe("configuration", () => {
+    it.each(["", "not-a-number", "0", "-1", "1.5", "9007199254740992"])(
+      "rejects invalid positive-integer input %j",
+      (value) => {
+        expect(() =>
+          requirePositiveSafeInteger(value, "PARCAE_TEST_LIMIT"),
+        ).toThrow("PARCAE_TEST_LIMIT must be a positive safe integer");
+      },
+    );
+
+    it("rejects invalid direct manager limits instead of failing open", () => {
+      expect(
+        () =>
+          new QuerySubscriptionManager(
+            vi.fn((_socketId: string, _event: string, _data: any) => {}),
+            {
+              reevalConcurrency: Number.NaN,
+            },
+          ),
+      ).toThrow("reevalConcurrency must be a positive safe integer");
+      expect(
+        () =>
+          new QuerySubscriptionManager(
+            vi.fn((_socketId: string, _event: string, _data: any) => {}),
+            {
+              maxSubscriptionsPerSocket: Number.POSITIVE_INFINITY,
+            },
+          ),
+      ).toThrow("maxSubscriptionsPerSocket must be a positive safe integer");
+    });
+  });
+
   // ── Subscribe ──────────────────────────────────────────────────────
 
   describe("subscribe", () => {
+    it("does not commit a subscription after its socket auth boundary changes", async () => {
+      let releaseQuery: () => void = () => undefined;
+      const queryReleased = new Promise<void>((resolve) => {
+        releaseQuery = resolve;
+      });
+      let queryStarted = false;
+      let sessionActive = true;
+      const query: any = {
+        __modelType: "project",
+        exec: () => ({
+          toSQL: () => ({
+            sql: "SELECT * FROM projects WHERE owner = 'user-1'",
+            bindings: [],
+          }),
+        }),
+        clone: () => query,
+        find: async () => {
+          queryStarted = true;
+          await queryReleased;
+          return [
+            {
+              __data: row("p1", { owner: "user-1" }),
+              sanitize: () => row("p1", { owner: "user-1" }),
+            },
+          ];
+        },
+      };
+
+      const subscription = manager.subscribe({
+        socketId: "shared-socket",
+        query,
+        isActive: () => sessionActive,
+      });
+      await vi.waitFor(() => expect(queryStarted).toBe(true));
+
+      sessionActive = false;
+      releaseQuery();
+
+      await expect(subscription).rejects.toThrow(
+        "session changed before subscription commit",
+      );
+      expect(manager.stats.queries).toBe(0);
+      expect(manager.stats.subscribers).toBe(0);
+      expect(manager.stats.sockets).toBe(0);
+    });
+
+    it("does not let a delayed prior-session re-eval target a replacement session", async () => {
+      let releaseReeval: () => void = () => undefined;
+      const reevalReleased = new Promise<void>((resolve) => {
+        releaseReeval = resolve;
+      });
+      let calls = 0;
+      let reevalStarted = false;
+      const query: any = {
+        __modelType: "project",
+        exec: () => ({
+          toSQL: () => ({ sql: "SELECT * FROM projects", bindings: [] }),
+        }),
+        clone: () => query,
+        find: async () => {
+          calls++;
+          if (calls === 2) {
+            reevalStarted = true;
+            await reevalReleased;
+          }
+          return [
+            {
+              sanitize: () => row("p1", { revision: calls }),
+            },
+          ];
+        },
+      };
+      const emitted: string[][] = [];
+      const guardedManager = new QuerySubscriptionManager(
+        {
+          emitToSocket: vi.fn(),
+          emitToSockets: (socketIds) => emitted.push([...socketIds]),
+        },
+        { debounceMs: 0, maxWaitMs: 0 },
+      );
+
+      const prior = await guardedManager.subscribe({
+        socketId: "shared-socket",
+        sessionLease: "shared-socket:operation-1",
+        principal: { id: "same-user" },
+        query,
+      });
+      guardedManager.onModelChange("project");
+      await vi.waitFor(() => expect(reevalStarted).toBe(true));
+
+      await guardedManager.unsubscribeAll("shared-socket");
+      const replacement = await guardedManager.subscribe({
+        socketId: "shared-socket",
+        sessionLease: "shared-socket:operation-2",
+        principal: { id: "same-user" },
+        query,
+      });
+      releaseReeval();
+      await tick();
+
+      expect(replacement.hash).not.toBe(prior.hash);
+      expect(emitted).toEqual([]);
+      expect(guardedManager.stats).toEqual({
+        queries: 1,
+        subscribers: 1,
+        sockets: 1,
+      });
+    });
+
     it("should return initial query results and a hash", async () => {
       source.setResults([
         row("p1", { name: "Project 1" }),
@@ -117,21 +261,154 @@ describe("QuerySubscriptionManager", () => {
       expect(sub.items[1]).toEqual({ id: "p2", name: "Project 2" });
     });
 
+    it("fails closed instead of exposing raw rows when sanitize is missing or invalid", async () => {
+      const raw = {
+        id: "patient-row",
+        secret: "must-never-leave-the-server",
+      };
+      const invalidRows = [
+        { __data: raw },
+        { __data: raw, sanitize: () => undefined },
+      ];
+
+      for (const [index, invalidRow] of invalidRows.entries()) {
+        const query: any = {
+          __modelType: "project",
+          exec: () => ({
+            toSQL: () => ({
+              sql: `SELECT * FROM projects WHERE invalid = ${index}`,
+              bindings: [],
+            }),
+          }),
+          clone: () => query,
+          find: async () => [invalidRow],
+        };
+
+        await expect(
+          manager.subscribe({
+            socketId: `invalid-${index}`,
+            query,
+          }),
+        ).rejects.toThrow(/sanitize/);
+      }
+
+      expect(manager.stats).toEqual({
+        queries: 0,
+        subscribers: 0,
+        sockets: 0,
+      });
+      expect(emitted).toEqual([]);
+    });
+
     it("should deduplicate subscriptions with same query", async () => {
       source.setResults([row("p1")]);
 
       const sub1 = await manager.subscribe({
         socketId: "s1",
+        sessionLease: "shared-session",
         query: source.query("project"),
       });
       const sub2 = await manager.subscribe({
         socketId: "s2",
+        sessionLease: "shared-session",
         query: source.query("project"),
       });
 
       expect(sub1.hash).toBe(sub2.hash);
       expect(manager.stats.queries).toBe(1);
       expect(manager.stats.subscribers).toBe(2);
+    });
+
+    it("isolates same-SQL parent and expanded-ref projections by principal", async () => {
+      let revision = 1;
+      const privateOwnerId = "user-1";
+      const query: any = {
+        __modelType: "project",
+        __adapter: {
+          batchFindByType: async () =>
+            new Map([
+              [
+                "clinician-1",
+                {
+                  sanitize: async (principal?: { id: string }) => ({
+                    id: "clinician-1",
+                    type: "user",
+                    displayName: `Clinician ${revision}`,
+                    ...(principal?.id === privateOwnerId
+                      ? { privateEmail: `private-${revision}@example.test` }
+                      : {}),
+                  }),
+                },
+              ],
+            ]),
+        },
+        exec: () => ({
+          toSQL: () => ({ sql: "SELECT * FROM projects", bindings: [] }),
+        }),
+        clone: () => query,
+        find: async () => [
+          {
+            sanitize: async (principal?: { id: string }) => ({
+              id: "p1",
+              name: `Project ${revision}`,
+              clinician: "clinician-1",
+              ...(principal?.id === privateOwnerId
+                ? { privateNote: `owner-only-${revision}` }
+                : {}),
+            }),
+          },
+        ],
+      };
+      const expand = [
+        {
+          refField: "clinician",
+          targetType: "user",
+          targetClass: {} as any,
+          projection: null,
+        },
+      ];
+
+      const owner = await manager.subscribe({
+        socketId: "shared-socket",
+        sessionLease: "shared-authorization-snapshot",
+        principal: { id: privateOwnerId },
+        query,
+        expand,
+      });
+      const other = await manager.subscribe({
+        socketId: "shared-socket",
+        sessionLease: "shared-authorization-snapshot",
+        principal: { id: "user-2" },
+        query,
+        expand,
+      });
+
+      expect(owner.hash).not.toBe(other.hash);
+      expect(owner.items[0]).toMatchObject({
+        privateNote: "owner-only-1",
+        clinician: { privateEmail: "private-1@example.test" },
+      });
+      expect(other.items[0]).not.toHaveProperty("privateNote");
+      expect(other.items[0]!.clinician).not.toHaveProperty("privateEmail");
+
+      revision = 2;
+      manager.onModelChange("project");
+      await tick();
+
+      const ownerFrame = emitted.find(
+        (frame) => frame.event === `query:${owner.hash}`,
+      );
+      const otherFrame = emitted.find(
+        (frame) => frame.event === `query:${other.hash}`,
+      );
+      expect(ownerFrame).toBeDefined();
+      expect(otherFrame).toBeDefined();
+      expect(JSON.stringify(ownerFrame!.data)).toContain("owner-only-2");
+      expect(JSON.stringify(ownerFrame!.data)).toContain(
+        "private-2@example.test",
+      );
+      expect(JSON.stringify(otherFrame!.data)).not.toContain("owner-only");
+      expect(JSON.stringify(otherFrame!.data)).not.toContain("private-");
     });
 
     it("should create separate subscriptions for different queries", async () => {
@@ -165,7 +442,7 @@ describe("QuerySubscriptionManager", () => {
       expect(manager.stats.queries).toBe(2);
     });
 
-    it("caps subscriptions per socket and returns empty items on overflow", async () => {
+    it("caps subscriptions per socket with an explicit client error", async () => {
       // Use a small explicit cap so we don't burn time creating 500
       // distinct queries (the default in production). The
       // configurability itself is what's being tested — runaway
@@ -186,13 +463,15 @@ describe("QuerySubscriptionManager", () => {
       }
       expect(cappedManager.stats.queries).toBe(CAP);
 
-      // The (CAP+1)th subscription is rejected — returns the hash so
-      // the client can correlate but with an empty items list.
-      const overflow = await cappedManager.subscribe({
-        socketId: "attacker",
-        query: source.query("project", `bucket_overflow`),
+      await expect(
+        cappedManager.subscribe({
+          socketId: "attacker",
+          query: source.query("project", `bucket_overflow`),
+        }),
+      ).rejects.toMatchObject({
+        status: 429,
+        message: "Realtime query subscription limit reached",
       });
-      expect(overflow.items).toEqual([]);
       // The rejected subscription was NOT cached server-side.
       expect(cappedManager.stats.queries).toBe(CAP);
 
@@ -227,11 +506,334 @@ describe("QuerySubscriptionManager", () => {
       });
       expect(dup.items).toHaveLength(1);
     });
+
+    it("reserves cap slots before concurrent query execution", async () => {
+      let releaseQueries: () => void = () => undefined;
+      const queriesReleased = new Promise<void>((resolve) => {
+        releaseQueries = resolve;
+      });
+      const makeDelayedQuery = (identity: string) => {
+        const query: any = {
+          __modelType: "project",
+          exec: () => ({
+            toSQL: () => ({ sql: identity, bindings: [] }),
+          }),
+          clone: () => query,
+          find: async () => {
+            await queriesReleased;
+            return [{ sanitize: () => row(identity) }];
+          },
+        };
+        return query;
+      };
+      const capped = new QuerySubscriptionManager(
+        (_socketId, _event, _data) => {},
+        {
+          debounceMs: 0,
+          maxWaitMs: 0,
+          maxSubscriptionsPerSocket: 3,
+        },
+      );
+
+      const accepted = [0, 1, 2].map((index) =>
+        capped.subscribe({
+          socketId: "one-socket",
+          query: makeDelayedQuery(`query-${index}`),
+        }),
+      );
+      const overflow = capped.subscribe({
+        socketId: "one-socket",
+        query: makeDelayedQuery("query-overflow"),
+      });
+      await expect(overflow).rejects.toMatchObject({ status: 429 });
+      releaseQueries();
+      await Promise.all(accepted);
+
+      expect(capped.stats).toEqual({
+        queries: 3,
+        subscribers: 3,
+        sockets: 1,
+      });
+    });
+
+    it("retains a shared reservation when its first same-hash contender fails", async () => {
+      let rejectFirst: (reason: Error) => void = () => undefined;
+      let releaseSecond: () => void = () => undefined;
+      let calls = 0;
+      const sharedQuery: any = {
+        __modelType: "project",
+        exec: () => ({
+          toSQL: () => ({ sql: "shared-query", bindings: [] }),
+        }),
+        clone: () => sharedQuery,
+        find: () => {
+          calls++;
+          if (calls === 1) {
+            return new Promise((_resolve, reject) => {
+              rejectFirst = reject;
+            });
+          }
+          return new Promise((resolve) => {
+            releaseSecond = () => resolve([{ sanitize: () => row("shared") }]);
+          });
+        },
+      };
+      const differentQuery: any = {
+        __modelType: "project",
+        exec: () => ({
+          toSQL: () => ({ sql: "different-query", bindings: [] }),
+        }),
+        clone: () => differentQuery,
+        find: async () => [{ sanitize: () => row("different") }],
+      };
+      const capped = new QuerySubscriptionManager(
+        (_socketId, _event, _data) => {},
+        {
+          debounceMs: 0,
+          maxWaitMs: 0,
+          maxSubscriptionsPerSocket: 1,
+        },
+      );
+
+      const first = capped.subscribe({
+        socketId: "one-socket",
+        query: sharedQuery,
+      });
+      const firstRejected = expect(first).rejects.toThrow("first failed");
+      const second = capped.subscribe({
+        socketId: "one-socket",
+        query: sharedQuery,
+      });
+      await vi.waitFor(() => expect(calls).toBe(2));
+
+      rejectFirst(new Error("first failed"));
+      await firstRejected;
+      await expect(
+        capped.subscribe({
+          socketId: "one-socket",
+          query: differentQuery,
+        }),
+      ).rejects.toMatchObject({ status: 429 });
+
+      releaseSecond();
+      await expect(second).resolves.toMatchObject({
+        items: [row("shared")],
+      });
+      expect(capped.stats).toEqual({
+        queries: 1,
+        subscribers: 1,
+        sockets: 1,
+      });
+    });
+
+    it("detaches stalled old-session reservations without deleting the new map", async () => {
+      let releaseOld: () => void = () => undefined;
+      let releaseNew: () => void = () => undefined;
+      let oldStarted = false;
+      let newStarted = false;
+      const oldGate = new Promise<void>((resolve) => {
+        releaseOld = resolve;
+      });
+      const newGate = new Promise<void>((resolve) => {
+        releaseNew = resolve;
+      });
+      const delayedQuery = (
+        identity: string,
+        gate: Promise<void>,
+        markStarted: () => void,
+      ) => {
+        const query: any = {
+          __modelType: "project",
+          exec: () => ({
+            toSQL: () => ({ sql: identity, bindings: [] }),
+          }),
+          clone: () => query,
+          find: async () => {
+            markStarted();
+            await gate;
+            return [{ sanitize: () => row(identity) }];
+          },
+        };
+        return query;
+      };
+      const immediateQuery = (identity: string) => {
+        const query: any = {
+          __modelType: "project",
+          exec: () => ({
+            toSQL: () => ({ sql: identity, bindings: [] }),
+          }),
+          clone: () => query,
+          find: async () => [{ sanitize: () => row(identity) }],
+        };
+        return query;
+      };
+      const capped = new QuerySubscriptionManager(
+        (_socketId, _event, _data) => {},
+        {
+          debounceMs: 0,
+          maxWaitMs: 0,
+          maxSubscriptionsPerSocket: 1,
+        },
+      );
+      const old = capped.subscribe({
+        socketId: "one-socket",
+        sessionLease: "old-session",
+        query: delayedQuery("old-query", oldGate, () => {
+          oldStarted = true;
+        }),
+      });
+      const oldRejected = expect(old).rejects.toThrow(
+        "Socket subscriptions cleared before commit",
+      );
+      await vi.waitFor(() => expect(oldStarted).toBe(true));
+
+      await capped.unsubscribeAll("one-socket");
+      const current = capped.subscribe({
+        socketId: "one-socket",
+        sessionLease: "new-session",
+        query: delayedQuery("new-query", newGate, () => {
+          newStarted = true;
+        }),
+        isActive: () => true,
+      });
+      await vi.waitFor(() => expect(newStarted).toBe(true));
+
+      releaseOld();
+      await oldRejected;
+      await expect(
+        capped.subscribe({
+          socketId: "one-socket",
+          sessionLease: "new-session",
+          query: immediateQuery("overflow-query"),
+        }),
+      ).rejects.toMatchObject({ status: 429 });
+
+      releaseNew();
+      await expect(current).resolves.toMatchObject({
+        items: [row("new-query")],
+      });
+      expect(capped.stats).toEqual({
+        queries: 1,
+        subscribers: 1,
+        sockets: 1,
+      });
+    });
+
+    it("merges concurrent same-hash cache misses without dropping a subscriber", async () => {
+      let releaseQueries: () => void = () => undefined;
+      const queriesReleased = new Promise<void>((resolve) => {
+        releaseQueries = resolve;
+      });
+      let started = 0;
+      const query: any = {
+        __modelType: "project",
+        exec: () => ({
+          toSQL: () => ({ sql: "SELECT * FROM projects", bindings: [] }),
+        }),
+        clone: () => query,
+        find: async () => {
+          started++;
+          await queriesReleased;
+          return [{ sanitize: () => row("p1") }];
+        },
+      };
+
+      const first = manager.subscribe({
+        socketId: "s1",
+        sessionLease: "shared-session",
+        query,
+      });
+      const second = manager.subscribe({
+        socketId: "s2",
+        sessionLease: "shared-session",
+        query,
+      });
+      await vi.waitFor(() => expect(started).toBe(2));
+      releaseQueries();
+      const [firstResult, secondResult] = await Promise.all([first, second]);
+
+      expect(firstResult.hash).toBe(secondResult.hash);
+      expect(manager.stats).toEqual({
+        queries: 1,
+        subscribers: 2,
+        sockets: 2,
+      });
+    });
   });
 
   // ── Unsubscribe ────────────────────────────────────────────────────
 
   describe("unsubscribe", () => {
+    it("does not roll back a later reuse of the same socket/hash", async () => {
+      source.setResults([row("p1")]);
+      const first = await manager.subscribe({
+        socketId: "s1",
+        sessionLease: "session-1",
+        query: source.query("project"),
+      });
+      const laterReuse = await manager.subscribe({
+        socketId: "s1",
+        sessionLease: "session-1",
+        query: source.query("project"),
+      });
+
+      expect(first.subscriptionCreated).toBe(true);
+      expect(laterReuse.subscriptionCreated).toBe(false);
+      expect(laterReuse.attachmentGeneration).toBeGreaterThan(
+        first.attachmentGeneration,
+      );
+
+      await manager.unsubscribeIfAttachmentCurrent(
+        "s1",
+        first.hash,
+        first.attachmentGeneration,
+      );
+
+      expect(manager.stats).toEqual({
+        queries: 1,
+        subscribers: 1,
+        sockets: 1,
+      });
+    });
+
+    it("cannot roll back an attachment after its batch owner commits", async () => {
+      source.setResults([row("p1")]);
+      const owner = {};
+      const created = await manager.subscribe({
+        socketId: "s1",
+        sessionLease: "session-1",
+        query: source.query("project"),
+        attachmentOwner: owner,
+      });
+      expect(created.attachmentOwnedByCaller).toBe(true);
+
+      manager.commitAttachmentOwner(
+        "s1",
+        created.hash,
+        created.attachmentGeneration,
+        owner,
+      );
+      const afterCommit = await manager.subscribe({
+        socketId: "s1",
+        sessionLease: "session-1",
+        query: source.query("project"),
+        attachmentOwner: owner,
+      });
+      expect(afterCommit.attachmentOwnedByCaller).toBe(false);
+
+      await manager.unsubscribeIfAttachmentCurrent(
+        "s1",
+        afterCommit.hash,
+        afterCommit.attachmentGeneration,
+        owner,
+      );
+      expect(manager.stats).toEqual({
+        queries: 1,
+        subscribers: 1,
+        sockets: 1,
+      });
+    });
+
     it("should remove a socket from a query subscription", async () => {
       source.setResults([row("p1")]);
       const sub = await manager.subscribe({
@@ -704,20 +1306,14 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("emits order array when only ordering changes (no membership change)", async () => {
-      source.setResults([
-        row("p1", { name: "A" }),
-        row("p2", { name: "B" }),
-      ]);
+      source.setResults([row("p1", { name: "A" }), row("p2", { name: "B" })]);
       await manager.subscribe({
         socketId: "s1",
         query: source.query("project"),
       });
 
       // Same membership, swapped order (e.g. orderBy on a mutable field).
-      source.setResults([
-        row("p2", { name: "B" }),
-        row("p1", { name: "A" }),
-      ]);
+      source.setResults([row("p2", { name: "B" }), row("p1", { name: "A" })]);
       manager.onModelChange("project");
       await tick();
 
@@ -729,20 +1325,14 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("omits order when membership and order are both stable", async () => {
-      source.setResults([
-        row("p1", { name: "A" }),
-        row("p2", { name: "B" }),
-      ]);
+      source.setResults([row("p1", { name: "A" }), row("p2", { name: "B" })]);
       await manager.subscribe({
         socketId: "s1",
         query: source.query("project"),
       });
 
       // Only p1 contents change. Order is identical.
-      source.setResults([
-        row("p1", { name: "A2" }),
-        row("p2", { name: "B" }),
-      ]);
+      source.setResults([row("p1", { name: "A2" }), row("p2", { name: "B" })]);
       manager.onModelChange("project");
       await tick();
 
@@ -882,10 +1472,12 @@ describe("QuerySubscriptionManager", () => {
       source.setResults([row("p1", { name: "A" })]);
       const sub1 = await manager.subscribe({
         socketId: "s1",
+        sessionLease: "shared-session",
         query: source.query("project"),
       });
       await manager.subscribe({
         socketId: "s2",
+        sessionLease: "shared-session",
         query: source.query("project"),
       });
       // Both sockets share one cache entry.
@@ -900,7 +1492,11 @@ describe("QuerySubscriptionManager", () => {
       // subscriber receives the update, and the response carries
       // the freshly-rebuilt items.
       const force = await manager.subscribe(
-        { socketId: "s1", query: source.query("project") },
+        {
+          socketId: "s1",
+          sessionLease: "shared-session",
+          query: source.query("project"),
+        },
         { force: true },
       );
 
@@ -926,6 +1522,7 @@ describe("QuerySubscriptionManager", () => {
       source.setResults([row("p1", { name: "A" })]);
       await manager.subscribe({
         socketId: "s1",
+        sessionLease: "shared-session",
         query: source.query("project"),
       });
 
@@ -933,6 +1530,7 @@ describe("QuerySubscriptionManager", () => {
       source.setResults([row("p1", { name: "A-drifted" })]);
       const refetch = await manager.subscribe({
         socketId: "s1",
+        sessionLease: "shared-session",
         query: source.query("project"),
       });
 
@@ -955,6 +1553,7 @@ describe("QuerySubscriptionManager", () => {
       source.setResults([row("p1")]);
       await manager.subscribe({
         socketId: "s1",
+        sessionLease: "shared-session",
         query: source.query("project"),
       });
 
@@ -966,6 +1565,7 @@ describe("QuerySubscriptionManager", () => {
 
       await manager.subscribe({
         socketId: "s2",
+        sessionLease: "shared-session",
         query: source.query("project"),
       });
 
@@ -978,7 +1578,7 @@ describe("QuerySubscriptionManager", () => {
   });
 });
 
-// ─── DOL-1047: concurrency cap + Socket.IO rooms ────────────────────────────
+// ─── DOL-1047: concurrency cap + exact Socket.IO targets ────────────────────
 //
 // Three new contracts pinned here:
 //
@@ -988,10 +1588,9 @@ describe("QuerySubscriptionManager", () => {
 //      `reevalConcurrency` (default 8), so the worst-case pool load
 //      from a write-storm stays bounded.
 //
-//   2. Socket.IO room broadcast — when the constructor is given an
-//      `emitToRoom` callback (and `joinRoom`/`leaveRoom`), every
-//      subscriber for a given cached query joins `query:${hash}` and
-//      re-eval emits ONCE via the room instead of N×emitToSocket.
+//   2. Exact-target batch broadcast — when the constructor is given an
+//      `emitToSockets` callback, re-eval targets the current logical
+//      subscriber ids once without retaining query-room memberships.
 //
 //   3. Per-row clone — `jsonClone` (JSON.parse(JSON.stringify(...)))
 //      gets replaced with a single recursive walker that converts
@@ -1025,9 +1624,7 @@ describe("QuerySubscriptionManager — re-eval concurrency cap (DOL-1047)", () =
                 inFlight++;
                 if (inFlight > peak) peak = inFlight;
                 if (!gateOpen) {
-                  await new Promise<void>((resolve) =>
-                    waiters.push(resolve),
-                  );
+                  await new Promise<void>((resolve) => waiters.push(resolve));
                 }
                 inFlight--;
                 return source.query("project").find();
@@ -1081,27 +1678,23 @@ describe("QuerySubscriptionManager — re-eval concurrency cap (DOL-1047)", () =
   });
 });
 
-describe("QuerySubscriptionManager — Socket.IO room broadcast (DOL-1047)", () => {
-  it("when emitToRoom is provided, emits ONCE per cached query (not per-subscriber)", async () => {
+describe("QuerySubscriptionManager — exact Socket.IO targets (DOL-1047)", () => {
+  it("emits once to the exact current subscriber set", async () => {
     const source = createQuerySource([row("p1", { name: "first" })]);
     const perSocket: Array<{ socketId: string; event: string }> = [];
-    const perRoom: Array<{ room: string; event: string; data: any }> = [];
-    const joins: Array<{ socketId: string; room: string }> = [];
-    const leaves: Array<{ socketId: string; room: string }> = [];
+    const batches: Array<{
+      socketIds: readonly string[];
+      event: string;
+      data: any;
+    }> = [];
 
     const m = new QuerySubscriptionManager(
       {
-        emitToSocket: (socketId, event) => {
+        emitToSocket: (socketId: string, event: string) => {
           perSocket.push({ socketId, event });
         },
-        emitToRoom: (room, event, data) => {
-          perRoom.push({ room, event, data });
-        },
-        joinRoom: (socketId, room) => {
-          joins.push({ socketId, room });
-        },
-        leaveRoom: (socketId, room) => {
-          leaves.push({ socketId, room });
+        emitToSockets: (socketIds, event, data) => {
+          batches.push({ socketIds: [...socketIds], event, data });
         },
       },
       { debounceMs: 0, maxWaitMs: 0 },
@@ -1109,42 +1702,89 @@ describe("QuerySubscriptionManager — Socket.IO room broadcast (DOL-1047)", () 
 
     const sub1 = await m.subscribe({
       socketId: "s1",
+      sessionLease: "shared-session",
       query: source.query("project"),
     });
     await m.subscribe({
       socketId: "s2",
+      sessionLease: "shared-session",
       query: source.query("project"),
     });
     await m.subscribe({
       socketId: "s3",
+      sessionLease: "shared-session",
       query: source.query("project"),
     });
 
-    // Joining the room is done at subscribe-time so the manager
-    // doesn't need a socket reference when it later broadcasts.
-    expect(joins).toEqual([
-      { socketId: "s1", room: `query:${sub1.hash}` },
-      { socketId: "s2", room: `query:${sub1.hash}` },
-      { socketId: "s3", room: `query:${sub1.hash}` },
-    ]);
-
-    // Trigger a re-eval that changes the data.
     source.setResults([row("p1", { name: "second" })]);
     m.onModelChange("project");
     await new Promise((r) => setTimeout(r, 10));
 
-    // Single room broadcast — not N per-socket emits.
-    expect(perRoom).toHaveLength(1);
-    expect(perRoom[0]!.room).toBe(`query:${sub1.hash}`);
-    expect(perRoom[0]!.event).toBe(`query:${sub1.hash}`);
+    expect(batches).toHaveLength(1);
+    expect(batches[0]!.socketIds).toEqual(["s1", "s2", "s3"]);
+    expect(batches[0]!.event).toBe(`query:${sub1.hash}`);
     expect(perSocket).toHaveLength(0);
 
-    // Unsubscribe must mirror the join with a leave.
-    m.unsubscribe("s2", sub1.hash);
-    expect(leaves).toContainEqual({
-      socketId: "s2",
-      room: `query:${sub1.hash}`,
+    await m.unsubscribe("s2", sub1.hash);
+    expect(m.stats.subscribers).toBe(2);
+  });
+
+  it("does not emit when the last subscriber leaves during a delayed re-eval", async () => {
+    let calls = 0;
+    let reevalStarted = false;
+    let releaseReeval: () => void = () => undefined;
+    const reevalReleased = new Promise<void>((resolve) => {
+      releaseReeval = resolve;
     });
+    const query: any = {
+      __modelType: "project",
+      exec: () => ({
+        toSQL: () => ({ sql: "SELECT * FROM projects", bindings: [] }),
+      }),
+      clone: () => query,
+      find: async () => {
+        calls++;
+        if (calls === 2) {
+          reevalStarted = true;
+          await reevalReleased;
+        }
+        return [
+          {
+            sanitize: () => row("p1", { revision: calls }),
+          },
+        ];
+      },
+    };
+    const targets: string[][] = [];
+    const m = new QuerySubscriptionManager(
+      {
+        emitToSocket: vi.fn(),
+        emitToSockets: (socketIds) => targets.push([...socketIds]),
+      },
+      { debounceMs: 0, maxWaitMs: 0 },
+    );
+
+    const sub = await m.subscribe({
+      socketId: "only-socket",
+      sessionLease: "only-session",
+      principal: { id: "user-1" },
+      query,
+    });
+    const cached = (m as any).queries.get(sub.hash);
+
+    m.onModelChange("project");
+    await vi.waitFor(() => expect(reevalStarted).toBe(true));
+    await m.unsubscribe("only-socket", sub.hash);
+    expect(cached.disposed).toBe(true);
+    expect(cached.result.size).toBe(0);
+    expect(cached.query).toBeNull();
+    expect(cached.principal).toBeNull();
+    releaseReeval();
+    await tick();
+
+    expect(targets).toEqual([]);
+    expect(cached.result.size).toBe(0);
+    expect(m.stats).toEqual({ queries: 0, subscribers: 0, sockets: 0 });
   });
 
   it("falls back to per-socket emit when only the legacy emitToSocket callback is provided", async () => {
@@ -1160,10 +1800,12 @@ describe("QuerySubscriptionManager — Socket.IO room broadcast (DOL-1047)", () 
 
     const sub = await m.subscribe({
       socketId: "s1",
+      sessionLease: "shared-session",
       query: source.query("project"),
     });
     await m.subscribe({
       socketId: "s2",
+      sessionLease: "shared-session",
       query: source.query("project"),
     });
 
@@ -1187,10 +1829,10 @@ describe("QuerySubscriptionManager — Date safety on re-eval clone (DOL-1047)",
         updatedAt: new Date("2024-01-01T00:00:00Z"),
       }),
     ]);
-    const m = new QuerySubscriptionManager(
-      () => {},
-      { debounceMs: 0, maxWaitMs: 0 },
-    );
+    const m = new QuerySubscriptionManager(() => {}, {
+      debounceMs: 0,
+      maxWaitMs: 0,
+    });
 
     const sub = await m.subscribe({
       socketId: "s1",

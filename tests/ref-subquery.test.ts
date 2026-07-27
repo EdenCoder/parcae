@@ -9,8 +9,8 @@
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import knex from "knex";
-import { Model } from "@parcae/model";
-import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
+import { Model } from "../packages/model/src";
+import type { ModelConstructor, SchemaDefinition } from "../packages/model/src";
 import { BackendAdapter } from "../packages/backend/src/adapters/model";
 
 // ─── Mock models ─────────────────────────────────────────────────────────────
@@ -91,19 +91,99 @@ beforeAll(async () => {
   // Seed data
   const now = new Date().toISOString();
   await db("tests").insert([
-    { id: "t1", category: "biometric", name: "Heart Rate", status: "active", data: "{}", createdAt: now, updatedAt: now },
-    { id: "t2", category: "wearable", name: "Step Count", status: "active", data: "{}", createdAt: now, updatedAt: now },
-    { id: "t3", category: "fitness", name: "VO2 Max", status: "active", data: "{}", createdAt: now, updatedAt: now },
-    { id: "t4", category: "cognitive", name: "Reaction Time", status: "archived", data: "{}", createdAt: now, updatedAt: now },
-    { id: "t5", category: "biometric", name: "Blood Pressure", status: "archived", data: "{}", createdAt: now, updatedAt: now },
+    {
+      id: "t1",
+      category: "biometric",
+      name: "Heart Rate",
+      status: "active",
+      data: "{}",
+      createdAt: now,
+      updatedAt: now,
+    },
+    {
+      id: "t2",
+      category: "wearable",
+      name: "Step Count",
+      status: "active",
+      data: "{}",
+      createdAt: now,
+      updatedAt: now,
+    },
+    {
+      id: "t3",
+      category: "fitness",
+      name: "VO2 Max",
+      status: "active",
+      data: "{}",
+      createdAt: now,
+      updatedAt: now,
+    },
+    {
+      id: "t4",
+      category: "cognitive",
+      name: "Reaction Time",
+      status: "archived",
+      data: "{}",
+      createdAt: now,
+      updatedAt: now,
+    },
+    {
+      id: "t5",
+      category: "biometric",
+      name: "Blood Pressure",
+      status: "archived",
+      data: "{}",
+      createdAt: now,
+      updatedAt: now,
+    },
   ]);
 
   await db("results").insert([
-    { id: "r1", test: "t1", score: 72, passed: true, data: "{}", createdAt: now, updatedAt: now },
-    { id: "r2", test: "t2", score: 8500, passed: true, data: "{}", createdAt: now, updatedAt: now },
-    { id: "r3", test: "t3", score: 45, passed: true, data: "{}", createdAt: now, updatedAt: now },
-    { id: "r4", test: "t4", score: 300, passed: false, data: "{}", createdAt: now, updatedAt: now },
-    { id: "r5", test: "t5", score: 120, passed: true, data: "{}", createdAt: now, updatedAt: now },
+    {
+      id: "r1",
+      test: "t1",
+      score: 72,
+      passed: true,
+      data: "{}",
+      createdAt: now,
+      updatedAt: now,
+    },
+    {
+      id: "r2",
+      test: "t2",
+      score: 8500,
+      passed: true,
+      data: "{}",
+      createdAt: now,
+      updatedAt: now,
+    },
+    {
+      id: "r3",
+      test: "t3",
+      score: 45,
+      passed: true,
+      data: "{}",
+      createdAt: now,
+      updatedAt: now,
+    },
+    {
+      id: "r4",
+      test: "t4",
+      score: 300,
+      passed: false,
+      data: "{}",
+      createdAt: now,
+      updatedAt: now,
+    },
+    {
+      id: "r5",
+      test: "t5",
+      score: 120,
+      passed: true,
+      data: "{}",
+      createdAt: now,
+      updatedAt: now,
+    },
   ]);
 });
 
@@ -190,22 +270,18 @@ describe("Ref subquery: dot-notation via queryFromClient", () => {
 
   it("should throw on invalid nested column", async () => {
     expect(() =>
-      adapter.queryFromClient(
-        Result as unknown as ModelConstructor,
-        {},
-        [{ method: "where", args: ["test.nonexistent", "foo"] }],
-      ),
+      adapter.queryFromClient(Result as unknown as ModelConstructor, {}, [
+        { method: "where", args: ["test.nonexistent", "foo"] },
+      ]),
     ).toThrow('Invalid column "nonexistent" on referenced model "test"');
   });
 
   it("should throw on non-ref dot-notation (not a ref column)", async () => {
     // "score.something" — score is a number, not a ref
     expect(() =>
-      adapter.queryFromClient(
-        Result as unknown as ModelConstructor,
-        {},
-        [{ method: "where", args: ["score.something", "foo"] }],
-      ),
+      adapter.queryFromClient(Result as unknown as ModelConstructor, {}, [
+        { method: "where", args: ["score.something", "foo"] },
+      ]),
     ).toThrow('Invalid column "score.something" on model "result"');
   });
 

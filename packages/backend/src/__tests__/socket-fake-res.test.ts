@@ -21,6 +21,20 @@ describe("createSocketFakeRes", () => {
     expect(socket.emit).toHaveBeenCalledWith("req-1", expect.anything());
   });
 
+  it("drops a late response after the socket session changes", () => {
+    const socket = makeSocket();
+    let sessionCurrent = true;
+    const res = createSocketFakeRes(socket, "req-1", () => sessionCurrent);
+
+    sessionCurrent = false;
+    res.end(
+      JSON.stringify({ result: { patient: "old-owner-phi" }, success: true }),
+    );
+
+    expect(res.writableEnded).toBe(true);
+    expect(socket.emit).not.toHaveBeenCalled();
+  });
+
   it("writeHead() sets statusCode before end()", () => {
     const res = createSocketFakeRes(makeSocket(), "req-1");
     res.writeHead(403, { "Content-Type": "application/json" });

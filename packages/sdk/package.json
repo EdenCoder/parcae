@@ -40,9 +40,12 @@
     "valtio": "^2.3.2"
   },
   "devDependencies": {
+    "@types/node": "^25.9.3",
     "@types/pako": "^2.0.4",
     "@types/react": "^19.2.16",
+    "@types/react-test-renderer": "^19.1.0",
     "react": "^19.2.7",
+    "react-test-renderer": "^19.2.7",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
     "vitest": "^4.1.8"
