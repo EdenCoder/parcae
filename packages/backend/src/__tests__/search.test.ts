@@ -100,6 +100,17 @@ const SettingModel = createPlainModel("setting", {
   value: "json",
 });
 
+// Table "knowledge-entries": Postgres parses the hyphens as subtraction
+// unless the identifier is quoted.
+const KebabModel = createSearchModel(
+  "knowledge-entry",
+  {
+    title: "string",
+    content: "text",
+  },
+  ["title", "content"],
+);
+
 // ─── Tests: queryFromClient with search ─────────────────────────────────────
 
 describe("BackendAdapter — search in queryFromClient", () => {
@@ -416,6 +427,73 @@ describe("BackendAdapter._applySearch", () => {
     const bindings = whereRawArgs[0]?.[1] || [];
     // 1 for tsvector + 1 for trigram (one field) = 2
     expect(bindings.length).toBe(2);
+  });
+
+  it("should quote a hyphenated table name in postgres SQL", () => {
+    const whereRawArgs: any[] = [];
+    const selectArgs: any[] = [];
+    const mockQuery: any = new Proxy(
+      {},
+      {
+        get(_t, prop: string) {
+          return (...args: any[]) => {
+            if (prop === "whereRaw") whereRawArgs.push(args);
+            if (prop === "select") selectArgs.push(args);
+            return mockQuery;
+          };
+        },
+      },
+    );
+
+    const { adapter } = createTestAdapter();
+    (adapter as any).services = {
+      read: Object.assign(() => {}, {
+        raw: (sql: string, bindings?: any[]) => ({ sql, bindings }),
+      }),
+      write: Object.assign(() => {}, {
+        raw: (sql: string, bindings?: any[]) => ({ sql, bindings }),
+      }),
+    };
+    (adapter as any).engine = "postgres";
+
+    (adapter as any)._applySearch(mockQuery, "fasting", KebabModel);
+
+    const whereSql: string = whereRawArgs[0]?.[0] || "";
+    const rankSql: string = selectArgs[0]?.[0]?.sql || "";
+    for (const sql of [whereSql, rankSql]) {
+      expect(sql).toContain('"knowledge-entries".');
+      // Every mention of the table is quoted, or Postgres reads the
+      // hyphens as subtraction and errors on a missing column.
+      expect(sql.split("knowledge-entries").length).toBe(
+        sql.split('"knowledge-entries"').length,
+      );
+    }
+  });
+
+  it("should quote a hyphenated table name in the sqlite fallback", () => {
+    const whereRawArgs: any[] = [];
+    const mockQuery: any = new Proxy(
+      {},
+      {
+        get(_t, prop: string) {
+          return (...args: any[]) => {
+            if (prop === "whereRaw") whereRawArgs.push(args);
+            return mockQuery;
+          };
+        },
+      },
+    );
+
+    const { adapter } = createTestAdapter();
+    (adapter as any).engine = "sqlite";
+
+    (adapter as any)._applySearch(mockQuery, "fasting", KebabModel);
+
+    const sql: string = whereRawArgs[0]?.[0] || "";
+    expect(sql).toContain('"knowledge-entries".title LIKE ?');
+    expect(sql.split("knowledge-entries").length).toBe(
+      sql.split('"knowledge-entries"').length,
+    );
   });
 });
 
