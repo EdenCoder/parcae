@@ -587,16 +587,20 @@ export class BackendAdapter implements ModelAdapter {
     if (!searchFields?.length || !term.trim()) return knexQuery;
 
     const table = tableName(modelClass);
+    // Every raw-SQL mention of the table goes through the quoted form: a
+    // model type like "knowledge-entry" pluralizes to a hyphenated table
+    // name that Postgres would otherwise parse as subtraction.
+    const qt = `"${table}"`;
 
     // Build the ranking expression
     // 1. Full-text rank (weight: 2x)
     const rankParts: string[] = [
-      `ts_rank(${table}._search, websearch_to_tsquery('english', ?)) * 2`,
+      `ts_rank(${qt}._search, websearch_to_tsquery('english', ?)) * 2`,
     ];
     const rankBindings: any[] = [term];
 
     // 2. Trigram similarity — best across all search fields (weight: 1x)
-    const simParts = searchFields.map((f) => `similarity(${table}.${f}, ?)`);
+    const simParts = searchFields.map((f) => `similarity(${qt}.${f}, ?)`);
     rankParts.push(`greatest(${simParts.join(", ")})`);
     for (const _f of searchFields) rankBindings.push(term);
 
@@ -606,7 +610,7 @@ export class BackendAdapter implements ModelAdapter {
       this.engine === "alloydb" && this._embeddingReady.has(table);
     if (useVector) {
       rankParts.push(
-        `(1.0 - (${table}._embedding <=> embedding('gemini-embedding-001', ?)::vector)) * 3`,
+        `(1.0 - (${qt}._embedding <=> embedding('gemini-embedding-001', ?)::vector)) * 3`,
       );
       rankBindings.push(term);
     }
@@ -615,18 +619,18 @@ export class BackendAdapter implements ModelAdapter {
 
     // Build the WHERE clause — match on any of the search methods
     const whereParts: string[] = [
-      `${table}._search @@ websearch_to_tsquery('english', ?)`,
+      `${qt}._search @@ websearch_to_tsquery('english', ?)`,
     ];
     const whereBindings: any[] = [term];
 
     for (const f of searchFields) {
-      whereParts.push(`${table}.${f} % ?`);
+      whereParts.push(`${qt}.${f} % ?`);
       whereBindings.push(term);
     }
 
     if (useVector) {
       whereParts.push(
-        `${table}._embedding <=> embedding('gemini-embedding-001', ?)::vector < 0.7`,
+        `${qt}._embedding <=> embedding('gemini-embedding-001', ?)::vector < 0.7`,
       );
       whereBindings.push(term);
     }
@@ -636,7 +640,7 @@ export class BackendAdapter implements ModelAdapter {
     return knexQuery
       .whereRaw(`(${whereExpr})`, whereBindings)
       .select(
-        this.write.raw(`${table}.*, (${rankExpr}) AS _rank`, rankBindings),
+        this.write.raw(`${qt}.*, (${rankExpr}) AS _rank`, rankBindings),
       )
       .clearOrder()
       .orderByRaw("_rank DESC");
