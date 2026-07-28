@@ -39,11 +39,15 @@ export function startLifecycle(
   // Mirrors ParcaeProvider: token rotation → fresh hello on the live
   // socket; sign-out → terminate (queries stop running as the user).
   const unsubChange = adapter.onChange((token) => {
-    if (token === null) {
-      client.terminateSession().catch(() => {});
-    } else {
+    if (token !== null) {
       client.refreshSession().catch(() => {});
+      return;
     }
+    // Only a signed-in session can be signed out of. Terminating an
+    // anonymous or still-pending one is sticky and leaves every query
+    // reporting "loaded, zero rows" for the rest of the runtime.
+    if (client.session.state.status !== "authenticated") return;
+    client.terminateSession().catch(() => {});
   });
 
   // Identity transitions invalidate every live snapshot — rows were

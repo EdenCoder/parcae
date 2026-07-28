@@ -148,9 +148,19 @@ describe("startLifecycle", () => {
     auth.changeToken("tok-1");
     expect(client.refreshSession).toHaveBeenCalledOnce();
     expect(client.terminateSession).not.toHaveBeenCalled();
+    client.setSession("authenticated", "u1");
 
     auth.changeToken(null);
     expect(client.terminateSession).toHaveBeenCalledOnce();
+  });
+
+  it("does not terminate a session that was never signed in", () => {
+    // `terminate()` is sticky and stops every query from building a
+    // cache key, so a null token has to mean "lost an identity" — not
+    // "confirmed we still have none".
+    expect(client.session.state.status).toBe("anonymous");
+    auth.changeToken(null);
+    expect(client.terminateSession).not.toHaveBeenCalled();
   });
 
   it("resets live stores when the session identity changes", async () => {

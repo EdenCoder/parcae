@@ -127,11 +127,17 @@ const ClientProvider: React.FC<ClientProviderProps> = ({
     if (!auth) return;
     auth.init(url || "");
     return auth.onChange((token) => {
-      if (token === null) {
-        client.terminateSession().catch(() => {});
-      } else {
+      if (token !== null) {
         client.refreshSession().catch(() => {});
+        return;
       }
+      // A null token is only a sign-out if there was a signed-in
+      // session to lose. Terminating an anonymous (or still-pending)
+      // one is a dead end — `terminate()` is sticky, `useQuery` stops
+      // building keys, and every mounted query reports "loaded, zero
+      // rows" for the rest of the page's life.
+      if (client.session.state.status !== "authenticated") return;
+      client.terminateSession().catch(() => {});
     });
   }, [auth, client, url]);
 

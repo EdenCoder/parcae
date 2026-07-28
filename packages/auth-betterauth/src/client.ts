@@ -68,6 +68,15 @@ export function betterAuth(opts: BetterAuthOptions = {}): AuthClientAdapter {
   // through `NonNullable<typeof client>` — the wire shape is what
   // matters here, not the static type.
   let primedSessionPromise: Promise<any> | null = null;
+  // Last token the adapter has observed, shared by `getToken()` and
+  // `onChange`. `undefined` means "never read one" — distinct from
+  // `null`, which is a confirmed anonymous session. `onChange` compares
+  // against this rather than its own private baseline: the hello
+  // handshake calls `getToken()` long before the first
+  // `visibilitychange`, so without the handoff that first read always
+  // looks like a change and an anonymous visitor gets reported as
+  // having just signed out.
+  let lastToken: string | null | undefined = undefined;
 
   const initInternal = (baseUrl: string): void => {
     if (client) return;
@@ -100,7 +109,9 @@ export function betterAuth(opts: BetterAuthOptions = {}): AuthClientAdapter {
       const primed = primedSessionPromise;
       primedSessionPromise = null; // one-shot
       const session = await (primed ?? client.getSession());
-      return session?.data?.session?.token ?? null;
+      const token: string | null = session?.data?.session?.token ?? null;
+      lastToken = token;
+      return token;
     },
 
     onChange(callback: (token: string | null) => void): () => void {
@@ -119,7 +130,6 @@ export function betterAuth(opts: BetterAuthOptions = {}): AuthClientAdapter {
       // the server). Visibility polling remains the only portable
       // cross-tab path without extra infrastructure.
 
-      let lastToken: string | null | undefined = undefined;
       let active = true;
       let generation = 0;
 
@@ -131,7 +141,12 @@ export function betterAuth(opts: BetterAuthOptions = {}): AuthClientAdapter {
           if (!active || currentGeneration !== generation) return;
           const token = session?.data?.session?.token ?? null;
           if (token === lastToken) return;
+          // First read of all, and it's anonymous: there is no prior
+          // identity to have lost, so this establishes the baseline
+          // rather than reporting a sign-out.
+          const baselining = lastToken === undefined;
           lastToken = token;
+          if (baselining && token === null) return;
           callback(token);
         } catch {
           // Transient auth endpoint failures are not sign-outs.
