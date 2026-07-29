@@ -11,8 +11,11 @@
  */
 import { describe, it, expect } from "vitest";
 
-import { BackendAdapter } from "../adapters/model";
 import type { SchemaDefinition } from "@parcae/model";
+// Value import — the aggregate tests below hand-build a chain that
+// returns real values, which the recording proxy can't stand in for.
+import { BackendAdapter } from "../adapters/model";
+import { createTestAdapter } from "./adapter-test";
 
 // A real class so `new ModelClass()` works — `_isJsonArrayColumn`
 // probes the runtime default to distinguish array vs object json columns.
@@ -30,43 +33,14 @@ class PostArrayModel {
   metadata: any = null; // ← object/any default
 }
 
-/** Build a recording knex stand-in: every method call is captured and
- *  returns the same proxy so chains compose. */
-function recordingChain() {
-  const calls: Array<{ method: string; args: any[] }> = [];
-  const make = (): any =>
-    new Proxy(
-      {},
-      {
-        get(_t, prop: string) {
-          if (prop === "find") return async () => [];
-          if (prop === "first") return async () => null;
-          if (prop === "count") return async () => 0;
-          if (prop === "exec") return () => ({});
-          if (prop === "clone") return () => make();
-          if (prop === "then") return undefined; // not a thenable
-          return (...args: any[]) => {
-            calls.push({ method: prop, args });
-            return make();
-          };
-        },
-      },
-    );
-  return { calls, chain: make() };
-}
-
-function createTestAdapter() {
-  const { calls, chain } = recordingChain();
-  const adapter = new (BackendAdapter as any)({
-    read: () => chain,
-    write: () => chain,
-  });
-  return { adapter: adapter as BackendAdapter, calls };
-}
+// `realQuery` leaves `adapter.query()` intact so the server-side path
+// under test actually runs; `read`/`write` still feed the recording
+// chain, so the emitted calls are captured either way.
+const testAdapter = () => createTestAdapter({ realQuery: true });
 
 describe("BackendAdapter.query() — server-side whereIn on JSON-array columns", () => {
   it("Postgres: dispatches whereIn(arrayCol, vals) to @> containment SQL", () => {
-    const { adapter, calls } = createTestAdapter();
+    const { adapter, calls } = testAdapter();
     (adapter as any).engine = "postgres";
 
     adapter.query(PostArrayModel as any).whereIn("performers", ["p1", "p2"]);
@@ -91,7 +65,7 @@ describe("BackendAdapter.query() — server-side whereIn on JSON-array columns",
   });
 
   it("falls through to native whereIn for scalar columns", () => {
-    const { adapter, calls } = createTestAdapter();
+    const { adapter, calls } = testAdapter();
     (adapter as any).engine = "postgres";
 
     adapter.query(PostArrayModel as any).whereIn("name", ["a", "b"]);
@@ -105,7 +79,7 @@ describe("BackendAdapter.query() — server-side whereIn on JSON-array columns",
   });
 
   it("dispatches to @> for any json column (schema-only — no array probe)", () => {
-    const { adapter, calls } = createTestAdapter();
+    const { adapter, calls } = testAdapter();
     (adapter as any).engine = "postgres";
 
     // `metadata` schema is `"json"` even though its runtime default is
@@ -119,7 +93,7 @@ describe("BackendAdapter.query() — server-side whereIn on JSON-array columns",
   });
 
   it("emits 1=0 for an empty values array", () => {
-    const { adapter, calls } = createTestAdapter();
+    const { adapter, calls } = testAdapter();
     (adapter as any).engine = "postgres";
 
     adapter.query(PostArrayModel as any).whereIn("performers", []);
@@ -132,7 +106,7 @@ describe("BackendAdapter.query() — server-side whereIn on JSON-array columns",
 
 describe("BackendAdapter.query() — aggregate terminals", () => {
   it("maps clearLimit() to Knex clear('limit')", () => {
-    const { adapter, calls } = createTestAdapter();
+    const { adapter, calls } = testAdapter();
 
     adapter.query(PostArrayModel as any).limit(10).clearLimit();
 

@@ -29,6 +29,11 @@ import {
   type WithRefs,
 } from "@parcae/model";
 import type { QuerySubscriptionManager } from "../services/subscriptions";
+import {
+  fieldPolicyFor,
+  NO_FIELD_POLICY,
+  type FieldPolicy,
+} from "../services/field-policy";
 import equal from "deep-equal";
 import fastJsonPatch from "fast-json-patch";
 import type { Operation as PatchOp } from "fast-json-patch";
@@ -966,9 +971,6 @@ export class BackendAdapter implements ModelAdapter {
    */
   private static DEFAULT_LIMIT = 25;
 
-  /** Shared empty result for models with no `scope.fields` policy. */
-  private static EMPTY_FIELD_SET: ReadonlySet<string> = new Set<string>();
-
   /**
    * Per-modelClass cache of "which `json` columns are actually arrays?".
    *
@@ -1045,24 +1047,6 @@ export class BackendAdapter implements ModelAdapter {
     return c.whereRaw(`(${parts})`, bindings);
   }
 
-  /**
-   * Columns `ctx` may not reference in a query, per `scope.fields`.
-   * A missing `ctx` (callers not replaying a client query) falls back
-   * to an empty one so the policy fails closed.
-   */
-  private _deniedFields(
-    modelClass: ModelConstructor<any>,
-    ctx?: ScopeContext,
-  ): ReadonlySet<string> {
-    const fields = modelClass.scope?.fields;
-    if (!fields) return BackendAdapter.EMPTY_FIELD_SET;
-    const denied = new Set<string>();
-    for (const name of Object.keys(fields)) {
-      if (!fields[name]!(ctx ?? {})) denied.add(name);
-    }
-    return denied;
-  }
-
   queryFromClient<T extends Model>(
     modelClass: ModelConstructor<T>,
     scope: Record<string, any>,
@@ -1093,7 +1077,7 @@ export class BackendAdapter implements ModelAdapter {
     // Kept separate from `validColumns`, which also gates `select` —
     // projecting a withheld column must still work, since `sanitize()`
     // strips it on the way out anyway.
-    const deniedColumns = this._deniedFields(modelClass, ctx);
+    const policy = fieldPolicyFor(modelClass, ctx);
 
     // Start with scope — always first, never overridable.
     // Scope can be an object { org: "xxx" } or a function (qb) => qb.where(...)
@@ -1126,8 +1110,7 @@ export class BackendAdapter implements ModelAdapter {
         validColumns,
         modelClass.type,
         schema,
-        ctx,
-        deniedColumns,
+        policy,
       );
       if (args.length > 0) predicates.push({ step, args });
     }
@@ -1191,8 +1174,7 @@ export class BackendAdapter implements ModelAdapter {
         validColumns,
         modelClass.type,
         schema,
-        ctx,
-        deniedColumns,
+        policy,
       );
 
       // Skip empty where({}) — sanitizer returns [] to signal "no-op"
@@ -1234,8 +1216,7 @@ export class BackendAdapter implements ModelAdapter {
     validColumns: Set<string>,
     modelType: string,
     schema?: SchemaDefinition,
-    ctx?: ScopeContext,
-    denied: ReadonlySet<string> = BackendAdapter.EMPTY_FIELD_SET,
+    policy: FieldPolicy = NO_FIELD_POLICY,
   ): any[] {
     const args = [...(step.args ?? [])];
 
@@ -1272,14 +1253,13 @@ export class BackendAdapter implements ModelAdapter {
               continue;
             // `schema` stays undefined on purpose — passing it would
             // switch on ref dot-notation, which nested steps have
-            // always rejected. `denied` still carries the field policy.
+            // always rejected. `policy` still applies.
             const innerArgs = this._sanitizeStepArgs(
               nested,
               validColumns,
               modelType,
               undefined,
-              ctx,
-              denied,
+              policy,
             );
             builder = builder[nested.method](...innerArgs);
           }
@@ -1291,12 +1271,12 @@ export class BackendAdapter implements ModelAdapter {
         // ── Dot-notation ref subquery rewriting ───────────────────
         // "test.category" → whereIn("test", subquery on tests table)
         if (firstArg.includes(".") && schema) {
-          const rewritten = this._rewriteRefDotNotation(step, args, schema, ctx);
+          const rewritten = this._rewriteRefDotNotation(step, args, schema, policy);
           if (rewritten) return rewritten;
           // Falls through if not a valid ref (throws below)
         }
 
-        if (!validColumns.has(firstArg) || denied.has(firstArg)) {
+        if (!validColumns.has(firstArg) || policy.own.has(firstArg)) {
           throw new ClientError(
             `Invalid column "${firstArg}" on model "${modelType}"`,
           );
@@ -1314,7 +1294,7 @@ export class BackendAdapter implements ModelAdapter {
       ) {
         // Object form: where({ col1: val, col2: val })
         for (const key of Object.keys(firstArg)) {
-          if (!validColumns.has(key) || denied.has(key)) {
+          if (!validColumns.has(key) || policy.own.has(key)) {
             throw new ClientError(
               `Invalid column "${key}" on model "${modelType}"`,
             );
@@ -1350,7 +1330,7 @@ export class BackendAdapter implements ModelAdapter {
     step: QueryStep,
     args: any[],
     schema: SchemaDefinition,
-    ctx?: ScopeContext,
+    policy: FieldPolicy = NO_FIELD_POLICY,
   ): any[] | null {
     const dot = (args[0] as string).indexOf(".");
     const refKey = (args[0] as string).slice(0, dot);
@@ -1380,12 +1360,10 @@ export class BackendAdapter implements ModelAdapter {
         "updatedAt",
         ...Object.keys(targetSchema),
       ]);
-      if (resolvedTarget) {
-        for (const denied of this._deniedFields(resolvedTarget, ctx)) {
-          targetValidColumns.delete(denied);
-        }
-      }
-      if (!targetValidColumns.has(refColumn)) {
+      if (
+        !targetValidColumns.has(refColumn) ||
+        policy.forTarget(resolvedTarget).has(refColumn)
+      ) {
         throw new ClientError(
           `Invalid column "${refColumn}" on referenced model "${targetType}"`,
         );
