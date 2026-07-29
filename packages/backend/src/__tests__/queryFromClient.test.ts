@@ -1,62 +1,15 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import knexFactory from "knex";
+// Value import — one test builds a real knex-backed adapter directly.
 import { BackendAdapter } from "../adapters/model";
 import type { QueryStep, SchemaDefinition } from "@parcae/model";
+import { createMockModel, createTestAdapter } from "./adapter-test";
 
-// ─── Mock Model Class ────────────────────────────────────────────────────────
-
-function createMockModel(type: string, schema: SchemaDefinition): any {
-  return {
-    type,
-    __schema: schema,
-  };
-}
-
-// ─── Recording Query Chain ──────────────────────────────────────────────────
-
-/**
- * Creates a mock BackendAdapter whose query() returns a recording chain.
- * Every method call is captured so we can assert what queryFromClient built.
- */
-function createTestAdapter() {
-  const calls: Array<{ method: string; args: any[] }> = [];
-
-  function makeChain(isRoot = true): any {
-    return new Proxy(
-      {},
-      {
-        get(_target, prop: string) {
-          if (prop === "find") return async () => [];
-          if (prop === "first") return async () => null;
-          if (prop === "count") return async () => 0;
-          if (prop === "exec") return () => ({});
-          if (prop === "clone") return () => makeChain();
-          return (...args: any[]) => {
-            if (
-              isRoot &&
-              prop === "where" &&
-              typeof args[0] === "function"
-            ) {
-              args[0](makeChain(false));
-              return makeChain();
-            }
-            calls[calls.length] = { method: prop, args };
-            return makeChain(isRoot);
-          };
-        },
-      },
-    );
-  }
-
-  const adapter = new (BackendAdapter as any)({
-    read: () => {},
-    write: () => {},
-  });
-  // Override query() to return our recording chain
-  adapter.query = () => makeChain();
-
-  return { adapter: adapter as BackendAdapter, calls };
-}
+// The grouping callback `queryFromClient` wraps its predicates in gets
+// invoked so those predicates land in `calls`; a `__nested` callback
+// one level down is left intact, because the nested-builder tests below
+// drive it themselves against their own instrumented builder.
+const testAdapter = () => createTestAdapter({ invoke: "root" });
 
 // ─── Test Schema ─────────────────────────────────────────────────────────────
 
@@ -75,7 +28,7 @@ describe("BackendAdapter.queryFromClient", () => {
   let calls: Array<{ method: string; args: any[] }>;
 
   beforeEach(() => {
-    const test = createTestAdapter();
+    const test = testAdapter();
     adapter = test.adapter;
     calls = test.calls;
   });
@@ -322,7 +275,7 @@ describe("BackendAdapter.queryFromClient", () => {
       ];
 
       for (const op of safeOps) {
-        const t = createTestAdapter();
+        const t = testAdapter();
         expect(() =>
           t.adapter.queryFromClient(ProjectModel, { userId: "u1" }, [
             { method: "where", args: ["views", op, 10] },
@@ -592,7 +545,7 @@ describe("BackendAdapter.queryFromClient", () => {
       ];
 
       for (const col of attacks) {
-        const t = createTestAdapter();
+        const t = testAdapter();
         expect(() =>
           t.adapter.queryFromClient(ProjectModel, { userId: "u1" }, [
             { method: "where", args: [col, "value"] },
@@ -632,7 +585,7 @@ describe("BackendAdapter.queryFromClient", () => {
       ];
 
       for (const op of badOps) {
-        const t = createTestAdapter();
+        const t = testAdapter();
         expect(() =>
           t.adapter.queryFromClient(ProjectModel, { userId: "u1" }, [
             { method: "where", args: ["name", op, "test"] },

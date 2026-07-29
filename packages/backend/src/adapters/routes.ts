@@ -118,9 +118,21 @@ function queryStringValue(value: unknown): string {
   return typeof raw === "string" ? raw : "";
 }
 
-function assertNumericColumn(modelClass: ModelConstructor, column: string): void {
+/**
+ * `__sum` names a column outside the `__query` step list, so it misses
+ * the replay's validation entirely. Gate it on the same `scope.fields`
+ * set the steps were gated on — otherwise a column withheld from every
+ * filter is still readable as an aggregate, which for a one-row filter
+ * is just the value. Denied and non-numeric share an error, matching
+ * the replay's "no existence oracle" rule.
+ */
+function assertNumericColumn(
+  modelClass: ModelConstructor,
+  column: string,
+  denied: ReadonlySet<string>,
+): void {
   const type = modelClass.__schema?.[column];
-  if (type !== "integer" && type !== "number") {
+  if ((type !== "integer" && type !== "number") || denied.has(column)) {
     throw new ClientError(`Invalid numeric column "${column}"`);
   }
 }
@@ -316,7 +328,7 @@ export function registerModelRoutes(
 
           const sumColumn = queryStringValue(data.__sum);
           if (sumColumn) {
-            assertNumericColumn(ModelClass, sumColumn);
+            assertNumericColumn(ModelClass, sumColumn, prep.denied);
             const total = await prep.query.sum(sumColumn);
             return json(res, 200, { result: { total }, success: true });
           }

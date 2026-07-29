@@ -5,65 +5,27 @@
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
-import { BackendAdapter } from "../adapters/model";
+import type { BackendAdapter } from "../adapters/model";
+import { prepareClientQuery } from "../services/query-subscription";
 import { ClientError } from "../helpers";
-import type { QueryStep, SchemaDefinition } from "@parcae/model";
-
-function createMockModel(
-  type: string,
-  schema: SchemaDefinition,
-  scope?: any,
-): any {
-  return { type, __schema: schema, scope };
-}
-
-function createTestAdapter() {
-  const calls: Array<{ method: string; args: any[] }> = [];
-
-  function makeChain(isRoot = true): any {
-    return new Proxy(
-      {},
-      {
-        get(_target, prop: string) {
-          if (prop === "find") return async () => [];
-          if (prop === "first") return async () => null;
-          if (prop === "count") return async () => 0;
-          if (prop === "clone") return () => makeChain();
-          return (...args: any[]) => {
-            // Invoke builder callbacks at every depth, as knex does.
-            // `__nested` steps only validate when their callback runs.
-            if (prop === "where" && typeof args[0] === "function") {
-              args[0](makeChain(false));
-              return makeChain(isRoot);
-            }
-            calls[calls.length] = { method: prop, args };
-            return makeChain(isRoot);
-          };
-        },
-      },
-    );
-  }
-
-  // `read`/`write` are getters over `services`, and the ref-subquery
-  // path calls `this.read(table)` — so the chain goes in here.
-  const adapter = new (BackendAdapter as any)({
-    read: () => makeChain(),
-    write: () => makeChain(),
-  });
-  adapter.query = () => makeChain();
-
-  return { adapter: adapter as BackendAdapter, calls };
-}
+import type { QueryStep } from "@parcae/model";
+import {
+  createMockModel,
+  createTestAdapter,
+  registerTestModels,
+} from "./adapter-test";
 
 // Open read scope with two withheld columns.
 const UserModel = createMockModel(
   "user",
   { name: "string", email: "string", role: "string" },
   {
-    read: () => () => {},
-    fields: {
-      email: (ctx: any) => !!ctx.user,
-      role: (ctx: any) => !!ctx.user,
+    scope: {
+      read: () => () => {},
+      fields: {
+        email: (ctx: any) => !!ctx.user,
+        role: (ctx: any) => !!ctx.user,
+      },
     },
   },
 );
@@ -75,7 +37,7 @@ describe("scope.fields — direct column references", () => {
   let adapter: BackendAdapter;
 
   beforeEach(() => {
-    ({ adapter } = createTestAdapter());
+    adapter = createTestAdapter({ invoke: "all" }).adapter;
   });
 
   const run = (steps: QueryStep[], ctx: any) =>
@@ -125,22 +87,14 @@ describe("scope.fields — direct column references", () => {
   });
 
   it("reports a denied column exactly as a nonexistent one", () => {
-    const denied = (() => {
-      try {
-        run([{ method: "where", args: ["email", "a@b.c"] }], ANON);
-      } catch (err) {
-        return (err as Error).message;
-      }
-    })();
-    const missing = (() => {
-      try {
-        run([{ method: "where", args: ["nope", "x"] }], ANON);
-      } catch (err) {
-        return (err as Error).message;
-      }
-    })();
-    expect(denied).toBe('Invalid column "email" on model "user"');
-    expect(missing).toBe('Invalid column "nope" on model "user"');
+    // Same class, same message — a withheld column can't be told apart
+    // from one that was never declared.
+    const expected = (col: string) =>
+      new ClientError(`Invalid column "${col}" on model "user"`);
+    expect(() => run([{ method: "where", args: ["email", "a@b.c"] }], ANON)) //
+      .toThrow(expected("email"));
+    expect(() => run([{ method: "where", args: ["nope", "x"] }], ANON)) //
+      .toThrow(expected("nope"));
   });
 
   it("allows the same query once the predicate passes", () => {
@@ -162,11 +116,9 @@ describe("scope.fields — direct column references", () => {
   });
 
   it("does not restrict a model that declares no field policy", () => {
-    const Open = createMockModel(
-      "open",
-      { email: "string" },
-      { read: () => () => {} },
-    );
+    const Open = createMockModel("open", { email: "string" }, {
+      scope: { read: () => () => {} },
+    });
     expect(() =>
       (adapter as any).queryFromClient(
         Open,
@@ -178,9 +130,17 @@ describe("scope.fields — direct column references", () => {
   });
 
   it("fails closed when no ctx is supplied", () => {
+    // Denies outright rather than evaluating against an empty ctx —
+    // this predicate is TRUE for `{}` and would otherwise sail through.
+    const FailOpen = createMockModel("failopen", { secret: "string" }, {
+      scope: {
+        read: () => () => {},
+        fields: { secret: (c: any) => c.user?.role !== "banned" },
+      },
+    });
     expect(() =>
-      (adapter as any).queryFromClient(UserModel, {}, [
-        { method: "where", args: ["email", "a@b.c"] },
+      (adapter as any).queryFromClient(FailOpen, {}, [
+        { method: "where", args: ["secret", "x"] },
       ]),
     ).toThrow(ClientError);
   });
@@ -197,15 +157,15 @@ describe("scope.fields — through a ref (dot-notation)", () => {
   let adapter: BackendAdapter;
 
   beforeEach(() => {
-    ({ adapter } = createTestAdapter());
+    adapter = createTestAdapter({ invoke: "all" }).adapter;
     // Register User so the ref target resolves out of the registry.
-    (adapter as any)._models.set("user", UserModel);
+    registerTestModels(adapter, { user: UserModel });
   });
 
   const PostModel = createMockModel("post", {
     title: "string",
     author: { kind: "ref", target: UserModel },
-  });
+  } as any);
 
   const run = (steps: QueryStep[], ctx: any) =>
     (adapter as any).queryFromClient(PostModel, {}, steps, ctx);
@@ -230,5 +190,54 @@ describe("scope.fields — through a ref (dot-notation)", () => {
     expect(() =>
       run([{ method: "where", args: ["author.name", "Ada"] }], ANON),
     ).not.toThrow();
+  });
+
+  it("exempts server-side chains, which carry no client policy", () => {
+    // `_buildQuery` ref-hops with no policy argument. Trusted code must
+    // not inherit a restriction meant for client replay.
+    expect(() =>
+      (adapter as any)._rewriteRefDotNotation(
+        { method: "where", args: ["author.email", "x"] },
+        ["author.email", "x"],
+        PostModel.__schema,
+      ),
+    ).not.toThrow();
+  });
+});
+
+describe("scope.fields — aggregate columns", () => {
+  // `__sum` names a column outside the step list, so the replay never
+  // sees it. `prepareClientQuery` surfaces the same denied set the
+  // steps were gated on, and routes.ts folds it into its numeric check.
+  it("surfaces the denied set for routes that validate their own column", () => {
+    const { adapter } = createTestAdapter({ invoke: "all" });
+    const prep = (ctx: any) =>
+      prepareClientQuery({
+        ModelClass: UserModel,
+        scopeResult: {},
+        rawSteps: [],
+        modelByType: new Map([["user", UserModel]]),
+        adapter,
+        ctx,
+      });
+
+    expect([...prep(ANON).denied].sort()).toEqual(["email", "role"]);
+    expect([...prep(SIGNED_IN).denied]).toEqual([]);
+  });
+
+  it("reports nothing denied for a model with no policy", () => {
+    const { adapter } = createTestAdapter({ invoke: "all" });
+    const Open = createMockModel("open", { views: "integer" }, {
+      scope: { read: () => () => {} },
+    });
+    const prep = prepareClientQuery({
+      ModelClass: Open,
+      scopeResult: {},
+      rawSteps: [],
+      modelByType: new Map([["open", Open]]),
+      adapter,
+      ctx: ANON,
+    });
+    expect(prep.denied.size).toBe(0);
   });
 });

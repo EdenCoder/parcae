@@ -54,6 +54,7 @@ import type {
 import { extractExpandFields, stripExpandSteps } from "@parcae/model";
 import type { BackendAdapter } from "../adapters/model";
 import { getRefLoader } from "./context";
+import { deniedFields } from "./field-policy";
 import {
   hydrateExpansions,
   parseExpandSpecs,
@@ -92,6 +93,13 @@ export interface PreparedClientQuery {
   /** Normalised, expand-stripped step array — exposed for callers
    *  that want to introspect the SQL-side step list. */
   steps: any[];
+  /**
+   * Columns `scope.fields` withholds from this caller. The step replay
+   * already enforces it; exposed so aggregate routes (`__sum`), which
+   * take a column outside the step list, gate on the same set instead
+   * of validating independently.
+   */
+  denied: ReadonlySet<string>;
 }
 
 /**
@@ -148,6 +156,7 @@ export function prepareClientQuery(
     expandResolved.length > 0 ? stripExpandSteps(normalised) : normalised,
   );
 
+  const denied = deniedFields(ModelClass, ctx);
   const query = adapter.queryFromClient(ModelClass, scopeResult, steps, ctx);
 
   // Parallel count query — same filters, no limit/offset — so clients
@@ -162,7 +171,7 @@ export function prepareClientQuery(
     ctx,
   );
 
-  return { query, countQuery, expandResolved, steps };
+  return { query, countQuery, expandResolved, steps, denied };
 }
 
 // ─── runQuerySubscription ────────────────────────────────────────────────────

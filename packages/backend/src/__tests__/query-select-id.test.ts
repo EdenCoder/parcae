@@ -10,39 +10,8 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { BackendAdapter } from "../adapters/model";
 import { prepareClientQuery } from "../services/query-subscription";
-
-function createTestAdapter() {
-  const calls: Array<{ method: string; args: any[] }> = [];
-
-  function makeChain(): any {
-    return new Proxy(
-      {},
-      {
-        get(_target, prop: string) {
-          if (prop === "find") return async () => [];
-          if (prop === "first") return async () => null;
-          if (prop === "count") return async () => 0;
-          if (prop === "exec") return () => ({});
-          if (prop === "clone") return () => makeChain();
-          return (...args: any[]) => {
-            calls[calls.length] = { method: prop, args };
-            return makeChain();
-          };
-        },
-      },
-    );
-  }
-
-  const adapter = new (BackendAdapter as any)({
-    read: () => {},
-    write: () => {},
-  });
-  adapter.query = () => makeChain();
-
-  return { adapter: adapter as BackendAdapter, calls };
-}
+import { createTestAdapter } from "./adapter-test";
 
 const ListModel = {
   type: "list",
