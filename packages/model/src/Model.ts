@@ -607,6 +607,8 @@ export class Model extends EventEmitter {
     update?: (ctx: any) => any;
     delete?: (ctx: any) => any;
     patch?: (ctx: any) => any;
+    /** Per-field query policy — see `ModelScope["fields"]`. */
+    fields?: Record<string, (ctx: any) => any>;
   };
   static indexes?: (string | string[])[];
   static searchFields?: string[];

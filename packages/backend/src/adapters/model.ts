@@ -20,6 +20,7 @@ import {
   type QueryChain,
   type QueryStep,
   type SchemaDefinition,
+  type ScopeContext,
 } from "@parcae/model";
 import {
   dateSafeClone,
@@ -965,6 +966,9 @@ export class BackendAdapter implements ModelAdapter {
    */
   private static DEFAULT_LIMIT = 25;
 
+  /** Shared empty result for models with no `scope.fields` policy. */
+  private static EMPTY_FIELD_SET: ReadonlySet<string> = new Set<string>();
+
   /**
    * Per-modelClass cache of "which `json` columns are actually arrays?".
    *
@@ -1041,10 +1045,29 @@ export class BackendAdapter implements ModelAdapter {
     return c.whereRaw(`(${parts})`, bindings);
   }
 
+  /**
+   * Columns `ctx` may not reference in a query, per `scope.fields`.
+   * A missing `ctx` (callers not replaying a client query) falls back
+   * to an empty one so the policy fails closed.
+   */
+  private _deniedFields(
+    modelClass: ModelConstructor<any>,
+    ctx?: ScopeContext,
+  ): ReadonlySet<string> {
+    const fields = modelClass.scope?.fields;
+    if (!fields) return BackendAdapter.EMPTY_FIELD_SET;
+    const denied = new Set<string>();
+    for (const name of Object.keys(fields)) {
+      if (!fields[name]!(ctx ?? {})) denied.add(name);
+    }
+    return denied;
+  }
+
   queryFromClient<T extends Model>(
     modelClass: ModelConstructor<T>,
     scope: Record<string, any>,
     rawSteps: QueryStep[] | string | undefined,
+    ctx?: ScopeContext,
   ): QueryChain<WithRefs<T>> {
     // Normalize: socket sends an array, HTTP may send a JSON string
     let steps: QueryStep[] = [];
@@ -1066,6 +1089,11 @@ export class BackendAdapter implements ModelAdapter {
       "updatedAt",
       ...Object.keys(schema),
     ]);
+
+    // Kept separate from `validColumns`, which also gates `select` —
+    // projecting a withheld column must still work, since `sanitize()`
+    // strips it on the way out anyway.
+    const deniedColumns = this._deniedFields(modelClass, ctx);
 
     // Start with scope — always first, never overridable.
     // Scope can be an object { org: "xxx" } or a function (qb) => qb.where(...)
@@ -1098,6 +1126,8 @@ export class BackendAdapter implements ModelAdapter {
         validColumns,
         modelClass.type,
         schema,
+        ctx,
+        deniedColumns,
       );
       if (args.length > 0) predicates.push({ step, args });
     }
@@ -1161,6 +1191,8 @@ export class BackendAdapter implements ModelAdapter {
         validColumns,
         modelClass.type,
         schema,
+        ctx,
+        deniedColumns,
       );
 
       // Skip empty where({}) — sanitizer returns [] to signal "no-op"
@@ -1202,6 +1234,8 @@ export class BackendAdapter implements ModelAdapter {
     validColumns: Set<string>,
     modelType: string,
     schema?: SchemaDefinition,
+    ctx?: ScopeContext,
+    denied: ReadonlySet<string> = BackendAdapter.EMPTY_FIELD_SET,
   ): any[] {
     const args = [...(step.args ?? [])];
 
@@ -1236,10 +1270,16 @@ export class BackendAdapter implements ModelAdapter {
           for (const nested of nestedSteps) {
             if (!BackendAdapter.SAFE_CLIENT_METHODS.has(nested.method))
               continue;
+            // `schema` stays undefined on purpose — passing it would
+            // switch on ref dot-notation, which nested steps have
+            // always rejected. `denied` still carries the field policy.
             const innerArgs = this._sanitizeStepArgs(
               nested,
               validColumns,
               modelType,
+              undefined,
+              ctx,
+              denied,
             );
             builder = builder[nested.method](...innerArgs);
           }
@@ -1251,12 +1291,12 @@ export class BackendAdapter implements ModelAdapter {
         // ── Dot-notation ref subquery rewriting ───────────────────
         // "test.category" → whereIn("test", subquery on tests table)
         if (firstArg.includes(".") && schema) {
-          const rewritten = this._rewriteRefDotNotation(step, args, schema);
+          const rewritten = this._rewriteRefDotNotation(step, args, schema, ctx);
           if (rewritten) return rewritten;
           // Falls through if not a valid ref (throws below)
         }
 
-        if (!validColumns.has(firstArg)) {
+        if (!validColumns.has(firstArg) || denied.has(firstArg)) {
           throw new ClientError(
             `Invalid column "${firstArg}" on model "${modelType}"`,
           );
@@ -1274,7 +1314,7 @@ export class BackendAdapter implements ModelAdapter {
       ) {
         // Object form: where({ col1: val, col2: val })
         for (const key of Object.keys(firstArg)) {
-          if (!validColumns.has(key)) {
+          if (!validColumns.has(key) || denied.has(key)) {
             throw new ClientError(
               `Invalid column "${key}" on model "${modelType}"`,
             );
@@ -1310,6 +1350,7 @@ export class BackendAdapter implements ModelAdapter {
     step: QueryStep,
     args: any[],
     schema: SchemaDefinition,
+    ctx?: ScopeContext,
   ): any[] | null {
     const dot = (args[0] as string).indexOf(".");
     const refKey = (args[0] as string).slice(0, dot);
@@ -1328,7 +1369,10 @@ export class BackendAdapter implements ModelAdapter {
     const targetSchema = (resolvedTarget?.__schema as SchemaDefinition) ?? null;
     const targetTable = pluralize(targetType);
 
-    // Validate the nested column exists on the target model
+    // Validate the nested column exists on the target — and that this
+    // ctx may reference it. The TARGET's `scope.fields` decides, not
+    // the queried model's, or the subquery becomes a side door around
+    // a field withheld on the target.
     if (targetSchema) {
       const targetValidColumns = new Set([
         "id",
@@ -1336,6 +1380,11 @@ export class BackendAdapter implements ModelAdapter {
         "updatedAt",
         ...Object.keys(targetSchema),
       ]);
+      if (resolvedTarget) {
+        for (const denied of this._deniedFields(resolvedTarget, ctx)) {
+          targetValidColumns.delete(denied);
+        }
+      }
       if (!targetValidColumns.has(refColumn)) {
         throw new ClientError(
           `Invalid column "${refColumn}" on referenced model "${targetType}"`,

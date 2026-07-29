@@ -306,6 +306,7 @@ export function registerModelRoutes(
             rawSteps,
             modelByType,
             adapter,
+            ctx,
           });
 
           if (data.__count === "true" || data.__count === true) {
