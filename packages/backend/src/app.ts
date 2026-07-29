@@ -701,7 +701,10 @@ export function createApp(config: AppConfig): ParcaeApp {
 
       // ── Step 4: Connect Redis (PubSub + Queue) ─────────────────────
       log.info("Connecting PubSub...");
-      const pubsub = new PubSub({ url: envConfig.REDIS_URL });
+      const pubsub = new PubSub({
+        url: envConfig.REDIS_URL,
+        channel: envConfig.PUBSUB_CHANNEL,
+      });
       resources.pubsub = pubsub;
       await pubsub.building;
       log.info("PubSub ready");

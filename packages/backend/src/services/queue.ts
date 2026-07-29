@@ -140,11 +140,17 @@ export class QueueService {
     // Parse Redis URL into the option shape ioredis accepts.
     const parsed = new URL(url);
     const isTLS = parsed.protocol === "rediss:";
+    // `redis://host:6379/2` selects logical database 2. ioredis reads it off
+    // the URL when handed one directly, but this path rebuilds the options
+    // object — so the path segment has to be carried across explicitly or
+    // every queue silently lands in db0.
+    const db = parsed.pathname.replace(/^\//, "");
     const opts: RedisOptions = {
       host: parsed.hostname,
       port: parseInt(parsed.port || "6379"),
       password: parsed.password || undefined,
       username: parsed.username || undefined,
+      ...(db ? { db: parseInt(db) } : {}),
       // Required by BullMQ for any connection that will service
       // blocking commands. Since BullMQ duplicates this instance to
       // build per-Worker blocking connections, the duplicates inherit

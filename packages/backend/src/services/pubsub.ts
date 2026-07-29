@@ -16,13 +16,17 @@ import { Redlock } from "@sesamecare-oss/redlock";
 import EventEmitter from "eventemitter3";
 import { log } from "../logger";
 
-// Namespaced Redis channel so multiple apps sharing one Redis
-// instance don't cross-contaminate each other's pub/sub traffic.
-const REDIS_CHANNEL = "parcae:events";
+// Default Redis channel. Redis pub/sub is global to the server — channels
+// are NOT scoped by the numeric database — so two apps sharing one Redis
+// instance cross-contaminate on this name unless one of them overrides it.
+// Set PUBSUB_CHANNEL per app when a Redis instance is shared.
+const DEFAULT_REDIS_CHANNEL = "parcae:events";
 
 export interface PubSubConfig {
   /** Redis URL. If not provided, falls back to in-process events only. */
   url?: string;
+  /** Event channel name. Defaults to `parcae:events`. */
+  channel?: string;
 }
 
 export class PubSub {
@@ -35,7 +39,10 @@ export class PubSub {
 
   public building: Promise<void>;
 
+  private readonly channel: string;
+
   constructor(config: PubSubConfig = {}) {
+    this.channel = config.channel || DEFAULT_REDIS_CHANNEL;
     this.building = config.url
       ? this.buildRedis(config.url)
       : Promise.resolve();
@@ -75,8 +82,8 @@ export class PubSub {
       retryJitter: 200,
     });
 
-    log.info("PubSub subscribing to events channel...");
-    await this.redisRead.subscribe(REDIS_CHANNEL);
+    log.info(`PubSub subscribing to "${this.channel}"...`);
+    await this.redisRead.subscribe(this.channel);
     log.info(`PubSub subscribed (${Date.now() - t0}ms)`);
 
     this.redisRead.on("message", (_channel: string, message: string) => {
@@ -92,7 +99,7 @@ export class PubSub {
   emit(event: string, ...args: any[]): void {
     if (this.redisWrite) {
       void this.redisWrite
-        .publish(REDIS_CHANNEL, JSON.stringify([event, ...args]))
+        .publish(this.channel, JSON.stringify([event, ...args]))
         .catch((err) => {
           log.error(`PubSub publish failed for "${event}":`, err);
         });

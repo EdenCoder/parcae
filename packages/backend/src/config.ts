@@ -174,6 +174,15 @@ export const configSchema = z.object({
 
   /** job queue name. Default: "parcae" */
   JOB_QUEUE_NAME: z.string().optional().default("parcae"),
+
+  /**
+   * Redis pub/sub channel for application events. Default: "parcae:events".
+   *
+   * Redis channels are global to the server — the numeric database in
+   * REDIS_URL does not scope them — so two Parcae apps sharing one Redis
+   * instance will receive each other's events unless one sets this.
+   */
+  PUBSUB_CHANNEL: z.string().optional(),
 });
 
 export type Config = z.infer<typeof configSchema>;
