@@ -500,7 +500,10 @@ export async function resyncQueries(
           const scope = (ModelClass as any).scope;
           if (!scope?.read) return results[index]!;
 
-          const scopeResult = scope.read({ user, params: {}, data: {} } as any);
+          // One ctx for the row gate and the field policy — a resync
+          // must not replay columns `scope.fields` would have withheld.
+          const ctx = { user, params: {}, data: {} } as any;
+          const scopeResult = scope.read(ctx);
           if (!scopeResult) return results[index]!;
 
           const prep = prepareClientQuery({
@@ -509,6 +512,7 @@ export async function resyncQueries(
             rawSteps: entry.steps,
             modelByType: adapter.modelsByType,
             adapter,
+            ctx,
           });
 
           if (entry.subscribe === false) {
