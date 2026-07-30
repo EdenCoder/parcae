@@ -13,6 +13,7 @@ import type { ParcaeClient, ClientConfig } from "../client";
 import type { AuthClientAdapter } from "../auth-adapter";
 import { ParcaeContext } from "./context";
 import { _onResyncRequired, _purgeCacheForUser } from "./useQuery";
+import { _authorizationClaimsFingerprint } from "../token-claims";
 import { log } from "../log";
 
 export interface ParcaeProviderProps {
@@ -343,13 +344,36 @@ const CommittedParcaeProvider: React.FC<CommittedProviderProps> = ({
       }
     });
 
-    // Token rotation / login / logout from the adapter. Each transition
-    // closes the context until the server has confirmed the new identity.
+    // Token rotation / login / logout from the adapter. An identity or
+    // authorization transition closes the context until the server has
+    // confirmed the new context. A pure rotation (same claims, new expiry)
+    // is invisible: a live socket session authenticates at hello, and every
+    // future handshake re-reads the resolver, so blanking the tree for it
+    // unmounted every screen mid-session each time the token refreshed.
+    let lastAuthorizationFingerprint: string | null = null;
+    void Promise.resolve(getToken())
+      .then((token) => {
+        if (!active || lastAuthorizationFingerprint !== null || !token) return;
+        lastAuthorizationFingerprint = _authorizationClaimsFingerprint(token);
+      })
+      .catch(() => {
+        // Seeding is best-effort; the first onChange then reconciles fully.
+      });
     const unsubChange =
       auth?.onChange((token) => {
-        reconcile(() =>
-          token === null ? client.terminateSession() : client.refreshSession(),
-        );
+        if (token === null) {
+          lastAuthorizationFingerprint = null;
+          reconcile(() => client.terminateSession());
+          return;
+        }
+        const fingerprint = _authorizationClaimsFingerprint(token);
+        const isPureRotation =
+          fingerprint !== null &&
+          fingerprint === lastAuthorizationFingerprint &&
+          client.session.state.status === "authenticated";
+        lastAuthorizationFingerprint = fingerprint;
+        if (isPureRotation) return;
+        reconcile(() => client.refreshSession());
       }) ?? (() => undefined);
 
     return () => {
