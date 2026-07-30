@@ -135,9 +135,9 @@ const ClientProvider: React.FC<ClientProviderProps> = ({
       if (token !== null) {
         // A rotation that changes no authorization claim needs no session
         // work: the socket session authenticated at hello and every future
-        // handshake re-reads the resolver. Reconciling anyway blanks the
-        // Provider's subtree, which unmounts every screen mid-session, and
-        // short-lived JWTs rotate continuously.
+        // handshake re-reads the resolver. Refreshing anyway re-runs the
+        // handshake and resyncs every mounted subscription, and short-lived
+        // JWTs rotate continuously, so that lands on a timer.
         //
         // The baseline is the token the server actually validated, never an
         // out-of-band resolver read: a fresher read can carry an
@@ -155,7 +155,7 @@ const ClientProvider: React.FC<ClientProviderProps> = ({
               _fingerprintAuthorizationClaims(next) ===
               _fingerprintAuthorizationClaims(confirmed)
             ) {
-              log.debug("rotation: authorization unchanged, tree stays open");
+              log.debug("rotation: authorization unchanged, skipping hello");
               return;
             }
             log.debug(
