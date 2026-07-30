@@ -13,7 +13,11 @@ import type { ParcaeClient, ClientConfig } from "../client";
 import type { AuthClientAdapter } from "../auth-adapter";
 import { ParcaeContext } from "./context";
 import { _onResyncRequired, _purgeCacheForUser } from "./useQuery";
-import { _authorizationClaimsFingerprint } from "../token-claims";
+import {
+  _authorizationClaims,
+  _differingClaimNames,
+  _fingerprintAuthorizationClaims,
+} from "../token-claims";
 import { log } from "../log";
 
 export interface ParcaeProviderProps {
@@ -350,29 +354,40 @@ const CommittedParcaeProvider: React.FC<CommittedProviderProps> = ({
     // is invisible: a live socket session authenticates at hello, and every
     // future handshake re-reads the resolver, so blanking the tree for it
     // unmounted every screen mid-session each time the token refreshed.
-    let lastAuthorizationFingerprint: string | null = null;
-    void Promise.resolve(getToken())
-      .then((token) => {
-        if (!active || lastAuthorizationFingerprint !== null || !token) return;
-        lastAuthorizationFingerprint = _authorizationClaimsFingerprint(token);
-      })
-      .catch(() => {
-        // Seeding is best-effort; the first onChange then reconciles fully.
-      });
+    //
+    // The baseline is the token the server last validated at hello, never an
+    // out-of-band resolver read: a resolver read can be minted after an
+    // authorization change the server has not confirmed yet, and comparing
+    // against it would swallow the corrective onChange for that change.
     const unsubChange =
       auth?.onChange((token) => {
         if (token === null) {
-          lastAuthorizationFingerprint = null;
           reconcile(() => client.terminateSession());
           return;
         }
-        const fingerprint = _authorizationClaimsFingerprint(token);
-        const isPureRotation =
-          fingerprint !== null &&
-          fingerprint === lastAuthorizationFingerprint &&
-          client.session.state.status === "authenticated";
-        lastAuthorizationFingerprint = fingerprint;
-        if (isPureRotation) return;
+        if (client.session.state.status === "authenticated") {
+          const confirmedToken = client._lastConfirmedToken?.() ?? null;
+          const confirmed =
+            confirmedToken === null
+              ? null
+              : _authorizationClaims(confirmedToken);
+          const next = _authorizationClaims(token);
+          if (confirmed !== null && next !== null) {
+            if (
+              _fingerprintAuthorizationClaims(next) ===
+              _fingerprintAuthorizationClaims(confirmed)
+            ) {
+              log.debug("rotation: authorization unchanged, tree stays open");
+              return;
+            }
+            log.debug(
+              `rotation: claims changed (${_differingClaimNames(
+                confirmed,
+                next,
+              ).join(",")}), reconciling`,
+            );
+          }
+        }
         reconcile(() => client.refreshSession());
       }) ?? (() => undefined);
 

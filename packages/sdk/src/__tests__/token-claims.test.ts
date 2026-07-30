@@ -71,6 +71,40 @@ describe("_authorizationClaimsFingerprint", () => {
     );
   });
 
+  // Clerk v2 session tokens carry fva (factor verification age, minutes),
+  // which ticks across pure rotations exactly like iat/exp. Two mints of the
+  // same authorization must match even when the minute boundary moved.
+  it("matches rotations of a Clerk v2-shaped token across an fva tick", () => {
+    const v2 = {
+      v: 2,
+      sub: "user_1",
+      sid: "sess_1",
+      iss: "https://clerk.example",
+      o: { id: "org_1", rol: "member", slg: "clinic-one" },
+      pla: "u:free",
+      fea: "o:assistant",
+    };
+    const first = jwt({ ...v2, fva: [7, -1], iat: 1000, exp: 1060 });
+    const second = jwt({ ...v2, fva: [8, -1], iat: 1030, exp: 1090 });
+    expect(_authorizationClaimsFingerprint(first)).toBe(
+      _authorizationClaimsFingerprint(second),
+    );
+    const roleChange = jwt({
+      ...v2,
+      o: { ...v2.o, rol: "admin" },
+      fva: [8, -1],
+      iat: 1030,
+      exp: 1090,
+    });
+    expect(_authorizationClaimsFingerprint(first)).not.toBe(
+      _authorizationClaimsFingerprint(roleChange),
+    );
+  });
+
+  it("rejects a payload with data after base64 padding", () => {
+    expect(_authorizationClaimsFingerprint("x.AB=garbage.y")).toBeNull();
+  });
+
   it("returns null for opaque tokens", () => {
     expect(_authorizationClaimsFingerprint("opaque-session-token")).toBeNull();
     expect(_authorizationClaimsFingerprint("a.b")).toBeNull();

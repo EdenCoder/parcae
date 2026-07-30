@@ -154,17 +154,11 @@ describe("ParcaeProvider owner remount", () => {
     await act(async () => renderer?.unmount());
     renderer = null;
 
-    // The Provider may read the resolver more than once per mount (the
-    // hello handshake and the rotation-fingerprint seed); release every
-    // pending read together.
-    const pendingTokenReads: ((token: string) => void)[] = [];
-    const resolveSecondToken = (token: string) => {
-      for (const resolve of pendingTokenReads.splice(0)) resolve(token);
-    };
+    let resolveSecondToken: (token: string) => void = () => undefined;
     const secondAuth = authAdapter(
       () =>
         new Promise<string>((resolve) => {
-          pendingTokenReads.push(resolve);
+          resolveSecondToken = resolve;
         }),
     );
 
@@ -291,17 +285,11 @@ describe("ParcaeProvider owner remount", () => {
     client.updateTokenResolver(async () => "token-user-1");
     await client.refreshSession();
 
-    // The Provider may read the resolver more than once per mount (the
-    // hello handshake and the rotation-fingerprint seed); release every
-    // pending read together.
-    const pendingTokenReads: ((token: string) => void)[] = [];
-    const resolveSecondToken = (token: string) => {
-      for (const resolve of pendingTokenReads.splice(0)) resolve(token);
-    };
+    let resolveSecondToken: (token: string) => void = () => undefined;
     const secondAuth = authAdapter(
       () =>
         new Promise<string>((resolve) => {
-          pendingTokenReads.push(resolve);
+          resolveSecondToken = resolve;
         }),
     );
 

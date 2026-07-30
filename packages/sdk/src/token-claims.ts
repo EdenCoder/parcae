@@ -13,7 +13,10 @@
  * compare" and take the full reconciliation path.
  */
 
-const VOLATILE_CLAIMS = new Set(["iat", "exp", "nbf", "jti"]);
+// fva is Clerk's factor-verification age in minutes: a default claim on v2
+// session tokens that ticks upward every minute, so it changes across pure
+// rotations exactly like the timestamp claims do.
+const VOLATILE_CLAIMS = new Set(["iat", "exp", "nbf", "jti", "fva"]);
 
 const BASE64_ALPHABET =
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -25,6 +28,10 @@ function base64UrlDecode(segment: string): string | null {
   let bits = 0;
   let bitCount = 0;
   let bytes = "";
+  const paddingStart = base64.indexOf("=");
+  if (paddingStart !== -1 && /[^=]/.test(base64.slice(paddingStart))) {
+    return null;
+  }
   for (const char of base64) {
     if (char === "=") break;
     const value = BASE64_ALPHABET.indexOf(char);
@@ -57,7 +64,11 @@ function canonicalize(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 
-export function _authorizationClaimsFingerprint(token: string): string | null {
+/** The token's payload minus the volatile claims, or null when the token is
+ * not a decodable JWT object. */
+export function _authorizationClaims(
+  token: string,
+): Record<string, unknown> | null {
   const segments = token.split(".");
   if (segments.length !== 3) return null;
   const decoded = base64UrlDecode(segments[1]!);
@@ -75,10 +86,32 @@ export function _authorizationClaimsFingerprint(token: string): string | null {
   ) {
     return null;
   }
-  const stable = Object.fromEntries(
+  return Object.fromEntries(
     Object.entries(payload as Record<string, unknown>).filter(
       ([claim]) => !VOLATILE_CLAIMS.has(claim),
     ),
   );
-  return canonicalize(stable);
+}
+
+export function _fingerprintAuthorizationClaims(
+  claims: Record<string, unknown>,
+): string {
+  return canonicalize(claims);
+}
+
+export function _authorizationClaimsFingerprint(token: string): string | null {
+  const claims = _authorizationClaims(token);
+  return claims === null ? null : canonicalize(claims);
+}
+
+/** Top-level claim names whose values differ between two claim sets. Names
+ * only, never values: claims can carry identifying data and this feeds logs. */
+export function _differingClaimNames(
+  previous: Record<string, unknown>,
+  next: Record<string, unknown>,
+): string[] {
+  const names = new Set([...Object.keys(previous), ...Object.keys(next)]);
+  return [...names]
+    .filter((name) => canonicalize(previous[name]) !== canonicalize(next[name]))
+    .sort();
 }

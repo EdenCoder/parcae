@@ -65,6 +65,8 @@ export interface ParcaeClient {
   releaseTokenResolverLease?(lease: object): boolean;
   /** Re-run the hello handshake on the current socket. */
   refreshSession(): Promise<{ userId: string | null }>;
+  /** @internal The token the server last validated at hello, if any. */
+  _lastConfirmedToken?(): string | null;
   /** @internal Wait until the current auth source is server-confirmed. */
   awaitSessionReconciled?(): Promise<{ userId: string | null }>;
   /** Explicit sign-out — terminates the session machine. */
@@ -247,6 +249,7 @@ function createClientInstance(
     releaseTokenResolverLease: (lease) =>
       transport.releaseTokenResolverLease(lease),
     refreshSession: () => transport.refreshSession(),
+    _lastConfirmedToken: () => transport.lastConfirmedToken(),
     awaitSessionReconciled: () => transport.awaitSessionReconciled(),
     terminateSession: () => transport.terminateSession(),
     resync: (entries) => transport.resync(entries),

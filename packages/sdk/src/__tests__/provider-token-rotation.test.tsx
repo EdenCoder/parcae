@@ -56,8 +56,20 @@ class FakeClient extends EventEmitter {
   disconnect = vi.fn();
   refreshCalls = 0;
   terminateCalls = 0;
+  confirmedToken: string | null = null;
+  deferNextRefresh = false;
+  private releaseRefresh: (() => void) | null = null;
   private getToken: ClientConfig["getToken"] | null = null;
   private tokenResolverLease: object | null = null;
+
+  _lastConfirmedToken(): string | null {
+    return this.confirmedToken;
+  }
+
+  releaseDeferredRefresh(): void {
+    this.releaseRefresh?.();
+    this.releaseRefresh = null;
+  }
 
   get hasTokenResolverLease(): boolean {
     return this.tokenResolverLease !== null;
@@ -82,6 +94,12 @@ class FakeClient extends EventEmitter {
   async refreshSession(): Promise<{ userId: string | null }> {
     this.refreshCalls += 1;
     this.session.beginReconciliation();
+    if (this.deferNextRefresh) {
+      this.deferNextRefresh = false;
+      await new Promise<void>((resolve) => {
+        this.releaseRefresh = resolve;
+      });
+    }
     const token = await this.getToken?.();
     let userId: string | null = null;
     if (typeof token === "string") {
@@ -91,11 +109,13 @@ class FakeClient extends EventEmitter {
       userId = payload.sub ?? null;
     }
     this.session.resolve(userId);
+    this.confirmedToken = typeof token === "string" ? token : null;
     return { userId };
   }
 
   async terminateSession(): Promise<void> {
     this.terminateCalls += 1;
+    this.confirmedToken = null;
     this.session.terminate();
   }
 }
@@ -139,6 +159,7 @@ describe("ParcaeProvider token rotation", () => {
       );
     });
     await act(async () => {
+      client.confirmedToken = jwt({ ...USER_1, iat: 1000, exp: 1060 });
       client.session.resolve("user-1");
       await client.session.ready;
     });
@@ -173,6 +194,7 @@ describe("ParcaeProvider token rotation", () => {
     await mountAuthenticated(client);
     const refreshesAfterMount = client.refreshCalls;
 
+    client.deferNextRefresh = true;
     await act(async () => {
       notify?.(
         jwt({ ...USER_1, org_role: "org:admin", iat: 1030, exp: 1090 }),
@@ -180,6 +202,11 @@ describe("ParcaeProvider token rotation", () => {
     });
 
     expect(client.refreshCalls).toBe(refreshesAfterMount + 1);
+    expect(currentRenderer().toJSON()).toBeNull();
+
+    await act(async () => {
+      client.releaseDeferredRefresh();
+    });
     expect(currentRenderer().toJSON()).not.toBeNull();
   });
 

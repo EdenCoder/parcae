@@ -127,6 +127,7 @@ export class SocketTransport extends EventEmitter implements Transport {
   private handshakeAttemptGeneration = 0;
   private sessionReadyForEvents = false;
   private hasResolvedSession = false;
+  private confirmedHelloToken: string | null = null;
   private inflight = new Map<string, Promise<any>>();
   private pendingCalls = new Map<string, (error: Error) => void>();
   private pendingResyncs = new Set<(error: Error) => void>();
@@ -389,6 +390,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     }
     this.session.resolve(userId);
     this.hasResolvedSession = true;
+    this.confirmedHelloToken = token;
     // Session listeners run synchronously and may start a newer refresh or
     // terminate the session. The superseded hello must not reopen raw events,
     // mark its resolver reconciled, or publish a resync signal afterward.
@@ -626,6 +628,13 @@ export class SocketTransport extends EventEmitter implements Transport {
     });
   }
 
+  /** The token the server last validated at hello, null before the first
+   * authenticated hello and after sign-out. The authorization baseline for
+   * rotation comparisons: it can never run ahead of the server session. */
+  lastConfirmedToken(): string | null {
+    return this.confirmedHelloToken;
+  }
+
   /** Explicit sign-out. Marks the session terminated and drops the socket auth. */
   async terminateSession(): Promise<void> {
     this._cancelPendingHandshake();
@@ -636,6 +645,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     this.sessionBoundaryGeneration++;
     this.authorizationGeneration++;
     this.sessionReadyForEvents = false;
+    this.confirmedHelloToken = null;
     this._cancelPendingDataOperations(
       new Error("Parcae request cancelled because the session terminated"),
     );
