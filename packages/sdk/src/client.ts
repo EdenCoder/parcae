@@ -59,6 +59,8 @@ export interface ParcaeClient {
   readonly isConnected: boolean;
   /** Re-run the hello handshake on the current socket. */
   refreshSession(): Promise<{ userId: string | null }>;
+  /** @internal The token the server last validated at hello, if any. */
+  _lastConfirmedToken?(): string | null;
   /** Explicit sign-out — terminates the session machine. */
   terminateSession(): Promise<void>;
   /** Server resync RPC — batched query subscription restore. */
@@ -102,6 +104,7 @@ export function createClient(config: ClientConfig): ParcaeClient {
       return transport.isConnected;
     },
     refreshSession: () => transport.refreshSession(),
+    _lastConfirmedToken: () => transport.lastConfirmedToken(),
     terminateSession: () => transport.terminateSession(),
     resync: (entries) => transport.resync(entries),
     on: (e, h) => transport.on(e, h),

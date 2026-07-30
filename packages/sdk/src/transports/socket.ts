@@ -135,6 +135,8 @@ export class SocketTransport extends EventEmitter implements Transport {
   private helloState: "idle" | "pending" | "resolved" | "rejected" = "idle";
   /** Settles when the most recent `hello` attempt settles. */
   private helloReady: Promise<void> = Promise.resolve();
+  /** The token the server validated at the last resolved hello. */
+  private confirmedHelloToken: string | null = null;
 
   constructor(config: SocketTransportConfig) {
     super();
@@ -263,6 +265,7 @@ export class SocketTransport extends EventEmitter implements Transport {
             `hello: ${userId ? `userId=${userId}` : "anonymous"} (${ms}ms)`,
           );
           this.session.resolve(userId);
+          this.confirmedHelloToken = token;
           resolveHello();
           this.emit("resync-required");
         });
@@ -388,8 +391,16 @@ export class SocketTransport extends EventEmitter implements Transport {
     return { userId: this.session.state.userId };
   }
 
+  /** The token the server validated at the last hello, null before the first
+   * one and after sign-out. The authorization baseline for rotation
+   * comparisons: it can never run ahead of the server's session. */
+  lastConfirmedToken(): string | null {
+    return this.confirmedHelloToken;
+  }
+
   /** Explicit sign-out. Marks the session terminated and drops the socket auth. */
   async terminateSession(): Promise<void> {
+    this.confirmedHelloToken = null;
     this.session.terminate();
     this._advanceGeneration(new Error("Session terminated"));
     if (this.socket.connected) {

@@ -29,6 +29,12 @@ class FakeClient extends EventEmitter {
     return model.bind(this.adapter);
   }
 
+  confirmedToken: string | null = null;
+
+  _lastConfirmedToken(): string | null {
+    return this.confirmedToken;
+  }
+
   refreshSession = vi.fn(async () => {
     if (this.session.state.status === 'terminated') this.session.reset();
     return { userId: this.session.state.userId };
@@ -46,6 +52,20 @@ class FakeClient extends EventEmitter {
 function asClient(client: FakeClient): ParcaeClient {
   return client as unknown as ParcaeClient;
 }
+
+function b64url(value: object): string {
+  return Buffer.from(JSON.stringify(value))
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+function jwt(payload: object): string {
+  return `${b64url({ alg: 'RS256', typ: 'JWT' })}.${b64url(payload)}.sig`;
+}
+
+const USER_1 = { sub: 'user-1', sid: 'sess-1', org_id: 'org-1', org_role: 'org:member' };
 
 /** Auth adapter whose `onChange` we can fire by hand. */
 function controllableAuth(): AuthClientAdapter & { emit(token: string | null): void } {
@@ -133,5 +153,59 @@ describe('ParcaeProvider auth token changes', () => {
 
     expect(client.refreshSession).toHaveBeenCalledTimes(1);
     expect(client.terminateSession).not.toHaveBeenCalled();
+  });
+
+  // Short-lived JWTs rotate continuously. A rotation that changes no
+  // authorization claim needs no hello: the socket session is already
+  // authenticated and every future handshake re-reads the resolver. Refreshing
+  // anyway re-runs the handshake and resyncs every subscription on a timer.
+  it('skips the refresh when a rotation changes no authorization claim', async () => {
+    const client = new FakeClient();
+    client.session.resolve('user-1');
+    client.confirmedToken = jwt({ ...USER_1, iat: 1000, exp: 1060 });
+    const auth = controllableAuth();
+    await mount(client, auth);
+
+    await act(async () => auth.emit(jwt({ ...USER_1, iat: 1030, exp: 1090 })));
+
+    expect(client.refreshSession).not.toHaveBeenCalled();
+  });
+
+  it('refreshes when a rotation carries a different authorization', async () => {
+    const client = new FakeClient();
+    client.session.resolve('user-1');
+    client.confirmedToken = jwt({ ...USER_1, iat: 1000, exp: 1060 });
+    const auth = controllableAuth();
+    await mount(client, auth);
+
+    await act(async () =>
+      auth.emit(jwt({ ...USER_1, org_role: 'org:admin', iat: 1030, exp: 1090 })),
+    );
+
+    expect(client.refreshSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('refreshes an anonymous session even when the claims match', async () => {
+    const client = new FakeClient();
+    client.session.resolve(null);
+    client.confirmedToken = jwt({ ...USER_1, iat: 1000, exp: 1060 });
+    const auth = controllableAuth();
+    await mount(client, auth);
+
+    await act(async () => auth.emit(jwt({ ...USER_1, iat: 1030, exp: 1090 })));
+
+    expect(client.refreshSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('refreshes when either token is not a decodable JWT', async () => {
+    const client = new FakeClient();
+    client.session.resolve('user-1');
+    client.confirmedToken = 'opaque-session-token';
+    const auth = controllableAuth();
+    await mount(client, auth);
+
+    await act(async () => auth.emit('opaque-session-token'));
+
+    expect(client.refreshSession).toHaveBeenCalledTimes(1);
   });
 });

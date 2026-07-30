@@ -7,6 +7,11 @@ import type { ParcaeClient, ClientConfig } from "../client";
 import type { AuthClientAdapter } from "../auth-adapter";
 import { ParcaeContext } from "./context";
 import { _onResyncRequired, _purgeCacheForUser } from "./useQuery";
+import {
+  _authorizationClaims,
+  _differingClaimNames,
+  _fingerprintAuthorizationClaims,
+} from "../token-claims";
 import { log } from "../log";
 
 export interface ParcaeProviderProps {
@@ -128,6 +133,39 @@ const ClientProvider: React.FC<ClientProviderProps> = ({
     auth.init(url || "");
     return auth.onChange((token) => {
       if (token !== null) {
+        // A rotation that changes no authorization claim needs no session
+        // work: the socket session authenticated at hello and every future
+        // handshake re-reads the resolver. Reconciling anyway blanks the
+        // Provider's subtree, which unmounts every screen mid-session, and
+        // short-lived JWTs rotate continuously.
+        //
+        // The baseline is the token the server actually validated, never an
+        // out-of-band resolver read: a fresher read can carry an
+        // authorization change the server has not confirmed, and comparing
+        // against it would swallow that change's corrective onChange.
+        if (client.session.state.status === "authenticated") {
+          const confirmedToken = client._lastConfirmedToken?.() ?? null;
+          const confirmed =
+            confirmedToken === null
+              ? null
+              : _authorizationClaims(confirmedToken);
+          const next = _authorizationClaims(token);
+          if (confirmed !== null && next !== null) {
+            if (
+              _fingerprintAuthorizationClaims(next) ===
+              _fingerprintAuthorizationClaims(confirmed)
+            ) {
+              log.debug("rotation: authorization unchanged, tree stays open");
+              return;
+            }
+            log.debug(
+              `rotation: claims changed (${_differingClaimNames(
+                confirmed,
+                next,
+              ).join(",")}), reconciling`,
+            );
+          }
+        }
         client.refreshSession().catch(() => {});
         return;
       }
