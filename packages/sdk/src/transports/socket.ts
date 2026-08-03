@@ -32,6 +32,9 @@ import { log } from "../log";
 const DEFAULT_TIMEOUT = 120_000;
 const HANDSHAKE_CANCELLED = Symbol("handshake-cancelled");
 const ANONYMOUS_TOKEN_RESOLVER = async (): Promise<null> => null;
+const WATCHDOG_STALE_MS = 8_000;
+const WATCHDOG_BACKOFF_CAP_MS = 60_000;
+const KICK_FLOOR_MS = 2_000;
 
 const uid = new ShortId({ length: 10 });
 
@@ -68,6 +71,23 @@ export interface SocketTransportConfig {
    * header set here reaches middleware like any per-request header.
    */
   extraHeaders?: Record<string, string>;
+  /**
+   * Watchdog stale threshold in ms. While the consumer reports the app
+   * active, a transport that stays unready (socket not connected, or
+   * connected with hello unacked) this long is torn down and rebuilt
+   * with exponential backoff. `0` disables the watchdog. Default 8000.
+   */
+  watchdogStaleMs?: number;
+}
+
+/** Point-in-time technical snapshot of the transport, for diagnostics. */
+export interface TransportDiagnostics {
+  connectionStatus: "idle" | "connecting" | "connected" | "disconnected";
+  sessionStatus: "pending" | "anonymous" | "authenticated" | "terminated";
+  msSinceHelloAttempt: number | null;
+  msSinceHelloAck: number | null;
+  subscriptionCount: number;
+  recoveryAttempts: number;
 }
 
 /** Wire shape for a single `resync` entry. */
@@ -143,6 +163,14 @@ export class SocketTransport extends EventEmitter implements Transport {
       { authorization: number; wrapper: (...args: any[]) => void }
     >
   >();
+  private watchdogStaleMs: number;
+  private watchdogActive = true;
+  private watchdogSuspended = false;
+  private watchdogTimer: ReturnType<typeof setTimeout> | null = null;
+  private watchdogUnhealthySince: number | null = null;
+  private watchdogRecoveries = 0;
+  private lastHelloAttemptAt: number | null = null;
+  private lastHelloAckAt: number | null = null;
   /** Resolves when the most recent `hello` ack lands. */
   private helloReady: Promise<void> = Promise.resolve();
   private pendingHandshake: {
@@ -159,6 +187,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     this.url = config.url;
     this.version = config.version ?? "v1";
     this.getToken = config.getToken;
+    this.watchdogStaleMs = config.watchdogStaleMs ?? WATCHDOG_STALE_MS;
 
     const socketPath = config.path ?? "/ws";
     const transports = [...(config.transports ?? ["websocket"])];
@@ -181,6 +210,7 @@ export class SocketTransport extends EventEmitter implements Transport {
       this.connection.connected();
       this.emit("connected");
       void this._handshake().catch(() => {});
+      this._scheduleWatchdog();
     });
 
     this.socket.on("disconnect", () => {
@@ -196,6 +226,7 @@ export class SocketTransport extends EventEmitter implements Transport {
       this._clearEventAcknowledgements();
       this.connection.disconnected();
       this.emit("disconnected");
+      this._scheduleWatchdog();
     });
 
     this.socket.on("error", (err: Error) => {
@@ -207,6 +238,141 @@ export class SocketTransport extends EventEmitter implements Transport {
       this.connection.connected();
       void this._handshake().catch(() => {});
     }
+    this._scheduleWatchdog();
+  }
+
+  // ── Watchdog ─────────────────────────────────────────────────────
+  //
+  // The OS can suppress the device's network stack so the socket.io
+  // engine wedges silently: no connect, no connect_error, no timers
+  // firing, forever. Recovery is a full engine rebuild under the same
+  // Socket: disconnect() destroys the wedged manager/engine state and
+  // connect() builds a fresh engine while every listener stays attached.
+
+  private _watchdogHealthy(): boolean {
+    return this.socket.connected && this.sessionReadyForEvents;
+  }
+
+  private _watchdogEligible(): boolean {
+    return (
+      this.watchdogStaleMs > 0 &&
+      this.watchdogActive &&
+      !this.watchdogSuspended &&
+      this.session.state.status !== "terminated"
+    );
+  }
+
+  private _scheduleWatchdog(): void {
+    if (this.watchdogTimer) {
+      clearTimeout(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+    if (!this._watchdogEligible()) {
+      this.watchdogUnhealthySince = null;
+      return;
+    }
+    if (this._watchdogHealthy()) {
+      this.watchdogUnhealthySince = null;
+      this.watchdogRecoveries = 0;
+      return;
+    }
+    if (this.watchdogUnhealthySince === null) {
+      this.watchdogUnhealthySince = Date.now();
+    }
+    const backoff = Math.min(
+      this.watchdogStaleMs * 2 ** this.watchdogRecoveries,
+      WATCHDOG_BACKOFF_CAP_MS,
+    );
+    const delay = Math.max(
+      this.watchdogUnhealthySince + backoff - Date.now(),
+      50,
+    );
+    this.watchdogTimer = setTimeout(() => {
+      this.watchdogTimer = null;
+      this._watchdogTick();
+    }, delay);
+  }
+
+  private _watchdogTick(): void {
+    if (!this._watchdogEligible() || this._watchdogHealthy()) {
+      this._scheduleWatchdog();
+      return;
+    }
+    this._recoverStuckTransport(
+      this.socket.connected ? "hello-stalled" : "connect-stalled",
+    );
+  }
+
+  private _recoverStuckTransport(
+    reason: "connect-stalled" | "hello-stalled",
+  ): void {
+    this.watchdogRecoveries++;
+    this.emit("watchdog:recover", {
+      reason,
+      attempt: this.watchdogRecoveries,
+      diagnostics: this.diagnostics(),
+    });
+    log.warn(`watchdog: recovering (${reason})`);
+    this.watchdogUnhealthySince = Date.now();
+    try {
+      this.socket.disconnect();
+    } catch {
+      log.warn("watchdog: teardown failed");
+    }
+    try {
+      this.socket.connect();
+    } catch {
+      log.warn("watchdog: reconnect failed");
+    }
+    this._scheduleWatchdog();
+  }
+
+  /** Consumer's foreground signal. The watchdog only runs while active. */
+  setActive(active: boolean): void {
+    if (this.watchdogActive === active) return;
+    this.watchdogActive = active;
+    // Measure staleness from re-activation, not from however long the
+    // app sat backgrounded with the socket legitimately idle.
+    if (active) this.watchdogUnhealthySince = null;
+    this._scheduleWatchdog();
+  }
+
+  /**
+   * Consumer's "conditions changed, try now" signal (app foregrounded,
+   * network came back). Resets the backoff and, when the transport has
+   * been unhealthy past a short floor, recovers immediately.
+   */
+  kick(): void {
+    this.watchdogRecoveries = 0;
+    if (
+      this._watchdogEligible() &&
+      !this._watchdogHealthy() &&
+      this.watchdogUnhealthySince !== null &&
+      Date.now() - this.watchdogUnhealthySince >= KICK_FLOOR_MS
+    ) {
+      this._recoverStuckTransport(
+        this.socket.connected ? "hello-stalled" : "connect-stalled",
+      );
+      return;
+    }
+    this._scheduleWatchdog();
+  }
+
+  diagnostics(): TransportDiagnostics {
+    return {
+      connectionStatus: this.connection.state.status,
+      sessionStatus: this.session.state.status,
+      msSinceHelloAttempt:
+        this.lastHelloAttemptAt === null
+          ? null
+          : Date.now() - this.lastHelloAttemptAt,
+      msSinceHelloAck:
+        this.lastHelloAckAt === null
+          ? null
+          : Date.now() - this.lastHelloAckAt,
+      subscriptionCount: this.subscriptions.size,
+      recoveryAttempts: this.watchdogRecoveries,
+    };
   }
 
   // ── Hello / resync handshake ─────────────────────────────────────
@@ -214,6 +380,7 @@ export class SocketTransport extends EventEmitter implements Transport {
   private _handshake(): Promise<void> {
     this._cancelPendingHandshake();
     this._cancelPendingTermination();
+    this.lastHelloAttemptAt = Date.now();
     const handshakeAttempt = ++this.handshakeAttemptGeneration;
     this.sessionBoundaryGeneration++;
     this.sessionReadyForEvents = false;
@@ -388,6 +555,7 @@ export class SocketTransport extends EventEmitter implements Transport {
       this._clearSubscriptions();
       this.authorizationGeneration++;
     }
+    this.lastHelloAckAt = Date.now();
     this.session.resolve(userId);
     this.hasResolvedSession = true;
     this.confirmedHelloToken = token;
@@ -402,6 +570,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     }
     this.sessionReadyForEvents = true;
     this.reconciledTokenResolverRevision = resolverRevision;
+    this._scheduleWatchdog();
     // Resync runs after every successful hello. Consumers track
     // their own cache state and decide whether they have anything
     // to ask the server about; the transport just publishes the
@@ -655,6 +824,7 @@ export class SocketTransport extends EventEmitter implements Transport {
       ),
     );
     this.session.terminate();
+    this._scheduleWatchdog();
     if (!this.socket.connected) {
       this.helloReady = Promise.resolve();
       return;
@@ -986,6 +1156,7 @@ export class SocketTransport extends EventEmitter implements Transport {
   }
 
   disconnect(): void {
+    this.watchdogSuspended = true;
     this._cancelPendingDataOperations(
       new Error("Parcae client disconnected during request"),
     );
@@ -994,11 +1165,17 @@ export class SocketTransport extends EventEmitter implements Transport {
     );
     this._clearEventAcknowledgements();
     this.socket.disconnect();
+    this._scheduleWatchdog();
   }
 
   async reconnect(): Promise<void> {
-    if (this.socket.connected) return;
+    this.watchdogSuspended = false;
+    if (this.socket.connected) {
+      this._scheduleWatchdog();
+      return;
+    }
     this.connection.connecting();
     this.socket.connect();
+    this._scheduleWatchdog();
   }
 }

@@ -10,7 +10,11 @@
 import { Model, FrontendAdapter } from "@parcae/model";
 import type { Transport, RequestOptions } from "@parcae/model";
 import { SocketTransport } from "./transports/socket";
-import type { ResyncEntry, ResyncResult } from "./transports/socket";
+import type {
+  ResyncEntry,
+  ResyncResult,
+  TransportDiagnostics,
+} from "./transports/socket";
 import type { SessionMachine } from "./session-machine";
 import type { ConnectionMachine } from "./connection-machine";
 
@@ -73,6 +77,14 @@ export interface ParcaeClient {
   terminateSession(): Promise<void>;
   /** Server resync RPC — batched query subscription restore. */
   resync(entries: ResyncEntry[]): Promise<ResyncResult[]>;
+  /** Watchdog foreground gate — the consumer's app-active signal. */
+  setActive?(active: boolean): void;
+  /** Watchdog "conditions changed, try now" signal. */
+  kick?(): void;
+  /** Technical transport snapshot for diagnostics/telemetry. */
+  diagnostics?(): TransportDiagnostics;
+  /** @internal Publish a diagnostic event on the transport emitter. */
+  _emitDiagnostic?(event: string, payload: Record<string, unknown>): void;
   on(event: string, handler: (...args: any[]) => void): void;
   off(event: string, handler?: (...args: any[]) => void): void;
   disconnect(): void;
@@ -253,6 +265,10 @@ function createClientInstance(
     awaitSessionReconciled: () => transport.awaitSessionReconciled(),
     terminateSession: () => transport.terminateSession(),
     resync: (entries) => transport.resync(entries),
+    setActive: (active) => transport.setActive(active),
+    kick: () => transport.kick(),
+    diagnostics: () => transport.diagnostics(),
+    _emitDiagnostic: (event, payload) => void transport.emit(event, payload),
     on: (e, h) => transport.on(e, h),
     off: (e, h) => transport.off(e, h),
     disconnect: () => transport.disconnect(),

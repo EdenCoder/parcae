@@ -14,4 +14,5 @@ export type {
   SocketTransportConfig,
   ResyncEntry,
   ResyncResult,
+  TransportDiagnostics,
 } from "./transports/socket";
