@@ -96,6 +96,7 @@ const clientIdentities = new WeakMap<object, number>();
 const observedClients = new WeakSet<object>();
 let nextClientIdentity = 1;
 const GC_DELAY = 60_000;
+const QUERY_STUCK_MS = 10_000;
 const EMPTY = Object.freeze([]) as unknown as any[];
 const INITIAL_HASH = "L";
 
@@ -1205,6 +1206,30 @@ export function useQuery<T>(
       doFetch(key, entry, currentChain, clientRef.current);
     }
   }, [key]);
+
+  // ── Stuck-loading diagnostic ───────────────────────────────────
+  // A hook continuously loading this long is stuck: the session never
+  // resolved (no key can be built) or the fetch/subscribe hung. Emit
+  // once per mount through the client; the app decides how to report.
+  const isLoading = key ? (cache.get(key)?.loading ?? true) : !sessionReady;
+  useEffect(() => {
+    if (!isLoading) return;
+    if (typeof setTimeout !== "function") return;
+    const startedAt = Date.now();
+    const timer = setTimeout(() => {
+      const currentClient: any = clientRef.current;
+      try {
+        currentClient?._emitDiagnostic?.("query-stuck", {
+          modelType: chainRef.current?.__modelType ?? "unknown",
+          elapsedMs: Date.now() - startedAt,
+          sessionStatus: currentClient?.session?.state?.status ?? "unknown",
+        });
+      } catch {
+        log.warn("useQuery: stuck diagnostic emit failed");
+      }
+    }, QUERY_STUCK_MS);
+    return () => clearTimeout(timer);
+  }, [isLoading]);
 
   // ── Drift poll ─────────────────────────────────────────────────
   const pollMs = options.poll ?? 60_000;
