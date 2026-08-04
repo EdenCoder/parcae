@@ -88,6 +88,10 @@ export interface TransportDiagnostics {
   msSinceHelloAck: number | null;
   subscriptionCount: number;
   recoveryAttempts: number;
+  /** In-flight `call` RPCs plus in-flight resyncs. */
+  pendingCallCount: number;
+  /** Age of the oldest in-flight RPC/resync, null when none pending. */
+  msSinceOldestPendingCall: number | null;
 }
 
 /** Wire shape for a single `resync` entry. */
@@ -149,8 +153,11 @@ export class SocketTransport extends EventEmitter implements Transport {
   private hasResolvedSession = false;
   private confirmedHelloToken: string | null = null;
   private inflight = new Map<string, Promise<any>>();
-  private pendingCalls = new Map<string, (error: Error) => void>();
-  private pendingResyncs = new Set<(error: Error) => void>();
+  private pendingCalls = new Map<
+    string,
+    { cancel: (error: Error) => void; sentAt: number }
+  >();
+  private pendingResyncs = new Map<(error: Error) => void, number>();
   private pendingConnectionWaits = new Set<(error: Error) => void>();
   private pendingEventAcknowledgements = new Map<
     symbol,
@@ -169,6 +176,8 @@ export class SocketTransport extends EventEmitter implements Transport {
   private watchdogTimer: ReturnType<typeof setTimeout> | null = null;
   private watchdogUnhealthySince: number | null = null;
   private watchdogRecoveries = 0;
+  private lastRpcResponseAt: number | null = null;
+  private rpcStallRecoveryPending = false;
   private lastHelloAttemptAt: number | null = null;
   private lastHelloAckAt: number | null = null;
   /** Resolves when the most recent `hello` ack lands. */
@@ -249,8 +258,50 @@ export class SocketTransport extends EventEmitter implements Transport {
   // Socket: disconnect() destroys the wedged manager/engine state and
   // connect() builds a fresh engine while every listener stays attached.
 
+  private _oldestPendingAt(): number | null {
+    let oldest: number | null = null;
+    for (const { sentAt } of this.pendingCalls.values()) {
+      if (oldest === null || sentAt < oldest) oldest = sentAt;
+    }
+    for (const sentAt of this.pendingResyncs.values()) {
+      if (oldest === null || sentAt < oldest) oldest = sentAt;
+    }
+    return oldest;
+  }
+
+  // A half-dead path can pass small frames (hello ack, pings) while
+  // dropping RPC response frames, so "connected + hello acked" is not
+  // proof of health. Stalled = the oldest in-flight RPC has waited a
+  // full stale window with no response of any kind arriving after it
+  // was dispatched. A response landing after dispatch proves the wire,
+  // so a merely slow server never trips this.
+  private _rpcStalled(): boolean {
+    const oldest = this._oldestPendingAt();
+    if (oldest === null) return false;
+    if (Date.now() - oldest < this.watchdogStaleMs) return false;
+    return this.lastRpcResponseAt === null || this.lastRpcResponseAt <= oldest;
+  }
+
+  private _noteRpcResponse(): void {
+    this.lastRpcResponseAt = Date.now();
+    if (this.rpcStallRecoveryPending) {
+      this.rpcStallRecoveryPending = false;
+      this.emit("rpc:recovered");
+    }
+  }
+
+  private _stallReason(): "connect-stalled" | "hello-stalled" | "rpc-stalled" {
+    if (!this.socket.connected) return "connect-stalled";
+    if (!this.sessionReadyForEvents) return "hello-stalled";
+    return "rpc-stalled";
+  }
+
   private _watchdogHealthy(): boolean {
-    return this.socket.connected && this.sessionReadyForEvents;
+    return (
+      this.socket.connected &&
+      this.sessionReadyForEvents &&
+      !this._rpcStalled()
+    );
   }
 
   private _watchdogEligible(): boolean {
@@ -274,10 +325,26 @@ export class SocketTransport extends EventEmitter implements Transport {
     if (this._watchdogHealthy()) {
       this.watchdogUnhealthySince = null;
       this.watchdogRecoveries = 0;
+      // Healthy with RPCs in flight: arm a check for the moment the
+      // oldest pending call would cross the stale window, so a stall
+      // that develops after this scheduling point is still noticed.
+      const oldest = this._oldestPendingAt();
+      if (oldest !== null) {
+        const delay = Math.max(oldest + this.watchdogStaleMs - Date.now(), 50);
+        this.watchdogTimer = setTimeout(() => {
+          this.watchdogTimer = null;
+          this._watchdogTick();
+        }, delay);
+      }
       return;
     }
     if (this.watchdogUnhealthySince === null) {
-      this.watchdogUnhealthySince = Date.now();
+      // For an RPC stall the transport has effectively been unhealthy
+      // since the starved call went out, not since the stall was
+      // noticed; anchoring backoff there recovers on the first tick.
+      const oldest = this._oldestPendingAt();
+      this.watchdogUnhealthySince =
+        this._rpcStalled() && oldest !== null ? oldest : Date.now();
     }
     const backoff = Math.min(
       this.watchdogStaleMs * 2 ** this.watchdogRecoveries,
@@ -298,14 +365,15 @@ export class SocketTransport extends EventEmitter implements Transport {
       this._scheduleWatchdog();
       return;
     }
-    this._recoverStuckTransport(
-      this.socket.connected ? "hello-stalled" : "connect-stalled",
-    );
+    this._recoverStuckTransport(this._stallReason());
   }
 
   private _recoverStuckTransport(
-    reason: "connect-stalled" | "hello-stalled",
+    reason: "connect-stalled" | "hello-stalled" | "rpc-stalled",
   ): void {
+    if (reason === "rpc-stalled") {
+      this.rpcStallRecoveryPending = true;
+    }
     this.watchdogRecoveries++;
     this.emit("watchdog:recover", {
       reason,
@@ -350,15 +418,14 @@ export class SocketTransport extends EventEmitter implements Transport {
       this.watchdogUnhealthySince !== null &&
       Date.now() - this.watchdogUnhealthySince >= KICK_FLOOR_MS
     ) {
-      this._recoverStuckTransport(
-        this.socket.connected ? "hello-stalled" : "connect-stalled",
-      );
+      this._recoverStuckTransport(this._stallReason());
       return;
     }
     this._scheduleWatchdog();
   }
 
   diagnostics(): TransportDiagnostics {
+    const oldestPending = this._oldestPendingAt();
     return {
       connectionStatus: this.connection.state.status,
       sessionStatus: this.session.state.status,
@@ -372,6 +439,9 @@ export class SocketTransport extends EventEmitter implements Transport {
           : Date.now() - this.lastHelloAckAt,
       subscriptionCount: this.subscriptions.size,
       recoveryAttempts: this.watchdogRecoveries,
+      pendingCallCount: this.pendingCalls.size + this.pendingResyncs.size,
+      msSinceOldestPendingCall:
+        oldestPending === null ? null : Date.now() - oldestPending,
     };
   }
 
@@ -421,9 +491,9 @@ export class SocketTransport extends EventEmitter implements Transport {
 
   private _cancelPendingDataOperations(error: Error): void {
     const calls = [...this.pendingCalls.values()];
-    const resyncs = [...this.pendingResyncs];
+    const resyncs = [...this.pendingResyncs.keys()];
     this.inflight.clear();
-    for (const cancel of calls) cancel(error);
+    for (const { cancel } of calls) cancel(error);
     for (const cancel of resyncs) cancel(error);
   }
 
@@ -611,11 +681,13 @@ export class SocketTransport extends EventEmitter implements Transport {
         else reject(outcome.error);
       };
       const cancel = (error: Error) => finish({ status: "rejected", error });
-      this.pendingResyncs.add(cancel);
+      this.pendingResyncs.set(cancel, Date.now());
+      this._scheduleWatchdog();
       timeout = setTimeout(() => {
         cancel(new Error("resync timeout"));
       }, DEFAULT_TIMEOUT);
       this.socket.emit("resync", { queries: entries }, (response: any) => {
+        this._noteRpcResponse();
         if (settled) return;
         if (
           operationGeneration !== this.sessionOperationGeneration ||
@@ -948,6 +1020,7 @@ export class SocketTransport extends EventEmitter implements Transport {
         clearTimeout(timeout);
         this.socket.off(id, onResponse);
         this.pendingCalls.delete(id);
+        this._scheduleWatchdog();
         if (outcome.status === "resolved") resolve(outcome.value);
         else reject(outcome.error);
       };
@@ -960,6 +1033,9 @@ export class SocketTransport extends EventEmitter implements Transport {
       }, timeoutMs);
 
       const onResponse = (msg: any) => {
+        // Any response frame proves the wire is alive, even one a
+        // session boundary is about to discard.
+        this._noteRpcResponse();
         if (
           callSessionOperationGeneration !== this.sessionOperationGeneration ||
           callSessionBoundaryGeneration !== this.sessionBoundaryGeneration ||
@@ -994,7 +1070,7 @@ export class SocketTransport extends EventEmitter implements Transport {
         }
       };
 
-      this.pendingCalls.set(id, cancel);
+      this.pendingCalls.set(id, { cancel, sentAt: Date.now() });
       this.socket.once(id, onResponse);
       this.socket.emit(
         "call",
@@ -1003,6 +1079,7 @@ export class SocketTransport extends EventEmitter implements Transport {
         `/${this.version}${path}`,
         data,
       );
+      this._scheduleWatchdog();
     });
   }
 
