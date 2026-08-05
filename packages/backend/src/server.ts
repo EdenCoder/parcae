@@ -9,7 +9,7 @@ import { createServer } from "node:http";
 import { parse as parseUrl } from "node:url";
 import polka from "polka";
 import { Server as SocketServer } from "socket.io";
-import bodyParser from "body-parser";
+import bodyParser, { type OptionsJson } from "body-parser";
 import type { Config } from "./config";
 
 export interface ServerContext {
@@ -22,6 +22,29 @@ export interface ServerOptions {
   config: Config;
   version: string;
 }
+
+/**
+ * JSON body-parser options for every app this factory builds. Exported so the
+ * regression test exercises the real configuration instead of a copy that can
+ * silently drift away from it.
+ */
+export const JSON_BODY_PARSER_OPTIONS: OptionsJson = {
+  limit: "50mb",
+  // Webhook senders routinely use an RFC 6839 structured suffix instead of
+  // plain application/json: LiveKit posts application/webhook+json.
+  // body-parser's default matches application/json exactly, so without this
+  // those requests skip the parser, arrive with an empty body and an unset
+  // rawBody, and every signature check fails closed.
+  type: ["application/json", "application/*+json"],
+  // Stash the unparsed body so webhook handlers can verify HMAC signatures
+  // (Stripe, GitHub, Svix, etc.) against the exact bytes the sender signed.
+  // body-parser discards the raw stream once it parses, and a re-serialised
+  // object is not byte-identical to the original, so verification needs the
+  // buffer captured here.
+  verify: (req, _res, buf) => {
+    (req as unknown as { rawBody?: Buffer }).rawBody = buf;
+  },
+};
 
 /**
  * Create and configure the HTTP + WebSocket server.
@@ -37,19 +60,7 @@ export function createServer_(options: ServerOptions): ServerContext {
 
   // Create Polka app with body parsing + query string parsing
   const app = polka();
-  app.use(
-    bodyParser.json({
-      limit: "50mb",
-      // Stash the unparsed body so webhook handlers can verify HMAC
-      // signatures (Stripe, GitHub, Svix, etc.) against the exact bytes the
-      // sender signed. body-parser discards the raw stream once it parses,
-      // and a re-serialised object is not byte-identical to the original, so
-      // verification needs the buffer captured here.
-      verify: (req, _res, buf) => {
-        (req as unknown as { rawBody?: Buffer }).rawBody = buf;
-      },
-    }),
-  );
+  app.use(bodyParser.json(JSON_BODY_PARSER_OPTIONS));
   app.use(bodyParser.urlencoded({ extended: true }));
 
   // Polka's handler unconditionally sets req.query = querystring.parse(info.query),
