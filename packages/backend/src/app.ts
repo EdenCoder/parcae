@@ -1120,7 +1120,11 @@ export function createApp(config: AppConfig): ParcaeApp {
                 attempt: bullJob.attemptsMade,
               });
             },
-            concurrency,
+            {
+              concurrency,
+              lockDuration: jobEntry.options?.lockDuration,
+              maxStalledCount: jobEntry.options?.maxStalledCount,
+            },
           );
           started.push({ name: jobEntry.name, concurrency });
         }

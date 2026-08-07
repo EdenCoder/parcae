@@ -181,18 +181,40 @@ export class QueueService {
     return queue;
   }
 
-  /** Create a Worker for a queue. */
+  /**
+   * Create a Worker for a queue.
+   *
+   * `tuning` accepts a bare concurrency number for the common case, or
+   * the full shape when a job needs its lock behaviour changed too —
+   * see `JobOptions.lockDuration` for why a long-running job wants a
+   * say in that.
+   */
   createWorker(
     name: string,
     processor: (job: Job) => Promise<any>,
-    concurrency = 1,
+    tuning:
+      | number
+      | {
+          concurrency?: number;
+          lockDuration?: number;
+          maxStalledCount?: number;
+        } = 1,
   ): Worker | null {
     if (!this.sharedRedis) return null;
+
+    const opts = typeof tuning === "number" ? { concurrency: tuning } : tuning;
 
     const worker = new Worker(name, processor, {
       // See `get()` for the cast rationale — same dual-ioredis story.
       connection: this.sharedRedis as unknown as ConnectionOptions,
-      concurrency,
+      concurrency: opts.concurrency ?? 1,
+      // Left undefined, BullMQ applies its own defaults (30_000 / 1).
+      ...(opts.lockDuration === undefined
+        ? {}
+        : { lockDuration: opts.lockDuration }),
+      ...(opts.maxStalledCount === undefined
+        ? {}
+        : { maxStalledCount: opts.maxStalledCount }),
     });
 
     this.workers.set(name, worker);
