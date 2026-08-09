@@ -10,10 +10,12 @@
  * a real DB) — they assert the strip / reject behavior happens BEFORE
  * `Model.create` / `model.save` / `model.patch` is called.
  */
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 import { clearRoutes, getRoutes } from "../routing/route";
 import { registerModelRoutes } from "../adapters/routes";
+import { PubSub } from "../services/pubsub";
+import { _setServices, _clearServices } from "../services/context";
 import type { BackendAdapter } from "../adapters/model";
 
 // ─── Test model ─────────────────────────────────────────────────────────────
@@ -172,6 +174,14 @@ function makeRes() {
 describe("auto-CRUD readonlyFields", () => {
   beforeEach(() => {
     clearRoutes();
+    // PUT takes a per-row lock, which needs a service context. No
+    // REDIS_URL here, so this is the in-process AsyncLock fallback.
+    // See put-row-lock.test.ts for the locking contract itself.
+    _setServices(null as any, new PubSub());
+  });
+
+  afterEach(() => {
+    _clearServices();
   });
 
   // POST stripping is exercised indirectly through `stripReadonly`
@@ -431,8 +441,9 @@ describe("auto-CRUD readonlyFields", () => {
       },
       makeRes() as any,
     );
-    await Promise.resolve();
-    await Promise.resolve();
+    // Long enough for the row-lock acquire plus the transaction's own
+    // awaits to land the request inside the gated `save()`.
+    await new Promise((r) => setTimeout(r, 10));
 
     expect(fixture.captured.lockStates).toEqual([true]);
     expect(fixture.captured.saveStates).toEqual([true]);

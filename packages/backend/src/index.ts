@@ -59,6 +59,7 @@ export type {
 export {
   enqueue,
   lock,
+  lockRow,
   getQueue,
   getPubSub,
   getIo,

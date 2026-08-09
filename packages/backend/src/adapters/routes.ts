@@ -47,6 +47,7 @@ import {
   runQueryStatic,
 } from "../services/query-subscription";
 import { projectForWire } from "../services/hydrate-expansions";
+import { lockRow } from "../services/context";
 import type { BackendAdapter } from "./model";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -59,6 +60,14 @@ import type { BackendAdapter } from "./model";
  * the full rationale.
  */
 const AUTO_CRUD_PRIORITY = 200;
+
+/**
+ * How long a PUT will wait for the row lock before giving up. Long
+ * enough that a queue of ordinary updates all get their turn, short
+ * enough that a stuck holder surfaces as a failed request rather than
+ * a hung one.
+ */
+const PUT_LOCK_WAIT_MS = 10_000;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -471,37 +480,54 @@ export function registerModelRoutes(
           const scopeResult = scope.update!(ctx);
           if (!scopeResult) return forbidden(res);
 
-          const item = await adapter.runInTransaction(async () => {
-            const current = await findByIdOrTmp(
-              adapter,
-              ModelClass,
-              req.params.id,
-              scopeResult,
-              true,
-            );
-            if (!current) return null;
+          // PUT is a read-modify-write of the whole row: two concurrent
+          // writers can each merge their body onto the same pre-write
+          // snapshot, and the one that saves last silently reverts the
+          // other's fields. The lock covers the whole read → assign →
+          // save so the second writer reads what the first wrote.
+          // PATCH deliberately takes no lock — it issues a
+          // column-subset UPDATE and never round-trips the whole row.
+          //
+          // The ttl is a max tolerable wait, not a work budget: on the
+          // Redis path it is the Redlock TTL, on the in-process
+          // fallback it is the queue-wait timeout that rejects a caller
+          // who has waited that long.
+          const unlock = await lockRow(type, req.params.id, PUT_LOCK_WAIT_MS);
+          try {
+            const item = await adapter.runInTransaction(async () => {
+              const current = await findByIdOrTmp(
+                adapter,
+                ModelClass,
+                req.params.id,
+                scopeResult,
+                true,
+              );
+              if (!current) return null;
 
-            // Strip readonly fields BEFORE mass-assigning. Per-model
-            // `updateReadonlyFields` supplements the fields protected on
-            // every write without affecting create-time input.
-            const data = stripReadonly(
-              ModelClass,
-              req.body || {},
-              readonlyFieldsForUpdate(ModelClass),
-            );
-            for (const [key, value] of Object.entries(data)) {
-              current[key] = value;
-            }
+              // Strip readonly fields BEFORE mass-assigning. Per-model
+              // `updateReadonlyFields` supplements the fields protected on
+              // every write without affecting create-time input.
+              const data = stripReadonly(
+                ModelClass,
+                req.body || {},
+                readonlyFieldsForUpdate(ModelClass),
+              );
+              for (const [key, value] of Object.entries(data)) {
+                current[key] = value;
+              }
 
-            await current.save();
-            return current;
-          });
-          if (!item) return notFound(res, type);
+              await current.save();
+              return current;
+            });
+            if (!item) return notFound(res, type);
 
-          json(res, 200, {
-            result: await projectForWire(item, ctx.user),
-            success: true,
-          });
+            json(res, 200, {
+              result: await projectForWire(item, ctx.user),
+              success: true,
+            });
+          } finally {
+            await unlock();
+          }
         } catch (err) {
           respondWithError(res, err, `PUT ${path}/:id`);
         }

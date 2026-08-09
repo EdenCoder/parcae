@@ -220,6 +220,34 @@ export async function lock(
   return _pubsub.lock(key, ttl);
 }
 
+/**
+ * Acquire the lock for one persisted row. Returns an unlock function.
+ *
+ * This is THE key every read-modify-write of a row should serialise
+ * on — read the record, change it in memory, write the whole thing
+ * back. Two such writers that interleave between the read and the
+ * write each save a merge built from a stale snapshot, so the later
+ * one silently reverts the earlier one's fields. The auto-CRUD PUT
+ * route takes this lock; application code doing the same round trip
+ * by hand should take it too, so both contend on the same key.
+ *
+ * ```typescript
+ * const unlock = await lockRow("event", event.id);
+ * try {
+ *   // exclusive read-modify-write of that row
+ * } finally {
+ *   await unlock();
+ * }
+ * ```
+ */
+export function lockRow(
+  type: string,
+  id: string,
+  ttl?: number,
+): Promise<() => Promise<void>> {
+  return lock(`row:${type}:${id}`, ttl);
+}
+
 // ─── getQueue() / getPubSub() — escape hatches ──────────────────────────────
 
 /** Get the raw QueueService instance. */
