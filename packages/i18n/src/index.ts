@@ -11,6 +11,7 @@ import {
 } from "./locale";
 
 export * from "./locale";
+export * from "./catalog";
 
 export interface ParcaeI18nContext<TLocale extends string = string>
   extends LocaleResolution<TLocale> {
