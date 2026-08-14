@@ -784,6 +784,28 @@ export function createApp(config: AppConfig): ParcaeApp {
         log.info("Database schema ensured");
       }
 
+      // ── Step 7.5: SCHEMA_ONLY exit ─────────────────────────────────
+      // One-shot schema runs for deploy pipelines that gate rollout on
+      // migration success (e.g. an ECS run-task before any service
+      // update). Runs the exact ENSURE_SCHEMA sequence above - user
+      // migrations, then ensureAllTables - and exits instead of
+      // serving. Failure modes stay loud: a throwing migration rejects
+      // start() and the process exits non-zero.
+      if (process.env.SCHEMA_ONLY === "true") {
+        if (!ensureSchema) {
+          throw new Error("SCHEMA_ONLY=true requires ENSURE_SCHEMA=true");
+        }
+        log.info("Schema ensured; exiting (SCHEMA_ONLY)");
+        await shutdownResources({
+          changeBus,
+          pubsub,
+          queue,
+          writeDb,
+          readDb,
+        });
+        process.exit(0);
+      }
+
       // ── Step 8: Create server ──────────────────────────────────────
       server = createServer_({ config: envConfig, version });
       _setIo(server.io);
