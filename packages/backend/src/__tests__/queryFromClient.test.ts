@@ -1068,11 +1068,76 @@ describe("BackendAdapter.queryFromClient", () => {
     });
 
     it("throws at construction for an invalid configured ceiling", () => {
-      for (const bad of [0, 0.5, -1, Number.POSITIVE_INFINITY, Number.NaN]) {
+      for (const bad of [0, 0.5, 10.5, -1, Number.POSITIVE_INFINITY, Number.NaN]) {
         expect(() => createTestAdapter({ maxClientQueryLimit: bad })).toThrow(
           "maxClientQueryLimit",
         );
       }
+    });
+  });
+
+  describe("adversarial: nested pagination and input caps", () => {
+    it("ignores limit, offset, and clearLimit inside a __nested group", () => {
+      const steps: QueryStep[] = [
+        {
+          method: "where",
+          args: [
+            {
+              __nested: [
+                { method: "where", args: ["status", "active"] },
+                { method: "limit", args: [999999999] },
+                { method: "offset", args: [999999999] },
+                { method: "clearLimit", args: [] },
+              ],
+            },
+          ],
+        },
+      ];
+
+      adapter.queryFromClient(ProjectModel, { userId: "u1" }, steps);
+
+      // The nested builder callback never sees pagination methods, and
+      // the top level still injects the default limit.
+      const limitCalls = calls.filter((c) => c.method === "limit");
+      expect(limitCalls).toHaveLength(1);
+      expect(limitCalls[0]!.args[0]).toBe(25);
+      expect(calls.find((c) => c.method === "offset")).toBeUndefined();
+    });
+
+    it("drops a negative or non-numeric offset instead of replaying it", () => {
+      for (const bad of [-1, "garbage", null]) {
+        const { adapter: a, calls: c } = createTestAdapter();
+        a.queryFromClient(ProjectModel, { userId: "u1" }, [
+          { method: "offset", args: [bad] },
+        ] as QueryStep[]);
+        expect(c.find((call) => call.method === "offset")).toBeUndefined();
+      }
+    });
+
+    it("coerces a valid offset to an integer", () => {
+      adapter.queryFromClient(ProjectModel, { userId: "u1" }, [
+        { method: "offset", args: ["50"] },
+      ] as QueryStep[]);
+      expect(calls.find((c) => c.method === "offset")!.args[0]).toBe(50);
+    });
+
+    it("rejects a __query with more than 100 steps", () => {
+      const steps: QueryStep[] = Array.from({ length: 101 }, () => ({
+        method: "where",
+        args: ["status", "active"],
+      }));
+      expect(() =>
+        adapter.queryFromClient(ProjectModel, { userId: "u1" }, steps),
+      ).toThrow("exceeds 100 steps");
+    });
+
+    it("rejects an oversized whereIn value array", () => {
+      const steps: QueryStep[] = [
+        { method: "whereIn", args: ["status", new Array(10_001).fill("x")] },
+      ];
+      expect(() =>
+        adapter.queryFromClient(ProjectModel, { userId: "u1" }, steps),
+      ).toThrow("exceeds 10000 values");
     });
   });
 

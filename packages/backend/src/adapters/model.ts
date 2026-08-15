@@ -49,11 +49,7 @@ export interface BackendServices {
   write: any; // Knex primary
   pubsub?: any; // Redis pub/sub + lock (optional)
   changeBus?: ChangeBus; // Cross-process model-change fan-out (optional)
-  /**
-   * Hard ceiling on client-provided limits in queryFromClient.
-   * Clamps explicit `.limit(N)` args and the `.clearLimit()` cap.
-   * Defaults to DEFAULT_MAX_CLIENT_LIMIT.
-   */
+  /** Ceiling on client limits in queryFromClient (see its doc). */
   maxClientQueryLimit?: number;
 }
 
@@ -292,14 +288,15 @@ export class BackendAdapter implements ModelAdapter {
     const ceiling = services.maxClientQueryLimit;
     if (
       ceiling !== undefined &&
-      (typeof ceiling !== "number" || !Number.isFinite(ceiling) || ceiling < 1)
+      (typeof ceiling !== "number" ||
+        !Number.isInteger(ceiling) ||
+        ceiling < 1)
     ) {
       // Fail loud at boot: silently substituting the default would let
-      // an operator believe they tightened the clamp when they didn't.
-      // A fractional value would also floor to limit(0) (zero rows) and
-      // Infinity would make Knex drop the LIMIT clause entirely.
+      // an operator believe they tightened the clamp when they didn't,
+      // and Infinity would make Knex drop the LIMIT clause entirely.
       throw new Error(
-        `maxClientQueryLimit must be a finite number >= 1, got ${String(ceiling)}`,
+        `maxClientQueryLimit must be an integer >= 1, got ${String(ceiling)}`,
       );
     }
     this.services = services;
@@ -743,6 +740,24 @@ export class BackendAdapter implements ModelAdapter {
     "clearLimit",
   ]);
 
+  /**
+   * Pagination methods: clamped or injected at the top level of the
+   * replay loop, and excluded entirely inside `__nested` groups (limit
+   * and offset would replay unclamped there; clearLimit doesn't exist
+   * on a raw Knex builder).
+   */
+  private static PAGINATION_METHODS = new Set([
+    "limit",
+    "offset",
+    "clearLimit",
+  ]);
+
+  /** Cap on client-sent __query steps: bounds replay work per request. */
+  private static MAX_CLIENT_STEPS = 100;
+
+  /** Cap on whereIn / whereNotIn value arrays: bounds SQL size. */
+  private static MAX_CLIENT_IN_VALUES = 10_000;
+
   /** Methods whose first arg is a column name (or object of column→value). */
   private static COLUMN_ARG_METHODS = new Set([
     "where",
@@ -786,21 +801,14 @@ export class BackendAdapter implements ModelAdapter {
    */
   private static DEFAULT_LIMIT = 25;
 
-  /**
-   * Absolute ceiling on client-provided limits. A client `.limit(N)`
-   * above this is clamped down; `.clearLimit()` maps to exactly this
-   * value. Overridable per app via `maxClientQueryLimit` on the
-   * services object (createApp passes its config option through).
-   */
+  /** Default for maxClientQueryLimit (see queryFromClient's doc). */
   private static DEFAULT_MAX_CLIENT_LIMIT = 10_000;
 
   private get _maxClientLimit(): number {
-    // Validated in the constructor: absent means the default, anything
-    // present is a finite number >= 1.
-    const configured = this.services.maxClientQueryLimit;
-    return configured === undefined
-      ? BackendAdapter.DEFAULT_MAX_CLIENT_LIMIT
-      : Math.floor(configured);
+    return (
+      this.services.maxClientQueryLimit ??
+      BackendAdapter.DEFAULT_MAX_CLIENT_LIMIT
+    );
   }
 
   /**
@@ -931,12 +939,18 @@ export class BackendAdapter implements ModelAdapter {
       chain = this.query(modelClass).where(scope);
     }
 
+    if (steps.length > BackendAdapter.MAX_CLIENT_STEPS) {
+      throw new ClientError(
+        `__query exceeds ${BackendAdapter.MAX_CLIENT_STEPS} steps`,
+      );
+    }
+
     let hasLimit = false;
 
     for (const step of steps) {
       if (!BackendAdapter.SAFE_CLIENT_METHODS.has(step.method)) continue;
 
-      // clearLimit — bypass default limit, cap at the ceiling
+      // clearLimit: bypass default limit, cap at the ceiling
       if (step.method === "clearLimit") {
         hasLimit = true;
         chain = chain.limit(this._maxClientLimit);
@@ -985,6 +999,15 @@ export class BackendAdapter implements ModelAdapter {
         );
       }
 
+      // Sanitize offset: non-negative integer, dropped entirely on
+      // parse failure (negative or non-numeric values 500 raw from the
+      // SQL driver otherwise).
+      if (step.method === "offset") {
+        const parsed = Number.parseInt(args[0]);
+        if (!Number.isFinite(parsed) || parsed < 0) continue;
+        args[0] = parsed;
+      }
+
       // ── whereIn on a JSON-array column → "array contains any of" ─────
       // Stock `WHERE col IN (?, ?)` compares the whole jsonb value to
       // each binding as a string, which never matches when the column
@@ -1027,6 +1050,19 @@ export class BackendAdapter implements ModelAdapter {
   ): any[] {
     const args = [...(step.args ?? [])];
 
+    // Bound whereIn value arrays: an oversized list dies in the driver
+    // as an opaque 500 (or a parameter-limit error) instead of a clear
+    // client error, and the SQL text grows with every element.
+    if (
+      (step.method === "whereIn" || step.method === "whereNotIn") &&
+      Array.isArray(args[1]) &&
+      args[1].length > BackendAdapter.MAX_CLIENT_IN_VALUES
+    ) {
+      throw new ClientError(
+        `${step.method} exceeds ${BackendAdapter.MAX_CLIENT_IN_VALUES} values`,
+      );
+    }
+
     // Skip no-op where: where() with no args or where({}) with empty object
     if (BackendAdapter.COLUMN_ARG_METHODS.has(step.method)) {
       if (args.length === 0) return [];
@@ -1053,11 +1089,15 @@ export class BackendAdapter implements ModelAdapter {
         Array.isArray(firstArg.__nested)
       ) {
         const nestedSteps: QueryStep[] = firstArg.__nested;
-        // Replace with a Knex builder callback
+        // Replace with a Knex builder callback. Pagination methods are
+        // excluded inside the group: limit/offset would replay verbatim
+        // with no clamp, and clearLimit doesn't exist on a raw Knex
+        // builder (a nested one was a client-triggerable TypeError).
         args[0] = (builder: any) => {
           for (const nested of nestedSteps) {
             if (!BackendAdapter.SAFE_CLIENT_METHODS.has(nested.method))
               continue;
+            if (BackendAdapter.PAGINATION_METHODS.has(nested.method)) continue;
             const innerArgs = this._sanitizeStepArgs(
               nested,
               validColumns,

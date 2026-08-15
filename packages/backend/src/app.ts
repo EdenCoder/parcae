@@ -150,10 +150,8 @@ export interface AppConfig {
    */
   maxSubscriptionsPerSocket?: number;
   /**
-   * Hard ceiling on client-provided `.limit(N)` / `.clearLimit()` in
-   * auto-CRUD list queries (queryFromClient). Defaults to 10,000.
-   * The model scope stays the row-visibility boundary; this bounds the
-   * per-request row count.
+   * Ceiling on client-provided limits in auto-CRUD list queries.
+   * Integer >= 1; defaults to 10,000. See queryFromClient's doc.
    */
   maxClientQueryLimit?: number;
 }
