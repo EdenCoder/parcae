@@ -1067,15 +1067,11 @@ describe("BackendAdapter.queryFromClient", () => {
       expect(smallCalls.find((c) => c.method === "limit")!.args[0]).toBe(500);
     });
 
-    it("ignores an invalid configured ceiling and uses the default", () => {
+    it("throws at construction for an invalid configured ceiling", () => {
       for (const bad of [0, 0.5, -1, Number.POSITIVE_INFINITY, Number.NaN]) {
-        const { adapter: a, calls: c } = createTestAdapter({
-          maxClientQueryLimit: bad,
-        });
-        a.queryFromClient(ProjectModel, { userId: "u1" }, [
-          { method: "limit", args: [Number.MAX_SAFE_INTEGER] },
-        ] as QueryStep[]);
-        expect(c.find((call) => call.method === "limit")!.args[0]).toBe(10_000);
+        expect(() => createTestAdapter({ maxClientQueryLimit: bad })).toThrow(
+          "maxClientQueryLimit",
+        );
       }
     });
   });

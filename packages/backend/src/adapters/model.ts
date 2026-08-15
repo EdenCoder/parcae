@@ -289,6 +289,19 @@ export class BackendAdapter implements ModelAdapter {
   }
 
   constructor(services: BackendServices) {
+    const ceiling = services.maxClientQueryLimit;
+    if (
+      ceiling !== undefined &&
+      (typeof ceiling !== "number" || !Number.isFinite(ceiling) || ceiling < 1)
+    ) {
+      // Fail loud at boot: silently substituting the default would let
+      // an operator believe they tightened the clamp when they didn't.
+      // A fractional value would also floor to limit(0) (zero rows) and
+      // Infinity would make Knex drop the LIMIT clause entirely.
+      throw new Error(
+        `maxClientQueryLimit must be a finite number >= 1, got ${String(ceiling)}`,
+      );
+    }
     this.services = services;
   }
 
@@ -782,15 +795,12 @@ export class BackendAdapter implements ModelAdapter {
   private static DEFAULT_MAX_CLIENT_LIMIT = 10_000;
 
   private get _maxClientLimit(): number {
+    // Validated in the constructor: absent means the default, anything
+    // present is a finite number >= 1.
     const configured = this.services.maxClientQueryLimit;
-    // Finite and >= 1 only: a fractional value would floor to limit(0)
-    // (zero rows everywhere) and Infinity would make Knex drop the
-    // LIMIT clause entirely (fully unbounded).
-    return typeof configured === "number" &&
-      Number.isFinite(configured) &&
-      configured >= 1
-      ? Math.floor(configured)
-      : BackendAdapter.DEFAULT_MAX_CLIENT_LIMIT;
+    return configured === undefined
+      ? BackendAdapter.DEFAULT_MAX_CLIENT_LIMIT
+      : Math.floor(configured);
   }
 
   /**
