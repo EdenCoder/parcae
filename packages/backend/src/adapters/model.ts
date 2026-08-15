@@ -49,6 +49,8 @@ export interface BackendServices {
   write: any; // Knex primary
   pubsub?: any; // Redis pub/sub + lock (optional)
   changeBus?: ChangeBus; // Cross-process model-change fan-out (optional)
+  /** Ceiling on client limits in queryFromClient (see its doc). */
+  maxClientQueryLimit?: number;
 }
 
 /**
@@ -283,6 +285,20 @@ export class BackendAdapter implements ModelAdapter {
   }
 
   constructor(services: BackendServices) {
+    const ceiling = services.maxClientQueryLimit;
+    if (
+      ceiling !== undefined &&
+      (typeof ceiling !== "number" ||
+        !Number.isInteger(ceiling) ||
+        ceiling < 1)
+    ) {
+      // Fail loud at boot: silently substituting the default would let
+      // an operator believe they tightened the clamp when they didn't,
+      // and Infinity would make Knex drop the LIMIT clause entirely.
+      throw new Error(
+        `maxClientQueryLimit must be an integer >= 1, got ${String(ceiling)}`,
+      );
+    }
     this.services = services;
   }
 
@@ -696,14 +712,12 @@ export class BackendAdapter implements ModelAdapter {
    *  2. Only whitelisted methods are replayed.
    *  3. Column names are validated against the model schema.
    *  4. A default limit is injected if the client omits one — clients
-   *     that want more must call `.limit(N)` explicitly with the exact
-   *     ceiling they need (or `.clearLimit()` to opt out entirely).
-   *
-   * No upper clamp on client-provided limits. The scope is the security
-   * boundary — it already restricts which rows the client can see; a
-   * row ceiling on top of that is defense-in-depth that mostly just
-   * silently truncates legitimate queries and forces callers to add
-   * `.clearLimit()` everywhere.
+   *     that want more call `.limit(N)` explicitly (or `.clearLimit()`
+   *     to jump straight to the ceiling).
+   *  5. Every client-provided limit clamps at the ceiling
+   *     (`maxClientQueryLimit`, default 10,000). The scope stays the
+   *     row-visibility boundary; the ceiling bounds how many rows one
+   *     request can demand regardless of scope size.
    *
    * Throws on invalid column references (fail loud during development).
    */
@@ -725,6 +739,24 @@ export class BackendAdapter implements ModelAdapter {
     "offset",
     "clearLimit",
   ]);
+
+  /**
+   * Pagination methods: clamped or injected at the top level of the
+   * replay loop, and excluded entirely inside `__nested` groups (limit
+   * and offset would replay unclamped there; clearLimit doesn't exist
+   * on a raw Knex builder).
+   */
+  private static PAGINATION_METHODS = new Set([
+    "limit",
+    "offset",
+    "clearLimit",
+  ]);
+
+  /** Cap on client-sent __query steps: bounds replay work per request. */
+  private static MAX_CLIENT_STEPS = 100;
+
+  /** Cap on whereIn / whereNotIn value arrays: bounds SQL size. */
+  private static MAX_CLIENT_IN_VALUES = 10_000;
 
   /** Methods whose first arg is a column name (or object of column→value). */
   private static COLUMN_ARG_METHODS = new Set([
@@ -764,10 +796,20 @@ export class BackendAdapter implements ModelAdapter {
    * Default limit injected when a client query has no `.limit()` call.
    * Bounded enough to prevent an unbounded sequential-scan from a
    * scope-wide `Model.where(...).find()` with no pagination. Clients
-   * that want more set an explicit `.limit(N)` (no upper clamp) or
-   * `.clearLimit()` to disable the injection.
+   * that want more set an explicit `.limit(N)` or `.clearLimit()`;
+   * both clamp at the ceiling below.
    */
   private static DEFAULT_LIMIT = 25;
+
+  /** Default for maxClientQueryLimit (see queryFromClient's doc). */
+  private static DEFAULT_MAX_CLIENT_LIMIT = 10_000;
+
+  private get _maxClientLimit(): number {
+    return (
+      this.services.maxClientQueryLimit ??
+      BackendAdapter.DEFAULT_MAX_CLIENT_LIMIT
+    );
+  }
 
   /**
    * Per-modelClass cache of "which `json` columns are actually arrays?".
@@ -897,24 +939,21 @@ export class BackendAdapter implements ModelAdapter {
       chain = this.query(modelClass).where(scope);
     }
 
-    let hasLimit = false;
-    let hasClearLimit = false;
-
-    // Pre-scan for clearLimit to know whether to bypass clamping
-    for (const step of steps) {
-      if (step.method === "clearLimit") {
-        hasClearLimit = true;
-        break;
-      }
+    if (steps.length > BackendAdapter.MAX_CLIENT_STEPS) {
+      throw new ClientError(
+        `__query exceeds ${BackendAdapter.MAX_CLIENT_STEPS} steps`,
+      );
     }
+
+    let hasLimit = false;
 
     for (const step of steps) {
       if (!BackendAdapter.SAFE_CLIENT_METHODS.has(step.method)) continue;
 
-      // clearLimit — bypass default limit, cap at 10,000 as safety net
+      // clearLimit: bypass default limit, cap at the ceiling
       if (step.method === "clearLimit") {
         hasLimit = true;
-        chain = chain.limit(10_000);
+        chain = chain.limit(this._maxClientLimit);
         continue;
       }
 
@@ -945,18 +984,28 @@ export class BackendAdapter implements ModelAdapter {
       }
 
       // Sanitize limit — coerce to a positive integer, fall back to
-      // DEFAULT_LIMIT on parse failure. No upper clamp; clients that
-      // need an unusually large window pass it explicitly. Skipped
-      // entirely when `clearLimit()` was used — that path sets the
-      // 10 000 safety cap below.
+      // DEFAULT_LIMIT on parse failure, clamp to the ceiling. Applies
+      // whether or not clearLimit appeared earlier: a later limit call
+      // overrides the clearLimit cap at the SQL layer, so it must obey
+      // the same ceiling.
       if (step.method === "limit") {
         hasLimit = true;
-        if (!hasClearLimit) {
-          args[0] = Math.max(
+        args[0] = Math.min(
+          Math.max(
             Number.parseInt(args[0]) || BackendAdapter.DEFAULT_LIMIT,
             1,
-          );
-        }
+          ),
+          this._maxClientLimit,
+        );
+      }
+
+      // Sanitize offset: non-negative integer, dropped entirely on
+      // parse failure (negative or non-numeric values 500 raw from the
+      // SQL driver otherwise).
+      if (step.method === "offset") {
+        const parsed = Number.parseInt(args[0]);
+        if (!Number.isFinite(parsed) || parsed < 0) continue;
+        args[0] = parsed;
       }
 
       // ── whereIn on a JSON-array column → "array contains any of" ─────
@@ -1001,6 +1050,19 @@ export class BackendAdapter implements ModelAdapter {
   ): any[] {
     const args = [...(step.args ?? [])];
 
+    // Bound whereIn value arrays: an oversized list dies in the driver
+    // as an opaque 500 (or a parameter-limit error) instead of a clear
+    // client error, and the SQL text grows with every element.
+    if (
+      (step.method === "whereIn" || step.method === "whereNotIn") &&
+      Array.isArray(args[1]) &&
+      args[1].length > BackendAdapter.MAX_CLIENT_IN_VALUES
+    ) {
+      throw new ClientError(
+        `${step.method} exceeds ${BackendAdapter.MAX_CLIENT_IN_VALUES} values`,
+      );
+    }
+
     // Skip no-op where: where() with no args or where({}) with empty object
     if (BackendAdapter.COLUMN_ARG_METHODS.has(step.method)) {
       if (args.length === 0) return [];
@@ -1027,11 +1089,15 @@ export class BackendAdapter implements ModelAdapter {
         Array.isArray(firstArg.__nested)
       ) {
         const nestedSteps: QueryStep[] = firstArg.__nested;
-        // Replace with a Knex builder callback
+        // Replace with a Knex builder callback. Pagination methods are
+        // excluded inside the group: limit/offset would replay verbatim
+        // with no clamp, and clearLimit doesn't exist on a raw Knex
+        // builder (a nested one was a client-triggerable TypeError).
         args[0] = (builder: any) => {
           for (const nested of nestedSteps) {
             if (!BackendAdapter.SAFE_CLIENT_METHODS.has(nested.method))
               continue;
+            if (BackendAdapter.PAGINATION_METHODS.has(nested.method)) continue;
             const innerArgs = this._sanitizeStepArgs(
               nested,
               validColumns,
