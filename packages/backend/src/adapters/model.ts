@@ -768,8 +768,8 @@ export class BackendAdapter implements ModelAdapter {
    * Default limit injected when a client query has no `.limit()` call.
    * Bounded enough to prevent an unbounded sequential-scan from a
    * scope-wide `Model.where(...).find()` with no pagination. Clients
-   * that want more set an explicit `.limit(N)` (no upper clamp) or
-   * `.clearLimit()` to disable the injection.
+   * that want more set an explicit `.limit(N)` or `.clearLimit()`;
+   * both clamp at the ceiling below.
    */
   private static DEFAULT_LIMIT = 25;
 
@@ -783,7 +783,12 @@ export class BackendAdapter implements ModelAdapter {
 
   private get _maxClientLimit(): number {
     const configured = this.services.maxClientQueryLimit;
-    return typeof configured === "number" && configured > 0
+    // Finite and >= 1 only: a fractional value would floor to limit(0)
+    // (zero rows everywhere) and Infinity would make Knex drop the
+    // LIMIT clause entirely (fully unbounded).
+    return typeof configured === "number" &&
+      Number.isFinite(configured) &&
+      configured >= 1
       ? Math.floor(configured)
       : BackendAdapter.DEFAULT_MAX_CLIENT_LIMIT;
   }
