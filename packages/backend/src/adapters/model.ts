@@ -49,6 +49,12 @@ export interface BackendServices {
   write: any; // Knex primary
   pubsub?: any; // Redis pub/sub + lock (optional)
   changeBus?: ChangeBus; // Cross-process model-change fan-out (optional)
+  /**
+   * Hard ceiling on client-provided limits in queryFromClient.
+   * Clamps explicit `.limit(N)` args and the `.clearLimit()` cap.
+   * Defaults to DEFAULT_MAX_CLIENT_LIMIT.
+   */
+  maxClientQueryLimit?: number;
 }
 
 /**
@@ -696,14 +702,12 @@ export class BackendAdapter implements ModelAdapter {
    *  2. Only whitelisted methods are replayed.
    *  3. Column names are validated against the model schema.
    *  4. A default limit is injected if the client omits one — clients
-   *     that want more must call `.limit(N)` explicitly with the exact
-   *     ceiling they need (or `.clearLimit()` to opt out entirely).
-   *
-   * No upper clamp on client-provided limits. The scope is the security
-   * boundary — it already restricts which rows the client can see; a
-   * row ceiling on top of that is defense-in-depth that mostly just
-   * silently truncates legitimate queries and forces callers to add
-   * `.clearLimit()` everywhere.
+   *     that want more call `.limit(N)` explicitly (or `.clearLimit()`
+   *     to jump straight to the ceiling).
+   *  5. Every client-provided limit clamps at the ceiling
+   *     (`maxClientQueryLimit`, default 10,000). The scope stays the
+   *     row-visibility boundary; the ceiling bounds how many rows one
+   *     request can demand regardless of scope size.
    *
    * Throws on invalid column references (fail loud during development).
    */
@@ -768,6 +772,21 @@ export class BackendAdapter implements ModelAdapter {
    * `.clearLimit()` to disable the injection.
    */
   private static DEFAULT_LIMIT = 25;
+
+  /**
+   * Absolute ceiling on client-provided limits. A client `.limit(N)`
+   * above this is clamped down; `.clearLimit()` maps to exactly this
+   * value. Overridable per app via `maxClientQueryLimit` on the
+   * services object (createApp passes its config option through).
+   */
+  private static DEFAULT_MAX_CLIENT_LIMIT = 10_000;
+
+  private get _maxClientLimit(): number {
+    const configured = this.services.maxClientQueryLimit;
+    return typeof configured === "number" && configured > 0
+      ? Math.floor(configured)
+      : BackendAdapter.DEFAULT_MAX_CLIENT_LIMIT;
+  }
 
   /**
    * Per-modelClass cache of "which `json` columns are actually arrays?".
@@ -898,23 +917,14 @@ export class BackendAdapter implements ModelAdapter {
     }
 
     let hasLimit = false;
-    let hasClearLimit = false;
-
-    // Pre-scan for clearLimit to know whether to bypass clamping
-    for (const step of steps) {
-      if (step.method === "clearLimit") {
-        hasClearLimit = true;
-        break;
-      }
-    }
 
     for (const step of steps) {
       if (!BackendAdapter.SAFE_CLIENT_METHODS.has(step.method)) continue;
 
-      // clearLimit — bypass default limit, cap at 10,000 as safety net
+      // clearLimit — bypass default limit, cap at the ceiling
       if (step.method === "clearLimit") {
         hasLimit = true;
-        chain = chain.limit(10_000);
+        chain = chain.limit(this._maxClientLimit);
         continue;
       }
 
@@ -945,18 +955,19 @@ export class BackendAdapter implements ModelAdapter {
       }
 
       // Sanitize limit — coerce to a positive integer, fall back to
-      // DEFAULT_LIMIT on parse failure. No upper clamp; clients that
-      // need an unusually large window pass it explicitly. Skipped
-      // entirely when `clearLimit()` was used — that path sets the
-      // 10 000 safety cap below.
+      // DEFAULT_LIMIT on parse failure, clamp to the ceiling. Applies
+      // whether or not clearLimit appeared earlier: a later limit call
+      // overrides the clearLimit cap at the SQL layer, so it must obey
+      // the same ceiling.
       if (step.method === "limit") {
         hasLimit = true;
-        if (!hasClearLimit) {
-          args[0] = Math.max(
+        args[0] = Math.min(
+          Math.max(
             Number.parseInt(args[0]) || BackendAdapter.DEFAULT_LIMIT,
             1,
-          );
-        }
+          ),
+          this._maxClientLimit,
+        );
       }
 
       // ── whereIn on a JSON-array column → "array contains any of" ─────
