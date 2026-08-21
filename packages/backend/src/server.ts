@@ -11,6 +11,8 @@ import polka from "polka";
 import { Server as SocketServer } from "socket.io";
 import bodyParser, { type OptionsJson } from "body-parser";
 import type { Config } from "./config";
+import { ClientError, error } from "./helpers";
+import { log } from "./logger";
 
 export interface ServerContext {
   polka: ReturnType<typeof polka>;
@@ -58,8 +60,27 @@ export function createServer_(options: ServerOptions): ServerContext {
     ? config.TRUSTED_ORIGINS.split(",").map((o) => o.trim())
     : ["http://localhost:*", "https://localhost:*"];
 
-  // Create Polka app with body parsing + query string parsing
-  const app = polka();
+  // Create Polka app with body parsing + query string parsing.
+  // Polka's default catch-all does `res.end(err.length && err || ...)`, and
+  // body-parser's errors carry a numeric `length`, so the Error object
+  // itself gets written, res.end throws, and on an aborted request that
+  // throw is an unhandled 'error' event that exits the process.
+  const app = polka({
+    onError: (err: unknown, req: any, res: any) => {
+      if (res.writableEnded || res.finished) return;
+      const status = err instanceof ClientError ? err.status : 500;
+      const message =
+        err instanceof ClientError
+          ? err.message
+          : "An error occurred while processing your request";
+      log.error("[http] request failed:", req.method, req.url, err);
+      error(res, status, message);
+    },
+    onNoMatch: (req: any, res: any) => {
+      log.warn("[http] no route:", req.method, req.url);
+      error(res, 404, "Not found");
+    },
+  });
   app.use(bodyParser.json(JSON_BODY_PARSER_OPTIONS));
   app.use(bodyParser.urlencoded({ extended: true }));
 
