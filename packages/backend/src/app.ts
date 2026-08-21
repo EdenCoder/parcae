@@ -798,13 +798,13 @@ export function createApp(config: AppConfig): ParcaeApp {
           throw new Error("SCHEMA_ONLY=true requires ENSURE_SCHEMA=true");
         }
         log.info("Schema ensured; exiting (SCHEMA_ONLY)");
-        await shutdownResources({
-          changeBus,
-          pubsub,
-          queue,
-          writeDb,
-          readDb,
-        });
+        // `resources` is already everything start() has opened by this
+        // point, and it stays that way if the setup order moves. The
+        // hand-listed version named `changeBus`, which isn't in scope
+        // until step 9 — a ReferenceError thrown at the exact moment
+        // the deploy gate expects exit 0, after the migration it was
+        // gating on had already succeeded.
+        await shutdownResources(resources);
         process.exit(0);
       }
 
