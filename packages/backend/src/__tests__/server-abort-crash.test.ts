@@ -67,6 +67,16 @@ function post(body: string): Promise<{ status: number; text: string }> {
 }
 
 describe("server survives body-parser errors", () => {
+  it("answers malformed JSON with a 4xx, not a 5xx", async () => {
+    // body-parser's parse failure is an http-error with status 400. A 500
+    // here would make client garbage look like a server fault to monitoring
+    // and invite webhook senders to retry it forever.
+    const res = await post("{not json");
+    expect(res.status).toBe(400);
+    expect(JSON.parse(res.text)).toMatchObject({ success: false });
+    expect(uncaught).toEqual([]);
+  });
+
   it("stays alive when the client hangs up mid-body", async () => {
     // The production shape: a webhook sender times out and resets the
     // connection while the JSON body is still uploading.

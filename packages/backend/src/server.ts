@@ -68,11 +68,24 @@ export function createServer_(options: ServerOptions): ServerContext {
   const app = polka({
     onError: (err: unknown, req: any, res: any) => {
       if (res.writableEnded || res.finished) return;
-      const status = err instanceof ClientError ? err.status : 500;
+      // http-errors (body-parser: malformed JSON, oversize body, abort)
+      // carries a numeric 4xx status; collapsing those to 500 would make
+      // client garbage retryable and page whoever watches 5xx rates.
+      const httpStatus = (err as { status?: unknown })?.status;
+      const status =
+        err instanceof ClientError
+          ? err.status
+          : typeof httpStatus === "number" &&
+              httpStatus >= 400 &&
+              httpStatus < 500
+            ? httpStatus
+            : 500;
       const message =
         err instanceof ClientError
           ? err.message
-          : "An error occurred while processing your request";
+          : status < 500
+            ? "Bad request"
+            : "An error occurred while processing your request";
       log.error("[http] request failed:", req.method, req.url, err);
       error(res, status, message);
     },
