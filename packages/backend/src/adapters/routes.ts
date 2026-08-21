@@ -151,6 +151,33 @@ function readonlyFieldsForUpdate(
 }
 
 /**
+ * The create deny-list for one request: the model's read-only fields
+ * plus every key the create scope pins.
+ *
+ * Merging `scopeData` last already beats a body that spells the field
+ * plainly, and `stripReadonly` refuses `$`-prefixed keys outright, so
+ * the raw twin `Model._apply` assigns past the ref setter can't get in
+ * either. Denying the scope's own keys says the same thing a third way,
+ * and it is the one that doesn't depend on how `$` is spelled: narrow
+ * that blanket to a mirror of the deny set — a reasonable-looking
+ * change — and `$patient` walks straight through unless the field the
+ * scope pinned is in there. Per-model `readonlyFields` can't hold this
+ * line, because staff legitimately set `patient` at create; the field
+ * is only unwritable in the scopes that pin it.
+ */
+function readonlyFieldsForCreate(
+  modelClass: ModelConstructor,
+  scopeData: Record<string, any>,
+): ReadonlySet<string> {
+  const base = readonlyFieldsFor(modelClass);
+  const pinned = Object.keys(scopeData);
+  if (pinned.length === 0) return base;
+  const merged = new Set(base);
+  for (const field of pinned) merged.add(field);
+  return merged;
+}
+
+/**
  * Strip framework-protected and model-protected fields from a client
  * body before they get mass-assigned onto a model instance. Returns
  * a fresh object so the caller's `req.body` isn't mutated.
@@ -440,10 +467,16 @@ export function registerModelRoutes(
           if (!scopeData) return forbidden(res);
 
           // 1. Strip readonly fields from the client body — counters,
-          //    ownership refs, state-machine cols (see Model.readonlyFields).
+          //    ownership refs, state-machine cols (see Model.readonlyFields)
+          //    — along with the fields this scope pins, under either
+          //    spelling (see readonlyFieldsForCreate).
           // 2. Merge in the scope-provided overrides last so a malicious
           //    body can't override e.g. `user: ctx.user.id`.
-          const body = stripReadonly(ModelClass, req.body || {});
+          const body = stripReadonly(
+            ModelClass,
+            req.body || {},
+            readonlyFieldsForCreate(ModelClass, scopeData),
+          );
           const data = { ...body, ...scopeData };
           const item = Model.create.call(
             ModelClass,

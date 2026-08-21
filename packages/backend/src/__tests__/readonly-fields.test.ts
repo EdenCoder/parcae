@@ -12,6 +12,8 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
+import { Model } from "@parcae/model";
+
 import { clearRoutes, getRoutes } from "../routing/route";
 import { registerModelRoutes } from "../adapters/routes";
 import type { BackendAdapter } from "../adapters/model";
@@ -172,6 +174,46 @@ function makeRes() {
 describe("auto-CRUD readonlyFields", () => {
   beforeEach(() => {
     clearRoutes();
+  });
+
+  it("POST refuses the raw twin of a ref the create scope pins", async () => {
+    // The shape that matters: an ownership ref the scope pins per
+    // request, which per-model `readonlyFields` deliberately leaves
+    // writable because staff set it directly at create time.
+    const Appointment: any = {
+      type: "appointment",
+      scope: { create: (ctx: any) => ({ patient: ctx.user?.id }) },
+      readonlyFields: [] as readonly string[],
+    };
+    const { adapter } = makeAdapterStub();
+    const created: Array<Record<string, any>> = [];
+    const create = vi
+      .spyOn(Model, "create")
+      .mockImplementation(function (this: any, data: any) {
+        created.push(data);
+        return { ...data, save: vi.fn(async () => {}) } as any;
+      });
+    registerModelRoutes([Appointment], adapter);
+
+    const route = findRoute("POST", "/v1/appointments");
+    const res = makeRes();
+    await route!.handler!(
+      {
+        session: { user: { id: "member-self" } },
+        body: {
+          title: "Your results are ready",
+          patient: "another-patient", // loses to the scope merge
+          $patient: "another-patient", // ...and so must its raw twin
+        },
+      },
+      res as any,
+    );
+    create.mockRestore();
+
+    expect(res.captured.status).toBe(201);
+    expect(created).toHaveLength(1);
+    expect(created[0]!.patient).toBe("member-self");
+    expect(created[0]).not.toHaveProperty("$patient");
   });
 
   // POST stripping is exercised indirectly through `stripReadonly`
