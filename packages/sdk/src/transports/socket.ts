@@ -137,6 +137,18 @@ export class SocketTransport extends EventEmitter implements Transport {
   private helloReady: Promise<void> = Promise.resolve();
   /** The token the server validated at the last resolved hello. */
   private confirmedHelloToken: string | null = null;
+  /**
+   * Raw-event delivery gate. False from the moment a session boundary
+   * starts (new hello, termination, disconnect) until the server
+   * confirms the next session, so a frame already in flight when the
+   * identity changes is dropped instead of delivered to handlers that
+   * belong to the prior session.
+   */
+  private sessionReadyForEvents = false;
+  private subscriptions = new Map<
+    string,
+    Map<(...args: any[]) => void, (...args: any[]) => void>
+  >();
 
   constructor(config: SocketTransportConfig) {
     super();
@@ -207,6 +219,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     const generation = this.sessionGeneration;
     this.helloGeneration = generation;
     this.helloState = "pending";
+    this.sessionReadyForEvents = false;
     this.inflight.clear();
 
     let resolveHello!: () => void;
@@ -266,6 +279,7 @@ export class SocketTransport extends EventEmitter implements Transport {
           );
           this.session.resolve(userId);
           this.confirmedHelloToken = token;
+          this.sessionReadyForEvents = true;
           resolveHello();
           this.emit("resync-required");
         });
@@ -294,6 +308,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     this.sessionGeneration++;
     this.inflight.clear();
     this.helloState = "rejected";
+    this.sessionReadyForEvents = false;
     this._rejectPending(error);
     const active = this.activeHandshake;
     if (!active) return;
@@ -622,12 +637,49 @@ export class SocketTransport extends EventEmitter implements Transport {
   }
 
   subscribe(event: string, handler: (...args: any[]) => void): () => void {
-    this.socket.on(event, handler);
-    return () => this.socket.off(event, handler);
+    let eventSubscriptions = this.subscriptions.get(event);
+    if (!eventSubscriptions) {
+      eventSubscriptions = new Map();
+      this.subscriptions.set(event, eventSubscriptions);
+    }
+    const existing = eventSubscriptions.get(handler);
+    if (existing) this.socket.off(event, existing);
+
+    const wrapper = (...args: any[]) => {
+      // A frame in flight across a session boundary belongs to the
+      // session that was live when the server sent it; drop it.
+      if (this.sessionReadyForEvents) handler(...args);
+    };
+    eventSubscriptions.set(handler, wrapper);
+    this.socket.on(event, wrapper);
+
+    return () => {
+      this.socket.off(event, wrapper);
+      if (eventSubscriptions?.get(handler) === wrapper) {
+        eventSubscriptions.delete(handler);
+        if (eventSubscriptions.size === 0) this.subscriptions.delete(event);
+      }
+    };
   }
 
   unsubscribe(event: string, handler?: (...args: any[]) => void): void {
-    this.socket.off(event, handler);
+    const eventSubscriptions = this.subscriptions.get(event);
+    if (!handler) {
+      if (eventSubscriptions) {
+        for (const wrapper of eventSubscriptions.values()) {
+          this.socket.off(event, wrapper);
+        }
+        this.subscriptions.delete(event);
+      } else {
+        this.socket.off(event);
+      }
+      return;
+    }
+    const wrapper = eventSubscriptions?.get(handler);
+    if (!wrapper) return;
+    this.socket.off(event, wrapper);
+    eventSubscriptions?.delete(handler);
+    if (eventSubscriptions?.size === 0) this.subscriptions.delete(event);
   }
 
   send(event: string, ...args: any[]): void {
@@ -665,6 +717,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     this.socket.removeAllListeners?.();
     this.socket.disconnect();
     this.inflight.clear();
+    this.subscriptions.clear();
     this.removeAllListeners();
     this.connection.disconnected();
   }
