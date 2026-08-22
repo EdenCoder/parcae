@@ -98,7 +98,9 @@ export interface ModelConstructor<T = any> {
    * set when a row is created and must not change afterward. Default (empty)
    * preserves the existing behavior for every field name.
    */
-  updateReadonlyFields?: readonly string[];
+  updateReadonlyFields?:
+    | readonly string[]
+    | ((ctx: ScopeContext) => readonly string[]);
   /**
    * Field-level read protection. Listed columns are stripped from
    * the default `sanitize()` projection so a column like

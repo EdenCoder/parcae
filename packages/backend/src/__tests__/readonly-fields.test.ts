@@ -298,6 +298,76 @@ describe("auto-CRUD readonlyFields", () => {
     expect(saved.user).toBe("user-original");
   });
 
+  it("PUT resolves update-only readonly fields from request context", async () => {
+    const ContextualPost: any = {
+      type: "contextualpost",
+      scope: { update: () => () => {} },
+      readonlyFields: [] as readonly string[],
+      updateReadonlyFields: (ctx: any) =>
+        ctx.user?.orgRole === "org:patient"
+          ? (["org", "patient", "user"] as const)
+          : (["org"] as const),
+    };
+    const { adapter, captured, setRow } = makeAdapterStub();
+    setRow({
+      id: "p1",
+      org: "org-original",
+      patient: "patient-original",
+      user: "user-original",
+    });
+    registerModelRoutes([ContextualPost], adapter);
+
+    const route = findRoute("PUT", "/v1/contextualposts/:id");
+
+    const staffRes = makeRes();
+    await route!.handler!(
+      {
+        session: { user: { orgRole: "org:clinician" } },
+        params: { id: "p1" },
+        body: {
+          org: "org-new",
+          patient: "patient-new",
+          user: "user-new",
+        },
+      },
+      staffRes as any,
+    );
+
+    expect(staffRes.captured.status).toBe(200);
+    expect(captured.saves[0]).toMatchObject({
+      org: "org-original",
+      patient: "patient-new",
+      user: "user-new",
+    });
+
+    setRow({
+      id: "p1",
+      org: "org-original",
+      patient: "patient-original",
+      user: "user-original",
+    });
+    const patientRes = makeRes();
+    await route!.handler!(
+      {
+        session: { user: { orgRole: "org:patient" } },
+        params: { id: "p1" },
+        body: {
+          org: "org-new",
+          patient: "patient-new",
+          user: "user-new",
+        },
+      },
+      patientRes as any,
+    );
+
+    expect(patientRes.captured.status).toBe(200);
+    expect(captured.saves[1]).toMatchObject({
+      org: "org-original",
+      patient: "patient-original",
+      user: "user-original",
+    });
+  });
+
   it("PUT keeps conventional field names writable unless configured", async () => {
     const PlainPost: any = {
       type: "plainpost",
@@ -551,6 +621,51 @@ describe("auto-CRUD readonlyFields", () => {
     expect(res.captured.status).toBe(403);
     expect(res.captured.body.error).toContain("patient");
     expect(captured.patches).toHaveLength(0);
+  });
+
+  it("PATCH resolves update-only readonly fields from request context", async () => {
+    const ContextualPost: any = {
+      type: "contextualpost",
+      scope: { patch: () => () => {} },
+      readonlyFields: [] as readonly string[],
+      updateReadonlyFields: (ctx: any) =>
+        ctx.user?.orgRole === "org:patient"
+          ? (["patient"] as const)
+          : ([] as const),
+    };
+    const { adapter, captured, setRow } = makeAdapterStub();
+    setRow({ id: "p1", patient: "patient-original" });
+    registerModelRoutes([ContextualPost], adapter);
+
+    const route = findRoute("PATCH", "/v1/contextualposts/:id");
+    const staffRes = makeRes();
+    await route!.handler!(
+      {
+        session: { user: { orgRole: "org:clinician" } },
+        params: { id: "p1" },
+        body: {
+          ops: [{ op: "replace", path: "/patient", value: "patient-new" }],
+        },
+      },
+      staffRes as any,
+    );
+    expect(staffRes.captured.status).toBe(200);
+    expect(captured.patches).toHaveLength(1);
+
+    const patientRes = makeRes();
+    await route!.handler!(
+      {
+        session: { user: { orgRole: "org:patient" } },
+        params: { id: "p1" },
+        body: {
+          ops: [{ op: "replace", path: "/patient", value: "patient-new" }],
+        },
+      },
+      patientRes as any,
+    );
+    expect(patientRes.captured.status).toBe(403);
+    expect(patientRes.captured.body.error).toContain("patient");
+    expect(captured.patches).toHaveLength(1);
   });
 
   it("PATCH keeps conventional field names writable unless configured", async () => {
