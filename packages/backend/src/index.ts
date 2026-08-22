@@ -65,6 +65,8 @@ export {
   getRuntimeFlags,
   runWithRequestContext,
   getRequestUser,
+  _setServices,
+  _clearServices,
 } from "./services/context";
 export type { EnqueueOptions } from "./services/context";
 
@@ -92,6 +94,9 @@ export type {
   RouteOptions,
   RouteEntry,
   SocketContext,
+  SocketContextEmitter,
+  SocketContextSocket,
+  SocketContextServer,
   SocketHandler,
   SocketMiddleware,
   SocketEntry,

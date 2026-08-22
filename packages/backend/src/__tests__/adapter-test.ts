@@ -55,6 +55,8 @@ export interface TestAdapterOptions {
    * way. Default `false` — `query()` is stubbed to the chain.
    */
   realQuery?: boolean;
+  /** Forwarded to the adapter's services (client limit ceiling). */
+  maxClientQueryLimit?: number;
 }
 
 export interface TestAdapter {
@@ -75,7 +77,12 @@ export function createMockModel(
 export function createTestAdapter(
   options: TestAdapterOptions = {},
 ): TestAdapter {
-  const { invoke = "never", props = {}, realQuery = false } = options;
+  const {
+    invoke = "never",
+    props = {},
+    realQuery = false,
+    maxClientQueryLimit,
+  } = options;
   const calls: RecordedCall[] = [];
 
   function make(isRoot = true): any {
@@ -125,6 +132,7 @@ export function createTestAdapter(
   const adapter = new (BackendAdapter as any)({
     read: service(),
     write: service(),
+    maxClientQueryLimit,
   });
   if (!realQuery) adapter.query = () => make();
 
