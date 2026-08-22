@@ -716,15 +716,36 @@ function scheduleRetry(key: string, entry: CacheEntry): void {
   }, delay);
 }
 
+/**
+ * A resync refused at an authorization boundary means the rows on
+ * screen were fetched under a session the server no longer honours.
+ */
+function isAuthorizationBoundaryError(error: Error): boolean {
+  return (
+    error.message.includes("Session changed") ||
+    error.message.includes("Session is not reconciled") ||
+    error.message.includes("Session terminated")
+  );
+}
+
 function recoverResyncEntry(
   cacheKey: string,
   entry: CacheEntry,
   error: Error,
 ): void {
-  // Stale-while-revalidate: keep the last good items on screen while
-  // the retry refetches and reconciles. Blanking the entry here
-  // flashed every list back to skeletons on a reconnect hiccup.
   detachSubscription(entry);
+  if (isAuthorizationBoundaryError(error)) {
+    // Fail closed: rows fetched under the prior authorization must not
+    // stay rendered while the retry refetches under the new one.
+    if (entry.items.length > 0) {
+      entry.items = [];
+      entry.version++;
+    }
+    entry.loading = true;
+  }
+  // Otherwise stale-while-revalidate: keep the last good items on
+  // screen while the retry refetches and reconciles. Blanking the
+  // entry on a reconnect hiccup flashed every list back to skeletons.
   entry.error = error;
   notify(entry);
   entry.retryCount = 0;

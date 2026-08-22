@@ -593,6 +593,54 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     release();
   });
 
+  it("blanks rendered items when a resync is refused at an authorization boundary", async () => {
+    vi.useFakeTimers();
+    const client = new FakeClient();
+    const chain = makeChain({
+      results: [{ id: "prior-privilege-row" }],
+      queryHash: "auth-hash",
+    });
+    const key = useQueryTest.buildKey("post", "u1", chain.__steps);
+    const release = useQueryTest.retain(client as any, key, () => {});
+    useQueryTest.fetch(key, chain, client as any);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(useQueryTest.getEntry(client as any, key)!.items).toHaveLength(1);
+
+    client.resync.mockRejectedValueOnce(new Error("Session changed"));
+    useQueryTest.onResyncRequired(client as any);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const entry = useQueryTest.getEntry(client as any, key)!;
+    // Rows fetched under the prior authorization fail closed instead
+    // of staying rendered while the retry refetches.
+    expect(entry.items).toHaveLength(0);
+    expect(entry.loading).toBe(true);
+    expect(entry.retryTimer).not.toBeNull();
+    release();
+  });
+
+  it("keeps rendered items when a resync fails on a transport hiccup", async () => {
+    vi.useFakeTimers();
+    const client = new FakeClient();
+    const chain = makeChain({
+      results: [{ id: "kept-row" }],
+      queryHash: "hiccup-hash",
+    });
+    const key = useQueryTest.buildKey("post", "u1", chain.__steps);
+    const release = useQueryTest.retain(client as any, key, () => {});
+    useQueryTest.fetch(key, chain, client as any);
+    await vi.advanceTimersByTimeAsync(0);
+
+    client.resync.mockRejectedValueOnce(new Error("resync timeout"));
+    useQueryTest.onResyncRequired(client as any);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const entry = useQueryTest.getEntry(client as any, key)!;
+    expect(entry.items).toHaveLength(1);
+    expect(entry.retryTimer).not.toBeNull();
+    release();
+  });
+
   it("unsubscribes every query hash purged on an identity change", async () => {
     const client = new FakeClient();
     const first = makeChain({ results: [{ id: "a" }], queryHash: "hash-a" });
