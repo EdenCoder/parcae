@@ -45,6 +45,11 @@ export interface ClientConfig {
    * leave the render server. `reconnect()` dials on demand.
    */
   autoConnect?: boolean;
+  /**
+   * Watchdog stale threshold in ms; `0` disables the transport
+   * watchdog. Default 8000. See SocketTransportConfig.
+   */
+  watchdogStaleMs?: number;
 }
 
 export interface ParcaeClient {
@@ -95,6 +100,7 @@ export function createClient(config: ClientConfig): ParcaeClient {
     transports: config.transports,
     extraHeaders: config.extraHeaders,
     autoConnect: config.autoConnect,
+    watchdogStaleMs: config.watchdogStaleMs,
   });
 
   const adapter = new FrontendAdapter(transport);
@@ -132,4 +138,24 @@ export function createClient(config: ClientConfig): ParcaeClient {
   };
 
   return client;
+}
+
+/**
+ * Run one isolated operation on its own physical socket and always
+ * release that socket afterward. For one-shot background work — a push
+ * action, a headless task — that must never share the Provider-owned
+ * client or leave a session-bearing socket open when it finishes.
+ * Query models through `client.bind(Model)`; the global Model binding
+ * is never touched.
+ */
+export async function withIsolatedClient<T>(
+  config: ClientConfig,
+  operation: (client: ParcaeClient) => Promise<T>,
+): Promise<T> {
+  const client = createClient(config);
+  try {
+    return await operation(client);
+  } finally {
+    client.dispose();
+  }
 }
