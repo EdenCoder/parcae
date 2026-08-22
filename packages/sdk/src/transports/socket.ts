@@ -25,6 +25,7 @@ import { decompress } from "compress-json";
 import { EventEmitter } from "eventemitter3";
 import ShortId from "short-unique-id";
 import type { Transport, RequestOptions } from "@parcae/model";
+import { SESSION_BOUNDARY_ERRORS } from "@parcae/model";
 import { SessionMachine } from "../session-machine";
 import { ConnectionMachine } from "../connection-machine";
 import { log } from "../log";
@@ -152,6 +153,8 @@ export class SocketTransport extends EventEmitter implements Transport {
       timer: ReturnType<typeof setTimeout>;
       reject: (error: Error) => void;
       sentAt: number;
+      /** Caller declared its own timeout; the stall clock skips it. */
+      watchdogExempt?: boolean;
     }
   >();
   private pendingWaiters = new Set<PendingWaiter>();
@@ -258,7 +261,8 @@ export class SocketTransport extends EventEmitter implements Transport {
 
   private _oldestPendingAt(): number | null {
     let oldest: number | null = null;
-    for (const { sentAt } of this.pendingCalls.values()) {
+    for (const { sentAt, watchdogExempt } of this.pendingCalls.values()) {
+      if (watchdogExempt) continue;
       if (oldest === null || sentAt < oldest) oldest = sentAt;
     }
     for (const { sentAt } of this.pendingWaiters) {
@@ -673,7 +677,7 @@ export class SocketTransport extends EventEmitter implements Transport {
   async terminateSession(): Promise<void> {
     this.confirmedHelloToken = null;
     this.session.terminate();
-    this._advanceGeneration(new Error("Session terminated"));
+    this._advanceGeneration(new Error(SESSION_BOUNDARY_ERRORS.terminated));
     this._scheduleWatchdog();
     if (this.socket.connected) {
       await new Promise<void>((resolve, reject) => {
@@ -716,7 +720,7 @@ export class SocketTransport extends EventEmitter implements Transport {
   private _assertCanRequest(): void {
     if (this.isDisposed) throw new Error("Transport disposed");
     if (this.session.state.status === "terminated") {
-      throw new Error("Session terminated");
+      throw new Error(SESSION_BOUNDARY_ERRORS.terminated);
     }
   }
 
@@ -814,7 +818,19 @@ export class SocketTransport extends EventEmitter implements Transport {
         );
         reject(new Error(`RPC timeout: ${method} ${path}`));
       }, timeoutMs);
-      this.pendingCalls.set(id, { timer: timeout, reject, sentAt: Date.now() });
+      this.pendingCalls.set(id, {
+        timer: timeout,
+        reject,
+        sentAt: Date.now(),
+        // A caller that declared its own timeout has told us the
+        // budget for this call; the watchdog must not second-guess it
+        // at the stale window. Server work that legitimately runs for
+        // tens of seconds (LLM generation, imports) is the sole
+        // in-flight RPC exactly when the user is waiting on it, and
+        // tearing the socket down mid-wait rejects a call the server
+        // goes on to complete and persist.
+        watchdogExempt: options?.timeout !== undefined,
+      });
 
       this.socket.once(id, (msg: any) => {
         // Any response frame proves the wire is alive.
@@ -908,6 +924,10 @@ export class SocketTransport extends EventEmitter implements Transport {
     if (existing) this.socket.off(event, existing);
 
     const wrapper = (...args: any[]) => {
+      // A subscription frame is a full data frame: it proves the wire
+      // passes more than pings, so it resets the RPC stall clock even
+      // when the boundary gate below drops it.
+      this._noteRpcResponse();
       // A frame in flight across a session boundary belongs to the
       // session that was live when the server sent it; drop it.
       if (this.sessionReadyForEvents) handler(...args);

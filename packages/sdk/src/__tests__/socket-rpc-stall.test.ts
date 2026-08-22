@@ -249,4 +249,51 @@ describe("SocketTransport — RPC-stall watchdog", () => {
     expect(transport.diagnostics().pendingCallCount).toBe(0);
     expect(transport.diagnostics().msSinceOldestPendingCall).toBeNull();
   });
+
+  it("never tears down a lone call that declared its own timeout", async () => {
+    const transport = await connectedAuthedTransport();
+    const events = recoverEvents(transport);
+
+    // The caller budgeted 90s for server-side work (LLM generation,
+    // imports); the stall clock must not second-guess it at 8s.
+    const pending = transport.post("/consult-reports/generate", {}, {
+      timeout: 90_000,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(events).toHaveLength(0);
+
+    answerCall(0, { ok: true });
+    await expect(pending).resolves.toEqual({ ok: true });
+    expect(events).toHaveLength(0);
+  });
+
+  it("an exempt call still fails at its own declared timeout", async () => {
+    const transport = await connectedAuthedTransport();
+    const pending = transport.post("/slow", {}, { timeout: 20_000 });
+    const rejection = expect(pending).rejects.toThrow("RPC timeout");
+    await vi.advanceTimersByTimeAsync(20_100);
+    await rejection;
+  });
+
+  it("a subscription frame resets the stall clock for default-timeout calls", async () => {
+    const transport = await connectedAuthedTransport();
+    const events = recoverEvents(transport);
+    transport.subscribe("query:h1", () => {});
+
+    const pending = transport.get("/nudges");
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Data frames keep arriving: the wire passes full frames, so the
+    // slow RPC is a slow server, not a dead socket.
+    for (let i = 0; i < 4; i++) {
+      await vi.advanceTimersByTimeAsync(6_000);
+      currentSocket._fire("query:h1", { op: "tick" });
+    }
+    expect(events).toHaveLength(0);
+
+    answerCall(0, []);
+    await expect(pending).resolves.toEqual([]);
+  });
 });
