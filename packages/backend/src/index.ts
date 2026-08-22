@@ -65,6 +65,8 @@ export {
   getRuntimeFlags,
   runWithRequestContext,
   getRequestUser,
+  _setServices,
+  _clearServices,
 } from "./services/context";
 export type { EnqueueOptions } from "./services/context";
 

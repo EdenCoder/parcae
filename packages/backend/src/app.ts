@@ -419,7 +419,8 @@ export function createSocketSessionController(
     get session(): AuthSession | null {
       return reconciler.session;
     },
-    capture: () => reconciler.capture(),
+    capture: (): { operation: number; session: AuthSession | null } | null =>
+      reconciler.capture(),
     isOperationCurrent: (operation: number) =>
       reconciler.isOperationCurrent(operation),
     runIfOperationCurrent: (operation: number, action: () => void) =>

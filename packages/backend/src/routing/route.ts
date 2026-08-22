@@ -155,7 +155,7 @@ export function clearSocketHandlers(): void {
  * successful middleware that intentionally omits `next()`.
  */
 export function wrapHttpHandler<T extends (...args: any[]) => any>(handler: T): T {
-  return ((req: any, res: any, next?: Next) => {
+  const wrapped = ((req: any, res: any, next?: Next) => {
     const reject = (error: unknown): unknown => {
       if (next) return next(error);
       throw error;
@@ -171,6 +171,12 @@ export function wrapHttpHandler<T extends (...args: any[]) => any>(handler: T): 
       return reject(error);
     }
   }) as T;
+  // Registration consumers (route-wiring tests, introspection) need to
+  // recognise the middleware they registered; the wrapper otherwise
+  // erases its identity.
+  (wrapped as { __original?: T }).__original =
+    (handler as { __original?: T }).__original ?? handler;
+  return wrapped;
 }
 
 /**
