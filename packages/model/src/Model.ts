@@ -1744,7 +1744,15 @@ type ReferenceTarget<T> = IsAny<T> extends true
           ? ModelMember<T>
           : never;
 
-/** Plain, potentially projected data carried by `.expand()`. */
+/**
+ * Plain, potentially projected data carried by `.expand()`.
+ *
+ * Nested reference members map to their raw id: expansion is one-hop
+ * only, so the wire row of an expanded value carries raw ids for its
+ * own refs. Mapping them as `Ref<...>` would also make the type
+ * self-referential for cyclic models (a parent ref to the same model,
+ * or a two-model cycle), which blows TS2589 at query call sites.
+ */
 export type ExpandedRef<T extends Model> = {
   [K in keyof T as K extends string
     ? K extends `__${string}`
@@ -1752,7 +1760,7 @@ export type ExpandedRef<T extends Model> = {
       : T[K] extends (...args: any[]) => any
       ? never
       : K
-    : never]?: T[K];
+    : never]?: [ModelMember<T[K]>] extends [never] ? T[K] : string | null;
 } & { id: string; type?: string; readonly [SYM_EXPANDED_REF]: true };
 
 /** A reference is a raw id, assigned Model, or inline wire projection. */
