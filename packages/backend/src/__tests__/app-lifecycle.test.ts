@@ -236,7 +236,9 @@ describe("socket hello session ordering", () => {
       user: { id: "u2", role: "admin" },
     });
     expect(staleCallback).toHaveBeenCalledWith({ userId: "u2" });
-    expect(subscriptions.unsubscribeAll).toHaveBeenCalledTimes(1);
+    // Every hello is an auth boundary: subscriptions drop before each
+    // token resolution, so both hellos unsubscribe.
+    expect(subscriptions.unsubscribeAll).toHaveBeenCalledTimes(2);
   });
 
   it("does not let a stale token overwrite a newer signout", async () => {
@@ -279,10 +281,11 @@ describe("socket hello session ordering", () => {
     await controller.hello({ token: "member" });
     await controller.hello({ token: "admin" });
 
-    expect(observed).toEqual([
-      null,
-      { user: { id: "u1", role: "member" } },
-    ]);
+    // Every hello drops subscriptions at the boundary, after the prior
+    // session is already cleared: no RPC or subscription can be served
+    // as the old claims while the new token resolves.
+    expect(observed).toEqual([null, null, null]);
+    expect(controller.session).toEqual({ user: { id: "u1", role: "admin" } });
   });
 });
 
