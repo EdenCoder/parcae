@@ -4,6 +4,7 @@ import {
   ensureIntermediates,
   generateId,
   Model,
+  SESSION_BOUNDARY_ERRORS,
   serializeLazyQueryArgs,
   SYM_SERVER_MERGE,
   SYM_SERVER_PATCH,
@@ -718,15 +719,29 @@ function scheduleRetry(key: string, entry: CacheEntry): void {
 }
 
 /**
- * A resync refused at an authorization boundary means the rows on
- * screen were fetched under a session the server no longer honours.
+ * A resync the server refused because the session that computed it is
+ * no longer the socket's session. Rows on screen may predate the
+ * current authorization. The strings are the shared wire contract in
+ * `SESSION_BOUNDARY_ERRORS`; never match on ad-hoc literals here.
  */
 function isAuthorizationBoundaryError(error: Error): boolean {
   return (
-    error.message.includes("Session changed") ||
-    error.message.includes("Session is not reconciled") ||
-    error.message.includes("Session terminated")
+    error.message.includes(SESSION_BOUNDARY_ERRORS.notReconciled) ||
+    error.message.includes(SESSION_BOUNDARY_ERRORS.terminated)
   );
+}
+
+/**
+ * A resync outraced by a newer hello on the same socket. Identity
+ * changes purge the cache through the session listener, so by the time
+ * this fires the entry either belongs to the still-current user or is
+ * already disposed — blanking it flashed clinical lists to skeletons
+ * on every pure token rotation. Keep the rows and refetch immediately
+ * so a same-user authorization downgrade is corrected within one round
+ * trip rather than rendered indefinitely.
+ */
+function isSupersededResyncError(error: Error): boolean {
+  return error.message.includes(SESSION_BOUNDARY_ERRORS.changed);
 }
 
 function recoverResyncEntry(
@@ -750,6 +765,10 @@ function recoverResyncEntry(
   entry.error = error;
   notify(entry);
   entry.retryCount = 0;
+  if (isSupersededResyncError(error) && entry.chain) {
+    void doFetch(cacheKey, entry, entry.chain, entry.client, { force: true });
+    return;
+  }
   scheduleRetry(cacheKey, entry);
 }
 

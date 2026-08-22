@@ -19,7 +19,7 @@ import {
   createSessionFencedEmitter,
   createSessionFencedSocket,
 } from "./socket-session-facade";
-import { Model } from "@parcae/model";
+import { Model, SESSION_BOUNDARY_ERRORS } from "@parcae/model";
 import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
 import { log } from "./logger";
 import { ClientError } from "./helpers";
@@ -1325,7 +1325,6 @@ export function createApp(config: AppConfig): ParcaeApp {
                 session: sessionSnapshot.session,
                 _socketRpc: true, // marker: skip auth middleware resolution
                 _socketId: socket.id,
-                _socketSessionActive: isSessionCurrent,
                 _parsedUrl: { pathname, query: qs || "", _raw: path },
               };
 
@@ -1421,7 +1420,7 @@ export function createApp(config: AppConfig): ParcaeApp {
             if (!sessionSnapshot) {
               callback?.({
                 success: false,
-                error: "Session is not reconciled",
+                error: SESSION_BOUNDARY_ERRORS.notReconciled,
               });
               return;
             }
@@ -1448,11 +1447,11 @@ export function createApp(config: AppConfig): ParcaeApp {
                 () => callback?.({ success: true, results }),
               );
               if (!acknowledged) {
-                callback?.({ success: false, error: "Session changed" });
+                callback?.({ success: false, error: SESSION_BOUNDARY_ERRORS.changed });
               }
             } catch (err: any) {
               if (!socketSession.isOperationCurrent(sessionOperation)) {
-                callback?.({ success: false, error: "Session changed" });
+                callback?.({ success: false, error: SESSION_BOUNDARY_ERRORS.changed });
                 return;
               }
               log.error("[socket] resync failed:", err);
@@ -1475,7 +1474,7 @@ export function createApp(config: AppConfig): ParcaeApp {
             if (!sessionSnapshot) {
               socket.emit("error", {
                 event: entry.event,
-                message: "Session is not reconciled",
+                message: SESSION_BOUNDARY_ERRORS.notReconciled,
               });
               return;
             }

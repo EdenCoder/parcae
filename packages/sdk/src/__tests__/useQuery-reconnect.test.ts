@@ -606,7 +606,7 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(useQueryTest.getEntry(client as any, key)!.items).toHaveLength(1);
 
-    client.resync.mockRejectedValueOnce(new Error("Session changed"));
+    client.resync.mockRejectedValueOnce(new Error("Session is not reconciled"));
     useQueryTest.onResyncRequired(client as any);
     await vi.advanceTimersByTimeAsync(0);
 
@@ -616,6 +616,32 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     expect(entry.items).toHaveLength(0);
     expect(entry.loading).toBe(true);
     expect(entry.retryTimer).not.toBeNull();
+    release();
+  });
+
+  it("keeps items and refetches immediately when a resync is outraced by a newer hello", async () => {
+    vi.useFakeTimers();
+    const client = new FakeClient();
+    const chain = makeChain({
+      results: [{ id: "kept-through-rotation" }],
+      queryHash: "rotation-hash",
+    });
+    const key = useQueryTest.buildKey("post", "u1", chain.__steps);
+    const release = useQueryTest.retain(client as any, key, () => {});
+    useQueryTest.fetch(key, chain, client as any);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(chain.findCalls).toBe(1);
+
+    client.resync.mockRejectedValueOnce(new Error("Session changed"));
+    useQueryTest.onResyncRequired(client as any);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const entry = useQueryTest.getEntry(client as any, key)!;
+    // A same-socket re-hello is not an identity change (purge handles
+    // those): the rows stay rendered and a forced refetch corrects any
+    // same-user authorization change within one round trip.
+    expect(entry.items).toHaveLength(1);
+    expect(chain.findCalls).toBe(2);
     release();
   });
 
