@@ -151,6 +151,11 @@ export interface AppConfig {
    * more, raise this; don't disable.
    */
   maxSubscriptionsPerSocket?: number;
+  /**
+   * Ceiling on client-provided limits in auto-CRUD list queries.
+   * Integer >= 1; defaults to 10,000. See queryFromClient's doc.
+   */
+  maxClientQueryLimit?: number;
 }
 
 export interface ParcaeApp {
@@ -728,6 +733,7 @@ export function createApp(config: AppConfig): ParcaeApp {
       const adapter = new BackendAdapter({
         read: readDb,
         write: writeDb,
+        maxClientQueryLimit: config.maxClientQueryLimit,
       });
       adapter.registerModels(models);
       Model.use(adapter);
