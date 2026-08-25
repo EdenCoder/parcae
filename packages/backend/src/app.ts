@@ -894,7 +894,12 @@ export function createApp(config: AppConfig): ParcaeApp {
       if (flags.server) {
         if (!ensureSchema) await adapter.verifyChangeTriggers(models);
         const modelTypeByTable = indexModelTypesByTable(models);
-        const changeBus = new ChangeBus({ url: envConfig.DATABASE_URL });
+        const changeBus = new ChangeBus({
+          url: envConfig.DATABASE_URL,
+          ...(envConfig.DATABASE_LISTEN_URL
+            ? { listenUrl: envConfig.DATABASE_LISTEN_URL }
+            : {}),
+        });
         resources.changeBus = changeBus;
         changeBus.on((change) => {
           const modelType = modelTypeByTable.get(change.table);
