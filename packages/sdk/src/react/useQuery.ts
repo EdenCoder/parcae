@@ -82,6 +82,14 @@ interface CacheEntry {
   client: ParcaeClient;
   retryCount: number;
   retryTimer: ReturnType<typeof setTimeout> | null;
+  /**
+   * A fetch or resync has successfully answered this entry at least
+   * once. Zero rows is an answer, so `items.length` cannot stand in for
+   * this: `reconcile` returns the previous array when neither length
+   * changed, which leaves a legitimately-empty result pointing at the
+   * shared `EMPTY` sentinel and indistinguishable from never-fetched.
+   */
+  loaded: boolean;
   fetchPromise: Promise<void> | null;
   /**
    * A batched `resync` covering this entry is in flight. Set alongside
@@ -317,6 +325,7 @@ function getOrCreate(
       chain: null,
       client,
       retryCount: 0,
+      loaded: false,
       retryTimer: null,
       fetchPromise: null,
       resyncPending: false,
@@ -336,6 +345,7 @@ function getOrCreate(
       e.items = stale.items;
       e.mergedItems = stale.items;
       e.totalCount = stale.totalCount;
+      e.loaded = true;
       e.loading = false;
       e.version = stale.version;
       e.hash = buildHash(e);
@@ -782,6 +792,7 @@ function recoverResyncEntry(
       entry.items = [];
       entry.version++;
     }
+    entry.loaded = false;
     entry.loading = true;
   }
   // Otherwise stale-while-revalidate: keep the last good items on
@@ -811,7 +822,7 @@ function doFetch(
 
   log.debug("useQuery: fetching", chain.__modelType);
 
-  if (entry.items === EMPTY) entry.loading = true;
+  if (!entry.loaded) entry.loading = true;
   entry.error = null;
   // This fetch is now the thing that settles the entry. Any resync
   // claim is superseded by the generation bump below, and its handlers
@@ -842,6 +853,7 @@ function doFetch(
       const reconciled = reconcile(entry.items, result, entry);
       entry.items = reconciled.items;
       if (reconciled.changed) entry.version++;
+      entry.loaded = true;
       entry.loading = false;
       entry.retryCount = 0;
       if (typeof (result as any).__totalCount === "number") {
@@ -963,6 +975,7 @@ export function _onResyncRequired(client: ParcaeClient): void {
           entry.totalCount = result.totalCount;
           entry.version++;
         }
+        entry.loaded = true;
         entry.loading = false;
         entry.error = null;
         entry.retryCount = 0;
@@ -1179,7 +1192,7 @@ export function useQuery<T>(
     const idle = !entry.fetchPromise && !entry.retryTimer && !entry.resyncPending;
     if (!entry.chain) {
       void doFetch(key, entry, currentChain, clientRef.current);
-    } else if (entry.items === EMPTY && idle) {
+    } else if (!entry.loaded && idle) {
       void doFetch(key, entry, currentChain, clientRef.current);
     }
   }, [client, key, subscribe]);
