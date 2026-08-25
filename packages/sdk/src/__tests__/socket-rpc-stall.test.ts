@@ -277,6 +277,59 @@ describe("SocketTransport — RPC-stall watchdog", () => {
     await rejection;
   });
 
+  it("recovers a starved RPC that other traffic was masking", async () => {
+    const transport = await connectedAuthedTransport();
+    const events = recoverEvents(transport);
+
+    // The app opens a screen and fires a burst. One find never comes
+    // back; the rest answer normally. `lastRpcResponseAt` then sits
+    // ahead of the starved call's dispatch time forever, so the
+    // "a response proves the wire" test can never fire again — the
+    // starved query pulsed a skeleton until its 120s timeout, retried,
+    // and pulsed again. A live wire cannot excuse an unanswered call
+    // indefinitely.
+    const starved = transport.get("/nutrition-sprints");
+    const healthy = transport.get("/events");
+    await vi.advanceTimersByTimeAsync(0);
+    const rejection = expect(starved).rejects.toThrow("Disconnected");
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    answerCall(1, []);
+    await expect(healthy).resolves.toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(events).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(events).toHaveLength(1);
+    expect(events[0].reason).toBe("rpc-stalled");
+    await rejection;
+  });
+
+  it("does not let the starvation floor touch a call with its own budget", async () => {
+    const transport = await connectedAuthedTransport();
+    const events = recoverEvents(transport);
+
+    // Same masking shape, but the long call declared its budget. The
+    // floor must read as "unanswered past any reasonable query", not
+    // "unanswered past 30s" — an exempt call is never in that clock.
+    const budgeted = transport.post("/nutrition/meals", {}, {
+      timeout: 120_000,
+    });
+    const healthy = transport.get("/events");
+    await vi.advanceTimersByTimeAsync(0);
+
+    answerCall(1, []);
+    await expect(healthy).resolves.toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(events).toHaveLength(0);
+
+    answerCall(0, { ok: true });
+    await expect(budgeted).resolves.toEqual({ ok: true });
+    expect(events).toHaveLength(0);
+  });
+
   it("a subscription frame resets the stall clock for default-timeout calls", async () => {
     const transport = await connectedAuthedTransport();
     const events = recoverEvents(transport);

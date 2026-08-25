@@ -83,6 +83,14 @@ interface CacheEntry {
   retryCount: number;
   retryTimer: ReturnType<typeof setTimeout> | null;
   fetchPromise: Promise<void> | null;
+  /**
+   * A batched `resync` covering this entry is in flight. Set alongside
+   * the generation bump in `_onResyncRequired`, which supersedes any
+   * running `doFetch` — so between those two points the resync is the
+   * only thing that can settle the entry, and the mount effect must not
+   * race a second fetch against it.
+   */
+  resyncPending: boolean;
   generation: number;
   pollConsumers: Map<symbol, number>;
   pollTimer: ReturnType<typeof setTimeout> | null;
@@ -311,6 +319,7 @@ function getOrCreate(
       retryCount: 0,
       retryTimer: null,
       fetchPromise: null,
+      resyncPending: false,
       generation: 0,
       pollConsumers: new Map(),
       pollTimer: null,
@@ -703,10 +712,26 @@ function attachSubscription(
   });
 }
 
+/**
+ * Give up on retrying, and say so in the entry. A caller that leaves
+ * `loading` true here strands the entry: nothing is in flight, nothing
+ * is scheduled, and every consumer renders a skeleton that no code path
+ * will ever resolve. `recoverResyncEntry` pins `loading` true on an
+ * authorization boundary and then lands right here whenever the last
+ * subscriber has already unmounted.
+ */
+function abandonRetry(entry: CacheEntry): void {
+  if (!entry.loading) return;
+  entry.loading = false;
+  notify(entry);
+}
+
 function scheduleRetry(key: string, entry: CacheEntry): void {
-  if (entry.retryCount >= MAX_RETRIES) return;
-  if (entry.retryTimer || !entry.chain) return;
-  if (entry.refs <= 0) return;
+  // A timer already armed IS the scheduled work — leave `loading` alone.
+  if (entry.retryTimer) return;
+  if (entry.retryCount >= MAX_RETRIES) return abandonRetry(entry);
+  if (!entry.chain) return abandonRetry(entry);
+  if (entry.refs <= 0) return abandonRetry(entry);
 
   const delay =
     RETRY_DELAYS[Math.min(entry.retryCount, RETRY_DELAYS.length - 1)]!;
@@ -788,6 +813,10 @@ function doFetch(
 
   if (entry.items === EMPTY) entry.loading = true;
   entry.error = null;
+  // This fetch is now the thing that settles the entry. Any resync
+  // claim is superseded by the generation bump below, and its handlers
+  // will skip this entry — so the claim must not outlive them.
+  entry.resyncPending = false;
   notify(entry);
 
   const boundChain = bindChainToClient(chain, client);
@@ -873,6 +902,7 @@ export function _onResyncRequired(client: ParcaeClient): void {
     const modelType = entry.chain.__modelType;
     if (!modelType) continue;
     entry.fetchPromise = null;
+    entry.resyncPending = true;
     entries.push({
       cacheKey,
       entry,
@@ -960,6 +990,17 @@ export function _onResyncRequired(client: ParcaeClient): void {
       for (const e of entries) {
         if (!isLive(e.entry) || e.entry.generation !== e.generation) continue;
         recoverResyncEntry(e.cacheKey, e.entry, error);
+      }
+    })
+    .finally(() => {
+      // Release every entry this batch claimed, including the ones both
+      // handlers skipped on a generation mismatch — a flag left set
+      // there would block the mount effect from ever restarting them.
+      // A newer batch that already re-claimed an entry owns its flag,
+      // which the generation check is what distinguishes.
+      for (const e of entries) {
+        if (e.entry.generation !== e.generation) continue;
+        e.entry.resyncPending = false;
       }
     });
 }
@@ -1129,9 +1170,16 @@ export function useQuery<T>(
       entry.retryTimer = null;
     }
 
+    // Refetch an empty entry unless something is already working on it.
+    // Keying off `loading`/`error` instead stranded the entry: a resync
+    // that superseded an in-flight fetch leaves `loading` true with
+    // nothing scheduled, and a mount that trusts that flag issues no
+    // request, so the screen pulses a skeleton for the life of the
+    // process. Ownership is what the guard has to test, not appearance.
+    const idle = !entry.fetchPromise && !entry.retryTimer && !entry.resyncPending;
     if (!entry.chain) {
       void doFetch(key, entry, currentChain, clientRef.current);
-    } else if (entry.items === EMPTY && !entry.loading && !entry.error) {
+    } else if (entry.items === EMPTY && idle) {
       void doFetch(key, entry, currentChain, clientRef.current);
     }
   }, [client, key, subscribe]);
