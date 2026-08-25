@@ -33,6 +33,12 @@ import { log } from "../log";
 const DEFAULT_TIMEOUT = 120_000;
 const WATCHDOG_STALE_MS = 8_000;
 const WATCHDOG_BACKOFF_CAP_MS = 60_000;
+/**
+ * Ceiling on how long a call with no declared budget may sit unanswered
+ * while other traffic flows. Past this the socket is rebuilt whatever
+ * the rest of the wire is doing — see `_rpcStalled`.
+ */
+const RPC_STARVATION_MS = 30_000;
 const KICK_FLOOR_MS = 2_000;
 
 const uid = new ShortId({ length: 10 });
@@ -278,10 +284,23 @@ export class SocketTransport extends EventEmitter implements Transport {
   // full stale window with no response of any kind arriving after it
   // was dispatched. A response landing after dispatch proves the wire,
   // so a merely slow server never trips this.
+  //
+  // That proof expires. `lastRpcResponseAt` is one clock for the whole
+  // socket, so a single answered call sits permanently ahead of a
+  // starved call's dispatch time and masks it — and a screen mounting
+  // a dozen queries at once always has something to answer. Past
+  // RPC_STARVATION_MS the wire being alive stops being an excuse: a
+  // call with no declared budget that the server has not answered in
+  // half a minute is a dropped response, not a slow one, and only a
+  // rebuild recovers it. Calls that declared their own timeout are
+  // excluded from `_oldestPendingAt`, so a long-budget RPC never
+  // reaches this.
   private _rpcStalled(): boolean {
     const oldest = this._oldestPendingAt();
     if (oldest === null) return false;
-    if (Date.now() - oldest < this.watchdogStaleMs) return false;
+    const age = Date.now() - oldest;
+    if (age < this.watchdogStaleMs) return false;
+    if (age >= RPC_STARVATION_MS) return true;
     return this.lastRpcResponseAt === null || this.lastRpcResponseAt <= oldest;
   }
 
@@ -334,7 +353,15 @@ export class SocketTransport extends EventEmitter implements Transport {
       // that develops after this scheduling point is still noticed.
       const oldest = this._oldestPendingAt();
       if (oldest !== null) {
-        const delay = Math.max(oldest + this.watchdogStaleMs - Date.now(), 50);
+        // Two boundaries matter for a pending call: the stale window,
+        // and the starvation floor that outlives any masking response.
+        // Arming at the one already passed would spin the tick at its
+        // 50ms minimum for the whole gap between them.
+        const next =
+          Date.now() - oldest < this.watchdogStaleMs
+            ? this.watchdogStaleMs
+            : RPC_STARVATION_MS;
+        const delay = Math.max(oldest + next - Date.now(), 50);
         this.watchdogTimer = setTimeout(() => {
           this.watchdogTimer = null;
           this._watchdogTick();
