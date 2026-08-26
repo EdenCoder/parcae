@@ -42,7 +42,10 @@ import {
 import { BackendAdapter } from "./adapters/model";
 import { registerModelRoutes } from "./adapters/routes";
 import { PubSub } from "./services/pubsub";
-import { QueueService } from "./services/queue";
+import {
+  QueueService,
+  formatOrphanQueueWarning,
+} from "./services/queue";
 import { RefLoader } from "./services/ref-loader";
 import {
   QuerySubscriptionManager,
@@ -1082,8 +1085,9 @@ export function createApp(config: AppConfig): ParcaeApp {
 
       // ── Step 15: Start per-job-name BullMQ workers ─────────────────
       //
-      // Each registered job gets its own BullMQ queue named
-      // `${defaultName}:${jobName}`. Workers subscribe to specific queues:
+      // Each registered job gets its own BullMQ queue, named by
+      // `queueNameFor` (percent-escaped, e.g. `parcae-post%3Aindex`).
+      // Workers subscribe to specific queues:
       //
       //   - RUN_JOBS=true    → subscribe to every registered job's queue
       //   - RUN_JOBS=false   → don't subscribe to anything (enqueue still
@@ -1185,6 +1189,18 @@ export function createApp(config: AppConfig): ParcaeApp {
             `Skipped ${skipped.length} job(s) not selected by RUN_JOBS: ${skipped.join(", ")}`,
           );
         }
+
+        // Advisory: a renamed job, or a change to the queue-name mapping,
+        // leaves the old queue holding jobs that nothing consumes. The
+        // old queue keeps serving plausible stats, so nothing else
+        // surfaces it. Report only; draining is the operator's call.
+        // Compare against QUEUE names, not job names.
+        const orphanWarning = formatOrphanQueueWarning(
+          await queue.findOrphanQueues(
+            registeredJobs.map((jobEntry) => queue.queueNameFor(jobEntry.name)),
+          ),
+        );
+        if (orphanWarning) log.warn(orphanWarning);
       } else if (!wantsAnyJobs && registeredJobs.length > 0) {
         log.info(
           `Skipped starting BullMQ workers (RUN_JOBS=false) — ` +

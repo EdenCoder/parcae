@@ -83,6 +83,77 @@ export async function addJobIfNotExists(
   return added;
 }
 
+/**
+ * BullMQ v5 rejects colons in queue names. Percent-escaping both `%`
+ * and `:` keeps the mapping injective (`post:index` cannot collide
+ * with `post-index` or the literal `post%3Aindex`).
+ */
+const escapeQueueName = (value: string): string =>
+  value.replace(/%/g, "%25").replace(/:/g, "%3A");
+
+/**
+ * The states a job can sit in on a queue nothing consumes. `paused`
+ * matters because pausing RENAMEs the wait list, and `active` because
+ * a job pulled by a worker that then died is only recovered by a
+ * running worker's stalled check, which an orphan queue has none of.
+ */
+const UNDONE_LIST_KEYS = ["wait", "paused", "active"] as const;
+const UNDONE_ZSET_KEYS = ["delayed", "prioritized"] as const;
+
+/** A queue holding undone jobs that no registered job maps to. */
+export interface OrphanQueue {
+  queue: string;
+  wait: number;
+  paused: number;
+  active: number;
+  delayed: number;
+  prioritized: number;
+}
+
+/**
+ * `incomplete` means the scan could not see the whole keyspace: it
+ * timed out, or Redis refused a command. It must be reported, because
+ * a scan that could not run looks exactly like one that found nothing.
+ */
+export interface OrphanScanResult {
+  orphans: OrphanQueue[];
+  incomplete: boolean;
+}
+
+/** How long the advisory scan may take before it gives up. */
+const ORPHAN_SCAN_TIMEOUT_MS = 5000;
+
+/**
+ * Render the boot warning for a scan result, or `null` when there is
+ * nothing to say. Kept separate from the scan so the wording is
+ * testable without a Redis keyspace.
+ */
+export function formatOrphanQueueWarning(
+  result: OrphanScanResult,
+): string | null {
+  const { orphans, incomplete } = result;
+  if (orphans.length === 0 && !incomplete) return null;
+
+  const caveat = incomplete
+    ? " The scan was INCOMPLETE (timed out or Redis refused a command), so this list may be partial."
+    : "";
+  if (orphans.length === 0) {
+    return `[jobs] the orphan-queue scan could not complete, so nothing was checked.${caveat}`;
+  }
+
+  const detail = orphans
+    .map(
+      (o) =>
+        `${o.queue} (wait=${o.wait}, paused=${o.paused}, active=${o.active}, delayed=${o.delayed}, prioritized=${o.prioritized})`,
+    )
+    .join(", ");
+  return (
+    `[jobs] ${orphans.length} queue(s) hold undone jobs that no registered job consumes: ${detail}. ` +
+    `Usually a renamed job or a change to the queue-name mapping; the jobs are NOT drained and will wait forever. ` +
+    `Check the name against queueNameFor before draining anything: a sibling service whose JOB_QUEUE_NAME extends this one shares the prefix and its live queues can appear here.${caveat}`
+  );
+}
+
 // ─── QueueService ────────────────────────────────────────────────────────────
 
 export interface QueueConfig {
@@ -103,7 +174,8 @@ export class QueueService {
   private workers = new Map<string, Worker>();
   /**
    * Namespace prefix for all queue names. Each registered job gets its own
-   * BullMQ queue named `${defaultName}:${jobName}`. The bare `defaultName`
+   * BullMQ queue named `${defaultName}-${jobName}`, percent-escaped by
+   * `queueNameFor`. The bare `defaultName`
    * queue is reserved as a transitional fallback for in-flight legacy jobs
    * enqueued before the per-name routing landed (see app.ts Step 15).
    */
@@ -131,9 +203,93 @@ export class QueueService {
    * queueNameFor("post:index")               → "parcae-post%3Aindex"
    */
   queueNameFor(jobName: string): string {
-    const escape = (value: string) =>
-      value.replace(/%/g, "%25").replace(/:/g, "%3A");
-    return `${escape(this.defaultName)}-${escape(jobName)}`;
+    return `${escapeQueueName(this.defaultName)}-${escapeQueueName(jobName)}`;
+  }
+
+  /**
+   * Advisory scan for queues in this service's namespace that no
+   * registered job maps to but that still hold undone jobs. A
+   * queue-naming change strands such jobs silently: the old queue
+   * keeps serving plausible stats while nothing consumes it, and a job
+   * added there waits forever with no error. This scan is the only
+   * signal.
+   *
+   * It reports, never drains, and is bounded by its own deadline. The
+   * deadline is load-bearing rather than defensive: the shared ioredis
+   * carries `maxRetriesPerRequest: null` (BullMQ requires it for
+   * blocking ops), and ioredis only flushes pending commands with an
+   * error when that option is a number. A command issued while the
+   * connection is down therefore never settles and never rejects, so
+   * without a deadline an awaiting caller waits out the whole outage.
+   *
+   * Scope: the bare `defaultName` queue plus names under the
+   * `${defaultName}-` prefix. That prefix is shared with any sibling
+   * service whose own name extends this one, so a reported queue is a
+   * candidate to investigate, not proof of a dead queue.
+   */
+  async findOrphanQueues(
+    registeredQueueNames: Iterable<string>,
+    opts: { timeoutMs?: number } = {},
+  ): Promise<OrphanScanResult> {
+    if (!this.sharedRedis) return { orphans: [], incomplete: false };
+    const redis = this.sharedRedis;
+    const known = new Set(registeredQueueNames);
+    const prefix = `${escapeQueueName(this.defaultName)}-`;
+    const orphans: OrphanQueue[] = [];
+
+    const deadline = new Promise<"timeout">((resolve) => {
+      const timer = setTimeout(
+        () => resolve("timeout"),
+        opts.timeoutMs ?? ORPHAN_SCAN_TIMEOUT_MS,
+      );
+      timer.unref?.();
+    });
+    /** Resolves "timeout" rather than hanging on a stuck connection. */
+    const bounded = async <T>(work: Promise<T>): Promise<T | "timeout"> =>
+      Promise.race([work, deadline]);
+
+    try {
+      const names: string[] = [];
+      let cursor = "0";
+      do {
+        const page = await bounded(
+          redis.scan(cursor, "MATCH", "bull:*:meta", "COUNT", "500"),
+        );
+        if (page === "timeout") return { orphans, incomplete: true };
+        const [next, keys] = page;
+        cursor = next;
+        for (const key of keys) names.push(key.slice(5, -5));
+      } while (cursor !== "0");
+
+      for (const name of names.sort()) {
+        if (name !== this.defaultName && !name.startsWith(prefix)) continue;
+        if (known.has(name)) continue;
+        const base = `bull:${name}:`;
+        const counts = await bounded(
+          Promise.all([
+            ...UNDONE_LIST_KEYS.map(
+              async (key) => [key, await redis.llen(`${base}${key}`)] as const,
+            ),
+            ...UNDONE_ZSET_KEYS.map(
+              async (key) => [key, await redis.zcard(`${base}${key}`)] as const,
+            ),
+          ]),
+        );
+        if (counts === "timeout") return { orphans, incomplete: true };
+        const undone = Object.fromEntries(counts) as Record<
+          (typeof UNDONE_LIST_KEYS)[number] | (typeof UNDONE_ZSET_KEYS)[number],
+          number
+        >;
+        const total = counts.reduce((sum, [, count]) => sum + count, 0);
+        if (total > 0) {
+          orphans.push({ queue: name, ...undone });
+        }
+      }
+    } catch {
+      // Report what was gathered, and say it is not the whole picture.
+      return { orphans, incomplete: true };
+    }
+    return { orphans, incomplete: false };
   }
 
   private async build(url: string): Promise<void> {

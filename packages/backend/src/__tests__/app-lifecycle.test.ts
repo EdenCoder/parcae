@@ -129,7 +129,10 @@ vi.mock("../schema/generate", () => ({
 vi.mock("../adapters/model", () => ({ BackendAdapter: mocks.BackendAdapter }));
 vi.mock("../adapters/routes", () => ({ registerModelRoutes: vi.fn(() => 0) }));
 vi.mock("../services/pubsub", () => ({ PubSub: mocks.PubSub }));
-vi.mock("../services/queue", () => ({
+// Spread the real module so app.ts's other imports from it (the orphan
+// scan's warning formatter) resolve while QueueService stays a double.
+vi.mock("../services/queue", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/queue")>()),
   QueueService: mocks.QueueService,
   addJobIfNotExists: vi.fn(),
 }));

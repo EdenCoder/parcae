@@ -452,7 +452,7 @@ Synchronous hooks are awaited in priority order. Async hooks (`async: true`) fir
 
 Source: `packages/backend/src/routing/job.ts`
 
-BullMQ background jobs. Each registered job gets its own per-name queue, named `` `${JOB_QUEUE_NAME}:${jobName}` `` with all colons collapsed to dashes (BullMQ v5 rejects colons), so `post:index` → queue `parcae-post-index`. Workers start per `RUN_JOBS`.
+BullMQ background jobs. Each registered job gets its own per-name queue, named `` `${JOB_QUEUE_NAME}-${jobName}` `` with `%` and `:` percent-escaped in both components (BullMQ v5 rejects colons; escaping keeps the mapping injective), so `post:index` → queue `parcae-post%3Aindex`. The mapping lives in `QueueService.queueNameFor` — any code or diagnostic that names a queue by hand must go through it, never rebuild it. Workers start per `RUN_JOBS`. A process that starts workers also runs an advisory boot scan (`findOrphanQueues`) that warns about namespace queues holding undone jobs (wait/paused/active/delayed/prioritized) which no registered job consumes, the fingerprint of a renamed job or a changed mapping. It never drains them, carries its own deadline so a stuck Redis cannot delay startup, and reports `incomplete` when it could not finish rather than a falsely clean result.
 
 ```typescript
 import { job } from "@parcae/backend";
