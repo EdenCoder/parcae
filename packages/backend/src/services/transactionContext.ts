@@ -31,6 +31,26 @@ export interface TransactionFrame {
 
 const storage = new AsyncLocalStorage<TransactionFrame>();
 
+// ─── Transaction prelude ─────────────────────────────────────────────────────
+
+/**
+ * Runs once per outermost transaction, before any statement in it.
+ *
+ * The framework has no opinion on what belongs here; it exists so an
+ * application can attach transaction-local session state — an actor name
+ * for audit triggers, a tenant id for RLS — that database-side code needs
+ * but cannot derive. Nested `withTransaction` calls share the outermost
+ * frame and therefore do not re-run it.
+ */
+export type TransactionPrelude = (trx: any) => Promise<void> | void;
+
+let transactionPrelude: TransactionPrelude | null = null;
+
+/** Register (or clear, with `null`) the transaction prelude. */
+export function setTransactionPrelude(fn: TransactionPrelude | null): void {
+  transactionPrelude = fn;
+}
+
 /** Get the active transaction frame, if any. */
 export function getActiveTransactionFrame(): TransactionFrame | null {
   const frame = storage.getStore();
@@ -104,7 +124,10 @@ export async function withTransaction<T>(
         afterCommit: [],
         afterRollback: [],
       };
-      return await storage.run(transaction.frame, () => fn(trx));
+      return await storage.run(transaction.frame, async () => {
+        if (transactionPrelude) await transactionPrelude(trx);
+        return await fn(trx);
+      });
     });
   } catch (err) {
     const frame = transaction.frame;

@@ -1654,70 +1654,77 @@ export class BackendAdapter implements ModelAdapter {
     // - Postgres UPDATE has no ORDER BY/LIMIT, but an id-subquery may —
     //   so `.orderBy(...).limit(100).update(...)` works ("update the
     //   100 stalest rows") instead of erroring.
-    chain.update = async (patch: Record<string, any>): Promise<number> => {
-      const table = tableName(modelClass);
-      const schema = (modelClass.__schema as SchemaDefinition) ?? {};
-      const entries = Object.entries(patch);
-      if (entries.length === 0) {
-        throw new Error("bulk update requires a non-empty patch");
-      }
+    chain.update = async (patch: Record<string, any>): Promise<number> =>
+      // One statement, but still wrapped: the transaction prelude
+      // publishes session state (e.g. an audit actor) that database-side
+      // code needs and cannot derive, and a bulk write is exactly the
+      // case where losing that attribution matters most. Hooks and
+      // scopes still do not run — that remains this primitive's
+      // documented contract.
+      this._withTransaction(async () => {
+        const table = tableName(modelClass);
+        const schema = (modelClass.__schema as SchemaDefinition) ?? {};
+        const entries = Object.entries(patch);
+        if (entries.length === 0) {
+          throw new Error("bulk update requires a non-empty patch");
+        }
 
-      const protectedKeys = new Set([
-        "id",
-        "createdAt",
-        "updatedAt",
-        "type",
-        "tmp",
-      ]);
-      const row: Record<string, any> = {};
-      const overflow: Record<string, any> = {};
-      for (const [key, value] of entries) {
-        if (protectedKeys.has(key)) {
-          throw new Error(
-            `bulk update cannot set system field "${key}" — ` +
-              "updatedAt is stamped automatically; id/createdAt/type are immutable",
+        const protectedKeys = new Set([
+          "id",
+          "createdAt",
+          "updatedAt",
+          "type",
+          "tmp",
+        ]);
+        const row: Record<string, any> = {};
+        const overflow: Record<string, any> = {};
+        for (const [key, value] of entries) {
+          if (protectedKeys.has(key)) {
+            throw new Error(
+              `bulk update cannot set system field "${key}" — ` +
+                "updatedAt is stamped automatically; id/createdAt/type are immutable",
+            );
+          }
+          const colDef = schema[key];
+          if (colDef !== undefined) {
+            const colType = resolveColType(colDef);
+            if (colType === "json" && value != null) {
+              row[key] = JSON.stringify(value);
+            } else if (colType === "datetime" && value != null) {
+              row[key] = new Date(value as string);
+            } else if (
+              typeof colDef === "object" &&
+              colDef.kind === "ref" &&
+              value != null &&
+              typeof value === "object"
+            ) {
+              // Accept a model instance where a ref id is expected.
+              row[key] = (value as any).id ?? value;
+            } else {
+              row[key] = value;
+            }
+          } else {
+            overflow[key] = value;
+          }
+        }
+        row.updatedAt = new Date();
+
+        if (Object.keys(overflow).length > 0) {
+          // Merge into the JSONB overflow without clobbering its other
+          // keys. A null value stores a JSON null rather than removing
+          // the key; both read back as null-ish through hydrate().
+          const json = JSON.stringify(overflow);
+          row.data = this.write.raw(
+            `COALESCE(data, '{}'::jsonb) || ?::jsonb`,
+            [json],
           );
         }
-        const colDef = schema[key];
-        if (colDef !== undefined) {
-          const colType = resolveColType(colDef);
-          if (colType === "json" && value != null) {
-            row[key] = JSON.stringify(value);
-          } else if (colType === "datetime" && value != null) {
-            row[key] = new Date(value as string);
-          } else if (
-            typeof colDef === "object" &&
-            colDef.kind === "ref" &&
-            value != null &&
-            typeof value === "object"
-          ) {
-            // Accept a model instance where a ref id is expected.
-            row[key] = (value as any).id ?? value;
-          } else {
-            row[key] = value;
-          }
-        } else {
-          overflow[key] = value;
-        }
-      }
-      row.updatedAt = new Date();
 
-      if (Object.keys(overflow).length > 0) {
-        // Merge into the JSONB overflow without clobbering its other
-        // keys. A null value stores a JSON null rather than removing
-        // the key; both read back as null-ish through hydrate().
-        const json = JSON.stringify(overflow);
-        row.data = this.write.raw(
-          `COALESCE(data, '{}'::jsonb) || ?::jsonb`,
-          [json],
-        );
-      }
-
-      const idSubquery = knexQuery.clone().clearSelect().select(`${table}.id`);
-      return await this.write(table)
-        .whereIn("id", idSubquery)
-        .update(row);
-    };
+        const idSubquery = knexQuery.clone().clearSelect().select(`${table}.id`);
+        return await this.write(table)
+          .whereIn("id", idSubquery)
+          .update(row);
+      });
 
     chain.exec = () => knexQuery;
     chain.clone = () => this._buildQuery(modelClass, knexQuery.clone(), expand);

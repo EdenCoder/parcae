@@ -61,6 +61,20 @@ export function getRequestUser(): {
 }
 
 /**
+ * True when the caller is running inside a request scope — the Polka
+ * middleware installed by `app.start()` wraps every HTTP request
+ * (auto-CRUD routes and custom controllers alike), and the socket query
+ * path wraps each batched entry.
+ *
+ * Useful to distinguish client-originated work from background work
+ * (jobs, workers, boot sweeps, scripts) without threading a flag through
+ * every call site.
+ */
+export function isRequestContext(): boolean {
+  return _requestContext.getStore() !== undefined;
+}
+
+/**
  * Get the request-scoped `RefLoader`, if any. Returns `null` when the
  * call is outside an `app.start()`-installed request scope (jobs,
  * tests). Consumers should fall through to direct queries on null —

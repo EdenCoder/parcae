@@ -51,10 +51,12 @@ export {
   withTransaction,
   getActiveTransactionFrame,
   activeTransactionHandle,
+  setTransactionPrelude,
 } from "./services/transactionContext";
 export type {
   TransactionFrame,
   WithTransactionDeps,
+  TransactionPrelude,
 } from "./services/transactionContext";
 export {
   enqueue,
@@ -67,6 +69,7 @@ export {
   getRequestUser,
   _setServices,
   _clearServices,
+  isRequestContext,
 } from "./services/context";
 export type { EnqueueOptions } from "./services/context";
 
