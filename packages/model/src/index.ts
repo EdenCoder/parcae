@@ -61,3 +61,8 @@ export type {
   ScopeContext,
   PatchOp,
 } from "./adapters/types";
+
+export {
+  SESSION_BOUNDARY_ERRORS,
+  isSessionBoundaryError,
+} from "./session-boundary";

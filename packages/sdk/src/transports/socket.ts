@@ -25,11 +25,21 @@ import { decompress } from "compress-json";
 import { EventEmitter } from "eventemitter3";
 import ShortId from "short-unique-id";
 import type { Transport, RequestOptions } from "@parcae/model";
+import { SESSION_BOUNDARY_ERRORS } from "@parcae/model";
 import { SessionMachine } from "../session-machine";
 import { ConnectionMachine } from "../connection-machine";
 import { log } from "../log";
 
 const DEFAULT_TIMEOUT = 120_000;
+const WATCHDOG_STALE_MS = 8_000;
+const WATCHDOG_BACKOFF_CAP_MS = 60_000;
+/**
+ * Ceiling on how long a call with no declared budget may sit unanswered
+ * while other traffic flows. Past this the socket is rebuilt whatever
+ * the rest of the wire is doing — see `_rpcStalled`.
+ */
+const RPC_STARVATION_MS = 30_000;
+const KICK_FLOOR_MS = 2_000;
 
 const uid = new ShortId({ length: 10 });
 
@@ -71,6 +81,28 @@ export interface SocketTransportConfig {
    * connection machine stays `"idle"`; `reconnect()` dials on demand.
    */
   autoConnect?: boolean;
+  /**
+   * Watchdog stale threshold in ms. While the consumer reports the app
+   * active, a transport that stays unready (socket not connected,
+   * connected with hello unacked, or in-flight RPCs starved of any
+   * response) this long is torn down and rebuilt with exponential
+   * backoff. `0` disables the watchdog. Default 8000.
+   */
+  watchdogStaleMs?: number;
+}
+
+/** Point-in-time technical snapshot of the transport, for diagnostics. */
+export interface TransportDiagnostics {
+  connectionStatus: "idle" | "connecting" | "connected" | "disconnected";
+  sessionStatus: "pending" | "anonymous" | "authenticated" | "terminated";
+  msSinceHelloAttempt: number | null;
+  msSinceHelloAck: number | null;
+  subscriptionCount: number;
+  recoveryAttempts: number;
+  /** In-flight `call` RPCs plus in-flight resyncs. */
+  pendingCallCount: number;
+  /** Age of the oldest in-flight RPC/resync, null when none pending. */
+  msSinceOldestPendingCall: number | null;
 }
 
 /** Wire shape for a single `resync` entry. */
@@ -107,6 +139,9 @@ export interface ResyncResult {
 interface PendingWaiter {
   cleanup: () => void;
   reject: (error: Error) => void;
+  /** Dispatch time for RPC-shaped waiters (resync); absent for
+   * connection/termination waits, which the watchdog must not count. */
+  sentAt?: number;
 }
 
 export class SocketTransport extends EventEmitter implements Transport {
@@ -120,7 +155,13 @@ export class SocketTransport extends EventEmitter implements Transport {
   private inflight = new Map<string, Promise<any>>();
   private pendingCalls = new Map<
     string,
-    { timer: ReturnType<typeof setTimeout>; reject: (error: Error) => void }
+    {
+      timer: ReturnType<typeof setTimeout>;
+      reject: (error: Error) => void;
+      sentAt: number;
+      /** Caller declared its own timeout; the stall clock skips it. */
+      watchdogExempt?: boolean;
+    }
   >();
   private pendingWaiters = new Set<PendingWaiter>();
   private handshakeTimeout: number;
@@ -137,6 +178,28 @@ export class SocketTransport extends EventEmitter implements Transport {
   private helloReady: Promise<void> = Promise.resolve();
   /** The token the server validated at the last resolved hello. */
   private confirmedHelloToken: string | null = null;
+  /**
+   * Raw-event delivery gate. False from the moment a session boundary
+   * starts (new hello, termination, disconnect) until the server
+   * confirms the next session, so a frame already in flight when the
+   * identity changes is dropped instead of delivered to handlers that
+   * belong to the prior session.
+   */
+  private sessionReadyForEvents = false;
+  private watchdogStaleMs: number;
+  private watchdogActive = true;
+  private watchdogSuspended = false;
+  private watchdogTimer: ReturnType<typeof setTimeout> | null = null;
+  private watchdogUnhealthySince: number | null = null;
+  private watchdogRecoveries = 0;
+  private lastRpcResponseAt: number | null = null;
+  private rpcStallRecoveryPending = false;
+  private lastHelloAttemptAt: number | null = null;
+  private lastHelloAckAt: number | null = null;
+  private subscriptions = new Map<
+    string,
+    Map<(...args: any[]) => void, (...args: any[]) => void>
+  >();
 
   constructor(config: SocketTransportConfig) {
     super();
@@ -144,6 +207,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     this.version = config.version ?? "v1";
     this.getToken = config.getToken;
     this.handshakeTimeout = config.handshakeTimeout ?? DEFAULT_TIMEOUT;
+    this.watchdogStaleMs = config.watchdogStaleMs ?? WATCHDOG_STALE_MS;
 
     const socketPath = config.path ?? "/ws";
     const transports = config.transports ?? ["websocket"];
@@ -158,12 +222,16 @@ export class SocketTransport extends EventEmitter implements Transport {
     });
 
     if (autoConnect) this.connection.connecting();
+    // A connection-less (SSR) transport must never be dialed by the
+    // watchdog; `reconnect()` lifts the suspension when it dials.
+    this.watchdogSuspended = !autoConnect;
 
     this.socket.on("connect", () => {
       if (this.isDisposed) return;
       this.connection.connected();
       this.emit("connected");
       void this._handshake().catch(() => {});
+      this._scheduleWatchdog();
     });
 
     this.socket.on("disconnect", (reason?: string) => {
@@ -186,6 +254,230 @@ export class SocketTransport extends EventEmitter implements Transport {
       this.connection.connected();
       void this._handshake().catch(() => {});
     }
+    this._scheduleWatchdog();
+  }
+
+  // ── Watchdog ─────────────────────────────────────────────────────
+  //
+  // The OS can suppress the device's network stack so the socket.io
+  // engine wedges silently: no connect, no connect_error, no timers
+  // firing, forever. Recovery is a full engine rebuild under the same
+  // Socket: disconnect() destroys the wedged manager/engine state and
+  // connect() builds a fresh engine while every listener stays attached.
+
+  private _oldestPendingAt(): number | null {
+    let oldest: number | null = null;
+    for (const { sentAt, watchdogExempt } of this.pendingCalls.values()) {
+      if (watchdogExempt) continue;
+      if (oldest === null || sentAt < oldest) oldest = sentAt;
+    }
+    for (const { sentAt } of this.pendingWaiters) {
+      if (sentAt === undefined) continue;
+      if (oldest === null || sentAt < oldest) oldest = sentAt;
+    }
+    return oldest;
+  }
+
+  // A half-dead path can pass small frames (hello ack, pings) while
+  // dropping RPC response frames, so "connected + hello acked" is not
+  // proof of health. Stalled = the oldest in-flight RPC has waited a
+  // full stale window with no response of any kind arriving after it
+  // was dispatched. A response landing after dispatch proves the wire,
+  // so a merely slow server never trips this.
+  //
+  // That proof expires. `lastRpcResponseAt` is one clock for the whole
+  // socket, so a single answered call sits permanently ahead of a
+  // starved call's dispatch time and masks it — and a screen mounting
+  // a dozen queries at once always has something to answer. Past
+  // RPC_STARVATION_MS the wire being alive stops being an excuse: a
+  // call with no declared budget that the server has not answered in
+  // half a minute is a dropped response, not a slow one, and only a
+  // rebuild recovers it. Calls that declared their own timeout are
+  // excluded from `_oldestPendingAt`, so a long-budget RPC never
+  // reaches this.
+  private _rpcStalled(): boolean {
+    const oldest = this._oldestPendingAt();
+    if (oldest === null) return false;
+    const age = Date.now() - oldest;
+    if (age < this.watchdogStaleMs) return false;
+    if (age >= RPC_STARVATION_MS) return true;
+    return this.lastRpcResponseAt === null || this.lastRpcResponseAt <= oldest;
+  }
+
+  private _noteRpcResponse(): void {
+    this.lastRpcResponseAt = Date.now();
+    if (this.rpcStallRecoveryPending) {
+      this.rpcStallRecoveryPending = false;
+      this.emit("rpc:recovered");
+    }
+  }
+
+  private _stallReason(): "connect-stalled" | "hello-stalled" | "rpc-stalled" {
+    if (!this.socket.connected) return "connect-stalled";
+    if (!this.sessionReadyForEvents) return "hello-stalled";
+    return "rpc-stalled";
+  }
+
+  private _watchdogHealthy(): boolean {
+    return (
+      this.socket.connected &&
+      this.sessionReadyForEvents &&
+      !this._rpcStalled()
+    );
+  }
+
+  private _watchdogEligible(): boolean {
+    return (
+      this.watchdogStaleMs > 0 &&
+      this.watchdogActive &&
+      !this.watchdogSuspended &&
+      !this.isDisposed &&
+      this.session.state.status !== "terminated"
+    );
+  }
+
+  private _scheduleWatchdog(): void {
+    if (this.watchdogTimer) {
+      clearTimeout(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+    if (!this._watchdogEligible()) {
+      this.watchdogUnhealthySince = null;
+      return;
+    }
+    if (this._watchdogHealthy()) {
+      this.watchdogUnhealthySince = null;
+      this.watchdogRecoveries = 0;
+      // Healthy with RPCs in flight: arm a check for the moment the
+      // oldest pending call would cross the stale window, so a stall
+      // that develops after this scheduling point is still noticed.
+      const oldest = this._oldestPendingAt();
+      if (oldest !== null) {
+        // Two boundaries matter for a pending call: the stale window,
+        // and the starvation floor that outlives any masking response.
+        // Arming at the one already passed would spin the tick at its
+        // 50ms minimum for the whole gap between them.
+        const next =
+          Date.now() - oldest < this.watchdogStaleMs
+            ? this.watchdogStaleMs
+            : RPC_STARVATION_MS;
+        const delay = Math.max(oldest + next - Date.now(), 50);
+        this.watchdogTimer = setTimeout(() => {
+          this.watchdogTimer = null;
+          this._watchdogTick();
+        }, delay);
+      }
+      return;
+    }
+    if (this.watchdogUnhealthySince === null) {
+      // For an RPC stall the transport has effectively been unhealthy
+      // since the starved call went out, not since the stall was
+      // noticed; anchoring backoff there recovers on the first tick.
+      const oldest = this._oldestPendingAt();
+      this.watchdogUnhealthySince =
+        this._rpcStalled() && oldest !== null ? oldest : Date.now();
+    }
+    const backoff = Math.min(
+      this.watchdogStaleMs * 2 ** this.watchdogRecoveries,
+      WATCHDOG_BACKOFF_CAP_MS,
+    );
+    const delay = Math.max(
+      this.watchdogUnhealthySince + backoff - Date.now(),
+      50,
+    );
+    this.watchdogTimer = setTimeout(() => {
+      this.watchdogTimer = null;
+      this._watchdogTick();
+    }, delay);
+  }
+
+  private _watchdogTick(): void {
+    if (!this._watchdogEligible() || this._watchdogHealthy()) {
+      this._scheduleWatchdog();
+      return;
+    }
+    this._recoverStuckTransport(this._stallReason());
+  }
+
+  private _recoverStuckTransport(
+    reason: "connect-stalled" | "hello-stalled" | "rpc-stalled",
+  ): void {
+    if (reason === "rpc-stalled") {
+      this.rpcStallRecoveryPending = true;
+    }
+    this.watchdogRecoveries++;
+    this.emit("watchdog:recover", {
+      reason,
+      attempt: this.watchdogRecoveries,
+      diagnostics: this.diagnostics(),
+    });
+    log.warn(`watchdog: recovering (${reason})`);
+    this.watchdogUnhealthySince = Date.now();
+    try {
+      this.socket.disconnect();
+    } catch {
+      log.warn("watchdog: teardown failed");
+    }
+    try {
+      this.socket.connect();
+    } catch {
+      log.warn("watchdog: reconnect failed");
+    }
+    this._scheduleWatchdog();
+  }
+
+  /** Consumer's foreground signal. The watchdog only runs while active. */
+  setActive(active: boolean): void {
+    if (this.watchdogActive === active) return;
+    this.watchdogActive = active;
+    // Measure staleness from re-activation, not from however long the
+    // app sat backgrounded with the socket legitimately idle.
+    if (active) this.watchdogUnhealthySince = null;
+    this._scheduleWatchdog();
+  }
+
+  /**
+   * Consumer's "conditions changed, try now" signal (app foregrounded,
+   * network came back). Resets the backoff and, when the transport has
+   * been unhealthy past a short floor, recovers immediately.
+   */
+  kick(): void {
+    this.watchdogRecoveries = 0;
+    if (
+      this._watchdogEligible() &&
+      !this._watchdogHealthy() &&
+      this.watchdogUnhealthySince !== null &&
+      Date.now() - this.watchdogUnhealthySince >= KICK_FLOOR_MS
+    ) {
+      this._recoverStuckTransport(this._stallReason());
+      return;
+    }
+    this._scheduleWatchdog();
+  }
+
+  diagnostics(): TransportDiagnostics {
+    const oldestPending = this._oldestPendingAt();
+    let pendingResyncCount = 0;
+    for (const { sentAt } of this.pendingWaiters) {
+      if (sentAt !== undefined) pendingResyncCount++;
+    }
+    return {
+      connectionStatus: this.connection.state.status,
+      sessionStatus: this.session.state.status,
+      msSinceHelloAttempt:
+        this.lastHelloAttemptAt === null
+          ? null
+          : Date.now() - this.lastHelloAttemptAt,
+      msSinceHelloAck:
+        this.lastHelloAckAt === null
+          ? null
+          : Date.now() - this.lastHelloAckAt,
+      subscriptionCount: this.subscriptions.size,
+      recoveryAttempts: this.watchdogRecoveries,
+      pendingCallCount: this.pendingCalls.size + pendingResyncCount,
+      msSinceOldestPendingCall:
+        oldestPending === null ? null : Date.now() - oldestPending,
+    };
   }
 
   // ── Hello / resync handshake ─────────────────────────────────────
@@ -207,6 +499,8 @@ export class SocketTransport extends EventEmitter implements Transport {
     const generation = this.sessionGeneration;
     this.helloGeneration = generation;
     this.helloState = "pending";
+    this.sessionReadyForEvents = false;
+    this.lastHelloAttemptAt = Date.now();
     this.inflight.clear();
 
     let resolveHello!: () => void;
@@ -264,8 +558,11 @@ export class SocketTransport extends EventEmitter implements Transport {
           log.debug(
             `hello: ${userId ? `userId=${userId}` : "anonymous"} (${ms}ms)`,
           );
+          this.lastHelloAckAt = Date.now();
           this.session.resolve(userId);
           this.confirmedHelloToken = token;
+          this.sessionReadyForEvents = true;
+          this._scheduleWatchdog();
           resolveHello();
           this.emit("resync-required");
         });
@@ -294,6 +591,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     this.sessionGeneration++;
     this.inflight.clear();
     this.helloState = "rejected";
+    this.sessionReadyForEvents = false;
     this._rejectPending(error);
     const active = this.activeHandshake;
     if (!active) return;
@@ -309,13 +607,15 @@ export class SocketTransport extends EventEmitter implements Transport {
     );
     this.connection.disconnected();
     this.emit("disconnected");
+    this._scheduleWatchdog();
   }
 
   private _trackWaiter(
     reject: (error: Error) => void,
     cleanup: () => void,
+    sentAt?: number,
   ): () => void {
-    const waiter = { reject, cleanup };
+    const waiter: PendingWaiter = { reject, cleanup, sentAt };
     this.pendingWaiters.add(waiter);
     return () => {
       if (!this.pendingWaiters.delete(waiter)) return;
@@ -357,8 +657,10 @@ export class SocketTransport extends EventEmitter implements Transport {
       const timeout = setTimeout(() => {
         fail(new Error("resync timeout"));
       }, DEFAULT_TIMEOUT);
-      release = this._trackWaiter(fail, () => clearTimeout(timeout));
+      release = this._trackWaiter(fail, () => clearTimeout(timeout), Date.now());
+      this._scheduleWatchdog();
       this.socket.emit("resync", { queries: entries }, (response: any) => {
+        this._noteRpcResponse();
         if (settled) return;
         settled = true;
         release();
@@ -402,7 +704,8 @@ export class SocketTransport extends EventEmitter implements Transport {
   async terminateSession(): Promise<void> {
     this.confirmedHelloToken = null;
     this.session.terminate();
-    this._advanceGeneration(new Error("Session terminated"));
+    this._advanceGeneration(new Error(SESSION_BOUNDARY_ERRORS.terminated));
+    this._scheduleWatchdog();
     if (this.socket.connected) {
       await new Promise<void>((resolve, reject) => {
         let settled = false;
@@ -444,7 +747,7 @@ export class SocketTransport extends EventEmitter implements Transport {
   private _assertCanRequest(): void {
     if (this.isDisposed) throw new Error("Transport disposed");
     if (this.session.state.status === "terminated") {
-      throw new Error("Session terminated");
+      throw new Error(SESSION_BOUNDARY_ERRORS.terminated);
     }
   }
 
@@ -536,16 +839,32 @@ export class SocketTransport extends EventEmitter implements Transport {
       const timeout = setTimeout(() => {
         this.socket.off(id);
         this.pendingCalls.delete(id);
+        this._scheduleWatchdog();
         log.debug(
           `✗ ${method.toUpperCase()} ${fullPath} timeout (${(timeoutMs / 1000).toFixed(0)}s)`,
         );
         reject(new Error(`RPC timeout: ${method} ${path}`));
       }, timeoutMs);
-      this.pendingCalls.set(id, { timer: timeout, reject });
+      this.pendingCalls.set(id, {
+        timer: timeout,
+        reject,
+        sentAt: Date.now(),
+        // A caller that declared its own timeout has told us the
+        // budget for this call; the watchdog must not second-guess it
+        // at the stale window. Server work that legitimately runs for
+        // tens of seconds (LLM generation, imports) is the sole
+        // in-flight RPC exactly when the user is waiting on it, and
+        // tearing the socket down mid-wait rejects a call the server
+        // goes on to complete and persist.
+        watchdogExempt: options?.timeout !== undefined,
+      });
 
       this.socket.once(id, (msg: any) => {
+        // Any response frame proves the wire is alive.
+        this._noteRpcResponse();
         clearTimeout(timeout);
         this.pendingCalls.delete(id);
+        this._scheduleWatchdog();
         const ms = (performance.now() - t0).toFixed(0);
         try {
           const uncompressed = pako.ungzip(msg, { to: "string" });
@@ -594,6 +913,7 @@ export class SocketTransport extends EventEmitter implements Transport {
         `/${this.version}${path}`,
         data,
       );
+      this._scheduleWatchdog();
     });
   }
 
@@ -622,12 +942,53 @@ export class SocketTransport extends EventEmitter implements Transport {
   }
 
   subscribe(event: string, handler: (...args: any[]) => void): () => void {
-    this.socket.on(event, handler);
-    return () => this.socket.off(event, handler);
+    let eventSubscriptions = this.subscriptions.get(event);
+    if (!eventSubscriptions) {
+      eventSubscriptions = new Map();
+      this.subscriptions.set(event, eventSubscriptions);
+    }
+    const existing = eventSubscriptions.get(handler);
+    if (existing) this.socket.off(event, existing);
+
+    const wrapper = (...args: any[]) => {
+      // A subscription frame is a full data frame: it proves the wire
+      // passes more than pings, so it resets the RPC stall clock even
+      // when the boundary gate below drops it.
+      this._noteRpcResponse();
+      // A frame in flight across a session boundary belongs to the
+      // session that was live when the server sent it; drop it.
+      if (this.sessionReadyForEvents) handler(...args);
+    };
+    eventSubscriptions.set(handler, wrapper);
+    this.socket.on(event, wrapper);
+
+    return () => {
+      this.socket.off(event, wrapper);
+      if (eventSubscriptions?.get(handler) === wrapper) {
+        eventSubscriptions.delete(handler);
+        if (eventSubscriptions.size === 0) this.subscriptions.delete(event);
+      }
+    };
   }
 
   unsubscribe(event: string, handler?: (...args: any[]) => void): void {
-    this.socket.off(event, handler);
+    const eventSubscriptions = this.subscriptions.get(event);
+    if (!handler) {
+      if (eventSubscriptions) {
+        for (const wrapper of eventSubscriptions.values()) {
+          this.socket.off(event, wrapper);
+        }
+        this.subscriptions.delete(event);
+      } else {
+        this.socket.off(event);
+      }
+      return;
+    }
+    const wrapper = eventSubscriptions?.get(handler);
+    if (!wrapper) return;
+    this.socket.off(event, wrapper);
+    eventSubscriptions?.delete(handler);
+    if (eventSubscriptions?.size === 0) this.subscriptions.delete(event);
   }
 
   send(event: string, ...args: any[]): void {
@@ -635,12 +996,16 @@ export class SocketTransport extends EventEmitter implements Transport {
   }
 
   disconnect(): void {
+    this.watchdogSuspended = true;
     if (!this.socket.connected) this._handleSocketDisconnect();
     this.socket.disconnect();
+    this._scheduleWatchdog();
   }
 
   async reconnect(): Promise<void> {
     if (this.isDisposed) throw new Error("Transport disposed");
+    this.watchdogSuspended = false;
+    this._scheduleWatchdog();
     if (this.socket.connected) {
       if (this.helloState === "rejected" || this.helloState === "idle") {
         await this._handshake(true);
@@ -660,11 +1025,13 @@ export class SocketTransport extends EventEmitter implements Transport {
   dispose(): void {
     if (this.isDisposed) return;
     this.isDisposed = true;
+    this._scheduleWatchdog();
     this._advanceGeneration(new Error("Transport disposed"));
     this.emit("dispose");
     this.socket.removeAllListeners?.();
     this.socket.disconnect();
     this.inflight.clear();
+    this.subscriptions.clear();
     this.removeAllListeners();
     this.connection.disconnected();
   }

@@ -86,7 +86,13 @@ let _flags: RuntimeFlags = {
   crons: false,
 };
 
-/** @internal — called by createApp() */
+/**
+ * Install the service registry. createApp() calls this during start();
+ * test harnesses that invoke controllers or jobs without an app install
+ * in-process services here (`new QueueService()` + `new PubSub()`, no
+ * Redis) so lock() has real single-process semantics instead of
+ * throwing.
+ */
 export function _setServices(queue: QueueService, pubsub: PubSub): void {
   _queue = queue;
   _pubsub = pubsub;
@@ -102,7 +108,7 @@ export function _setRuntimeFlags(flags: RuntimeFlags): void {
   _flags = flags;
 }
 
-/** @internal — clears app-owned globals after failed startup or shutdown. */
+/** Clears app-owned globals after failed startup, shutdown, or a test. */
 export function _clearServices(): void {
   _queue = null;
   _pubsub = null;

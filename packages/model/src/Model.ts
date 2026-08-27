@@ -53,6 +53,7 @@ import {
   type QueryChain,
   type SchemaDefinition,
   type PatchOp,
+  type ScopeContext,
 } from "./adapters/types";
 
 export type ModelOperationSource = "local" | "remote";
@@ -609,6 +610,8 @@ export class Model extends EventEmitter {
     update?: (ctx: any) => any;
     delete?: (ctx: any) => any;
     patch?: (ctx: any) => any;
+    /** Per-field query policy — see `ModelScope["fields"]`. */
+    fields?: Record<string, (ctx: any) => any>;
   };
   static indexes?: (string | string[])[];
   static searchFields?: string[];
@@ -640,14 +643,17 @@ export class Model extends EventEmitter {
   /**
    * Additional fields protected only after a row has been created.
    * Auto-CRUD `POST` accepts these columns, while `PUT` strips them and
-   * `PATCH` rejects operations that target them. This lets applications
-   * define create-time identifiers or relationships without imposing any
+   * `PATCH` rejects operations that target them. A resolver can vary the
+   * protected fields by request context. This lets applications define
+   * create-time identifiers or relationships without imposing any
    * domain-specific field names at framework level.
    *
    * Server-side model writes are unaffected. Default is empty so existing
    * models remain backward-compatible.
    */
-  static readonly updateReadonlyFields: readonly string[] = [];
+  static readonly updateReadonlyFields:
+    | readonly string[]
+    | ((ctx: ScopeContext) => readonly string[]) = [];
   /**
    * Field-level read protection for the default `sanitize()`. Listed
    * columns are stripped from the response shape so a column like
@@ -1734,37 +1740,74 @@ export class Model extends EventEmitter {
  * refs stay `string` so their model declaration remains the source of truth.
  */
 type IsAny<T> = 0 extends 1 & T ? true : false;
-type ModelMember<T> = Extract<NonNullable<T>, Model>;
-type NonModelMember<T> = Exclude<NonNullable<T>, Model>;
-type ProjectionMember<T> = Exclude<NonModelMember<T>, string>;
+/**
+ * The Model half of a `Ref<X>` union. The projection member is dropped
+ * by its `SYM_EXPANDED_REF` brand rather than by comparison against
+ * `Model` or `ExpandedRef<...>`: either of those comparisons evaluates
+ * the projection's mapped type, which re-enters the in-flight
+ * instantiation on cyclic models and blows TS2589 at query call sites.
+ */
+type ModelMember<T> = Exclude<
+  NonNullable<T>,
+  string | { readonly [SYM_EXPANDED_REF]: true }
+>;
+/**
+ * Detects a `Ref<X>` field: only ref unions carry full `string`
+ * alongside a Model member. Deliberately shallow — see ModelMember.
+ */
 type ReferenceTarget<T> = IsAny<T> extends true
   ? never
-  : [ModelMember<T>] extends [never]
-    ? never
-    : [Extract<NonModelMember<T>, string>] extends [never]
-      ? never
-      : [ProjectionMember<T>] extends [never]
-        ? never
-        : [ProjectionMember<T>] extends [ExpandedRef<ModelMember<T>>]
-          ? ModelMember<T>
-          : never;
+  : string extends NonNullable<T>
+    ? Extract<ModelMember<T>, Model>
+    : never;
 
-/** Plain, potentially projected data carried by `.expand()`. */
+/**
+ * Plain, potentially projected data carried by `.expand()`.
+ *
+ * Nested reference members map to their raw id: expansion is one-hop
+ * only, so the wire row of an expanded value carries raw ids for its
+ * own refs. Mapping them as `Ref<...>` would also make the type
+ * self-referential for cyclic models (a parent ref to the same model,
+ * or a two-model cycle), which blows TS2589 at query call sites. The
+ * detector is `string extends member`: every `Ref<X>` union carries
+ * plain `string`, and no other field shape does except a bare string
+ * field, which the widening leaves semantically unchanged. Anything
+ * that inspects the Model or ExpandedRef member here would re-enter
+ * the in-flight instantiation on a cycle.
+ */
 export type ExpandedRef<T extends Model> = {
-  [K in keyof T as K extends string
+  // Base Model keys (every method plus id/timestamps) are excluded by
+  // KEY, not by a `T[K] extends Function` value check: a value check
+  // distributes over nested `Ref<...>` unions and instantiates each
+  // linked model's ExpandedRef in turn, walking the entire model graph
+  // and hitting the instantiation depth limit on any ref cycle. The
+  // shared projection fields come back in the intersection below.
+  [K in Exclude<keyof T, keyof Model> as K extends string
     ? K extends `__${string}`
       ? never
-      : T[K] extends (...args: any[]) => any
-      ? never
       : K
-    : never]?: T[K];
-} & { id: string; type?: string; readonly [SYM_EXPANDED_REF]: true };
+    : never]?: string extends NonNullable<T[K]>
+    ? NonNullable<T[K]> extends string
+      ? T[K]
+      : string | null
+    : T[K];
+} & {
+  id: string;
+  type?: string;
+  createdAt?: Date;
+  updatedAt?: Date;
+  readonly [SYM_EXPANDED_REF]: true;
+};
 
 /** A reference is a raw id, assigned Model, or inline wire projection. */
 export type Ref<T extends Model> = T | ExpandedRef<T> | string;
 
 export type WithRefs<T extends Model> = T & {
-  [K in keyof T as K extends string
+  // Base Model members (id, timestamps, every method) can never be
+  // refs; excluding them upfront skips a ReferenceTarget evaluation
+  // per inherited member per model, which is the bulk of this type's
+  // instantiation cost across a large model graph.
+  [K in Exclude<keyof T, keyof Model> as K extends string
     ? [ReferenceTarget<T[K]>] extends [never]
       ? never
       : `$${K}`

@@ -98,7 +98,9 @@ export interface ModelConstructor<T = any> {
    * set when a row is created and must not change afterward. Default (empty)
    * preserves the existing behavior for every field name.
    */
-  updateReadonlyFields?: readonly string[];
+  updateReadonlyFields?:
+    | readonly string[]
+    | ((ctx: ScopeContext) => readonly string[]);
   /**
    * Field-level read protection. Listed columns are stripped from
    * the default `sanitize()` projection so a column like
@@ -173,6 +175,12 @@ export type ScopeResult = ((qb: any) => any) | Record<string, any> | null;
 export type ScopeFunction = (ctx: ScopeContext) => ScopeResult;
 
 /**
+ * Per-field scope predicate. Falsy withholds the column from this
+ * context's query surface, mirroring the operation scopes' deny-by-null.
+ */
+export type FieldScopeFunction = (ctx: ScopeContext) => unknown;
+
+/**
  * Per-operation scope definitions.
  */
 export interface ModelScope {
@@ -181,6 +189,28 @@ export interface ModelScope {
   update?: ScopeFunction;
   delete?: ScopeFunction;
   patch?: ScopeFunction;
+  /**
+   * Per-field query policy. A field whose predicate returns falsy is
+   * dropped from the columns a client query may reference — filters,
+   * ordering, nested builders, and other models' ref dot-notation
+   * (`Post.where("author.email", …)` consults User's entry). It's
+   * rejected as an unknown column, so denied and nonexistent look
+   * identical and neither can be probed for.
+   *
+   * Governs the query surface only; `privateFields` / `sanitize()`
+   * govern the response. A column stripped by `sanitize` usually wants
+   * an entry here too, or it stays readable a bit at a time through
+   * `where('col','ilike','a%')` + `.count()`.
+   *
+   * @example
+   * ```typescript
+   * static scope = {
+   *   read: () => () => {},
+   *   fields: { email: (ctx) => !!ctx.user },
+   * };
+   * ```
+   */
+  fields?: Record<string, FieldScopeFunction>;
 }
 
 // ─── Query Chain ─────────────────────────────────────────────────────────────
@@ -476,6 +506,8 @@ export interface ModelAdapter {
     modelClass: ModelConstructor<T>,
     scope: Record<string, any>,
     rawSteps: QueryStep[] | string | undefined,
+    /** Request context consulted by the model's `scope.fields` policy. */
+    ctx?: ScopeContext,
   ): QueryChain<WithRefs<T>>;
 
   /**

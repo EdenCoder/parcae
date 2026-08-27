@@ -46,10 +46,15 @@
  * `null` on every reconnect until a manual refetch.
  */
 
-import type { ModelConstructor, QueryChain } from "@parcae/model";
+import type {
+  ModelConstructor,
+  QueryChain,
+  ScopeContext,
+} from "@parcae/model";
 import { extractExpandFields, stripExpandSteps } from "@parcae/model";
 import type { BackendAdapter } from "../adapters/model";
 import { getRefLoader } from "./context";
+import { deniedFields } from "./field-policy";
 import {
   hydrateExpansions,
   parseExpandSpecs,
@@ -74,6 +79,8 @@ export interface PrepareClientQueryOptions {
    */
   modelByType: Map<string, ModelConstructor>;
   adapter: BackendAdapter;
+  /** Forwarded to `queryFromClient` for the `scope.fields` policy. */
+  ctx?: ScopeContext;
 }
 
 export interface PreparedClientQuery {
@@ -86,6 +93,13 @@ export interface PreparedClientQuery {
   /** Normalised, expand-stripped step array — exposed for callers
    *  that want to introspect the SQL-side step list. */
   steps: any[];
+  /**
+   * Columns `scope.fields` withholds from this caller. The step replay
+   * already enforces it; exposed so aggregate routes (`__sum`), which
+   * take a column outside the step list, gate on the same set instead
+   * of validating independently.
+   */
+  denied: ReadonlySet<string>;
 }
 
 /**
@@ -123,7 +137,7 @@ function ensureIdSelected(steps: any[]): any[] {
 export function prepareClientQuery(
   opts: PrepareClientQueryOptions,
 ): PreparedClientQuery {
-  const { ModelClass, scopeResult, rawSteps, modelByType, adapter } = opts;
+  const { ModelClass, scopeResult, rawSteps, modelByType, adapter, ctx } = opts;
 
   const normalised = normaliseSteps(rawSteps);
 
@@ -142,7 +156,8 @@ export function prepareClientQuery(
     expandResolved.length > 0 ? stripExpandSteps(normalised) : normalised,
   );
 
-  const query = adapter.queryFromClient(ModelClass, scopeResult, steps);
+  const denied = deniedFields(ModelClass, ctx);
+  const query = adapter.queryFromClient(ModelClass, scopeResult, steps, ctx);
 
   // Parallel count query — same filters, no limit/offset — so clients
   // can render the full result-set size, not the current page size.
@@ -153,9 +168,10 @@ export function prepareClientQuery(
     ModelClass,
     scopeResult,
     stepsWithoutPagination,
+    ctx,
   );
 
-  return { query, countQuery, expandResolved, steps };
+  return { query, countQuery, expandResolved, steps, denied };
 }
 
 // ─── runQuerySubscription ────────────────────────────────────────────────────

@@ -12,6 +12,8 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
+import { Model } from "@parcae/model";
+
 import { clearRoutes, getRoutes } from "../routing/route";
 import { registerModelRoutes } from "../adapters/routes";
 import type { BackendAdapter } from "../adapters/model";
@@ -174,6 +176,46 @@ describe("auto-CRUD readonlyFields", () => {
     clearRoutes();
   });
 
+  it("POST refuses the raw twin of a ref the create scope pins", async () => {
+    // The shape that matters: an ownership ref the scope pins per
+    // request, which per-model `readonlyFields` deliberately leaves
+    // writable because staff set it directly at create time.
+    const Appointment: any = {
+      type: "appointment",
+      scope: { create: (ctx: any) => ({ patient: ctx.user?.id }) },
+      readonlyFields: [] as readonly string[],
+    };
+    const { adapter } = makeAdapterStub();
+    const created: Array<Record<string, any>> = [];
+    const create = vi
+      .spyOn(Model, "create")
+      .mockImplementation(function (this: any, data: any) {
+        created.push(data);
+        return { ...data, save: vi.fn(async () => {}) } as any;
+      });
+    registerModelRoutes([Appointment], adapter);
+
+    const route = findRoute("POST", "/v1/appointments");
+    const res = makeRes();
+    await route!.handler!(
+      {
+        session: { user: { id: "member-self" } },
+        body: {
+          title: "Your results are ready",
+          patient: "another-patient", // loses to the scope merge
+          $patient: "another-patient", // ...and so must its raw twin
+        },
+      },
+      res as any,
+    );
+    create.mockRestore();
+
+    expect(res.captured.status).toBe(201);
+    expect(created).toHaveLength(1);
+    expect(created[0]!.patient).toBe("member-self");
+    expect(created[0]).not.toHaveProperty("$patient");
+  });
+
   // POST stripping is exercised indirectly through `stripReadonly`
   // (same helper used by PUT below) — a focused unit test would have
   // to boot the real `Model` class, which isn't worth it for a one-
@@ -254,6 +296,76 @@ describe("auto-CRUD readonlyFields", () => {
     expect(saved.org).toBe("org-original");
     expect(saved.patient).toBe("patient-original");
     expect(saved.user).toBe("user-original");
+  });
+
+  it("PUT resolves update-only readonly fields from request context", async () => {
+    const ContextualPost: any = {
+      type: "contextualpost",
+      scope: { update: () => () => {} },
+      readonlyFields: [] as readonly string[],
+      updateReadonlyFields: (ctx: any) =>
+        ctx.user?.orgRole === "org:patient"
+          ? (["org", "patient", "user"] as const)
+          : (["org"] as const),
+    };
+    const { adapter, captured, setRow } = makeAdapterStub();
+    setRow({
+      id: "p1",
+      org: "org-original",
+      patient: "patient-original",
+      user: "user-original",
+    });
+    registerModelRoutes([ContextualPost], adapter);
+
+    const route = findRoute("PUT", "/v1/contextualposts/:id");
+
+    const staffRes = makeRes();
+    await route!.handler!(
+      {
+        session: { user: { orgRole: "org:clinician" } },
+        params: { id: "p1" },
+        body: {
+          org: "org-new",
+          patient: "patient-new",
+          user: "user-new",
+        },
+      },
+      staffRes as any,
+    );
+
+    expect(staffRes.captured.status).toBe(200);
+    expect(captured.saves[0]).toMatchObject({
+      org: "org-original",
+      patient: "patient-new",
+      user: "user-new",
+    });
+
+    setRow({
+      id: "p1",
+      org: "org-original",
+      patient: "patient-original",
+      user: "user-original",
+    });
+    const patientRes = makeRes();
+    await route!.handler!(
+      {
+        session: { user: { orgRole: "org:patient" } },
+        params: { id: "p1" },
+        body: {
+          org: "org-new",
+          patient: "patient-new",
+          user: "user-new",
+        },
+      },
+      patientRes as any,
+    );
+
+    expect(patientRes.captured.status).toBe(200);
+    expect(captured.saves[1]).toMatchObject({
+      org: "org-original",
+      patient: "patient-original",
+      user: "user-original",
+    });
   });
 
   it("PUT keeps conventional field names writable unless configured", async () => {
@@ -509,6 +621,51 @@ describe("auto-CRUD readonlyFields", () => {
     expect(res.captured.status).toBe(403);
     expect(res.captured.body.error).toContain("patient");
     expect(captured.patches).toHaveLength(0);
+  });
+
+  it("PATCH resolves update-only readonly fields from request context", async () => {
+    const ContextualPost: any = {
+      type: "contextualpost",
+      scope: { patch: () => () => {} },
+      readonlyFields: [] as readonly string[],
+      updateReadonlyFields: (ctx: any) =>
+        ctx.user?.orgRole === "org:patient"
+          ? (["patient"] as const)
+          : ([] as const),
+    };
+    const { adapter, captured, setRow } = makeAdapterStub();
+    setRow({ id: "p1", patient: "patient-original" });
+    registerModelRoutes([ContextualPost], adapter);
+
+    const route = findRoute("PATCH", "/v1/contextualposts/:id");
+    const staffRes = makeRes();
+    await route!.handler!(
+      {
+        session: { user: { orgRole: "org:clinician" } },
+        params: { id: "p1" },
+        body: {
+          ops: [{ op: "replace", path: "/patient", value: "patient-new" }],
+        },
+      },
+      staffRes as any,
+    );
+    expect(staffRes.captured.status).toBe(200);
+    expect(captured.patches).toHaveLength(1);
+
+    const patientRes = makeRes();
+    await route!.handler!(
+      {
+        session: { user: { orgRole: "org:patient" } },
+        params: { id: "p1" },
+        body: {
+          ops: [{ op: "replace", path: "/patient", value: "patient-new" }],
+        },
+      },
+      patientRes as any,
+    );
+    expect(patientRes.captured.status).toBe(403);
+    expect(patientRes.captured.body.error).toContain("patient");
+    expect(captured.patches).toHaveLength(1);
   });
 
   it("PATCH keeps conventional field names writable unless configured", async () => {

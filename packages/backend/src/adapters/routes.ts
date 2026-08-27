@@ -118,23 +118,72 @@ function queryStringValue(value: unknown): string {
   return typeof raw === "string" ? raw : "";
 }
 
-function assertNumericColumn(modelClass: ModelConstructor, column: string): void {
+/**
+ * `__sum` names a column outside the `__query` step list, so it misses
+ * the replay's validation entirely. Gate it on the same `scope.fields`
+ * set the steps were gated on — otherwise a column withheld from every
+ * filter is still readable as an aggregate, which for a one-row filter
+ * is just the value. Denied and non-numeric share an error, matching
+ * the replay's "no existence oracle" rule.
+ */
+function assertNumericColumn(
+  modelClass: ModelConstructor,
+  column: string,
+  denied: ReadonlySet<string>,
+): void {
   const type = modelClass.__schema?.[column];
-  if (type !== "integer" && type !== "number") {
+  if ((type !== "integer" && type !== "number") || denied.has(column)) {
     throw new ClientError(`Invalid numeric column "${column}"`);
   }
 }
 
 function readonlyFieldsForUpdate(
   modelClass: ModelConstructor,
+  ctx: ScopeContext,
 ): ReadonlySet<string> {
+  const configured = modelClass.updateReadonlyFields;
+  // A resolver varies the deny-list per request, so its result can
+  // never be cached on the class.
+  if (typeof configured === "function") {
+    const merged = new Set(readonlyFieldsFor(modelClass));
+    for (const field of configured(ctx)) merged.add(field);
+    return merged;
+  }
+
   const cached = UPDATE_READONLY_CACHE.get(modelClass);
   if (cached) return cached;
   const merged = new Set(readonlyFieldsFor(modelClass));
-  if (modelClass.updateReadonlyFields) {
-    for (const field of modelClass.updateReadonlyFields) merged.add(field);
+  if (configured) {
+    for (const field of configured) merged.add(field);
   }
   UPDATE_READONLY_CACHE.set(modelClass, merged);
+  return merged;
+}
+
+/**
+ * The create deny-list for one request: the model's read-only fields
+ * plus every key the create scope pins.
+ *
+ * Merging `scopeData` last already beats a body that spells the field
+ * plainly, and `stripReadonly` refuses `$`-prefixed keys outright, so
+ * the raw twin `Model._apply` assigns past the ref setter can't get in
+ * either. Denying the scope's own keys says the same thing a third way,
+ * and it is the one that doesn't depend on how `$` is spelled: narrow
+ * that blanket to a mirror of the deny set — a reasonable-looking
+ * change — and `$patient` walks straight through unless the field the
+ * scope pinned is in there. Per-model `readonlyFields` can't hold this
+ * line, because staff legitimately set `patient` at create; the field
+ * is only unwritable in the scopes that pin it.
+ */
+function readonlyFieldsForCreate(
+  modelClass: ModelConstructor,
+  scopeData: Record<string, any>,
+): ReadonlySet<string> {
+  const base = readonlyFieldsFor(modelClass);
+  const pinned = Object.keys(scopeData);
+  if (pinned.length === 0) return base;
+  const merged = new Set(base);
+  for (const field of pinned) merged.add(field);
   return merged;
 }
 
@@ -306,6 +355,7 @@ export function registerModelRoutes(
             rawSteps,
             modelByType,
             adapter,
+            ctx,
           });
 
           if (data.__count === "true" || data.__count === true) {
@@ -315,7 +365,7 @@ export function registerModelRoutes(
 
           const sumColumn = queryStringValue(data.__sum);
           if (sumColumn) {
-            assertNumericColumn(ModelClass, sumColumn);
+            assertNumericColumn(ModelClass, sumColumn, prep.denied);
             const total = await prep.query.sum(sumColumn);
             return json(res, 200, { result: { total }, success: true });
           }
@@ -427,10 +477,16 @@ export function registerModelRoutes(
           if (!scopeData) return forbidden(res);
 
           // 1. Strip readonly fields from the client body — counters,
-          //    ownership refs, state-machine cols (see Model.readonlyFields).
+          //    ownership refs, state-machine cols (see Model.readonlyFields)
+          //    — along with the fields this scope pins, under either
+          //    spelling (see readonlyFieldsForCreate).
           // 2. Merge in the scope-provided overrides last so a malicious
           //    body can't override e.g. `user: ctx.user.id`.
-          const body = stripReadonly(ModelClass, req.body || {});
+          const body = stripReadonly(
+            ModelClass,
+            req.body || {},
+            readonlyFieldsForCreate(ModelClass, scopeData),
+          );
           const data = { ...body, ...scopeData };
           const item = Model.create.call(
             ModelClass,
@@ -474,7 +530,7 @@ export function registerModelRoutes(
             const data = stripReadonly(
               ModelClass,
               req.body || {},
-              readonlyFieldsForUpdate(ModelClass),
+              readonlyFieldsForUpdate(ModelClass, ctx),
             );
             for (const [key, value] of Object.entries(data)) {
               current[key] = value;
@@ -552,7 +608,7 @@ export function registerModelRoutes(
           // The first path segment is the column (RFC 6902 paths
           // start with `/`, then column, then optional inner JSON
           // path); only top-level reads are protected.
-          const deny = readonlyFieldsForUpdate(ModelClass);
+          const deny = readonlyFieldsForUpdate(ModelClass, ctx);
           for (const op of data.ops) {
             if (!op?.path || typeof op.path !== "string") continue;
             const column = op.path

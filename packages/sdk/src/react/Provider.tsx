@@ -47,6 +47,11 @@ export interface ParcaeProviderProps {
    * render creates a fresh client.
    */
   extraHeaders?: Record<string, string>;
+  /**
+   * Transport watchdog stale threshold in ms; `0` disables it.
+   * Forwarded to the owned client's transport (url form only).
+   */
+  watchdogStaleMs?: number;
   children: React.ReactNode;
   onReady?: (client: ParcaeClient) => void;
   onError?: (error: Error) => void;
@@ -208,6 +213,7 @@ const OwnedProvider: React.FC<Omit<ParcaeProviderProps, "client">> = ({
   version = "v1",
   transports,
   extraHeaders,
+  watchdogStaleMs,
   ...props
 }) => {
   const [client, setClient] = useState<ParcaeClient | null>(null);
@@ -226,10 +232,11 @@ const OwnedProvider: React.FC<Omit<ParcaeProviderProps, "client">> = ({
       getToken,
       transports,
       extraHeaders,
+      watchdogStaleMs,
     });
     setClient(owned);
     return () => owned.dispose();
-  }, [url, version, auth, transports, extraHeaders]);
+  }, [url, version, auth, transports, extraHeaders, watchdogStaleMs]);
 
   if (!client) return null;
   return <ClientProvider {...props} url={url} auth={auth} client={client} />;

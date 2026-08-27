@@ -1,77 +1,33 @@
 import { describe, it, expect, beforeEach } from "vitest";
+// Value import — the engine-detection tests build adapters directly.
 import { BackendAdapter } from "../adapters/model";
 import type { QueryStep, SchemaDefinition } from "@parcae/model";
+import {
+  createMockModel,
+  createTestAdapter,
+  type RecordedCall,
+} from "./adapter-test";
 
 // ─── Mock Model Classes ─────────────────────────────────────────────────────
 
-function createSearchModel(
+const createSearchModel = (
   type: string,
   schema: SchemaDefinition,
   searchFields: string[],
-): any {
-  return {
-    type,
-    __schema: schema,
-    searchFields,
-  };
-}
+): any => createMockModel(type, schema, { searchFields });
 
-function createPlainModel(type: string, schema: SchemaDefinition): any {
-  return {
-    type,
-    __schema: schema,
-  };
-}
+const createPlainModel = (type: string, schema: SchemaDefinition): any =>
+  createMockModel(type, schema);
 
-// ─── Recording Query Chain ──────────────────────────────────────────────────
-
-/**
- * Creates a mock BackendAdapter whose query() returns a recording chain.
- * Every method call is captured so we can assert what queryFromClient built.
- */
-function createTestAdapter() {
-  const calls: Array<{ method: string; args: any[] }> = [];
-
-  function makeChain(): any {
-    return new Proxy(
-      {},
-      {
-        get(_target, prop: string) {
-          if (prop === "find") return async () => [];
-          if (prop === "first") return async () => null;
-          if (prop === "count") return async () => 0;
-          if (prop === "exec") return () => ({});
-          if (prop === "clone") return () => makeChain();
-          if (prop === "__steps") return calls;
-          if (prop === "__modelType") return "test";
-          if (prop === "__modelClass") return {};
-          if (prop === "__adapter") return null;
-          return (...args: any[]) => {
-            calls[calls.length] = { method: prop, args };
-            return makeChain();
-          };
-        },
-      },
-    );
-  }
-
-  const adapter = new (BackendAdapter as any)({
-    read: Object.assign(() => makeChain(), {
-      raw: (sql: string, bindings?: any[]) => ({ sql, bindings }),
-    }),
-    write: Object.assign(() => makeChain(), {
-      raw: (sql: string, bindings?: any[]) => ({ sql, bindings }),
-      schema: {
-        hasTable: async () => false,
-        hasColumn: async () => false,
-      },
-    }),
+// `_applySearch` reads these off the chain while composing the query.
+const testAdapter = () =>
+  createTestAdapter({
+    props: {
+      __modelType: "test",
+      __modelClass: {},
+      __adapter: null,
+    },
   });
-  // Override query() to return our recording chain
-  adapter.query = () => makeChain();
-
-  return { adapter: adapter as BackendAdapter, calls };
-}
 
 // ─── Test Models ─────────────────────────────────────────────────────────────
 
@@ -115,10 +71,10 @@ const KebabModel = createSearchModel(
 
 describe("BackendAdapter — search in queryFromClient", () => {
   let adapter: BackendAdapter;
-  let calls: Array<{ method: string; args: any[] }>;
+  let calls: RecordedCall[];
 
   beforeEach(() => {
-    const test = createTestAdapter();
+    const test = testAdapter();
     adapter = test.adapter;
     calls = test.calls;
   });
@@ -197,7 +153,7 @@ describe("BackendAdapter — search in queryFromClient", () => {
 
 describe("BackendAdapter._applySearch", () => {
   it("should return unmodified query for empty term", () => {
-    const { adapter } = createTestAdapter();
+    const { adapter } = testAdapter();
     const mockQuery = { clone: () => mockQuery };
 
     const result = (adapter as any)._applySearch(mockQuery, "", ProjectModel);
@@ -205,7 +161,7 @@ describe("BackendAdapter._applySearch", () => {
   });
 
   it("should return unmodified query for whitespace term", () => {
-    const { adapter } = createTestAdapter();
+    const { adapter } = testAdapter();
     const mockQuery = { clone: () => mockQuery };
 
     const result = (adapter as any)._applySearch(
@@ -217,7 +173,7 @@ describe("BackendAdapter._applySearch", () => {
   });
 
   it("should return unmodified query for model without searchFields", () => {
-    const { adapter } = createTestAdapter();
+    const { adapter } = testAdapter();
     const mockQuery = { clone: () => mockQuery };
 
     const result = (adapter as any)._applySearch(
@@ -242,7 +198,7 @@ describe("BackendAdapter._applySearch", () => {
       },
     );
 
-    const { adapter } = createTestAdapter();
+    const { adapter } = testAdapter();
     // Ensure adapter.write.raw is available for the select call
     (adapter as any).services = {
       read: Object.assign(() => {}, {
@@ -276,7 +232,7 @@ describe("BackendAdapter._applySearch", () => {
       },
     );
 
-    const { adapter } = createTestAdapter();
+    const { adapter } = testAdapter();
     (adapter as any).services = {
       read: Object.assign(() => {}, {
         raw: (sql: string, bindings?: any[]) => ({ sql, bindings }),
@@ -311,7 +267,7 @@ describe("BackendAdapter._applySearch", () => {
       },
     );
 
-    const { adapter } = createTestAdapter();
+    const { adapter } = testAdapter();
     (adapter as any).services = {
       read: Object.assign(() => {}, {
         raw: (sql: string, bindings?: any[]) => ({ sql, bindings }),
@@ -343,7 +299,7 @@ describe("BackendAdapter._applySearch", () => {
       },
     );
 
-    const { adapter } = createTestAdapter();
+    const { adapter } = testAdapter();
     (adapter as any).services = {
       read: Object.assign(() => {}, {
         raw: (sql: string, bindings?: any[]) => ({ sql, bindings }),
@@ -378,7 +334,7 @@ describe("BackendAdapter._applySearch", () => {
       },
     );
 
-    const { adapter } = createTestAdapter();
+    const { adapter } = testAdapter();
     (adapter as any).services = {
       read: Object.assign(() => {}, {
         raw: (sql: string, bindings?: any[]) => ({ sql, bindings }),
@@ -411,7 +367,7 @@ describe("BackendAdapter._applySearch", () => {
       },
     );
 
-    const { adapter } = createTestAdapter();
+    const { adapter } = testAdapter();
     (adapter as any).services = {
       read: Object.assign(() => {}, {
         raw: (sql: string, bindings?: any[]) => ({ sql, bindings }),
@@ -475,7 +431,7 @@ describe("BackendAdapter._applySearch", () => {
 
 describe("BackendAdapter.detectEngine", () => {
   it("should default to postgres", () => {
-    const { adapter } = createTestAdapter();
+    const { adapter } = testAdapter();
     expect((adapter as any).engine).toBe("postgres");
   });
 

@@ -41,6 +41,28 @@ export interface JobOptions {
    * across all registered jobs (minimum 1).
    */
   concurrency?: number;
+  /**
+   * How long BullMQ holds this job's lock, in ms. Default 30_000.
+   *
+   * The worker renews the lock every `lockDuration / 2` for as long as
+   * it is alive, so this is not "how long the job may run" — it is the
+   * window between a worker dying and the queue being allowed to hand
+   * its job to someone else. 30s is right for short jobs and too tight
+   * for one that spends minutes inside a single provider call, where a
+   * momentarily busy event loop can miss a renewal and get the job
+   * double-fired.
+   *
+   * Raise it for long jobs, but no further than you are willing to
+   * wait for a dead worker's work to come back.
+   */
+  lockDuration?: number;
+  /**
+   * How many times this job may be reclaimed as stalled before BullMQ
+   * fails it outright. Default 1 — meaning one worker death mid-job is
+   * survivable and the second is terminal. Jobs that run long enough
+   * to straddle a deploy or a dev-server restart want more.
+   */
+  maxStalledCount?: number;
 }
 
 export interface JobEntry {

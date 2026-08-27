@@ -20,6 +20,7 @@ import {
   type QueryChain,
   type QueryStep,
   type SchemaDefinition,
+  type ScopeContext,
 } from "@parcae/model";
 import {
   dateSafeClone,
@@ -28,6 +29,11 @@ import {
   type WithRefs,
 } from "@parcae/model";
 import type { QuerySubscriptionManager } from "../services/subscriptions";
+import {
+  fieldPolicyFor,
+  NO_FIELD_POLICY,
+  type FieldPolicy,
+} from "../services/field-policy";
 import equal from "deep-equal";
 import fastJsonPatch from "fast-json-patch";
 import type { Operation as PatchOp } from "fast-json-patch";
@@ -59,6 +65,8 @@ import {
 export interface BackendServices {
   read: any; // Knex read replica
   write: any; // Knex primary
+  /** Ceiling on client limits in queryFromClient (see its doc). */
+  maxClientQueryLimit?: number;
 }
 
 /**
@@ -443,6 +451,20 @@ export class BackendAdapter implements ModelAdapter {
     return activeTransactionHandle() ?? this.services.write;
   }
   constructor(services: BackendServices) {
+    const ceiling = services.maxClientQueryLimit;
+    if (
+      ceiling !== undefined &&
+      (typeof ceiling !== "number" ||
+        !Number.isInteger(ceiling) ||
+        ceiling < 1)
+    ) {
+      // Fail loud at boot: silently substituting the default would let
+      // an operator believe they tightened the clamp when they didn't,
+      // and Infinity would make Knex drop the LIMIT clause entirely.
+      throw new Error(
+        `maxClientQueryLimit must be an integer >= 1, got ${String(ceiling)}`,
+      );
+    }
     this.services = services;
   }
 
@@ -888,14 +910,12 @@ export class BackendAdapter implements ModelAdapter {
    *  2. Only whitelisted methods are replayed.
    *  3. Column names are validated against the model schema.
    *  4. A default limit is injected if the client omits one — clients
-   *     that want more must call `.limit(N)` explicitly with the exact
-   *     ceiling they need (or `.clearLimit()` to opt out entirely).
-   *
-   * No upper clamp on client-provided limits. The scope is the security
-   * boundary — it already restricts which rows the client can see; a
-   * row ceiling on top of that is defense-in-depth that mostly just
-   * silently truncates legitimate queries and forces callers to add
-   * `.clearLimit()` everywhere.
+   *     that want more call `.limit(N)` explicitly (or `.clearLimit()`
+   *     to jump straight to the ceiling).
+   *  5. Every client-provided limit clamps at the ceiling
+   *     (`maxClientQueryLimit`, default 10,000). The scope stays the
+   *     row-visibility boundary; the ceiling bounds how many rows one
+   *     request can demand regardless of scope size.
    *
    * Throws on invalid column references (fail loud during development).
    */
@@ -932,6 +952,18 @@ export class BackendAdapter implements ModelAdapter {
     "orderBy",
   ]);
 
+  /**
+   * Pagination methods: clamped or injected at the top level of the
+   * replay loop, and excluded entirely inside `__nested` groups (limit
+   * and offset would replay unclamped there; clearLimit doesn't exist
+   * on a raw Knex builder).
+   */
+  private static PAGINATION_METHODS = new Set([
+    "limit",
+    "offset",
+    "clearLimit",
+  ]);
+
   private static CLIENT_PREDICATE_METHODS = new Set([
     "where",
     "andWhere",
@@ -964,14 +996,30 @@ export class BackendAdapter implements ModelAdapter {
     "@>",
   ]);
 
+  /** Cap on client-sent __query steps: bounds replay work per request. */
+  private static MAX_CLIENT_STEPS = 100;
+
+  /** Cap on whereIn / whereNotIn value arrays: bounds SQL size. */
+  private static MAX_CLIENT_IN_VALUES = 10_000;
+
   /**
    * Default limit injected when a client query has no `.limit()` call.
    * Bounded enough to prevent an unbounded sequential-scan from a
    * scope-wide `Model.where(...).find()` with no pagination. Clients
-   * that want more set an explicit `.limit(N)` (no upper clamp) or
-   * `.clearLimit()` to disable the injection.
+   * that want more set an explicit `.limit(N)` or `.clearLimit()`;
+   * both clamp at the ceiling below.
    */
   private static DEFAULT_LIMIT = 25;
+
+  /** Default for maxClientQueryLimit (see queryFromClient's doc). */
+  private static DEFAULT_MAX_CLIENT_LIMIT = 10_000;
+
+  private get _maxClientLimit(): number {
+    return (
+      this.services.maxClientQueryLimit ??
+      BackendAdapter.DEFAULT_MAX_CLIENT_LIMIT
+    );
+  }
 
   /**
    * Per-modelClass cache of "which `json` columns are actually arrays?".
@@ -1053,6 +1101,7 @@ export class BackendAdapter implements ModelAdapter {
     modelClass: ModelConstructor<T>,
     scope: Record<string, any>,
     rawSteps: QueryStep[] | string | undefined,
+    ctx?: ScopeContext,
   ): QueryChain<WithRefs<T>> {
     // Normalize: socket sends an array, HTTP may send a JSON string
     let steps: QueryStep[] = [];
@@ -1075,6 +1124,11 @@ export class BackendAdapter implements ModelAdapter {
       ...Object.keys(schema),
     ]);
 
+    // Kept separate from `validColumns`, which also gates `select` —
+    // projecting a withheld column must still work, since `sanitize()`
+    // strips it on the way out anyway.
+    const policy = fieldPolicyFor(modelClass, ctx);
+
     // Start with scope — always first, never overridable.
     // Scope can be an object { org: "xxx" } or a function (qb) => qb.where(...)
     let chain: QueryChain<WithRefs<T>>;
@@ -1087,16 +1141,13 @@ export class BackendAdapter implements ModelAdapter {
       chain = this.query(modelClass).where(scope);
     }
 
-    let hasLimit = false;
-    let hasClearLimit = false;
-
-    // Pre-scan for clearLimit to know whether to bypass clamping
-    for (const step of steps) {
-      if (step.method === "clearLimit") {
-        hasClearLimit = true;
-        break;
-      }
+    if (steps.length > BackendAdapter.MAX_CLIENT_STEPS) {
+      throw new ClientError(
+        `__query exceeds ${BackendAdapter.MAX_CLIENT_STEPS} steps`,
+      );
     }
+
+    let hasLimit = false;
 
     const predicates: Array<{ step: QueryStep; args: any[] }> = [];
     for (const step of steps) {
@@ -1106,6 +1157,7 @@ export class BackendAdapter implements ModelAdapter {
         validColumns,
         modelClass.type,
         schema,
+        policy,
       );
       if (args.length > 0) predicates.push({ step, args });
     }
@@ -1148,10 +1200,10 @@ export class BackendAdapter implements ModelAdapter {
         continue;
       }
 
-      // clearLimit — bypass default limit, cap at 10,000 as safety net
+      // clearLimit: bypass default limit, cap at the ceiling
       if (step.method === "clearLimit") {
         hasLimit = true;
-        chain = chain.limit(10_000);
+        chain = chain.limit(this._maxClientLimit);
         continue;
       }
 
@@ -1169,24 +1221,35 @@ export class BackendAdapter implements ModelAdapter {
         validColumns,
         modelClass.type,
         schema,
+        policy,
       );
 
       // Skip empty where({}) — sanitizer returns [] to signal "no-op"
       if (args.length === 0 && step.method !== "limit") continue;
 
       // Sanitize limit — coerce to a positive integer, fall back to
-      // DEFAULT_LIMIT on parse failure. No upper clamp; clients that
-      // need an unusually large window pass it explicitly. Skipped
-      // entirely when `clearLimit()` was used — that path sets the
-      // 10 000 safety cap below.
+      // DEFAULT_LIMIT on parse failure, clamp to the ceiling. Applies
+      // whether or not clearLimit appeared earlier: a later limit call
+      // overrides the clearLimit cap at the SQL layer, so it must obey
+      // the same ceiling.
       if (step.method === "limit") {
         hasLimit = true;
-        if (!hasClearLimit) {
-          args[0] = Math.max(
+        args[0] = Math.min(
+          Math.max(
             Number.parseInt(args[0]) || BackendAdapter.DEFAULT_LIMIT,
             1,
-          );
-        }
+          ),
+          this._maxClientLimit,
+        );
+      }
+
+      // Sanitize offset: non-negative integer, dropped entirely on
+      // parse failure (negative or non-numeric values 500 raw from the
+      // SQL driver otherwise).
+      if (step.method === "offset") {
+        const parsed = Number.parseInt(args[0]);
+        if (!Number.isFinite(parsed) || parsed < 0) continue;
+        args[0] = parsed;
       }
 
       chain = (chain as any)[step.method](...args);
@@ -1210,8 +1273,22 @@ export class BackendAdapter implements ModelAdapter {
     validColumns: Set<string>,
     modelType: string,
     schema?: SchemaDefinition,
+    policy: FieldPolicy = NO_FIELD_POLICY,
   ): any[] {
     const args = [...(step.args ?? [])];
+
+    // Bound whereIn value arrays: an oversized list dies in the driver
+    // as an opaque 500 (or a parameter-limit error) instead of a clear
+    // client error, and the SQL text grows with every element.
+    if (
+      (step.method === "whereIn" || step.method === "whereNotIn") &&
+      Array.isArray(args[1]) &&
+      args[1].length > BackendAdapter.MAX_CLIENT_IN_VALUES
+    ) {
+      throw new ClientError(
+        `${step.method} exceeds ${BackendAdapter.MAX_CLIENT_IN_VALUES} values`,
+      );
+    }
 
     // Skip no-op where: where() with no args or where({}) with empty object
     if (BackendAdapter.COLUMN_ARG_METHODS.has(step.method)) {
@@ -1239,15 +1316,24 @@ export class BackendAdapter implements ModelAdapter {
         Array.isArray(firstArg.__nested)
       ) {
         const nestedSteps: QueryStep[] = firstArg.__nested;
-        // Replace with a Knex builder callback
+        // Replace with a Knex builder callback. Pagination methods are
+        // excluded inside the group: limit/offset would replay verbatim
+        // with no clamp, and clearLimit doesn't exist on a raw Knex
+        // builder (a nested one was a client-triggerable TypeError).
         args[0] = (builder: any) => {
           for (const nested of nestedSteps) {
             if (!BackendAdapter.SAFE_CLIENT_METHODS.has(nested.method))
               continue;
+            if (BackendAdapter.PAGINATION_METHODS.has(nested.method)) continue;
+            // `schema` stays undefined on purpose — passing it would
+            // switch on ref dot-notation, which nested steps have
+            // always rejected. `policy` still applies.
             const innerArgs = this._sanitizeStepArgs(
               nested,
               validColumns,
               modelType,
+              undefined,
+              policy,
             );
             builder = builder[nested.method](...innerArgs);
           }
@@ -1259,12 +1345,12 @@ export class BackendAdapter implements ModelAdapter {
         // ── Dot-notation ref subquery rewriting ───────────────────
         // "test.category" → whereIn("test", subquery on tests table)
         if (firstArg.includes(".") && schema) {
-          const rewritten = this._rewriteRefDotNotation(step, args, schema);
+          const rewritten = this._rewriteRefDotNotation(step, args, schema, policy);
           if (rewritten) return rewritten;
           // Falls through if not a valid ref (throws below)
         }
 
-        if (!validColumns.has(firstArg)) {
+        if (!validColumns.has(firstArg) || policy.own.has(firstArg)) {
           throw new ClientError(
             `Invalid column "${firstArg}" on model "${modelType}"`,
           );
@@ -1282,7 +1368,7 @@ export class BackendAdapter implements ModelAdapter {
       ) {
         // Object form: where({ col1: val, col2: val })
         for (const key of Object.keys(firstArg)) {
-          if (!validColumns.has(key)) {
+          if (!validColumns.has(key) || policy.own.has(key)) {
             throw new ClientError(
               `Invalid column "${key}" on model "${modelType}"`,
             );
@@ -1318,6 +1404,7 @@ export class BackendAdapter implements ModelAdapter {
     step: QueryStep,
     args: any[],
     schema: SchemaDefinition,
+    policy: FieldPolicy = NO_FIELD_POLICY,
   ): any[] | null {
     const dot = (args[0] as string).indexOf(".");
     const refKey = (args[0] as string).slice(0, dot);
@@ -1336,7 +1423,10 @@ export class BackendAdapter implements ModelAdapter {
     const targetSchema = (resolvedTarget?.__schema as SchemaDefinition) ?? null;
     const targetTable = pluralize(targetType);
 
-    // Validate the nested column exists on the target model
+    // Validate the nested column exists on the target — and that this
+    // ctx may reference it. The TARGET's `scope.fields` decides, not
+    // the queried model's, or the subquery becomes a side door around
+    // a field withheld on the target.
     if (targetSchema) {
       const targetValidColumns = new Set([
         "id",
@@ -1344,7 +1434,10 @@ export class BackendAdapter implements ModelAdapter {
         "updatedAt",
         ...Object.keys(targetSchema),
       ]);
-      if (!targetValidColumns.has(refColumn)) {
+      if (
+        !targetValidColumns.has(refColumn) ||
+        policy.forTarget(resolvedTarget).has(refColumn)
+      ) {
         throw new ClientError(
           `Invalid column "${refColumn}" on referenced model "${targetType}"`,
         );

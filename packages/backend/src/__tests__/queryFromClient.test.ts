@@ -1,62 +1,15 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import knexFactory from "knex";
+// Value import — one test builds a real knex-backed adapter directly.
 import { BackendAdapter } from "../adapters/model";
 import type { QueryStep, SchemaDefinition } from "@parcae/model";
+import { createMockModel, createTestAdapter } from "./adapter-test";
 
-// ─── Mock Model Class ────────────────────────────────────────────────────────
-
-function createMockModel(type: string, schema: SchemaDefinition): any {
-  return {
-    type,
-    __schema: schema,
-  };
-}
-
-// ─── Recording Query Chain ──────────────────────────────────────────────────
-
-/**
- * Creates a mock BackendAdapter whose query() returns a recording chain.
- * Every method call is captured so we can assert what queryFromClient built.
- */
-function createTestAdapter() {
-  const calls: Array<{ method: string; args: any[] }> = [];
-
-  function makeChain(isRoot = true): any {
-    return new Proxy(
-      {},
-      {
-        get(_target, prop: string) {
-          if (prop === "find") return async () => [];
-          if (prop === "first") return async () => null;
-          if (prop === "count") return async () => 0;
-          if (prop === "exec") return () => ({});
-          if (prop === "clone") return () => makeChain();
-          return (...args: any[]) => {
-            if (
-              isRoot &&
-              prop === "where" &&
-              typeof args[0] === "function"
-            ) {
-              args[0](makeChain(false));
-              return makeChain();
-            }
-            calls[calls.length] = { method: prop, args };
-            return makeChain(isRoot);
-          };
-        },
-      },
-    );
-  }
-
-  const adapter = new (BackendAdapter as any)({
-    read: () => {},
-    write: () => {},
-  });
-  // Override query() to return our recording chain
-  adapter.query = () => makeChain();
-
-  return { adapter: adapter as BackendAdapter, calls };
-}
+// The grouping callback `queryFromClient` wraps its predicates in gets
+// invoked so those predicates land in `calls`; a `__nested` callback
+// one level down is left intact, because the nested-builder tests below
+// drive it themselves against their own instrumented builder.
+const testAdapter = () => createTestAdapter({ invoke: "root" });
 
 // ─── Test Schema ─────────────────────────────────────────────────────────────
 
@@ -75,7 +28,7 @@ describe("BackendAdapter.queryFromClient", () => {
   let calls: Array<{ method: string; args: any[] }>;
 
   beforeEach(() => {
-    const test = createTestAdapter();
+    const test = testAdapter();
     adapter = test.adapter;
     calls = test.calls;
   });
@@ -177,13 +130,13 @@ describe("BackendAdapter.queryFromClient", () => {
 
   // ── Limit Sanitization ────────────────────────────────────────────
   //
-  // No upper clamp on client-provided limits since commit ba22391 —
-  // the scope is the security boundary. Client `.limit(N)` passes
-  // through verbatim, coerced to a positive integer, falling back to
-  // DEFAULT_LIMIT (25) on parse failure.
+  // Client `.limit(N)` is coerced to a positive integer, falls back to
+  // DEFAULT_LIMIT (25) on parse failure, and clamps at the ceiling
+  // (maxClientQueryLimit, default 10,000). The scope stays the
+  // row-visibility boundary; the ceiling bounds per-request row count.
 
   describe("limit sanitization", () => {
-    it("should pass large client limits through verbatim (no upper clamp)", () => {
+    it("should pass limits at or below the ceiling through verbatim", () => {
       const steps: QueryStep[] = [{ method: "limit", args: [500] }];
 
       adapter.queryFromClient(ProjectModel, { userId: "u1" }, steps);
@@ -322,7 +275,7 @@ describe("BackendAdapter.queryFromClient", () => {
       ];
 
       for (const op of safeOps) {
-        const t = createTestAdapter();
+        const t = testAdapter();
         expect(() =>
           t.adapter.queryFromClient(ProjectModel, { userId: "u1" }, [
             { method: "where", args: ["views", op, 10] },
@@ -592,7 +545,7 @@ describe("BackendAdapter.queryFromClient", () => {
       ];
 
       for (const col of attacks) {
-        const t = createTestAdapter();
+        const t = testAdapter();
         expect(() =>
           t.adapter.queryFromClient(ProjectModel, { userId: "u1" }, [
             { method: "where", args: [col, "value"] },
@@ -632,7 +585,7 @@ describe("BackendAdapter.queryFromClient", () => {
       ];
 
       for (const op of badOps) {
-        const t = createTestAdapter();
+        const t = testAdapter();
         expect(() =>
           t.adapter.queryFromClient(ProjectModel, { userId: "u1" }, [
             { method: "where", args: ["name", op, "test"] },
@@ -1013,11 +966,7 @@ describe("BackendAdapter.queryFromClient", () => {
   });
 
   describe("adversarial: DoS via limit/offset", () => {
-    it("should pass absurdly large limits through (scope is the DoS boundary, not the limit)", () => {
-      // No upper clamp since ba22391 — the scope already restricts
-      // which rows the client can see. A naked `Number.MAX_SAFE_INTEGER`
-      // here just becomes whatever the SQL driver does with it, which
-      // is bounded by the actual scoped row count.
+    it("should clamp absurdly large limits to the ceiling", () => {
       const steps: QueryStep[] = [
         { method: "limit", args: [Number.MAX_SAFE_INTEGER] },
       ];
@@ -1025,7 +974,7 @@ describe("BackendAdapter.queryFromClient", () => {
       adapter.queryFromClient(ProjectModel, { userId: "u1" }, steps);
 
       const limitCall = calls.find((c) => c.method === "limit");
-      expect(limitCall!.args[0]).toBe(Number.MAX_SAFE_INTEGER);
+      expect(limitCall!.args[0]).toBe(10_000);
     });
 
     it("should handle negative limit", () => {
@@ -1060,7 +1009,7 @@ describe("BackendAdapter.queryFromClient", () => {
       expect(limitCall!.args[0]).toBe(10_000);
     });
 
-    it("should allow explicit limit after clearLimit without clamping", () => {
+    it("should allow explicit sub-ceiling limit after clearLimit", () => {
       const steps: QueryStep[] = [
         { method: "clearLimit", args: [] },
         { method: "limit", args: [500] },
@@ -1069,22 +1018,128 @@ describe("BackendAdapter.queryFromClient", () => {
       adapter.queryFromClient(ProjectModel, { userId: "u1" }, steps);
 
       const limitCalls = calls.filter((c) => c.method === "limit");
-      // clearLimit sets 10,000, then explicit limit sets 500 unclamped
+      // clearLimit sets the ceiling, then explicit limit sets 500
       expect(limitCalls).toHaveLength(2);
       expect(limitCalls[0]!.args[0]).toBe(10_000);
       expect(limitCalls[1]!.args[0]).toBe(500);
     });
 
-    it("should not clamp large limit when clearLimit is present", () => {
+    it("should clamp a limit that follows clearLimit (the cap-escape shape)", () => {
+      // A limit call after clearLimit overrides the clearLimit cap at
+      // the SQL layer, so it must obey the same ceiling.
       const steps: QueryStep[] = [
         { method: "clearLimit", args: [] },
-        { method: "limit", args: [5000] },
+        { method: "limit", args: [999999999] },
       ];
 
       adapter.queryFromClient(ProjectModel, { userId: "u1" }, steps);
 
       const limitCalls = calls.filter((c) => c.method === "limit");
-      expect(limitCalls[1]!.args[0]).toBe(5000);
+      expect(limitCalls[limitCalls.length - 1]!.args[0]).toBe(10_000);
+    });
+  });
+
+  describe("client limit ceiling (maxClientQueryLimit)", () => {
+    it("honours a configured ceiling for explicit limits", () => {
+      const { adapter: small, calls: smallCalls } = createTestAdapter({
+        invoke: "root",
+        maxClientQueryLimit: 500,
+      });
+      small.queryFromClient(ProjectModel, { userId: "u1" }, [
+        { method: "limit", args: [9999] },
+      ] as QueryStep[]);
+      expect(smallCalls.find((c) => c.method === "limit")!.args[0]).toBe(500);
+    });
+
+    it("honours a configured ceiling for clearLimit", () => {
+      const { adapter: small, calls: smallCalls } = createTestAdapter({
+        invoke: "root",
+        maxClientQueryLimit: 500,
+      });
+      small.queryFromClient(ProjectModel, { userId: "u1" }, [
+        { method: "clearLimit", args: [] },
+      ] as QueryStep[]);
+      expect(smallCalls.find((c) => c.method === "limit")!.args[0]).toBe(500);
+    });
+
+    it("throws at construction for an invalid configured ceiling", () => {
+      for (const bad of [
+        0,
+        0.5,
+        10.5,
+        -1,
+        Number.POSITIVE_INFINITY,
+        Number.NaN,
+      ]) {
+        expect(() =>
+          createTestAdapter({ invoke: "root", maxClientQueryLimit: bad }),
+        ).toThrow("maxClientQueryLimit");
+      }
+    });
+  });
+
+  describe("adversarial: nested pagination and input caps", () => {
+    it("ignores limit, offset, and clearLimit inside a __nested group", () => {
+      const steps: QueryStep[] = [
+        {
+          method: "where",
+          args: [
+            {
+              __nested: [
+                { method: "where", args: ["status", "active"] },
+                { method: "limit", args: [999999999] },
+                { method: "offset", args: [999999999] },
+                { method: "clearLimit", args: [] },
+              ],
+            },
+          ],
+        },
+      ];
+
+      adapter.queryFromClient(ProjectModel, { userId: "u1" }, steps);
+
+      // The nested builder callback never sees pagination methods, and
+      // the top level still injects the default limit.
+      const limitCalls = calls.filter((c) => c.method === "limit");
+      expect(limitCalls).toHaveLength(1);
+      expect(limitCalls[0]!.args[0]).toBe(25);
+      expect(calls.find((c) => c.method === "offset")).toBeUndefined();
+    });
+
+    it("drops a negative or non-numeric offset instead of replaying it", () => {
+      for (const bad of [-1, "garbage", null]) {
+        const { adapter: a, calls: c } = testAdapter();
+        a.queryFromClient(ProjectModel, { userId: "u1" }, [
+          { method: "offset", args: [bad] },
+        ] as QueryStep[]);
+        expect(c.find((call) => call.method === "offset")).toBeUndefined();
+      }
+    });
+
+    it("coerces a valid offset to an integer", () => {
+      adapter.queryFromClient(ProjectModel, { userId: "u1" }, [
+        { method: "offset", args: ["50"] },
+      ] as QueryStep[]);
+      expect(calls.find((c) => c.method === "offset")!.args[0]).toBe(50);
+    });
+
+    it("rejects a __query with more than 100 steps", () => {
+      const steps: QueryStep[] = Array.from({ length: 101 }, () => ({
+        method: "where",
+        args: ["status", "active"],
+      }));
+      expect(() =>
+        adapter.queryFromClient(ProjectModel, { userId: "u1" }, steps),
+      ).toThrow("exceeds 100 steps");
+    });
+
+    it("rejects an oversized whereIn value array", () => {
+      const steps: QueryStep[] = [
+        { method: "whereIn", args: ["status", new Array(10_001).fill("x")] },
+      ];
+      expect(() =>
+        adapter.queryFromClient(ProjectModel, { userId: "u1" }, steps),
+      ).toThrow("exceeds 10000 values");
     });
   });
 

@@ -29,6 +29,7 @@ export interface SocketEmitter {
 export function createSocketFakeRes(
   socket: SocketEmitter,
   requestId: string,
+  isSessionCurrent: () => boolean = () => true,
 ): any {
   // biome-ignore lint/suspicious/noExplicitAny: parsed JSON of any shape
   let responseBody: any = null;
@@ -46,6 +47,11 @@ export function createSocketFakeRes(
     },
     end(body?: string) {
       if (this.writableEnded) return;
+      this.writableEnded = true;
+      // A response computed under a prior session must never reach the
+      // socket after an auth boundary; the state flip above still lets
+      // middleware short-circuit checks observe a finished response.
+      if (!isSessionCurrent()) return;
       if (body) {
         try {
           responseBody = JSON.parse(body);
@@ -65,7 +71,6 @@ export function createSocketFakeRes(
         JSON.stringify(compress(responseBody ?? { result: null, success: true })),
       );
       socket.emit(requestId, compressed);
-      this.writableEnded = true;
     },
   };
 }
