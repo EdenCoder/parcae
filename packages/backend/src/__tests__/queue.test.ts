@@ -67,6 +67,7 @@ const mocks = vi.hoisted(() => {
   ) {
     this.name = name;
     this.opts = opts;
+    this.add = vi.fn(async () => ({ id: "created" }));
     this.close = vi.fn(async () => {});
     queueInstances.push(this);
   });
@@ -119,6 +120,7 @@ vi.mock("bullmq", () => ({
 
 // Late import so the mocks above are in place.
 import { QueueService, addJobIfNotExists } from "../services/queue";
+import { _clearServices, _setServices, enqueue } from "../services/context";
 
 describe("QueueService — shared ioredis", () => {
   beforeEach(() => {
@@ -305,5 +307,52 @@ describe("addJobIfNotExists", () => {
       addJobIfNotExists(queue as any, "build", {}, { jobId: "retry" }),
     ).resolves.toEqual({ id: "retry" });
     expect(queue.add).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("enqueue", () => {
+  beforeEach(() => mocks.reset());
+  afterEach(() => _clearServices());
+
+  it("forwards native deduplication without entering the jobId cache", async () => {
+    const svc = new QueueService({ url: "redis://localhost:6379" });
+    await svc.building;
+    _setServices(svc, {} as any);
+    const data = { postId: "abc" };
+    const deduplication = { id: "post:abc", keepLastIfActive: true };
+
+    await expect(enqueue("post:index", data, { deduplication })).resolves.toEqual({
+      id: "created",
+    });
+
+    expect(mocks.queueInstances[0].add).toHaveBeenCalledWith("post:index", data, {
+      deduplication,
+      removeOnComplete: 100,
+      removeOnFail: 50,
+    });
+    expect(mocks.Job.fromId).not.toHaveBeenCalled();
+  });
+
+  it("preserves the existing jobId path when native deduplication is also supplied", async () => {
+    const svc = new QueueService({ url: "redis://localhost:6379" });
+    await svc.building;
+    _setServices(svc, {} as any);
+
+    await enqueue("post:index", {}, {
+      jobId: "legacy:abc",
+      deduplication: { id: "post:abc", keepLastIfActive: true },
+      removeOnComplete: false,
+      removeOnFail: 7,
+    });
+
+    expect(mocks.Job.fromId).toHaveBeenCalledWith(
+      mocks.queueInstances[0],
+      "legacy.abc",
+    );
+    expect(mocks.queueInstances[0].add).toHaveBeenCalledWith("post:index", {}, {
+      jobId: "legacy.abc",
+      removeOnComplete: false,
+      removeOnFail: 7,
+    });
   });
 });

@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { Job } from "bullmq";
+import type { Job, JobsOptions } from "bullmq";
 import { log } from "../logger";
 /**
  * @parcae/backend — Global service context
@@ -134,6 +134,8 @@ export function getRuntimeFlags(): RuntimeFlags {
 export interface EnqueueOptions {
   /** Unique job ID for deduplication. If a job with this ID is already queued/active, skip. */
   jobId?: string;
+  /** BullMQ deduplication when no jobId is supplied. */
+  deduplication?: JobsOptions["deduplication"];
   /** Max completed jobs to keep. Default: 100 */
   removeOnComplete?: number | boolean;
   /** Max failed jobs to keep. Default: 50 */
@@ -184,6 +186,7 @@ export async function enqueue(
   }
 
   return await queue.add(name, data, {
+    deduplication: options.deduplication,
     removeOnComplete: options.removeOnComplete ?? 100,
     removeOnFail: options.removeOnFail ?? 50,
   });
