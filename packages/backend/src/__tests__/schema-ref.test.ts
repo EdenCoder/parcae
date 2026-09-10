@@ -55,7 +55,29 @@ class StructuralRefPost extends Model {
   payload: Other.Ref<string> = { value: "" };
 }
 
-describe("SchemaResolver Ref<T>", () => {
+class ComputedFile extends Model {
+  static override type = "computed-file" as const;
+  meta = { seconds: 0 };
+
+  get seconds(): number {
+    return this.meta.seconds;
+  }
+
+  set duration(value: number) {
+    this.meta.seconds = value;
+  }
+}
+
+describe("SchemaResolver", () => {
+  it("persists stored fields without getter or setter accessors", () => {
+    const schemas = new SchemaResolver().resolveFromFiles(
+      [ComputedFile],
+      [fileURLToPath(import.meta.url)],
+    );
+
+    expect(schemas.get(ComputedFile.type)).toEqual({ meta: "json" });
+  });
+
   it("stores raw-or-expanded refs as reference columns", () => {
     const resolver = new SchemaResolver();
     const schemas = resolver.resolveFromFiles(

@@ -44,8 +44,9 @@ import { SchemaResolver } from "./resolver";
  *  10: reject non-concrete Ref targets and Model members in JSON unions
  *  11: propagate concrete type arguments through chained Ref aliases
  *  12: distinguish Parcae Ref<T> from unrelated aliases named Ref
+ *  13: exclude getter and setter accessors from persisted columns
  */
-const RESOLVER_VERSION = 12;
+const RESOLVER_VERSION = 13;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 

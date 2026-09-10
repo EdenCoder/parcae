@@ -376,8 +376,12 @@ export class SchemaResolver {
       // Skip private/internal
       if (SKIP_PREFIXES.some((p) => name.startsWith(p))) continue;
 
-      // Skip methods
-      if (prop.getKind() === SyntaxKind.MethodDeclaration) continue;
+      // Accessors derive or mutate stored fields; they are not columns.
+      if (
+        prop.isKind(SyntaxKind.GetAccessor) ||
+        prop.isKind(SyntaxKind.SetAccessor)
+      )
+        continue;
 
       // Skip ambient (`declare`) properties — they describe values
       // installed at runtime (e.g. the `$field` raw-id companion of a
