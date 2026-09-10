@@ -6,7 +6,6 @@
  */
 
 import { createServer } from "node:http";
-import { parse as parseUrl } from "node:url";
 import polka from "polka";
 import { Server as SocketServer } from "socket.io";
 import bodyParser, { type OptionsJson } from "body-parser";
@@ -80,16 +79,10 @@ export function createServer_(options: ServerOptions): ServerContext {
   app.use(bodyParser.json(JSON_BODY_PARSER_OPTIONS));
   app.use(bodyParser.urlencoded({ extended: true }));
 
-  // Polka's handler unconditionally sets req.query = querystring.parse(info.query),
-  // which flattens complex objects from socket RPC data. Restore the original
-  // structured query for socket calls, and fall back to URL parsing for HTTP.
+  // Polka parses HTTP query strings before middleware. Socket RPC supplies
+  // structured query data that must survive that parsing unchanged.
   app.use((req: any, _res: any, next: any) => {
-    if (req._socketQuery) {
-      req.query = req._socketQuery;
-    } else if (!req.query || Object.keys(req.query).length === 0) {
-      const parsed = parseUrl(req.url || "", true);
-      req.query = parsed.query || {};
-    }
+    if (req._socketQuery) req.query = req._socketQuery;
     next();
   });
 
