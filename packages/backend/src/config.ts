@@ -172,7 +172,7 @@ export const configSchema = z.object({
   /** Frontend URL. */
   FRONTEND_URL: z.string().optional(),
 
-  /** job queue name. Default: "parcae" */
+  /** Shared Redis application namespace for queues, events, and locks. */
   JOB_QUEUE_NAME: z.string().optional().default("parcae"),
 });
 

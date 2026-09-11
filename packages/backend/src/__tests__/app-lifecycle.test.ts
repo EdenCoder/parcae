@@ -167,6 +167,8 @@ describe("application lifecycle", () => {
   });
 
   it("cleans every acquired resource when listen startup fails", async () => {
+    vi.stubEnv("REDIS_URL", "redis://unused:6379");
+    vi.stubEnv("JOB_QUEUE_NAME", "island");
     const bindError = Object.assign(new Error("address in use"), {
       code: "EADDRINUSE",
     });
@@ -183,6 +185,9 @@ describe("application lifecycle", () => {
     expect(mocks.buses[0]!.stop).toHaveBeenCalledTimes(1);
     expect(mocks.queues[0]!.close).toHaveBeenCalledTimes(1);
     expect(mocks.pubsubs[0]!.close).toHaveBeenCalledTimes(1);
+    const redisConfig = { url: "redis://unused:6379", name: "island" };
+    expect(mocks.PubSub).toHaveBeenCalledExactlyOnceWith(redisConfig);
+    expect(mocks.QueueService).toHaveBeenCalledExactlyOnceWith(redisConfig);
     expect(mocks.dbs[0]!.destroy).toHaveBeenCalledTimes(1);
     expect(getQueue()).toBeNull();
     expect(getPubSub()).toBeNull();

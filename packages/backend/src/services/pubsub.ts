@@ -16,16 +16,16 @@ import { Redlock } from "@sesamecare-oss/redlock";
 import EventEmitter from "eventemitter3";
 import { log } from "../logger";
 
-// Namespaced Redis channel so multiple apps sharing one Redis
-// instance don't cross-contaminate each other's pub/sub traffic.
-const REDIS_CHANNEL = "parcae:events";
-
 export interface PubSubConfig {
   /** Redis URL. If not provided, falls back to in-process events only. */
   url?: string;
+  /** Shared application namespace for events and locks. Default: "parcae". */
+  name?: string;
 }
 
 export class PubSub {
+  private readonly name: string;
+  private readonly channel: string;
   private __lock = new AsyncLock();
   private __events = new EventEmitter();
   private redlock: Redlock | null = null;
@@ -36,6 +36,8 @@ export class PubSub {
   public building: Promise<void>;
 
   constructor(config: PubSubConfig = {}) {
+    this.name = config.name ?? "parcae";
+    this.channel = `${this.name}:events`;
     this.building = config.url
       ? this.buildRedis(config.url)
       : Promise.resolve();
@@ -76,7 +78,7 @@ export class PubSub {
     });
 
     log.info("PubSub subscribing to events channel...");
-    await this.redisRead.subscribe(REDIS_CHANNEL);
+    await this.redisRead.subscribe(this.channel);
     log.info(`PubSub subscribed (${Date.now() - t0}ms)`);
 
     this.redisRead.on("message", (_channel: string, message: string) => {
@@ -92,7 +94,7 @@ export class PubSub {
   emit(event: string, ...args: any[]): void {
     if (this.redisWrite) {
       void this.redisWrite
-        .publish(REDIS_CHANNEL, JSON.stringify([event, ...args]))
+        .publish(this.channel, JSON.stringify([event, ...args]))
         .catch((err) => {
           log.error(`PubSub publish failed for "${event}":`, err);
         });
@@ -115,6 +117,7 @@ export class PubSub {
     key: string,
     timeout = 5000,
   ): Promise<() => Promise<void>> {
+    key = `${this.name}:${key}`;
     const MAX_RETRIES = 10;
 
     // In-process fallback — local lock only.
@@ -197,6 +200,7 @@ export class PubSub {
    * elapses. Falls back to in-process state when no Redis is configured.
    */
   async tryLock(key: string, ttlMs: number): Promise<boolean> {
+    key = `${this.name}:${key}`;
     if (this.redisWrite) {
       const ttlSeconds = Math.max(1, Math.ceil(ttlMs / 1000));
       const result = await this.redisWrite.set(

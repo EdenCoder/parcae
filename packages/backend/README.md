@@ -356,7 +356,7 @@ Redis-backed cross-process application events. Falls back to an in-process `Even
 ```typescript
 import { PubSub } from "@parcae/backend";
 
-const pubsub = new PubSub({ url: "redis://localhost:6379" });
+const pubsub = new PubSub({ url: "redis://localhost:6379", name: "my-app" });
 await pubsub.building;
 
 pubsub.emit("post:updated", { id: "abc" });
@@ -460,6 +460,7 @@ At startup, `createApp()` generates type metadata into `.parcae/` (gitignored, l
 | `DATABASE_URL`                    | Yes      | --            | PostgreSQL connection string                      |
 | `DATABASE_READ_URL`               | No       | --            | Read replica connection string                    |
 | `REDIS_URL`                       | No       | --            | Redis for app events, locks, and queues           |
+| `JOB_QUEUE_NAME`                  | No       | `parcae`      | Shared Redis namespace for queues, events, locks  |
 | `PORT`                            | No       | `3000`        | HTTP server port                                  |
 | `AUTH_SECRET`                     | No       | --            | Session signing secret (required if auth enabled) |
 | `TRUSTED_ORIGINS`                 | No       | --            | Comma-separated CORS origins                      |
@@ -470,6 +471,10 @@ At startup, `createApp()` generates type metadata into `.parcae/` (gitignored, l
 | `RUN_CRONS`                       | No       | follows JOBS  | `true` / `false` / `"name1,name2"` (schedulers)   |
 | `ENSURE_SCHEMA`                   | No       | `false`       | Run migrations, additive schema, and trigger DDL  |
 | `PARCAE_ALLOW_CHECKSUM_DRIFT`     | No       | `false`       | Emergency bypass for applied-migration drift      |
+
+Apps sharing Redis must use different `JOB_QUEUE_NAME` values; replicas of one app must use the same value. PubSub uses `<name>:events` and prefixes distributed locks, including cron deduplication, with `<name>:`.
+
+Redis isolation tests require a disposable instance: `PARCAE_TEST_REDIS_URL=redis://127.0.0.1:6380 pnpm --filter @parcae/backend exec vitest run src/__tests__/pubsub-redis.test.ts`.
 
 ### Process roles
 

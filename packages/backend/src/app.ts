@@ -700,17 +700,18 @@ export function createApp(config: AppConfig): ParcaeApp {
       log.info("Database connected");
 
       // ── Step 4: Connect Redis (PubSub + Queue) ─────────────────────
+      const redisConfig = {
+        url: envConfig.REDIS_URL,
+        name: envConfig.JOB_QUEUE_NAME || "parcae",
+      };
       log.info("Connecting PubSub...");
-      const pubsub = new PubSub({ url: envConfig.REDIS_URL });
+      const pubsub = new PubSub(redisConfig);
       resources.pubsub = pubsub;
       await pubsub.building;
       log.info("PubSub ready");
 
       log.info("Connecting Queue...");
-      const queue = new QueueService({
-        url: envConfig.REDIS_URL,
-        name: envConfig.JOB_QUEUE_NAME || "parcae",
-      });
+      const queue = new QueueService(redisConfig);
       resources.queue = queue;
       await queue.building;
       log.info("Queue ready");

@@ -133,7 +133,10 @@ describe("PubSub failures", () => {
     pubsub.emit("change", { id: "x" });
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(publish).toHaveBeenCalledTimes(1);
+    expect(publish).toHaveBeenCalledExactlyOnceWith(
+      "parcae:events",
+      JSON.stringify(["change", { id: "x" }]),
+    );
     expect(logged).toHaveBeenCalledWith(
       'PubSub publish failed for "change":',
       failure,
