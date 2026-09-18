@@ -236,10 +236,11 @@ export class QueueService {
 
   /** Close all queues and workers, then the shared connection. */
   async close(): Promise<void> {
-    await Promise.all([
-      ...Array.from(this.queues.values()).map((q) => q.close()),
-      ...Array.from(this.workers.values()).map((w) => w.close()),
-    ]);
+    // Workers first: a job finishing under the drain may still enqueue
+    // (a delivery that yields pokes its own follow-up), and that add
+    // needs the queues open until every worker has let go.
+    await Promise.all(Array.from(this.workers.values()).map((w) => w.close()));
+    await Promise.all(Array.from(this.queues.values()).map((q) => q.close()));
     this.queues.clear();
     this.workers.clear();
     if (this.sharedRedis) {
