@@ -451,9 +451,10 @@ function prefixPatchOps(field: string, ops: readonly PatchOp[]): PatchOp[] {
  */
 export function ensureIntermediates(
   doc: Record<string, any>,
-  ops: readonly { path: string }[],
+  ops: readonly PatchOp[],
 ): void {
-  for (const { path } of ops) {
+  for (const { op, path } of ops) {
+    if (op === "test") continue;
     const segments = pointerSegments(path);
     let cursor: any = doc;
     for (let i = 0; i < segments.length - 1; i++) {
@@ -540,13 +541,14 @@ function mergeServerWithLocalChanges(
   return merged;
 }
 
-/** Return the set of top-level keys touched by a batch of ops. */
+/** Return the top-level fields written by a batch of ops. */
 function topLevelKeys(ops: readonly PatchOp[]): Set<string> {
   const keys = new Set<string>();
   for (const op of ops) {
+    if (op.op === "test") continue;
     const top = pointerSegments(op.path)[0];
     if (top !== undefined) keys.add(top);
-    if (op.op === "copy" || op.op === "move") {
+    if (op.op === "move") {
       const fromTop = pointerSegments(op.from)[0];
       if (fromTop !== undefined) keys.add(fromTop);
     }
@@ -1157,12 +1159,11 @@ export class Model extends EventEmitter {
     const ops = structuredClone(dedupOps(rawOps)) as PatchOp[];
     if (ops.length === 0) return ops;
 
-    // Apply locally on a plain-object snapshot (fast-json-patch
-    // mutates in place), then copy the touched top-level keys back
-    // onto `this`. We avoid applyPatch'ing `this` directly because
-    // the instance carries methods / ref accessors / EE internals
-    // that would confuse the walker.
+    // Published field snapshots must survive later nested writes.
     const snap = this.__data;
+    for (const key of topLevelKeys(ops)) {
+      snap[key] = structuredClone(snap[key]);
+    }
     ensureIntermediates(snap, ops);
     applyPatch(snap, ops, false, true);
     this._copyPatchedTopLevels(snap, ops);
