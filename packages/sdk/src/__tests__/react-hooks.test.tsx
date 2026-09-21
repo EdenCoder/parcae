@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ParcaeClient } from '../client';
 import { ConnectionMachine } from '../connection-machine';
 import { ParcaeProvider } from '../react/Provider';
-import { useModelAtomic } from '../react/useModelAtomic';
+import { useModelAtomic, useModelsAtomic } from '../react/useModelAtomic';
 import { useQuery, prefetch, __test as useQueryTest } from '../react/useQuery';
 import { useSaving } from '../react/useSaving';
 import { useSetting } from '../react/useSetting';
@@ -252,6 +252,66 @@ describe('mounted React SDK hooks', () => {
     expect(renders).toBe(1);
     expect(latest).toBe(initial);
   });
+
+  it.each(['stage', 'patch'] as const)(
+    'updates atomic snapshots for nested %s without repainting unchanged paths',
+    async (method) => {
+      const fake = new FakeClient();
+      const project = Project.hydrate(fake.adapter, {
+        id     : 'project-1',
+        blocks : { A: { id: 'A', text: 'alpha' }, B: { id: 'B', text: 'beta' } },
+      });
+      fake.patch.mockImplementation(async () => structuredClone(project.__data));
+      const other = Project.hydrate(fake.adapter, { id: 'project-2' });
+      const projects = [project, other];
+      let one: Record<string, BlockData> | undefined;
+      let many: readonly (Record<string, BlockData> | undefined)[];
+      const renders = { one: 0, many: 0, sibling: 0 };
+
+      function One() {
+        renders.one++;
+        one = useModelAtomic<Record<string, BlockData>>(project, 'blocks');
+        return null;
+      }
+
+      function Many() {
+        renders.many++;
+        many = useModelsAtomic<Record<string, BlockData>>(projects, 'blocks');
+        return null;
+      }
+
+      function Sibling() {
+        renders.sibling++;
+        useModelAtomic<BlockData>(project, 'blocks.B');
+        return null;
+      }
+
+      await act(async () => {
+        renderer = create(
+          <>
+            <One />
+            <Many />
+            <Sibling />
+          </>,
+        );
+      });
+      const initial = one;
+      const initialMany = many!;
+
+      await act(async () => {
+        await project[method]([{ op: 'replace', path: '/blocks/A/text', value: 'edited' }]);
+      });
+
+      expect(one?.A?.text).toBe('edited');
+      expect(many![0]?.A?.text).toBe('edited');
+      expect(initial?.A?.text).toBe('alpha');
+      expect(initialMany[0]?.A?.text).toBe('alpha');
+      expect(one).not.toBe(initial);
+      expect(many!).not.toBe(initialMany);
+      expect(many![1]).toBe(initialMany[1]);
+      expect(renders).toEqual({ one: 2, many: 2, sibling: 1 });
+    },
+  );
 
   it('renders a fresh atomic value merged after reconnect', async () => {
     const fake = new FakeClient();

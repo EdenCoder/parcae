@@ -794,6 +794,120 @@ describe("Model", () => {
     });
   });
 
+  describe.each(["stage", "patch"] as const)("%s snapshots", (method) => {
+    it("publishes fresh nested snapshots before change while retaining untouched fields", async () => {
+      const post = Post.hydrate(adapter, {
+        id     : "p1",
+        meta   : { theme: "light" },
+        blocks : { answer: { episode: "e2" }, optional: undefined },
+      });
+      const before = post.__data;
+      const change = vi.fn(() => {
+        expect(post.__data.blocks).not.toBe(before.blocks);
+        expect(before.blocks.answer.episode).toBe("e2");
+        expect(post.__data.blocks.answer.episode).toBe("e3");
+      });
+      post.on("change", change);
+
+      const writing = post[method]([
+        { op: "replace", path: "/blocks/answer/episode", value: "e3" },
+      ]);
+
+      expect(change).toHaveBeenCalledOnce();
+      expect(post.__data.meta).toBe(before.meta);
+      expect(post.__data.blocks).toHaveProperty("optional", undefined);
+      await writing;
+      expect(before.blocks.answer.episode).toBe("e2");
+    });
+
+    it("isolates both move fields while preserving a read-only copy source", async () => {
+      const post = Post.hydrate(adapter, {
+        archive : {},
+        id      : "p1",
+        blocks  : { moving: { text: "move" } },
+        library : { original: { text: "copy" } },
+      });
+      const before = post.__data;
+
+      const writing = post[method]([
+        { op: "copy", from: "/library/original", path: "/blocks/copied" },
+        { op: "replace", path: "/blocks/copied/text", value: "edited" },
+        { op: "move", from: "/blocks/moving", path: "/archive/moved" },
+      ]);
+
+      expect(post.__data.library).toBe(before.library);
+      expect(post.__data.archive).not.toBe(before.archive);
+      expect(post.__data.blocks).not.toBe(before.blocks);
+      expect(post.__data.blocks).toEqual({ copied: { text: "edited" } });
+      expect(post.__data.archive).toEqual({ moved: { text: "move" } });
+      expect(before.library).toEqual({ original: { text: "copy" } });
+      expect(before.blocks).toEqual({ moving: { text: "move" } });
+      expect(before.archive).toEqual({});
+      await writing;
+    });
+
+    it("keeps array operations ordered without mutating the previous array", async () => {
+      const post = Post.hydrate(adapter, { id: "p1", items: ["a", "b"] });
+      const before = post.__data.items;
+
+      await post[method]([
+        { op: "add", path: "/items/-", value: "c" },
+        { op: "move", from: "/items/0", path: "/items/2" },
+        { op: "copy", from: "/items/0", path: "/items/-" },
+        { op: "replace", path: "/items/0", value: "edited" },
+      ]);
+
+      expect(before).toEqual(["a", "b"]);
+      expect(post.__data.items).toEqual(["edited", "c", "a", "b"]);
+    });
+
+    it("retains escaped paths, missing parents, undefined values and removals", async () => {
+      const post = Post.hydrate(adapter, {
+        id       : "p1",
+        obsolete : { old: true },
+        "a/b"    : { "til~de": { old: true }, absent: undefined },
+      });
+      const before = post.__data;
+
+      await post[method]([
+        { op: "remove", path: "/obsolete" },
+        { op: "remove", path: "/a~1b/til~0de/old" },
+        { op: "add", path: "/a~1b/absent/0/value", value: undefined },
+      ]);
+
+      expect(post.__data).not.toHaveProperty("obsolete");
+      expect(post.__data["a/b"]).toEqual({ "til~de": {}, absent: [{ value: undefined }] });
+      expect(before["a/b"]).toEqual({ "til~de": { old: true }, absent: undefined });
+      expect(before.obsolete).toEqual({ old: true });
+    });
+
+    it("preserves identities for read-only tests and leaves rejected batches unapplied", async () => {
+      const post = Post.hydrate(adapter, {
+        id   : "p1",
+        meta : { title: "before", absent: undefined },
+      });
+      const original = post.__data.meta;
+      const writing = post[method]([{ op: "test", path: "/meta/title", value: "before" }]);
+      expect(post.__data.meta).toBe(original);
+      await writing;
+      const before = post.__data.meta;
+      const change = vi.fn();
+      post.on("change", change);
+
+      expect(() =>
+        post[method]([{ op: "test", path: "/meta/absent/title", value: "missing" }])).toThrow();
+      expect(() =>
+        post[method]([
+          { op: "replace", path: "/meta/title", value: "after" },
+          { op: "test", path: "/meta/title", value: "wrong" },
+        ])).toThrow();
+
+      expect(post.__data.meta).toBe(before);
+      expect(before).toEqual({ title: "before", absent: undefined });
+      expect(change).not.toHaveBeenCalled();
+    });
+  });
+
   describe("operations", () => {
     it("stage applies locally without calling the adapter or changing write state", () => {
       const post = Post.hydrate(adapter, { id: "p1", title: "before" });
