@@ -997,10 +997,15 @@ export class Model extends EventEmitter {
     }
   }
 
-  /** Install the synchronized raw-value companion used by ref fields. */
+  /**
+   * Install the synchronized raw-value companion used by ref fields, once
+   * per class on its prototype: the accessor reads `this`, so every object
+   * built on the prototype projects its raw ids, a clone included.
+   */
   private _installRawAccessor(field: string): void {
-    if (Object.getOwnPropertyDescriptor(this, `$${field}`)) return;
-    Object.defineProperty(this, `$${field}`, {
+    const prototype = Object.getPrototypeOf(this);
+    if (Object.prototype.hasOwnProperty.call(prototype, `$${field}`)) return;
+    Object.defineProperty(prototype, `$${field}`, {
       configurable: true,
       enumerable: false,
       get(this: any) {

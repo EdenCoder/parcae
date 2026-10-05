@@ -1302,6 +1302,15 @@ describe("Model", () => {
       expect(after).toBe("a3");
     });
 
+    it("projects raw ids on a clone built from the model's prototype", () => {
+      const article = Article.hydrate(adapter, { title: "x", author: "a1" });
+      const clone = Object.assign(Object.create(Object.getPrototypeOf(article)), article);
+      expect(clone.$author).toBe("a1");
+      clone.author = "a2";
+      expect(clone.$author).toBe("a2");
+      expect(article.$author).toBe("a1");
+    });
+
     it("keeps an unexpanded ref as its raw id without loading", () => {
       const findByIdSpy = vi.fn(async () => null);
       const oldFindById = adapter.findById;
