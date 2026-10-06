@@ -41,6 +41,7 @@ import pluralize from "pluralize";
 import { ClientError, json, notFound, forbidden } from "../helpers";
 import { log } from "../logger";
 import { route } from "../routing/route";
+import type { HookAction } from "../routing/hook";
 import {
   prepareClientQuery,
   runQuerySubscription,
@@ -227,14 +228,13 @@ async function findByIdOrTmp(
   ModelClass: ModelConstructor,
   paramId: string,
   scopeResult: any,
-  lock = false,
+  mutation?: { action: HookAction; data?: Record<string, any> },
 ): Promise<RouteModelRow | null> {
   const byId = adapter
     .query(ModelClass)
     .select("*")
     .where("id", paramId)
     .where(scopeResult);
-  if (lock) byId.exec().forUpdate();
   let item = await byId.first();
   if (!item) {
     const byTmp = adapter
@@ -242,8 +242,13 @@ async function findByIdOrTmp(
       .select("*")
       .where("tmp", paramId)
       .where(scopeResult);
-    if (lock) byTmp.exec().forUpdate();
     item = await byTmp.first();
+  }
+  if (item && mutation) {
+    await adapter.runHooks(item, mutation.action, "lock", { data: mutation.data });
+    const locked = adapter.query(ModelClass).select("*").where("id", item.id).where(scopeResult);
+    locked.exec().forUpdate();
+    item = await locked.first();
   }
   return (item as RouteModelRow | null) ?? null;
 }
@@ -510,7 +515,7 @@ export function registerModelRoutes(
               ModelClass,
               req.params.id,
               scopeResult,
-              true,
+              { action: "save", data: { fields: Object.keys(req.body || {}) } },
             );
             if (!current) return null;
 
@@ -557,7 +562,7 @@ export function registerModelRoutes(
               ModelClass,
               req.params.id,
               scopeResult,
-              true,
+              { action: "remove" },
             );
             if (!current) return null;
             await current.remove();
@@ -621,7 +626,7 @@ export function registerModelRoutes(
               ModelClass,
               req.params.id,
               scopeResult,
-              true,
+              { action: "patch", data },
             );
             if (!current) return null;
             await current.patch(data.ops);

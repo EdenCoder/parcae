@@ -30,6 +30,8 @@ export interface JobContext {
   bullJob?: any;
   /** Job attempt number. */
   attempt?: number;
+  /** Cancelled when this delivery loses its queue lock. */
+  signal?: AbortSignal;
 }
 
 export type JobHandler = (ctx: JobContext) => Promise<any>;
@@ -111,11 +113,7 @@ export function clearJobs(): void {
  * job("dialogue:audio", handler, { concurrency: 24 });
  * ```
  */
-export function job(
-  name: string,
-  handler: JobHandler,
-  options: JobOptions = {},
-): JobEntry {
+export function job(name: string, handler: JobHandler, options: JobOptions = {}): JobEntry {
   const entry: JobEntry = { name, handler, options };
   const existingIdx = registeredJobs.findIndex((j) => j.name === name);
   if (existingIdx >= 0) {

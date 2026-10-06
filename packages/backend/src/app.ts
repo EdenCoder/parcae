@@ -1147,11 +1147,12 @@ export function createApp(config: AppConfig): ParcaeApp {
           const queueName = queue.queueNameFor(jobEntry.name);
           queue.createWorker(
             queueName,
-            async (bullJob) => {
+            async (bullJob, _token, signal) => {
               return jobEntry.handler({
                 data: bullJob.data,
                 bullJob,
                 attempt: bullJob.attemptsMade,
+                signal,
               });
             },
             {

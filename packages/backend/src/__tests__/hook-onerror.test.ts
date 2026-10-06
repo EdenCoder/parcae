@@ -15,17 +15,7 @@ import {
 
 // ─── Test fixtures ───────────────────────────────────────────────────────────
 
-type TestModelClass = {
-  type: string;
-  __schema: Record<string, string>;
-};
-
-const TestModel: TestModelClass = {
-  type: "testitem",
-  __schema: { name: "string" },
-};
-
-class CapturedModel extends Model {
+class TestModel extends Model {
   static override type = "testitem";
   static override __schema = { name: "string" as const };
 
@@ -284,7 +274,7 @@ describePostgres("ctx.onError — compensating actions", () => {
     });
     const seen: string[] = [];
 
-    hook.before(CapturedModel, "save", async ({ model }) => {
+    hook.before(TestModel, "save", async ({ model }) => {
       seen.push(model.name);
       if (seen.length === 1) {
         entered();
@@ -293,7 +283,7 @@ describePostgres("ctx.onError — compensating actions", () => {
       model.name = `${model.name}-hook`;
     });
 
-    const model = CapturedModel.hydrate(adapter, {
+    const model = TestModel.hydrate(adapter, {
       id: "captured-save",
       name: "first",
     });

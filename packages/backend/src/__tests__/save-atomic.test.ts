@@ -46,7 +46,7 @@ describePostgres("atomic save", () => {
     await db("atomicRecords").insert({
       id: "r1",
       title: "before",
-      items: ["a", "b"],
+      items: JSON.stringify(["a", "b"]),
       profile: { local: "before", remote: "before" },
       createdAt: new Date(0),
       updatedAt: new Date(0),

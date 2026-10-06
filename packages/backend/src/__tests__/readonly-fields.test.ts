@@ -71,6 +71,7 @@ function makeAdapterStub() {
   let saveGate: Promise<void> | null = null;
 
   const adapter: any = {
+    async runHooks() {},
     async runInTransaction(fn: () => Promise<any>) {
       isTransactionActive = true;
       try {
@@ -473,8 +474,7 @@ describe("auto-CRUD readonlyFields", () => {
       },
       makeRes() as any,
     );
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
 
     expect(fixture.captured.lockStates).toEqual([true]);
     expect(fixture.captured.saveStates).toEqual([true]);

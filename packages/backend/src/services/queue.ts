@@ -27,8 +27,8 @@
  * Worker = `N+1` total instead of `3N`. For 30 jobs: 90 → 31.
  */
 
-import { Queue, Worker, Job, type ConnectionOptions } from "bullmq";
-import IORedis, { type RedisOptions } from "ioredis";
+import { Queue, Worker, Job, type Processor, type ConnectionOptions } from 'bullmq';
+import IORedis, { type RedisOptions } from 'ioredis';
 
 // ─── Dedup Cache ─────────────────────────────────────────────────────────────
 
@@ -67,8 +67,7 @@ export async function addJobIfNotExists(
   const existing = await Job.fromId(queue, jobId);
   if (existing) {
     const state = await existing.getState();
-    if (state === "waiting" || state === "active" || state === "delayed")
-      return null;
+    if (state === 'waiting' || state === 'active' || state === 'delayed') return null;
     try {
       await existing.remove();
     } catch {}
@@ -111,7 +110,7 @@ export class QueueService {
   public building: Promise<void>;
 
   constructor(config: QueueConfig = {}) {
-    this.defaultName = config.name ?? "parcae";
+    this.defaultName = config.name ?? 'parcae';
     this.building = config.url ? this.build(config.url) : Promise.resolve();
   }
 
@@ -131,18 +130,17 @@ export class QueueService {
    * queueNameFor("post:index")               → "parcae-post%3Aindex"
    */
   queueNameFor(jobName: string): string {
-    const escape = (value: string) =>
-      value.replace(/%/g, "%25").replace(/:/g, "%3A");
+    const escape = (value: string) => value.replace(/%/g, '%25').replace(/:/g, '%3A');
     return `${escape(this.defaultName)}-${escape(jobName)}`;
   }
 
   private async build(url: string): Promise<void> {
     // Parse Redis URL into the option shape ioredis accepts.
     const parsed = new URL(url);
-    const isTLS = parsed.protocol === "rediss:";
+    const isTLS = parsed.protocol === 'rediss:';
     const opts: RedisOptions = {
       host: parsed.hostname,
-      port: parseInt(parsed.port || "6379"),
+      port: parseInt(parsed.port || '6379'),
       password: parsed.password || undefined,
       username: parsed.username || undefined,
       // Required by BullMQ for any connection that will service
@@ -171,7 +169,7 @@ export class QueueService {
       connection: this.sharedRedis as unknown as ConnectionOptions,
       defaultJobOptions: {
         attempts: 3,
-        backoff: { type: "exponential", delay: 5000 },
+        backoff: { type: 'exponential', delay: 5000 },
         removeOnComplete: 100,
         removeOnFail: 50,
       },
@@ -191,7 +189,7 @@ export class QueueService {
    */
   createWorker(
     name: string,
-    processor: (job: Job) => Promise<any>,
+    processor: Processor,
     tuning:
       | number
       | {
@@ -202,19 +200,15 @@ export class QueueService {
   ): Worker | null {
     if (!this.sharedRedis) return null;
 
-    const opts = typeof tuning === "number" ? { concurrency: tuning } : tuning;
+    const opts = typeof tuning === 'number' ? { concurrency: tuning } : tuning;
 
     const worker = new Worker(name, processor, {
       // See `get()` for the cast rationale — same dual-ioredis story.
       connection: this.sharedRedis as unknown as ConnectionOptions,
       concurrency: opts.concurrency ?? 1,
       // Left undefined, BullMQ applies its own defaults (30_000 / 1).
-      ...(opts.lockDuration === undefined
-        ? {}
-        : { lockDuration: opts.lockDuration }),
-      ...(opts.maxStalledCount === undefined
-        ? {}
-        : { maxStalledCount: opts.maxStalledCount }),
+      ...(opts.lockDuration === undefined ? {} : { lockDuration: opts.lockDuration }),
+      ...(opts.maxStalledCount === undefined ? {} : { maxStalledCount: opts.maxStalledCount }),
     });
 
     this.workers.set(name, worker);

@@ -670,11 +670,14 @@ export class BackendAdapter implements ModelAdapter {
     const cleanups: Array<() => Promise<void> | void> = [];
     const operationModel = this._captureSaveModel(model, data, creating);
     const serverSnapshot = structuredClone(model.__serverSnapshot ?? data);
+    const schema = (ModelClass.__schema as SchemaDefinition) ?? {};
+    let ops = creating ? undefined : saveDiff(schema, serverSnapshot, data).ops;
     let persistedData: Record<string, any>;
 
     try {
       persistedData = await this._withTransaction(async () => {
-        await this.runHooks(operationModel, action, "before", { cleanups });
+        await this.runHooks(operationModel, action, "lock", { data: { ops }, cleanups });
+        await this.runHooks(operationModel, action, "before", { data: { ops }, cleanups });
 
         (operationModel as any).updatedAt = new Date();
         if (creating && !(operationModel as any).createdAt) {
@@ -706,17 +709,17 @@ export class BackendAdapter implements ModelAdapter {
                   updatedAt: insertedRow.updatedAt ?? writeData.updatedAt,
                 };
         } else {
-          const schema = (ModelClass.__schema as SchemaDefinition) ?? {};
-          const { ops, patchSchema } = saveDiff(
+          const diff = saveDiff(
             schema,
             serverSnapshot,
             writeData,
           );
+          ops = diff.ops;
           persistedData = await this._patchPostgres(
             operationModel,
             ops,
             table,
-            patchSchema,
+            diff.patchSchema,
             cleanups,
             {
               lockRow: true,
@@ -731,7 +734,7 @@ export class BackendAdapter implements ModelAdapter {
         } else {
           this._replaceOperationData(operationModel, persistedData);
         }
-        await this.runHooks(operationModel, action, "after", { cleanups });
+        await this.runHooks(operationModel, action, "after", { data: { ops, result: persistedData }, cleanups });
         return persistedData;
       });
     } catch (err) {
@@ -756,6 +759,7 @@ export class BackendAdapter implements ModelAdapter {
 
     try {
       await this._withTransaction(async () => {
+        await this.runHooks(model, "remove", "lock", { cleanups });
         await this.runHooks(model, "remove", "before", { cleanups });
         await this.write(table).where("id", model.id).del();
         await this.runHooks(model, "remove", "after", { cleanups });
@@ -1601,6 +1605,7 @@ export class BackendAdapter implements ModelAdapter {
 
     try {
       const persistedData = await this._withTransaction(async () => {
+        await this.runHooks(model, "patch", "lock", { data: { ops }, cleanups });
         return await this._patchPostgres(model, ops, table, schema, cleanups);
       });
       this._retainCleanupsForOuterRollback(
@@ -1914,17 +1919,18 @@ export class BackendAdapter implements ModelAdapter {
       .returning("*");
     const updatedRow = Array.isArray(updated) ? updated[0] : updated;
     if (!updatedRow) throw new ClientError(`patch: row not found id=${model.id}`);
-    if (options.runHooks !== false) {
-      await this.runHooks(model, "patch", "after", {
-        data: { ops },
-        cleanups,
-      });
-    }
-    return (hydrate(
+    const result = (hydrate(
       ModelClass as unknown as ModelConstructor,
       this,
       updatedRow,
     ) as any).__data;
+    if (options.runHooks !== false) {
+      await this.runHooks(model, "patch", "after", {
+        data: { ops, result },
+        cleanups,
+      });
+    }
+    return result;
   }
 
   /**
@@ -2133,19 +2139,13 @@ export class BackendAdapter implements ModelAdapter {
       cleanups?: Array<() => Promise<void> | void>;
     },
   ): Promise<void> {
-    // RUN_HOOKS=false: skip dispatch entirely. The hook registry is still
-    // populated (so `getHooksFor` would return entries), but worker-only
-    // processes that want pure job consumption can opt out of hook side
-    // effects. Note: this also means before-hooks that mutate `model`
-    // (e.g. `model.title = model.title.trim()`) won't fire.
-    if (!getRuntimeFlags().hooks) return;
-
     const ModelClass = model.constructor as typeof Model;
     const hooks = getHooksFor(
       ModelClass.type,
       timing as HookTiming,
       action as HookAction,
-    );
+    ).filter((entry) => getRuntimeFlags().hooks || entry.always);
+    if (!hooks.length) return;
 
     // Resolve user: explicit extra > AsyncLocalStorage request context
     const user = extra?.user ?? getRequestUser() ?? undefined;

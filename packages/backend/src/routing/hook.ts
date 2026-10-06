@@ -50,7 +50,7 @@ import type { EnqueueOptions } from "../services/context";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-export type HookTiming = "before" | "after";
+export type HookTiming = "lock" | "before" | "after";
 export type HookAction = "save" | "patch" | "remove" | "create" | "update";
 
 export type HookHandler<M = any> = (ctx: HookContext<M>) => Promise<void> | void;
@@ -67,7 +67,7 @@ export interface HookContext<M = any> {
   model: M extends Model ? WithRefs<M> : M;
   /** The action being performed. */
   action: HookAction;
-  /** The raw request data (if applicable). */
+  /** Mutation inputs; after save/patch, `result` is the persisted acknowledgement. */
   data?: Record<string, any>;
   /** Distributed lock function. */
   lock: (key: string, ttl?: number) => Promise<() => Promise<void>>;
@@ -104,6 +104,8 @@ export interface HookContext<M = any> {
 }
 
 export interface HookOptions {
+  /** Invariants run even when optional lifecycle hooks are disabled. */
+  always?: boolean;
   /** Whether the hook runs asynchronously (doesn't block the response). Default: false. */
   async?: boolean;
   /** Hook priority (lower = runs first). Default: 100. */
@@ -116,6 +118,7 @@ export interface HookEntry {
   timing: HookTiming;
   actions: HookAction[];
   async: boolean;
+  always: boolean;
   priority: number;
   handler: HookHandler;
 }
@@ -187,6 +190,7 @@ function register(
     timing,
     actions,
     async: options.async ?? false,
+    always: options.always ?? false,
     priority: options.priority ?? 100,
     handler,
   };
@@ -213,6 +217,18 @@ function register(
  * fallback overload that preserves the original flexible call shape.
  */
 export interface HookApi {
+  /** Acquire aggregate locks before the mutation locks its own row. */
+  lock<M extends Model>(
+    modelClass: ModelConstructor<M>,
+    action: HookAction,
+    handler: HookHandler<M>,
+    options?: HookOptions,
+  ): HookEntry;
+  lock(
+    modelClass: ModelConstructor,
+    action: HookAction,
+    ...args: any[]
+  ): HookEntry;
   /**
    * Register an "after" hook — runs after the action completes.
    *
@@ -251,6 +267,13 @@ export interface HookApi {
 }
 
 export const hook: HookApi = {
+  lock(
+    modelClass: ModelConstructor,
+    action: HookAction,
+    ...args: any[]
+  ): HookEntry {
+    return register(modelClass, "lock", action, ...args);
+  },
   after(
     modelClass: ModelConstructor,
     action: HookAction,
