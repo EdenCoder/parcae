@@ -682,6 +682,7 @@ export function createApp(config: AppConfig): ParcaeApp {
       const writeDb = knex({
         client: "pg",
         connection: envConfig.DATABASE_URL,
+        compileSqlOnError: false,
         pool: { min: 2, max: dbPoolMax },
       });
       resources.writeDb = writeDb;
@@ -690,12 +691,23 @@ export function createApp(config: AppConfig): ParcaeApp {
         readDb = knex({
           client: "pg",
           connection: envConfig.DATABASE_READ_URL,
+          compileSqlOnError: false,
           pool: { min: 2, max: dbPoolMax },
         });
       } else {
         readDb = writeDb;
       }
       resources.readDb = readDb;
+
+      // Knex prefixes this exact query; retain PostgreSQL's message and diagnostics.
+      for (const db of new Set([writeDb, readDb])) {
+        db.on("query-error", (error: Error, query: { sql: string }) => {
+          const prefix = `${query.sql} - `;
+          if (error.message.startsWith(prefix)) {
+            error.message = error.message.slice(prefix.length);
+          }
+        });
+      }
 
       log.info("Database connected");
 
