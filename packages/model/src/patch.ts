@@ -29,7 +29,7 @@
  *
  * # Composition hygiene
  *
- * `dedupOps(ops)` drops any op whose path lives UNDER another
+ * `dedupOps(ops)` drops any mutation whose path lives UNDER another
  * `remove` op in the same batch. This is invariant-preserving
  * normalization — when a parent gets removed, sub-path ops (whether
  * additional removes, replaces, or adds) would target a parent that
@@ -107,16 +107,17 @@ export const ops: OpBuilder & { scope(base: string): OpBuilder } = {
 };
 
 /**
- * Drop ops whose path lives UNDER another `remove` op in the same
+ * Drop mutations whose path lives UNDER another `remove` op in the same
  * batch. Composing helpers can produce overlapping clears — e.g.
  * one emits `remove /blocks/X/shots/Y/render` (whole render), another
  * emits `remove /blocks/X/shots/Y/render/url`. JSON-Patch applies the
  * second op against a path that no longer exists; `fast-json-patch`
  * throws. The dedup keeps only the outer remove.
  *
- * Non-remove ops under a parent-remove are also dropped (a `replace`
+ * Non-remove mutations under a parent-remove are also dropped (a `replace`
  * targeting a sub-path of a removed parent would fail for the same
  * reason).
+ * Ordered `test` guards are always retained.
  *
  * Called automatically by `Model.patch`. Exposed for tests and
  * callers that want to inspect the post-dedup ops without
@@ -134,6 +135,7 @@ export function dedupOps(ops: readonly PatchOp[]): PatchOp[] {
 
   const emittedRemoves = new Set<string>();
   return ops.filter((op) => {
+    if (op.op === "test") return true;
     // Drop ops whose path lives strictly UNDER any remove in the
     // batch — those would crash fast-json-patch (their parent is
     // about to be removed). Non-remove ops at the same path as a

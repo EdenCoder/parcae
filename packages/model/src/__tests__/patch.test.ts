@@ -109,18 +109,22 @@ describe("dedupOps", () => {
     ]);
   });
 
-  it("drops non-remove ops under a parent-remove (would crash applyPatch)", () => {
+  it("keeps ordered guards while dropping mutations under a parent-remove", () => {
     // The whole point: fast-json-patch throws when an op targets a
     // path whose parent was just removed in the same batch. Dedup
     // collapses these so callers can freely compose helpers without
     // having to know the cleanup order.
     const input: PatchOp[] = [
+      { op: "test", path: "/blocks/X/image/url", value: "old" },
       { op: "remove", path: "/blocks/X/image" },
       { op: "replace", path: "/blocks/X/image/url", value: "foo" },
       { op: "add", path: "/blocks/X/image/hash", value: "deadbeef" },
     ];
     const out = dedupOps(input);
-    expect(out).toEqual([{ op: "remove", path: "/blocks/X/image" }]);
+    expect(out).toEqual([
+      { op: "test", path: "/blocks/X/image/url", value: "old" },
+      { op: "remove", path: "/blocks/X/image" },
+    ]);
   });
 
   it("collapses duplicate identical removes to one", () => {
