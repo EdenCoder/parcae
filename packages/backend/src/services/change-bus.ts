@@ -7,6 +7,7 @@
  * the cross-process fan-out; Redis and adapter-side duplicate events are not
  * involved.
  */
+import { randomUUID } from 'node:crypto';
 import { Client } from 'pg';
 
 import { log } from '../logger';
@@ -17,6 +18,32 @@ export const PARCAE_CHANNEL = PARCAE_CHANGE_CHANNEL;
 const INITIAL_RECONNECT_DELAY = 500;
 const MAX_RECONNECT_DELAY = 30_000;
 const CONNECT_TIMEOUT = 10_000;
+const DELIVERY_PROBE_TIMEOUT = 5_000;
+
+/** Marks a self-addressed notification, never dispatched to listeners. */
+const PROBE_KEY = '__parcaeProbe';
+
+/**
+ * A connection pooler in transaction mode accepts LISTEN, reports success,
+ * and then hands the server connection back to the pool, so the session that
+ * holds the subscription is not the session any later NOTIFY reaches. Nothing
+ * errors: the trigger fires, the notification is delivered to nobody, and
+ * every realtime surface goes quiet while looking healthy. Neon publishes a
+ * direct endpoint alongside the pooled one under the same host with the
+ * `-pooler` suffix removed, so a deployment that only knows its pooled URL
+ * can still reach a session that keeps a LISTEN.
+ */
+export function directEndpointFor(url: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  if (!parsed.hostname.includes('-pooler')) return null;
+  parsed.hostname = parsed.hostname.replace('-pooler', '');
+  return parsed.toString();
+}
 
 export type ChangeOp = 'insert' | 'update' | 'delete';
 
@@ -32,9 +59,16 @@ export type ChangeListener = (change: Change) => void;
 
 interface ChangeBusOptions {
   url: string;
+  /**
+   * Connection to hold the LISTEN on, when it differs from `url`. Defaults
+   * to `url` with any pooler suffix removed, because `url` is the one every
+   * deployment already sets and a pooled one cannot carry a subscription.
+   */
+  listenUrl?: string;
   initialReconnectDelay?: number;
   maxReconnectDelay?: number;
   connectTimeoutMs?: number;
+  deliveryProbeTimeoutMs?: number;
 }
 
 export class ChangeBus {
@@ -54,9 +88,22 @@ export class ChangeBus {
   private cancelConnect: (() => void) | null = null;
   private closingClients = new WeakMap<Client, Promise<void>>();
   private disconnectedDuringStart = false;
+  private deliveryProbeTimeoutMs: number;
+  private pendingProbe: { nonce: string; settle: (ok: boolean) => void } | null =
+    null;
 
   constructor(opts: ChangeBusOptions) {
-    this.url = opts.url;
+    const listenUrl = opts.listenUrl ?? directEndpointFor(opts.url);
+    if (listenUrl && listenUrl !== opts.url) {
+      log.info(
+        'changeBus: holding LISTEN on the direct endpoint, not the pooled one',
+      );
+    }
+    this.url = listenUrl ?? opts.url;
+    this.deliveryProbeTimeoutMs = Math.max(
+      1,
+      opts.deliveryProbeTimeoutMs ?? DELIVERY_PROBE_TIMEOUT,
+    );
     this.initialReconnectDelay =
       opts.initialReconnectDelay ?? INITIAL_RECONNECT_DELAY;
     this.maxReconnectDelay = opts.maxReconnectDelay ?? MAX_RECONNECT_DELAY;
@@ -139,6 +186,7 @@ export class ChangeBus {
     });
     client.on('notification', (message) => {
       if (message.channel !== PARCAE_CHANNEL) return;
+      if (this._consumeProbe(message.payload)) return;
       const change = this._parse(message.payload);
       if (!change) return;
       for (const listener of this.listeners) {
@@ -164,6 +212,9 @@ export class ChangeBus {
         await client.query(`LISTEN ${PARCAE_CHANNEL}`);
       })();
       await this._awaitConnect(setup);
+      if (this._isCurrent(generation) && !abandoned) {
+        await this._assertDelivery();
+      }
     } catch (err) {
       abandoned = true;
       if (this.client === client) this.client = null;
@@ -189,6 +240,86 @@ export class ChangeBus {
         }
       }
     }
+    return true;
+  }
+
+  /**
+   * Prove this connection can actually receive what a row trigger sends.
+   *
+   * The notification is issued from a SECOND connection on purpose. A
+   * transaction-mode pooler will happily deliver a notification a session
+   * sends to itself in the same breath, because the server connection has
+   * not been recycled yet — so a same-connection probe passes against a
+   * pooled endpoint and proves nothing. Verified against Freia production:
+   * self-notify was delivered on both the pooled and direct endpoints,
+   * cross-connection was delivered only on the direct one. A trigger always
+   * fires on some other connection, so that is the shape worth testing.
+   *
+   * A LISTEN that reports success but delivers nothing is silent by
+   * construction: every consumer reads a healthy log line and gets no
+   * events. Failing the connection sends it down the reconnect path, where
+   * the error is logged on every attempt rather than once at startup.
+   */
+  private async _assertDelivery(): Promise<void> {
+    const nonce = randomUUID();
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const delivered = new Promise<boolean>((resolve) => {
+      this.pendingProbe = { nonce, settle: resolve };
+      timer = setTimeout(() => resolve(false), this.deliveryProbeTimeoutMs);
+      timer.unref?.();
+    });
+    const notifier = new Client({
+      connectionString: this.url,
+      connectionTimeoutMillis: this.connectTimeoutMs,
+    });
+    // A failed notifier must not take the process down on its own error
+    // event; the probe result below is the only verdict that counts.
+    notifier.on('error', (err: Error) => {
+      log.warn(`changeBus: probe notifier error: ${err.message}`);
+    });
+    try {
+      await notifier.connect();
+      await notifier.query('SELECT pg_notify($1, $2)', [
+        PARCAE_CHANNEL,
+        JSON.stringify({ [PROBE_KEY]: nonce }),
+      ]);
+      if (await delivered) return;
+    } catch (err) {
+      throw new Error(
+        `changeBus: could not probe delivery on "${PARCAE_CHANNEL}": ${
+          (err as Error).message
+        }`,
+      );
+    } finally {
+      if (timer) clearTimeout(timer);
+      this.pendingProbe = null;
+      await this._endClient(notifier);
+    }
+    throw new Error(
+      `changeBus: LISTEN on "${PARCAE_CHANNEL}" succeeded but a notification ` +
+        `sent from a second connection did not arrive within ` +
+        `${this.deliveryProbeTimeoutMs}ms. This connection cannot carry a ` +
+        'subscription, which a transaction-mode pooler does silently. Point ' +
+        'the change bus at a direct endpoint.',
+    );
+  }
+
+  /** True when the payload is our own probe, which listeners never see. */
+  private _consumeProbe(raw: unknown): boolean {
+    if (typeof raw !== 'string' || !raw.includes(PROBE_KEY)) return false;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return false;
+    }
+    if (typeof parsed !== 'object' || parsed === null) return false;
+    const nonce = (parsed as Record<string, unknown>)[PROBE_KEY];
+    if (typeof nonce !== 'string') return false;
+    // Every process listening on the channel sees every other process's
+    // probe. Only our own settles ours; the rest are still swallowed here,
+    // because a probe is never a model change.
+    if (this.pendingProbe?.nonce === nonce) this.pendingProbe.settle(true);
     return true;
   }
 

@@ -681,4 +681,70 @@ describe("SocketTransport — hello/resync protocol", () => {
 
     await rejection;
   });
+
+  it("drops subscription frames in flight across a session boundary", async () => {
+    const t = makeTransport(async () => "tok");
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("user-alice");
+
+    const received: any[] = [];
+    t.subscribe("query:h1", (frame: any) => received.push(frame));
+    currentSocket._fire("query:h1", { op: "alice-1" });
+    expect(received).toEqual([{ op: "alice-1" }]);
+
+    // Boundary opens: refreshSession clears the delivery gate before
+    // the new hello resolves. A frame emitted for the prior session
+    // that arrives in this window must not reach the handler.
+    const refresh = t.refreshSession();
+    currentSocket._fire("query:h1", { op: "alice-late" });
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("user-bob");
+    await refresh;
+
+    currentSocket._fire("query:h1", { op: "bob-1" });
+    expect(received).toEqual([{ op: "alice-1" }, { op: "bob-1" }]);
+  });
+
+  it("stops delivering subscription frames after terminateSession", async () => {
+    const t = makeTransport(async () => "tok");
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("user-1");
+
+    const received: any[] = [];
+    t.subscribe("query:h2", (frame: any) => received.push(frame));
+    currentSocket._fire("query:h2", { op: "live" });
+
+    const termination = t.terminateSession();
+    currentSocket._fire("query:h2", { op: "post-signout" });
+    ackHello(null);
+    await termination.catch(() => {});
+    currentSocket._fire("query:h2", { op: "still-signed-out" });
+
+    expect(received).toEqual([{ op: "live" }]);
+  });
+
+  it("unsubscribe detaches the gated wrapper", async () => {
+    const t = makeTransport(async () => "tok");
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("user-1");
+
+    const received: any[] = [];
+    const handler = (frame: any) => received.push(frame);
+    const off = t.subscribe("query:h3", handler);
+    off();
+    currentSocket._fire("query:h3", { op: "after-off" });
+
+    t.subscribe("query:h3", handler);
+    t.unsubscribe("query:h3", handler);
+    currentSocket._fire("query:h3", { op: "after-unsubscribe" });
+
+    expect(received).toEqual([]);
+  });
 });

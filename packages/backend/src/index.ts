@@ -51,10 +51,12 @@ export {
   withTransaction,
   getActiveTransactionFrame,
   activeTransactionHandle,
+  setTransactionPrelude,
 } from "./services/transactionContext";
 export type {
   TransactionFrame,
   WithTransactionDeps,
+  TransactionPrelude,
 } from "./services/transactionContext";
 export {
   enqueue,
@@ -65,6 +67,9 @@ export {
   getRuntimeFlags,
   runWithRequestContext,
   getRequestUser,
+  _setServices,
+  _clearServices,
+  isRequestContext,
 } from "./services/context";
 export type { EnqueueOptions } from "./services/context";
 
@@ -92,6 +97,9 @@ export type {
   RouteOptions,
   RouteEntry,
   SocketContext,
+  SocketContextEmitter,
+  SocketContextSocket,
+  SocketContextServer,
   SocketHandler,
   SocketMiddleware,
   SocketEntry,

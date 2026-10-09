@@ -4,6 +4,7 @@ import {
   ensureIntermediates,
   generateId,
   Model,
+  SESSION_BOUNDARY_ERRORS,
   serializeLazyQueryArgs,
   SYM_SERVER_MERGE,
   SYM_SERVER_PATCH,
@@ -81,7 +82,23 @@ interface CacheEntry {
   client: ParcaeClient;
   retryCount: number;
   retryTimer: ReturnType<typeof setTimeout> | null;
+  /**
+   * A fetch or resync has successfully answered this entry at least
+   * once. Zero rows is an answer, so `items.length` cannot stand in for
+   * this: `reconcile` returns the previous array when neither length
+   * changed, which leaves a legitimately-empty result pointing at the
+   * shared `EMPTY` sentinel and indistinguishable from never-fetched.
+   */
+  loaded: boolean;
   fetchPromise: Promise<void> | null;
+  /**
+   * A batched `resync` covering this entry is in flight. Set alongside
+   * the generation bump in `_onResyncRequired`, which supersedes any
+   * running `doFetch` — so between those two points the resync is the
+   * only thing that can settle the entry, and the mount effect must not
+   * race a second fetch against it.
+   */
+  resyncPending: boolean;
   generation: number;
   pollConsumers: Map<symbol, number>;
   pollTimer: ReturnType<typeof setTimeout> | null;
@@ -99,6 +116,7 @@ interface CacheEntry {
 
 let caches = new WeakMap<ParcaeClient, Map<string, CacheEntry>>();
 const GC_DELAY = 60_000;
+const QUERY_STUCK_MS = 10_000;
 const EMPTY: any[] = [];
 const INITIAL_HASH = "L";
 
@@ -307,8 +325,10 @@ function getOrCreate(
       chain: null,
       client,
       retryCount: 0,
+      loaded: false,
       retryTimer: null,
       fetchPromise: null,
+      resyncPending: false,
       generation: 0,
       pollConsumers: new Map(),
       pollTimer: null,
@@ -325,6 +345,7 @@ function getOrCreate(
       e.items = stale.items;
       e.mergedItems = stale.items;
       e.totalCount = stale.totalCount;
+      e.loaded = true;
       e.loading = false;
       e.version = stale.version;
       e.hash = buildHash(e);
@@ -701,10 +722,26 @@ function attachSubscription(
   });
 }
 
+/**
+ * Give up on retrying, and say so in the entry. A caller that leaves
+ * `loading` true here strands the entry: nothing is in flight, nothing
+ * is scheduled, and every consumer renders a skeleton that no code path
+ * will ever resolve. `recoverResyncEntry` pins `loading` true on an
+ * authorization boundary and then lands right here whenever the last
+ * subscriber has already unmounted.
+ */
+function abandonRetry(entry: CacheEntry): void {
+  if (!entry.loading) return;
+  entry.loading = false;
+  notify(entry);
+}
+
 function scheduleRetry(key: string, entry: CacheEntry): void {
-  if (entry.retryCount >= MAX_RETRIES) return;
-  if (entry.retryTimer || !entry.chain) return;
-  if (entry.refs <= 0) return;
+  // A timer already armed IS the scheduled work — leave `loading` alone.
+  if (entry.retryTimer) return;
+  if (entry.retryCount >= MAX_RETRIES) return abandonRetry(entry);
+  if (!entry.chain) return abandonRetry(entry);
+  if (entry.refs <= 0) return abandonRetry(entry);
 
   const delay =
     RETRY_DELAYS[Math.min(entry.retryCount, RETRY_DELAYS.length - 1)]!;
@@ -716,18 +753,58 @@ function scheduleRetry(key: string, entry: CacheEntry): void {
   }, delay);
 }
 
+/**
+ * A resync the server refused because the session that computed it is
+ * no longer the socket's session. Rows on screen may predate the
+ * current authorization. The strings are the shared wire contract in
+ * `SESSION_BOUNDARY_ERRORS`; never match on ad-hoc literals here.
+ */
+function isAuthorizationBoundaryError(error: Error): boolean {
+  return (
+    error.message.includes(SESSION_BOUNDARY_ERRORS.notReconciled) ||
+    error.message.includes(SESSION_BOUNDARY_ERRORS.terminated)
+  );
+}
+
+/**
+ * A resync outraced by a newer hello on the same socket. Identity
+ * changes purge the cache through the session listener, so by the time
+ * this fires the entry either belongs to the still-current user or is
+ * already disposed — blanking it flashed clinical lists to skeletons
+ * on every pure token rotation. Keep the rows and refetch immediately
+ * so a same-user authorization downgrade is corrected within one round
+ * trip rather than rendered indefinitely.
+ */
+function isSupersededResyncError(error: Error): boolean {
+  return error.message.includes(SESSION_BOUNDARY_ERRORS.changed);
+}
+
 function recoverResyncEntry(
   cacheKey: string,
   entry: CacheEntry,
   error: Error,
 ): void {
-  // Stale-while-revalidate: keep the last good items on screen while
-  // the retry refetches and reconciles. Blanking the entry here
-  // flashed every list back to skeletons on a reconnect hiccup.
   detachSubscription(entry);
+  if (isAuthorizationBoundaryError(error)) {
+    // Fail closed: rows fetched under the prior authorization must not
+    // stay rendered while the retry refetches under the new one.
+    if (entry.items.length > 0) {
+      entry.items = [];
+      entry.version++;
+    }
+    entry.loaded = false;
+    entry.loading = true;
+  }
+  // Otherwise stale-while-revalidate: keep the last good items on
+  // screen while the retry refetches and reconciles. Blanking the
+  // entry on a reconnect hiccup flashed every list back to skeletons.
   entry.error = error;
   notify(entry);
   entry.retryCount = 0;
+  if (isSupersededResyncError(error) && entry.chain) {
+    void doFetch(cacheKey, entry, entry.chain, entry.client, { force: true });
+    return;
+  }
   scheduleRetry(cacheKey, entry);
 }
 
@@ -745,8 +822,12 @@ function doFetch(
 
   log.debug("useQuery: fetching", chain.__modelType);
 
-  if (entry.items === EMPTY) entry.loading = true;
+  if (!entry.loaded) entry.loading = true;
   entry.error = null;
+  // This fetch is now the thing that settles the entry. Any resync
+  // claim is superseded by the generation bump below, and its handlers
+  // will skip this entry — so the claim must not outlive them.
+  entry.resyncPending = false;
   notify(entry);
 
   const boundChain = bindChainToClient(chain, client);
@@ -772,6 +853,7 @@ function doFetch(
       const reconciled = reconcile(entry.items, result, entry);
       entry.items = reconciled.items;
       if (reconciled.changed) entry.version++;
+      entry.loaded = true;
       entry.loading = false;
       entry.retryCount = 0;
       if (typeof (result as any).__totalCount === "number") {
@@ -832,6 +914,7 @@ export function _onResyncRequired(client: ParcaeClient): void {
     const modelType = entry.chain.__modelType;
     if (!modelType) continue;
     entry.fetchPromise = null;
+    entry.resyncPending = true;
     entries.push({
       cacheKey,
       entry,
@@ -892,6 +975,7 @@ export function _onResyncRequired(client: ParcaeClient): void {
           entry.totalCount = result.totalCount;
           entry.version++;
         }
+        entry.loaded = true;
         entry.loading = false;
         entry.error = null;
         entry.retryCount = 0;
@@ -919,6 +1003,17 @@ export function _onResyncRequired(client: ParcaeClient): void {
       for (const e of entries) {
         if (!isLive(e.entry) || e.entry.generation !== e.generation) continue;
         recoverResyncEntry(e.cacheKey, e.entry, error);
+      }
+    })
+    .finally(() => {
+      // Release every entry this batch claimed, including the ones both
+      // handlers skipped on a generation mismatch — a flag left set
+      // there would block the mount effect from ever restarting them.
+      // A newer batch that already re-claimed an entry owns its flag,
+      // which the generation check is what distinguishes.
+      for (const e of entries) {
+        if (e.entry.generation !== e.generation) continue;
+        e.entry.resyncPending = false;
       }
     });
 }
@@ -1088,12 +1183,45 @@ export function useQuery<T>(
       entry.retryTimer = null;
     }
 
+    // Refetch an empty entry unless something is already working on it.
+    // Keying off `loading`/`error` instead stranded the entry: a resync
+    // that superseded an in-flight fetch leaves `loading` true with
+    // nothing scheduled, and a mount that trusts that flag issues no
+    // request, so the screen pulses a skeleton for the life of the
+    // process. Ownership is what the guard has to test, not appearance.
+    const idle = !entry.fetchPromise && !entry.retryTimer && !entry.resyncPending;
     if (!entry.chain) {
       void doFetch(key, entry, currentChain, clientRef.current);
-    } else if (entry.items === EMPTY && !entry.loading && !entry.error) {
+    } else if (!entry.loaded && idle) {
       void doFetch(key, entry, currentChain, clientRef.current);
     }
   }, [client, key, subscribe]);
+
+  // ── Stuck-loading diagnostic ───────────────────────────────────
+  // A hook continuously loading this long is stuck: the session never
+  // resolved (no key can be built) or the fetch/subscribe hung. Emit
+  // once per mount through the client; the app decides how to report.
+  const isLoading = key
+    ? (caches.get(client)?.get(key)?.loading ?? true)
+    : !sessionReady;
+  useEffect(() => {
+    if (!isLoading) return;
+    if (typeof setTimeout !== "function") return;
+    const startedAt = Date.now();
+    const timer = setTimeout(() => {
+      const currentClient: any = clientRef.current;
+      try {
+        currentClient?._emitDiagnostic?.("query-stuck", {
+          modelType: chainRef.current?.__modelType ?? "unknown",
+          elapsedMs: Date.now() - startedAt,
+          sessionStatus: currentClient?.session?.state?.status ?? "unknown",
+        });
+      } catch {
+        log.warn("useQuery: stuck diagnostic emit failed");
+      }
+    }, QUERY_STUCK_MS);
+    return () => clearTimeout(timer);
+  }, [isLoading]);
 
   // ── Drift poll ─────────────────────────────────────────────────
   const pollMs = options.poll ?? 0;

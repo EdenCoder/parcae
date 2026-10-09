@@ -492,9 +492,25 @@ probes.
 
 Each registered job is enqueued into its own BullMQ queue, named
 `${defaultName}-${jobName}` (e.g. `parcae-panel`, `parcae-post.index`).
-Colons in either component are collapsed to dashes because BullMQ v5
-rejects colons in queue names — the job-side identifier (`post:index`)
-keeps its original shape; only the derived queue name is sanitised.
+`%` and `:` in either component are percent-escaped because BullMQ v5
+rejects colons in queue names, so `post:index` becomes the queue
+`parcae-post%3Aindex` — the job-side identifier keeps its original
+shape; only the derived queue name is sanitised. Resolve a queue name
+through `QueueService.queueNameFor`, never by rebuilding the rule:
+a job added to a hand-spelt queue waits forever with no error.
+
+Renaming a job, or changing this mapping, orphans the old queue. A
+process that starts workers runs an advisory `findOrphanQueues` scan at
+boot and warns when a queue in the namespace holds undone jobs (waiting,
+paused, active, delayed, or prioritized) that no registered job
+consumes. It never drains anything, and it carries its own deadline so a
+slow or unreachable Redis cannot delay startup. A scan that could not
+finish reports `incomplete` rather than an empty result, because a
+detector that silently fails is worse than none.
+
+Scope is the bare `defaultName` queue plus the `${defaultName}-` prefix,
+which a sibling service whose own name extends this one also matches.
+Treat a reported queue as a candidate to investigate, not proof.
 Workers subscribe to specific queues, so an operator can split workloads
 across machines without each worker pulling jobs it can't handle:
 

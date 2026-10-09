@@ -102,6 +102,19 @@ export const configSchema = z.object({
     })
     .optional(),
 
+  /**
+   * Postgres URL the change bus holds its LISTEN on. Optional: defaults to
+   * DATABASE_URL with any pooler suffix removed. Set it explicitly when the
+   * direct endpoint cannot be derived from the pooled one, because a
+   * transaction-mode pooler accepts LISTEN and delivers nothing.
+   */
+  DATABASE_LISTEN_URL: z
+    .string()
+    .refine((url) => /^postgres(?:ql)?:\/\//.test(url), {
+      message: "DATABASE_LISTEN_URL must be a Postgres URL",
+    })
+    .optional(),
+
   /** Redis URL. Optional — queues and distributed locks degrade locally. */
   REDIS_URL: z.string().optional(),
 

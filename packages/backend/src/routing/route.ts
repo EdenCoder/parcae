@@ -54,19 +54,50 @@ export interface RouteEntry {
 
 // ─── Socket Types ────────────────────────────────────────────────────────────
 
+/** Session-fenced emitter capabilities exposed to route.on() handlers. */
+export interface SocketContextEmitter {
+  emit(event: string, ...args: any[]): boolean;
+  to(room: string | string[]): SocketContextEmitter;
+  in(room: string | string[]): SocketContextEmitter;
+  except(room: string | string[]): SocketContextEmitter;
+  timeout(ms: number): SocketContextEmitter;
+  readonly volatile: SocketContextEmitter;
+}
+
+/** Session-fenced socket capabilities exposed to route.on() handlers. */
+export interface SocketContextSocket extends SocketContextEmitter {
+  readonly id: string;
+  readonly handshake: Readonly<Record<string, any>>;
+  readonly rooms: ReadonlySet<string>;
+  readonly broadcast: SocketContextEmitter;
+  join(room: string | string[]): Promise<void>;
+  leave(room: string): Promise<void>;
+  disconnect(close?: boolean): void;
+}
+
+/** Session-fenced server emitter exposed to route.on() handlers. */
+export type SocketContextServer = SocketContextEmitter;
+
 /** Context passed to every route.on() handler. */
 export interface SocketContext {
-  /** The raw Socket.IO socket. */
-  socket: any;
-  /** The Socket.IO server instance (for targeted emits, rooms, etc.). */
-  io: any;
+  /**
+   * Session-fenced Socket.IO facade. Output methods become no-ops after the
+   * receiving session changes; no raw transport/connection handle is exposed.
+   */
+  socket: SocketContextSocket;
+  /** Session-fenced server/room emitter facade. */
+  io: SocketContextServer;
   /** The event payload sent by the client. */
   data: any;
   /** Resolved auth session (same shape as req.session from HTTP routes). */
   session: any;
   /** Sugar for socket.id. */
   socketId: string;
-  /** Emit an event back to this specific client. */
+  /**
+   * Emit an event back to this client only while the session that received the
+   * input event is still current. Late output is dropped after any auth
+   * boundary.
+   */
   emit: (event: string, ...args: any[]) => void;
 }
 
@@ -124,7 +155,7 @@ export function clearSocketHandlers(): void {
  * successful middleware that intentionally omits `next()`.
  */
 export function wrapHttpHandler<T extends (...args: any[]) => any>(handler: T): T {
-  return ((req: any, res: any, next?: Next) => {
+  const wrapped = ((req: any, res: any, next?: Next) => {
     const reject = (error: unknown): unknown => {
       if (next) return next(error);
       throw error;
@@ -140,6 +171,12 @@ export function wrapHttpHandler<T extends (...args: any[]) => any>(handler: T): 
       return reject(error);
     }
   }) as T;
+  // Registration consumers (route-wiring tests, introspection) need to
+  // recognise the middleware they registered; the wrapper otherwise
+  // erases its identity.
+  (wrapped as { __original?: T }).__original =
+    (handler as { __original?: T }).__original ?? handler;
+  return wrapped;
 }
 
 /**

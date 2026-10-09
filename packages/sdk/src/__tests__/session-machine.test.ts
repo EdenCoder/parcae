@@ -76,4 +76,15 @@ describe("SessionMachine", () => {
     s.terminate(); // 3
     expect(fn).toHaveBeenCalledTimes(3);
   });
+
+  it("isolates a throwing listener so later listeners still run", () => {
+    const s = new SessionMachine();
+    const survivor = vi.fn();
+    s.subscribe(() => {
+      throw new Error("bad app listener");
+    });
+    s.subscribe(survivor);
+    s.resolve("u1");
+    expect(survivor).toHaveBeenCalledTimes(1);
+  });
 });

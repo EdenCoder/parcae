@@ -120,6 +120,15 @@ export class SessionMachine {
   }
 
   private _notify(): void {
-    for (const fn of this._listeners) fn();
+    // Copy first and isolate each listener: one throwing app listener
+    // must not stop the Provider's cache-purge listener from running
+    // at a session boundary.
+    for (const fn of [...this._listeners]) {
+      try {
+        fn();
+      } catch (error) {
+        log.warn("session listener threw", error);
+      }
+    }
   }
 }

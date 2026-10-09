@@ -10,7 +10,11 @@
 import { Model, FrontendAdapter } from "@parcae/model";
 import type { Transport, RequestOptions } from "@parcae/model";
 import { SocketTransport } from "./transports/socket";
-import type { ResyncEntry, ResyncResult } from "./transports/socket";
+import type {
+  ResyncEntry,
+  ResyncResult,
+  TransportDiagnostics,
+} from "./transports/socket";
 import type { SessionMachine } from "./session-machine";
 import type { ConnectionMachine } from "./connection-machine";
 
@@ -41,6 +45,11 @@ export interface ClientConfig {
    * leave the render server. `reconnect()` dials on demand.
    */
   autoConnect?: boolean;
+  /**
+   * Watchdog stale threshold in ms; `0` disables the transport
+   * watchdog. Default 8000. See SocketTransportConfig.
+   */
+  watchdogStaleMs?: number;
 }
 
 export interface ParcaeClient {
@@ -65,6 +74,14 @@ export interface ParcaeClient {
   terminateSession(): Promise<void>;
   /** Server resync RPC — batched query subscription restore. */
   resync(entries: ResyncEntry[]): Promise<ResyncResult[]>;
+  /** Watchdog foreground gate — the consumer's app-active signal. */
+  setActive?(active: boolean): void;
+  /** Watchdog "conditions changed, try now" signal. */
+  kick?(): void;
+  /** Technical transport snapshot for diagnostics/telemetry. */
+  diagnostics?(): TransportDiagnostics;
+  /** @internal Publish a diagnostic event on the transport emitter. */
+  _emitDiagnostic?(event: string, payload: Record<string, unknown>): void;
   on(event: string, handler: (...args: any[]) => void): void;
   off(event: string, handler?: (...args: any[]) => void): void;
   disconnect(): void;
@@ -83,6 +100,7 @@ export function createClient(config: ClientConfig): ParcaeClient {
     transports: config.transports,
     extraHeaders: config.extraHeaders,
     autoConnect: config.autoConnect,
+    watchdogStaleMs: config.watchdogStaleMs,
   });
 
   const adapter = new FrontendAdapter(transport);
@@ -107,6 +125,10 @@ export function createClient(config: ClientConfig): ParcaeClient {
     _lastConfirmedToken: () => transport.lastConfirmedToken(),
     terminateSession: () => transport.terminateSession(),
     resync: (entries) => transport.resync(entries),
+    setActive: (active) => transport.setActive(active),
+    kick: () => transport.kick(),
+    diagnostics: () => transport.diagnostics(),
+    _emitDiagnostic: (event, payload) => void transport.emit(event, payload),
     on: (e, h) => transport.on(e, h),
     off: (e, h) => transport.off(e, h),
     disconnect: () => transport.disconnect(),
@@ -116,4 +138,24 @@ export function createClient(config: ClientConfig): ParcaeClient {
   };
 
   return client;
+}
+
+/**
+ * Run one isolated operation on its own physical socket and always
+ * release that socket afterward. For one-shot background work — a push
+ * action, a headless task — that must never share the Provider-owned
+ * client or leave a session-bearing socket open when it finishes.
+ * Query models through `client.bind(Model)`; the global Model binding
+ * is never touched.
+ */
+export async function withIsolatedClient<T>(
+  config: ClientConfig,
+  operation: (client: ParcaeClient) => Promise<T>,
+): Promise<T> {
+  const client = createClient(config);
+  try {
+    return await operation(client);
+  } finally {
+    client.dispose();
+  }
 }

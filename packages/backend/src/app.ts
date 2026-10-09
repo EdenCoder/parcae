@@ -11,10 +11,15 @@ import { resolve, join } from "node:path";
 import { readdirSync, existsSync } from "node:fs";
 import pako from "pako";
 import { compress } from "compress-json";
-import equal from "deep-equal";
 import pluralize from "pluralize";
 import { createSocketFakeRes } from "./socket-fake-res";
-import { Model } from "@parcae/model";
+import { SocketSessionReconciler } from "./socket-session-reconciler";
+import {
+  SocketSessionRoomManager,
+  createSessionFencedEmitter,
+  createSessionFencedSocket,
+} from "./socket-session-facade";
+import { Model, SESSION_BOUNDARY_ERRORS } from "@parcae/model";
 import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
 import { log } from "./logger";
 import { ClientError } from "./helpers";
@@ -37,7 +42,10 @@ import {
 import { BackendAdapter } from "./adapters/model";
 import { registerModelRoutes } from "./adapters/routes";
 import { PubSub } from "./services/pubsub";
-import { QueueService } from "./services/queue";
+import {
+  QueueService,
+  formatOrphanQueueWarning,
+} from "./services/queue";
 import { RefLoader } from "./services/ref-loader";
 import {
   QuerySubscriptionManager,
@@ -151,6 +159,11 @@ export interface AppConfig {
    * more, raise this; don't disable.
    */
   maxSubscriptionsPerSocket?: number;
+  /**
+   * Ceiling on client-provided limits in auto-CRUD list queries.
+   * Integer >= 1; defaults to 10,000. See queryFromClient's doc.
+   */
+  maxClientQueryLimit?: number;
 }
 
 export interface ParcaeApp {
@@ -403,36 +416,42 @@ export function createSocketSessionController(
   authAdapter: AuthAdapter | null,
   subscriptions: SocketSessionSubscriptions,
 ) {
-  let session: AuthSession | null = null;
-  let generation = 0;
+  const reconciler = new SocketSessionReconciler<AuthSession>();
 
   return {
     get session(): AuthSession | null {
-      return session;
+      return reconciler.session;
     },
+    capture: (): { operation: number; session: AuthSession | null } | null =>
+      reconciler.capture(),
+    isOperationCurrent: (operation: number) =>
+      reconciler.isOperationCurrent(operation),
+    runIfOperationCurrent: (operation: number, action: () => void) =>
+      reconciler.runIfOperationCurrent(operation, action),
+    invalidate: () => reconciler.invalidate(),
     async hello(
       payload: { token?: string | null } | null | undefined,
       callback?: (result: { userId: string | null }) => void,
+      onBoundary?: () => Promise<void>,
     ): Promise<void> {
-      const acceptedGeneration = ++generation;
       const token = payload?.token ?? null;
-      let nextSession: AuthSession | null = null;
-      if (authAdapter && token) {
-        try {
-          nextSession = await authAdapter.resolveToken(token);
-        } catch {
-          nextSession = null;
-        }
-      }
-
-      if (acceptedGeneration !== generation) {
-        callback?.({ userId: session?.user?.id ?? null });
-        return;
-      }
-      if (!equal(session, nextSession, { strict: true })) {
+      const result = await reconciler.reconcile(async () => {
+        // reconcile() has already cleared the published session, so an
+        // RPC dispatched during token resolution can never be served as
+        // the prior owner. Drop that owner's subscriptions and finish
+        // its room/ack cleanup before the next session becomes visible.
         subscriptions.unsubscribeAll(socketId);
-        session = nextSession;
-      }
+        await onBoundary?.();
+        if (authAdapter && token) {
+          try {
+            return await authAdapter.resolveToken(token);
+          } catch {
+            return null;
+          }
+        }
+        return null;
+      });
+      const session = result.applied ? result.session : reconciler.session;
       callback?.({ userId: session?.user?.id ?? null });
     },
   };
@@ -740,6 +759,7 @@ export function createApp(config: AppConfig): ParcaeApp {
       const adapter = new BackendAdapter({
         read: readDb,
         write: writeDb,
+        maxClientQueryLimit: config.maxClientQueryLimit,
       });
       adapter.registerModels(models);
       Model.use(adapter);
@@ -889,7 +909,12 @@ export function createApp(config: AppConfig): ParcaeApp {
       if (flags.server) {
         if (!ensureSchema) await adapter.verifyChangeTriggers(models);
         const modelTypeByTable = indexModelTypesByTable(models);
-        const changeBus = new ChangeBus({ url: envConfig.DATABASE_URL });
+        const changeBus = new ChangeBus({
+          url: envConfig.DATABASE_URL,
+          ...(envConfig.DATABASE_LISTEN_URL
+            ? { listenUrl: envConfig.DATABASE_LISTEN_URL }
+            : {}),
+        });
         resources.changeBus = changeBus;
         changeBus.on((change) => {
           const modelType = modelTypeByTable.get(change.table);
@@ -1072,8 +1097,9 @@ export function createApp(config: AppConfig): ParcaeApp {
 
       // ── Step 15: Start per-job-name BullMQ workers ─────────────────
       //
-      // Each registered job gets its own BullMQ queue named
-      // `${defaultName}:${jobName}`. Workers subscribe to specific queues:
+      // Each registered job gets its own BullMQ queue, named by
+      // `queueNameFor` (percent-escaped, e.g. `parcae-post%3Aindex`).
+      // Workers subscribe to specific queues:
       //
       //   - RUN_JOBS=true    → subscribe to every registered job's queue
       //   - RUN_JOBS=false   → don't subscribe to anything (enqueue still
@@ -1176,6 +1202,18 @@ export function createApp(config: AppConfig): ParcaeApp {
             `Skipped ${skipped.length} job(s) not selected by RUN_JOBS: ${skipped.join(", ")}`,
           );
         }
+
+        // Advisory: a renamed job, or a change to the queue-name mapping,
+        // leaves the old queue holding jobs that nothing consumes. The
+        // old queue keeps serving plausible stats, so nothing else
+        // surfaces it. Report only; draining is the operator's call.
+        // Compare against QUEUE names, not job names.
+        const orphanWarning = formatOrphanQueueWarning(
+          await queue.findOrphanQueues(
+            registeredJobs.map((jobEntry) => queue.queueNameFor(jobEntry.name)),
+          ),
+        );
+        if (orphanWarning) log.warn(orphanWarning);
       } else if (!wantsAnyJobs && registeredJobs.length > 0) {
         log.info(
           `Skipped starting BullMQ workers (RUN_JOBS=false) — ` +
@@ -1257,6 +1295,7 @@ export function createApp(config: AppConfig): ParcaeApp {
           authAdapter,
           subscriptions,
         );
+        const socketRooms = new SocketSessionRoomManager(socket as any);
 
         // ── RPC: pipe socket calls through Polka's HTTP handler ─────
         socket.on(
@@ -1267,6 +1306,22 @@ export function createApp(config: AppConfig): ParcaeApp {
             path: string,
             data: any,
           ) => {
+            const sessionSnapshot = socketSession.capture();
+            if (!sessionSnapshot) {
+              const unavailable = createSocketFakeRes(socket, requestId);
+              unavailable.writeHead(409);
+              unavailable.end(
+                JSON.stringify({
+                  result: null,
+                  success: false,
+                  error: "Socket session is not reconciled",
+                }),
+              );
+              return;
+            }
+            const sessionOperation = sessionSnapshot.operation;
+            const isSessionCurrent = () =>
+              socketSession.isOperationCurrent(sessionOperation);
             try {
               // Parse query string from path
               const [pathname, qs] = path.split("?");
@@ -1301,7 +1356,7 @@ export function createApp(config: AppConfig): ParcaeApp {
                 query: mergedQuery,
                 _socketQuery: mergedQuery,
                 params: {},
-                session: socketSession.session,
+                session: sessionSnapshot.session,
                 _socketRpc: true, // marker: skip auth middleware resolution
                 _socketId: socket.id,
                 _parsedUrl: { pathname, query: qs || "", _raw: path },
@@ -1315,7 +1370,11 @@ export function createApp(config: AppConfig): ParcaeApp {
               // short-circuit. `writeHead`/`end` are idempotent so a
               // late write from a downstream handler can't clobber the
               // first response.
-              const fakeRes = createSocketFakeRes(socket, requestId);
+              const fakeRes = createSocketFakeRes(
+                socket,
+                requestId,
+                isSessionCurrent,
+              );
 
               // Run through Polka's full handler (includes middleware, auth, auto-CRUD, custom routes)
               (server!.polka as any).handler(fakeReq, fakeRes);
@@ -1334,7 +1393,9 @@ export function createApp(config: AppConfig): ParcaeApp {
                   }),
                 ),
               );
-              socket.emit(requestId, compressed);
+              if (isSessionCurrent()) {
+                socket.emit(requestId, compressed);
+              }
             }
           },
         );
@@ -1352,8 +1413,20 @@ export function createApp(config: AppConfig): ParcaeApp {
         // id. One round trip restores N queries.
         socket.on(
           "hello",
-          (payload: { token?: string | null }, callback: any) =>
-            socketSession.hello(payload, callback),
+          async (payload: { token?: string | null }, callback: any) => {
+            try {
+              await socketSession.hello(payload, callback, () =>
+                socketRooms.clearForBoundary(),
+              );
+            } catch {
+              // Failing open would publish the next session while prior
+              // room membership or ack closures may still be live.
+              socketSession.invalidate();
+              log.error("[socket] auth-boundary room cleanup failed");
+              callback?.({ userId: null });
+              socket.disconnect(true);
+            }
+          },
         );
 
         socket.on(
@@ -1377,6 +1450,15 @@ export function createApp(config: AppConfig): ParcaeApp {
             callback: any,
           ) => {
             const entries = Array.isArray(payload?.queries) ? payload.queries : [];
+            const sessionSnapshot = socketSession.capture();
+            if (!sessionSnapshot) {
+              callback?.({
+                success: false,
+                error: SESSION_BOUNDARY_ERRORS.notReconciled,
+              });
+              return;
+            }
+            const sessionOperation = sessionSnapshot.operation;
             if (entries.length === 0) {
               callback?.({ success: true, results: [] });
               return;
@@ -1384,7 +1466,7 @@ export function createApp(config: AppConfig): ParcaeApp {
             try {
               const results = await resyncQueries(
                 socket.id,
-                socketSession.session,
+                sessionSnapshot.session,
                 entries,
                 adapter,
                 {
@@ -1392,8 +1474,20 @@ export function createApp(config: AppConfig): ParcaeApp {
                   concurrency: resyncConcurrency,
                 },
               );
-              callback?.({ success: true, results });
+              // Results computed under a prior session must not be
+              // acknowledged into the next owner's cache.
+              const acknowledged = socketSession.runIfOperationCurrent(
+                sessionOperation,
+                () => callback?.({ success: true, results }),
+              );
+              if (!acknowledged) {
+                callback?.({ success: false, error: SESSION_BOUNDARY_ERRORS.changed });
+              }
             } catch (err: any) {
+              if (!socketSession.isOperationCurrent(sessionOperation)) {
+                callback?.({ success: false, error: SESSION_BOUNDARY_ERRORS.changed });
+                return;
+              }
               log.error("[socket] resync failed:", err);
               callback?.({
                 success: false,
@@ -1410,27 +1504,50 @@ export function createApp(config: AppConfig): ParcaeApp {
         const socketHandlers = getSocketHandlers();
         for (const entry of socketHandlers) {
           socket.on(entry.event, async (data: any) => {
+            const sessionSnapshot = socketSession.capture();
+            if (!sessionSnapshot) {
+              socket.emit("error", {
+                event: entry.event,
+                message: SESSION_BOUNDARY_ERRORS.notReconciled,
+              });
+              return;
+            }
+            const sessionOperation = sessionSnapshot.operation;
+            const isSessionCurrent = () =>
+              socketSession.isOperationCurrent(sessionOperation);
+            const sessionSocket = createSessionFencedSocket(
+              socket as any,
+              isSessionCurrent,
+              socketRooms,
+            );
             const ctx: SocketContext = {
-              socket,
-              io: server!.io,
+              socket: sessionSocket,
+              io: createSessionFencedEmitter(
+                server!.io as any,
+                isSessionCurrent,
+                socketRooms,
+              ),
               data,
-              session: socketSession.session,
+              session: sessionSnapshot.session,
               socketId: socket.id,
-              emit: (event: string, ...args: any[]) =>
-                socket.emit(event, ...args),
+              emit: (event: string, ...args: any[]) => {
+                sessionSocket.emit(event, ...args);
+              },
             };
             try {
               await runSocketChain(entry.middlewares, entry.handler, ctx);
             } catch (err: any) {
               log.error(`[socket] ${entry.event} error:`, err);
-              socket.emit("error", {
-                event: entry.event,
-                status: err instanceof ClientError ? err.status : 500,
-                message:
-                  err instanceof ClientError
-                    ? err.message
-                    : "An error occurred",
-              });
+              if (isSessionCurrent()) {
+                sessionSocket.emit("error", {
+                  event: entry.event,
+                  status: err instanceof ClientError ? err.status : 500,
+                  message:
+                    err instanceof ClientError
+                      ? err.message
+                      : "An error occurred",
+                });
+              }
             }
           });
         }
@@ -1441,6 +1558,11 @@ export function createApp(config: AppConfig): ParcaeApp {
         });
 
         socket.on("disconnect", () => {
+          socketSession.invalidate();
+          socketRooms.invalidateSessionOutputs();
+          void socketRooms.clearForBoundary().catch(() => {
+            log.warn("[socket] disconnect room cleanup failed");
+          });
           subscriptions.unsubscribeAll(socket.id);
         });
       });

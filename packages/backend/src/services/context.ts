@@ -61,6 +61,20 @@ export function getRequestUser(): {
 }
 
 /**
+ * True when the caller is running inside a request scope — the Polka
+ * middleware installed by `app.start()` wraps every HTTP request
+ * (auto-CRUD routes and custom controllers alike), and the socket query
+ * path wraps each batched entry.
+ *
+ * Useful to distinguish client-originated work from background work
+ * (jobs, workers, boot sweeps, scripts) without threading a flag through
+ * every call site.
+ */
+export function isRequestContext(): boolean {
+  return _requestContext.getStore() !== undefined;
+}
+
+/**
  * Get the request-scoped `RefLoader`, if any. Returns `null` when the
  * call is outside an `app.start()`-installed request scope (jobs,
  * tests). Consumers should fall through to direct queries on null —
@@ -86,7 +100,13 @@ let _flags: RuntimeFlags = {
   crons: false,
 };
 
-/** @internal — called by createApp() */
+/**
+ * Install the service registry. createApp() calls this during start();
+ * test harnesses that invoke controllers or jobs without an app install
+ * in-process services here (`new QueueService()` + `new PubSub()`, no
+ * Redis) so lock() has real single-process semantics instead of
+ * throwing.
+ */
 export function _setServices(queue: QueueService, pubsub: PubSub): void {
   _queue = queue;
   _pubsub = pubsub;
@@ -102,7 +122,7 @@ export function _setRuntimeFlags(flags: RuntimeFlags): void {
   _flags = flags;
 }
 
-/** @internal — clears app-owned globals after failed startup or shutdown. */
+/** Clears app-owned globals after failed startup, shutdown, or a test. */
 export function _clearServices(): void {
   _queue = null;
   _pubsub = null;
