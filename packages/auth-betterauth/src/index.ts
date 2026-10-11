@@ -48,7 +48,12 @@ export interface BetterAuthConfig {
    * `clientId` (Services ID) + `clientSecret` (self-minted ES256 JWT) are
    * required only for the web/Android OAuth flow.
    */
-  apple?: { clientId?: string; clientSecret?: string; appBundleIdentifier?: string };
+  apple?: {
+    clientId?: string;
+    clientSecret?: string;
+    appBundleIdentifier?: string;
+    audience?: string | string[];
+  };
   /** Session config. */
   session?: { expiresIn?: number; updateAge?: number };
   /** Trusted origins for CORS (in addition to TRUSTED_ORIGINS env var). */
@@ -250,6 +255,7 @@ export function betterAuth(config: BetterAuthConfig = {}): BetterAuthAdapter {
           clientId: config.apple.clientId ?? config.apple.appBundleIdentifier ?? "",
           clientSecret: config.apple.clientSecret ?? "unused-for-native-idtoken",
           appBundleIdentifier: config.apple.appBundleIdentifier,
+          audience: config.apple.audience,
         };
       }
 
