@@ -20,6 +20,7 @@
  */
 
 import { betterAuth as createBetterAuth } from "better-auth";
+import type { BetterAuthOptions } from "better-auth";
 import { log } from "@parcae/backend";
 import { bearer } from "better-auth/plugins/bearer";
 import pg from "pg";
@@ -48,7 +49,12 @@ export interface BetterAuthConfig {
    * `clientId` (Services ID) + `clientSecret` (self-minted ES256 JWT) are
    * required only for the web/Android OAuth flow.
    */
-  apple?: { clientId?: string; clientSecret?: string; appBundleIdentifier?: string };
+  apple?: {
+    clientId?: string;
+    clientSecret?: string;
+    appBundleIdentifier?: string;
+    audience?: string | string[];
+  };
   /** Session config. */
   session?: { expiresIn?: number; updateAge?: number };
   /** Trusted origins for CORS (in addition to TRUSTED_ORIGINS env var). */
@@ -68,6 +74,8 @@ export interface BetterAuthConfig {
       verify?: (data: { hash: string; password: string }) => Promise<boolean>;
     };
   };
+  /** Passthrough to Better Auth's `user.deleteUser`; account deletion is off unless set. */
+  deleteUser?: NonNullable<BetterAuthOptions["user"]>["deleteUser"];
   /**
    * Explicit allowlists for custom User fields. Inferred fields are private
    * to Better Auth by default: they cannot be written through auth endpoints
@@ -250,6 +258,7 @@ export function betterAuth(config: BetterAuthConfig = {}): BetterAuthAdapter {
           clientId: config.apple.clientId ?? config.apple.appBundleIdentifier ?? "",
           clientSecret: config.apple.clientSecret ?? "unused-for-native-idtoken",
           appBundleIdentifier: config.apple.appBundleIdentifier,
+          audience: config.apple.audience,
         };
       }
 
@@ -293,6 +302,7 @@ export function betterAuth(config: BetterAuthConfig = {}): BetterAuthAdapter {
             Object.keys(additionalFields).length > 0
               ? additionalFields
               : undefined,
+          deleteUser: config.deleteUser,
         },
 
         session: {
