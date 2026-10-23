@@ -72,7 +72,7 @@
 
 import { Model } from "@parcae/model";
 import { objectEquals } from "@observ33r/object-equals";
-import { useCallback, useRef, useSyncExternalStore } from "react";
+import { useMemo, useCallback, useRef, useSyncExternalStore } from "react";
 import { log } from "../log";
 
 // ─── Shared rAF batcher for `coalesced: true` subscriptions ─────────────────
@@ -143,6 +143,37 @@ export function scheduleCoalesced(notify: () => void): void {
  */
 export function cancelCoalesced(notify: () => void): void {
   coalescedNotifies.delete(notify);
+}
+
+// ─── One "change" listener per model ────────────────────────────────────────
+//
+// Every atomic reader of a model shares one listener on it. The listener
+// names the model to each reader, so a reader of many models re-reads only
+// the ones that changed, and adding or removing a reader never touches the
+// model's emitter unless it is the first or the last.
+
+type ModelReader = (model: Model) => void;
+
+const watched = new WeakMap<Model, { readers: Set<ModelReader>; listener: () => void }>();
+
+function watch(model: Model, reader: ModelReader): () => void {
+  let entry = watched.get(model);
+  if (!entry) {
+    const readers = new Set<ModelReader>();
+    const listener = () => {
+      for (const read of [...readers]) read(model);
+    };
+    entry = { readers, listener };
+    watched.set(model, entry);
+    model.on("change", listener);
+  }
+  const { readers, listener } = entry;
+  readers.add(reader);
+  return () => {
+    if (!readers.delete(reader) || readers.size) return;
+    model.off("change", listener);
+    watched.delete(model);
+  };
 }
 
 export interface UseModelAtomicOptions<V = unknown> {
@@ -249,11 +280,11 @@ export function useModelAtomic<V = unknown>(
       } else {
         notify = cb;
       }
-      model.on("change", notify);
+      const release = watch(model, notify);
       return () => {
         if (timer) clearTimeout(timer);
         if (coalesced) cancelCoalesced(cb);
-        model.off("change", notify);
+        release();
       };
     },
     [model, isReactive, debounceMs, coalesced],
@@ -360,6 +391,21 @@ export function useModelsAtomic<V = unknown>(
   const compareFn =
     explicitCompareFn ?? (defaultEqual as (a: V, b: V) => boolean);
 
+  // Each model's slots in `models`, so a change re-reads only the slots it fills.
+  const slots = useMemo(() => {
+    const found = new Map<Model, number[]>();
+    models.forEach((model, at) => {
+      if (!model) return;
+      const list = found.get(model);
+      if (list) list.push(at);
+      else found.set(model, [at]);
+    });
+    return found;
+  }, [models]);
+
+  // The models that changed since the last snapshot; `null` reads every slot.
+  const changedRef = useRef<Set<Model> | null>(null);
+
   const subscribe = useCallback(
     (cb: () => void) => {
       let timer: ReturnType<typeof setTimeout> | null = null;
@@ -377,65 +423,74 @@ export function useModelsAtomic<V = unknown>(
       } else {
         notify = cb;
       }
-      const subscribed: Model[] = [];
-      for (const model of models) {
-        if (!isLiveModel(model)) continue;
-        model.on("change", notify);
-        subscribed.push(model);
-      }
+      const changed = (model: Model) => {
+        changedRef.current?.add(model);
+        notify();
+      };
+      // A change before this subscription went unseen, so the next snapshot reads every slot.
+      changedRef.current = null;
+      const releases: (() => void)[] = [];
+      for (const model of slots.keys())
+        if (isLiveModel(model)) releases.push(watch(model, changed));
       return () => {
         if (timer) clearTimeout(timer);
         if (coalesced) cancelCoalesced(cb);
-        for (const model of subscribed) {
-          model.off("change", notify);
-        }
+        for (const release of releases) release();
       };
     },
-    [models, debounceMs, coalesced],
+    [slots, debounceMs, coalesced],
   );
 
-  // Identity-stable cache: same length AND every position's value
-  // `Object.is`- or compareFn-equal to the cached entry → reuse the
-  // prior array reference so consumers' useMemo / useEffect deps
-  // bail. New array only when a real value moved.
-  const cacheRef = useRef<readonly (V | undefined)[]>(
-    EMPTY_VALUES as readonly (V | undefined)[],
-  );
+  // Identity-stable cache: every slot's value `Object.is`- or
+  // compareFn-equal to the cached entry → reuse the prior array
+  // reference so consumers' useMemo / useEffect deps bail. New array
+  // only when a real value moved.
+  const cacheRef = useRef<{
+    models: readonly (Model | null | undefined)[];
+    path: string;
+    values: readonly (V | undefined)[];
+  }>({ models: EMPTY_VALUES as readonly Model[], path, values: EMPTY_VALUES as readonly V[] });
 
   const getSnapshot = useCallback((): readonly (V | undefined)[] => {
-    const cached = cacheRef.current;
-    if (models.length === 0) {
-      if (cached.length === 0) return cached;
-      const empty = EMPTY_VALUES as readonly (V | undefined)[];
-      cacheRef.current = empty;
-      return empty;
+    const cache = cacheRef.current;
+    const changed = changedRef.current;
+    const same = (prev: V | undefined, value: V | undefined) =>
+      Object.is(prev, value) ||
+      (prev !== undefined && value !== undefined && compareFn(prev, value));
+    if (changed && cache.models === models && cache.path === path) {
+      if (!changed.size) return cache.values;
+      let next: (V | undefined)[] | null = null;
+      for (const model of changed)
+        for (const at of slots.get(model) ?? []) {
+          const value = getAtPath(model, path) as V | undefined;
+          if (same(cache.values[at], value)) continue;
+          next ??= [...cache.values];
+          next[at] = value;
+        }
+      changed.clear();
+      if (!next) return cache.values;
+      const values = Object.freeze(next) as readonly (V | undefined)[];
+      cacheRef.current = { models, path, values };
+      return values;
     }
+    changedRef.current = new Set();
+    const cached = cache.values;
     const next: (V | undefined)[] = new Array(models.length);
-    let same = cached.length === models.length;
+    let kept = cached.length === models.length;
     for (let i = 0; i < models.length; i++) {
       const model = models[i];
       const value = model ? (getAtPath(model, path) as V | undefined) : undefined;
       next[i] = value;
-      if (!same) continue;
-      const prev = cached[i];
-      if (Object.is(prev, value)) continue;
-      if (prev === undefined || value === undefined) {
-        same = false;
-        continue;
-      }
-      if (!compareFn(prev, value)) {
-        same = false;
-        continue;
-      }
-      // Structurally equal — keep the cached reference at this slot
-      // (matches single-model `useModelAtomic` semantics).
-      next[i] = prev;
+      if (!kept) continue;
+      if (same(cached[i], value)) next[i] = cached[i];
+      else kept = false;
     }
-    if (same) return cached;
-    const frozen = Object.freeze(next) as readonly (V | undefined)[];
-    cacheRef.current = frozen;
-    return frozen;
-  }, [models, path, compareFn]);
+    const values = kept
+      ? cached
+      : (Object.freeze(next) as readonly (V | undefined)[]);
+    cacheRef.current = { models, path, values };
+    return values;
+  }, [models, path, compareFn, slots]);
 
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
