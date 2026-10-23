@@ -1851,7 +1851,7 @@ export class BackendAdapter implements ModelAdapter {
         );
       }
 
-      parsed.push({ op: o, column, colType, innerSegments });
+      if (o.op !== "test") parsed.push({ op: o, column, colType, innerSegments });
     }
 
     // Group by column
@@ -1869,12 +1869,10 @@ export class BackendAdapter implements ModelAdapter {
 
       // Scalar columns: direct value SET. Only `add` / `replace` /
       // `remove` are meaningful at the root of a scalar column; the
-      // other discriminants either need a json path (`move`, `copy`)
-      // or were short-circuited above (`test`).
+      // other discriminants need a json path (`move`, `copy`).
       if (colType !== "json") {
         const lastOp = columnOps[columnOps.length - 1]!;
         const op = lastOp.op;
-        if (op.op === "test") continue;
         // `value` is present on AddOperation / ReplaceOperation; a
         // bare `remove` leaves the field undefined → coerce to null.
         const value =
@@ -2038,8 +2036,6 @@ export class BackendAdapter implements ModelAdapter {
             }
             break;
           }
-          case "test":
-            break;
           default:
             throw new ClientError(`patch: unsupported op "${o.op}"`);
         }
