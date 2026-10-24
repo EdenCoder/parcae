@@ -17,6 +17,8 @@
  *   - disconnect does NOT touch session state
  *   - reconnect emits a single `resync` event after `hello` resolves
  *   - session changes propagate through SessionMachine.resolve only
+ *   - a GET the wire drops goes again after the next `hello`; any
+ *     other call goes out once
  */
 
 import SocketIO from "socket.io-client";
@@ -42,6 +44,9 @@ const RPC_STARVATION_MS = 30_000;
 const KICK_FLOOR_MS = 2_000;
 
 const uid = new ShortId({ length: 10 });
+
+/** Errors that mean the wire dropped, not that the session ended. */
+const wireLoss = new WeakSet<Error>();
 
 export interface SocketTransportConfig {
   url: string;
@@ -241,6 +246,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     });
 
     this.socket.on("connect_error", (err: Error) => {
+      wireLoss.add(err);
       this._advanceGeneration(err);
       this.connection.disconnected(err);
       this.emit("error", err);
@@ -602,9 +608,11 @@ export class SocketTransport extends EventEmitter implements Transport {
 
   private _handleSocketDisconnect(reason?: string): void {
     if (this.connection.state.status === "disconnected") return;
-    this._advanceGeneration(
-      new Error(reason ? `Disconnected: ${reason}` : "Disconnected"),
+    const error = new Error(
+      reason ? `Disconnected: ${reason}` : "Disconnected",
     );
+    wireLoss.add(error);
+    this._advanceGeneration(error);
     this.connection.disconnected();
     this.emit("disconnected");
     this._scheduleWatchdog();
@@ -785,42 +793,50 @@ export class SocketTransport extends EventEmitter implements Transport {
 
   // ── Request/Response ─────────────────────────────────────────────
 
+  /**
+   * A call waits for a connected socket and its hello. A GET whose answer
+   * the wire drops goes again under the same session, with what is left
+   * of its budget. Any other method goes out once: the server may have
+   * done the work, so a drop rejects it.
+   */
   private async fetch(
     method: string,
     path: string,
     data: any = {},
     options?: RequestOptions,
   ): Promise<any> {
-    this._assertCanRequest();
-
-    // Wait for the first hello to land — guarantees the socket is
-    // authenticated before the call goes out. Subsequent calls don't
-    // re-await because `helloReady` resolves once and stays resolved
-    // until the next reconnect kicks a new handshake.
-    await this.helloReady;
-
-    if (!this.socket.connected) {
-      await this._waitForConnection();
-      await this.helloReady;
+    const read = method.toUpperCase() === "GET";
+    const deadline = Date.now() + (options?.timeout ?? DEFAULT_TIMEOUT);
+    let session: number | undefined;
+    let attempt = options;
+    for (;;) {
+      try {
+        this._assertCanRequest();
+        if (!this.socket.connected) await this._waitForConnection();
+        await this.helloReady;
+        this._assertCanRequest();
+        session ??= this.session.state.version;
+        if (this.session.state.version !== session) {
+          throw new Error(SESSION_BOUNDARY_ERRORS.changed);
+        }
+        if (!read) return await this._call(method, path, data, attempt);
+        const key = `${this.sessionGeneration}:${path}:${JSON.stringify(data)}`;
+        let request = this.inflight.get(key);
+        if (!request) {
+          request = this._call(method, path, data, attempt);
+          this.inflight.set(key, request);
+          const forget = () => this.inflight.delete(key);
+          request.then(forget, forget);
+        }
+        return await request;
+      } catch (error) {
+        if (!read || !wireLoss.has(error as Error)) throw error;
+        if (Date.now() >= deadline) throw error;
+        // A declared budget keeps the stall clock off the call: the drop
+        // already cost one rebuild, and a slow answer must not cost another.
+        attempt = { ...options, timeout: deadline - Date.now() };
+      }
     }
-
-    this._assertCanRequest();
-
-    const upper = method.toUpperCase();
-    if (upper === "GET") {
-      const dedupeKey = `${this.sessionGeneration}:${path}:${JSON.stringify(data)}`;
-      const existing = this.inflight.get(dedupeKey);
-      if (existing) return existing;
-      const req = this._call(method, path, data, options);
-      this.inflight.set(dedupeKey, req);
-      req.then(
-        () => this.inflight.delete(dedupeKey),
-        () => this.inflight.delete(dedupeKey),
-      );
-      return req;
-    }
-
-    return this._call(method, path, data, options);
   }
 
   private _call(

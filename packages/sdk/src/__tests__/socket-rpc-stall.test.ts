@@ -149,7 +149,6 @@ describe("SocketTransport — RPC-stall watchdog", () => {
     const events = recoverEvents(transport);
 
     const pending = transport.get("/nudges");
-    const rejection = expect(pending).rejects.toThrow("Disconnected");
     await vi.advanceTimersByTimeAsync(0);
     expect(
       currentSocket.emits.filter((e) => e.event === "call"),
@@ -161,7 +160,17 @@ describe("SocketTransport — RPC-stall watchdog", () => {
     await vi.advanceTimersByTimeAsync(400);
     expect(events).toHaveLength(1);
     expect(events[0].reason).toBe("rpc-stalled");
-    await rejection;
+
+    // The GET goes again after the rebuild's hello, and a slow second
+    // answer costs no second rebuild.
+    await ackHello("u1");
+    expect(
+      currentSocket.emits.filter((e) => e.event === "call"),
+    ).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(events).toHaveLength(1);
+    answerCall(1, ["late"]);
+    await expect(pending).resolves.toEqual(["late"]);
   });
 
   it("does not rebuild while responses are still flowing", async () => {
@@ -195,7 +204,7 @@ describe("SocketTransport — RPC-stall watchdog", () => {
     await expect(first).resolves.toEqual([]);
 
     await vi.advanceTimersByTimeAsync(5_000);
-    const starved = transport.get("/starved");
+    const starved = transport.post("/starved");
     const rejection = expect(starved).rejects.toThrow("Disconnected");
     await vi.advanceTimersByTimeAsync(8_400);
     expect(events).toHaveLength(1);
@@ -208,7 +217,7 @@ describe("SocketTransport — RPC-stall watchdog", () => {
     const recovered: unknown[] = [];
     transport.on("rpc:recovered", () => recovered.push(true));
 
-    const starved = transport.get("/nudges");
+    const starved = transport.post("/nudges");
     const rejection = expect(starved).rejects.toThrow();
     await vi.advanceTimersByTimeAsync(8_400);
     await rejection;
@@ -288,7 +297,7 @@ describe("SocketTransport — RPC-stall watchdog", () => {
     // starved query pulsed a skeleton until its 120s timeout, retried,
     // and pulsed again. A live wire cannot excuse an unanswered call
     // indefinitely.
-    const starved = transport.get("/nutrition-sprints");
+    const starved = transport.post("/nutrition-sprints");
     const healthy = transport.get("/events");
     await vi.advanceTimersByTimeAsync(0);
     const rejection = expect(starved).rejects.toThrow("Disconnected");

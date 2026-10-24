@@ -114,6 +114,9 @@ function respondToLatestCall(response: Record<string, unknown>): void {
   );
 }
 
+/** Let every pending promise continuation run. */
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (error: Error) => void;
@@ -612,14 +615,14 @@ describe("SocketTransport — hello/resync protocol", () => {
     await Promise.all([first, duplicate, nextGeneration]);
   });
 
-  it("rejects pending RPC and resync acknowledgements on disconnect", async () => {
+  it("rejects a pending write and resync acknowledgements on disconnect", async () => {
     const transport = makeTransport(async () => "token");
     currentSocket.connect();
     await Promise.resolve();
     await Promise.resolve();
     ackHello("user");
 
-    const call = transport.get("/posts");
+    const call = transport.post("/posts");
     const resync = transport.resync([
       { key: "posts", modelType: "post", steps: [] },
     ]);
@@ -631,6 +634,67 @@ describe("SocketTransport — hello/resync protocol", () => {
 
     await callRejection;
     await resyncRejection;
+  });
+
+  it("sends a dropped GET again after the next hello, and a dropped write never", async () => {
+    const transport = makeTransport(async () => "token");
+    currentSocket.connect();
+    await tick();
+    ackHello("user");
+
+    const read = transport.get("/quote", { actions: ["shoot"] });
+    const write = transport.post("/action", { hash: "h" });
+    const writeRejection = expect(write).rejects.toThrow("Disconnected");
+    await tick();
+    currentSocket.disconnect();
+    await writeRejection;
+
+    currentSocket.connect();
+    await tick();
+    ackHello("user");
+    await tick();
+    respondToLatestCall({ success: true, result: { credits: 3 } });
+
+    await expect(read).resolves.toEqual({ credits: 3 });
+    const paths = currentSocket.emits
+      .filter((entry) => entry.event === "call")
+      .map((entry) => entry.args[2]);
+    expect(paths).toEqual(["/v1/quote", "/v1/action", "/v1/quote"]);
+  });
+
+  it("rejects a dropped GET when the next hello confirms someone else", async () => {
+    const transport = makeTransport(async () => "token");
+    currentSocket.connect();
+    await tick();
+    ackHello("user-1");
+
+    const read = transport.get("/posts");
+    const rejection = expect(read).rejects.toThrow("Session changed");
+    await tick();
+    currentSocket.disconnect();
+    currentSocket.connect();
+    await tick();
+    ackHello("user-2");
+
+    await rejection;
+    expect(currentSocket.emits.filter((entry) => entry.event === "call")).toHaveLength(1);
+  });
+
+  it("waits for the next connection when the wire drops a hello in flight", async () => {
+    const transport = makeTransport(async () => "token");
+    currentSocket.connect();
+    await tick();
+    currentSocket.disconnect();
+
+    const read = transport.get("/posts");
+    await tick();
+    currentSocket.connect();
+    await tick();
+    ackHello("user");
+    await tick();
+    respondToLatestCall({ success: true, result: [] });
+
+    await expect(read).resolves.toEqual([]);
   });
 
   it("rejects an RPC when a fresh session generation starts", async () => {
