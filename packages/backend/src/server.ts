@@ -11,6 +11,7 @@ import polka from "polka";
 import { Server as SocketServer } from "socket.io";
 import bodyParser, { type OptionsJson } from "body-parser";
 import type { Config } from "./config";
+import { timeRequest } from "./durations";
 import { ClientError, error } from "./helpers";
 import { log } from "./logger";
 
@@ -23,6 +24,7 @@ export interface ServerContext {
 export interface ServerOptions {
   config: Config;
   version: string;
+  timed?: boolean;
 }
 
 /**
@@ -53,7 +55,7 @@ export const JSON_BODY_PARSER_OPTIONS: OptionsJson = {
 };
 
 export function createServer_(options: ServerOptions): ServerContext {
-  const { config } = options;
+  const { config, timed } = options;
 
   // Parse trusted origins
   const trustedOrigins = config.TRUSTED_ORIGINS
@@ -90,6 +92,8 @@ export function createServer_(options: ServerOptions): ServerContext {
       error(res, 404, "Not found");
     },
   });
+  // First, so HTTP and socket calls are timed from the same point.
+  if (timed) app.use(timeRequest);
   app.use(bodyParser.json(JSON_BODY_PARSER_OPTIONS));
   app.use(bodyParser.urlencoded({ extended: true }));
 
