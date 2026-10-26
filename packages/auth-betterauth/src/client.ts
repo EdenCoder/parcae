@@ -1,7 +1,7 @@
 /**
  * @parcae/auth-betterauth — Client adapter
  *
- * Usage (eager, recommended — pre-fires the session HTTP at module
+ * Usage (eager, recommended — starts the session read at module
  * evaluation so the token is ready by the time React mounts):
  *
  * ```tsx
@@ -20,22 +20,33 @@
  * <ParcaeProvider url="..." auth={auth}>
  * ```
  *
- * The eager form saves the round-trip-from-Provider-effect-to-server
- * handshake (typically 40–80ms on a cold start, depending on whether
- * `/v1/auth/get-session` is hot in the backend). The lazy form is
- * backward-compatible — no change required for existing callers.
+ * Better Auth's `session` atom owns the session. Once watched it reads
+ * `/get-session`, and reads it again after every auth-mutating call, on
+ * focus, back online, and when another tab broadcasts a change. The
+ * adapter watches it for its whole life and takes the token from it, so
+ * Parcae and the app's `useSession` share one read.
  */
 
-import { createAuthClient } from "better-auth/react";
-import type { AuthClientAdapter } from "@parcae/sdk";
+import { createAuthClient } from 'better-auth/react';
+import type { AuthClientAdapter } from '@parcae/sdk';
+
+type Client = ReturnType<typeof createAuthClient>;
+
+interface Session {
+  data: { session?: { token?: string | null } | null } | null;
+  isPending: boolean;
+}
+
+interface SessionAtom {
+  get(): Session;
+  listen(listener: (value: Session) => void): () => void;
+}
 
 export interface BetterAuthOptions {
   /**
    * Backend base URL. When provided, the adapter calls `init()`
-   * immediately and fires the first `getSession()` request from
-   * module evaluation — typically before React renders the Provider.
-   * The pending session Promise is cached and consumed by the first
-   * `getToken()` call, avoiding a separate round trip later.
+   * immediately, which starts the first `/get-session` read from module
+   * evaluation — typically before React renders the Provider.
    *
    * Omit to defer initialisation until `ParcaeProvider` calls `init()`.
    */
@@ -46,156 +57,77 @@ export interface BetterAuthOptions {
    * holds a singleton `createAuthClient()` instance (e.g. for direct
    * sign-in/sign-out UI calls) so the adapter shares the *same* client.
    *
-   * Sharing is critical: every `createAuthClient()` call creates its
-   * own `$sessionSignal` nanostore atom. If the UI calls `signOut()`
-   * on one client and the adapter listens for `$sessionSignal` on a
-   * different client, the adapter never sees the change and Parcae's
-   * session machine stays stuck.
+   * Sharing is critical: every `createAuthClient()` call creates its own
+   * `session` atom. If the UI calls `signOut()` on one client and the
+   * adapter watches a different client, the adapter never sees the
+   * change and Parcae's session machine stays stuck.
    *
    * When `client` is provided, `baseUrl` is ignored (the client already
    * has its own base URL configured).
    */
-  client?: ReturnType<typeof createAuthClient>;
+  client?: Client;
 }
 
-export function betterAuth(opts: BetterAuthOptions = {}): AuthClientAdapter {
-  let client: ReturnType<typeof createAuthClient> | null = opts.client ?? null;
-  // Cache for the pending session request when `baseUrl` (or `client`)
-  // is provided eagerly. The first `getToken()` consumes it and clears
-  // the slot so subsequent calls re-fetch (covers token rotation).
-  // Typed as `any` because better-auth's `getSession()` return type is
-  // overload-shaped and the tsup DTS pass struggles to narrow it
-  // through `NonNullable<typeof client>` — the wire shape is what
-  // matters here, not the static type.
-  let primedSessionPromise: Promise<any> | null = null;
-  // Last token the adapter has observed, shared by `getToken()` and
-  // `onChange`. `undefined` means "never read one" — distinct from
-  // `null`, which is a confirmed anonymous session. `onChange` compares
-  // against this rather than its own private baseline: the hello
-  // handshake calls `getToken()` long before the first
-  // `visibilitychange`, so without the handoff that first read always
-  // looks like a change and an anonymous visitor gets reported as
-  // having just signed out.
-  let lastToken: string | null | undefined = undefined;
+const tokenOf = (value: Session): string | null => value.data?.session?.token ?? null;
 
-  const initInternal = (baseUrl: string): void => {
-    if (client) return;
-    client = createAuthClient({
-      baseURL: baseUrl,
-      basePath: "/v1/auth",
+export function betterAuth(opts: BetterAuthOptions = {}): AuthClientAdapter {
+  let client: Client | null = opts.client ?? null;
+  let session: SessionAtom | null = null;
+  // The last settled token. `undefined` until the first settled read —
+  // distinct from `null`, a confirmed anonymous session — so that read
+  // sets the baseline instead of reporting a sign-in or a sign-out.
+  let lastToken: string | null | undefined = undefined;
+  const callbacks = new Set<(token: string | null) => void>();
+
+  const start = (baseUrl?: string): void => {
+    if (!client && baseUrl) {
+      client = createAuthClient({ baseURL: baseUrl, basePath: '/v1/auth' });
+    }
+    // The server renders without a session, and a watched atom would
+    // start Better Auth's focus and broadcast managers there.
+    if (!client || session || typeof window === 'undefined') return;
+    // boundary: Better Auth types `$store.atoms` as a loose record.
+    session = (client.$store.atoms as unknown as { session: SessionAtom }).session;
+    const now = session.get();
+    if (!now.isPending) lastToken = tokenOf(now);
+    // Never released: the adapter lives as long as the app. A failed
+    // read keeps the last data, so only a read that proves a change
+    // reaches the callbacks.
+    session.listen((value) => {
+      if (value.isPending) return;
+      const token = tokenOf(value);
+      if (token === lastToken) return;
+      const baselining = lastToken === undefined;
+      lastToken = token;
+      if (baselining) return;
+      for (const callback of [...callbacks]) callback(token);
     });
   };
 
-  // Eager init — pre-fire the session HTTP at module evaluation so
-  // the token is ready (or close to it) by the time React mounts.
-  // Triggers when EITHER an external client was passed OR a baseUrl
-  // was given. With an external client, `initInternal()` is a no-op.
-  if (opts.client) {
-    primedSessionPromise = opts.client.getSession();
-  } else if (opts.baseUrl) {
-    initInternal(opts.baseUrl);
-    primedSessionPromise = client!.getSession();
-  }
+  start(opts.baseUrl);
 
   return {
-    init(baseUrl: string) {
-      // Idempotent — eager init already ran if `baseUrl` was provided
-      // to the factory.
-      initInternal(baseUrl);
-    },
+    // Idempotent — an eager adapter already watches its client.
+    init: start,
 
-    async getToken(): Promise<string | null> {
-      if (!client) return null;
-      const primed = primedSessionPromise;
-      primedSessionPromise = null; // one-shot
-      const session = await (primed ?? client.getSession());
-      const token: string | null = session?.data?.session?.token ?? null;
-      lastToken = token;
-      return token;
+    getToken(): Promise<string | null> {
+      const atom = session;
+      if (!atom) return Promise.resolve(null);
+      const now = atom.get();
+      if (!now.isPending) return Promise.resolve(tokenOf(now));
+      return new Promise((resolve) => {
+        const stop = atom.listen((value) => {
+          if (value.isPending) return;
+          stop();
+          resolve(tokenOf(value));
+        });
+      });
     },
 
     onChange(callback: (token: string | null) => void): () => void {
-      // Better Auth bumps its internal `$sessionSignal` nanostore atom on:
-      //   /sign-in/email, /sign-up/email, /sign-out, /revoke-session(s),
-      //   /update-user, /update-session, /verify-email, /change-email,
-      //   /delete-user
-      //
-      // Subscribing to that atom lets us react synchronously to in-tab
-      // auth changes — sign-out shows protected gates immediately,
-      // sign-in lifts them without a page reload.
-      //
-      // We additionally listen on `visibilitychange` to cover sessions
-      // mutated outside this tab (another tab signed out and the
-      // BroadcastChannel didn't reach us, or the cookie was revoked by
-      // the server). Visibility polling remains the only portable
-      // cross-tab path without extra infrastructure.
-
-      let active = true;
-      let generation = 0;
-
-      const readAndNotify = async () => {
-        if (!client) return;
-        const currentGeneration = ++generation;
-        try {
-          const session = await client.getSession();
-          if (!active || currentGeneration !== generation) return;
-          const token = session?.data?.session?.token ?? null;
-          if (token === lastToken) return;
-          // First read of all, and it's anonymous: there is no prior
-          // identity to have lost, so this establishes the baseline
-          // rather than reporting a sign-out.
-          const baselining = lastToken === undefined;
-          lastToken = token;
-          if (baselining && token === null) return;
-          callback(token);
-        } catch {
-          // Transient auth endpoint failures are not sign-outs.
-          // Keep the current session identity until a successful
-          // session read proves it changed.
-        }
-      };
-
-      // Reactive path: better-auth's session signal atom. The proxy
-      // bumps it (with a 10ms setTimeout) after every auth-mutating
-      // request resolves successfully.
-      //
-      // Nanostores' `listen(fn)` (vs `subscribe(fn)`) does NOT fire on
-      // attach — only on subsequent changes, which is what we want.
-      let unsubscribeSignal: (() => void) | null = null;
-      const c = client as unknown as
-        | {
-            $store?: {
-              atoms?: Record<
-                string,
-                { listen?: (l: () => void) => () => void }
-              >;
-            };
-          }
-        | null;
-      const atom = c?.$store?.atoms?.$sessionSignal;
-      if (atom?.listen) {
-        unsubscribeSignal = atom.listen(() => {
-          void readAndNotify();
-        });
-      }
-
-      // Visibility fallback (cross-tab / external mutations).
-      const visibilityHandler = () => {
-        if (typeof document === "undefined") return;
-        if (document.visibilityState !== "visible") return;
-        void readAndNotify();
-      };
-      if (typeof document !== "undefined") {
-        document.addEventListener("visibilitychange", visibilityHandler);
-      }
-
+      callbacks.add(callback);
       return () => {
-        active = false;
-        generation++;
-        unsubscribeSignal?.();
-        if (typeof document !== "undefined") {
-          document.removeEventListener("visibilitychange", visibilityHandler);
-        }
+        callbacks.delete(callback);
       };
     },
   };
