@@ -239,9 +239,9 @@ export class SocketTransport extends EventEmitter implements Transport {
 
     this.socket.on("connect", () => {
       if (this.isDisposed) return;
+      void this._handshake().catch(() => {});
       this.connection.connected();
       this.emit("connected");
-      void this._handshake().catch(() => {});
       this._scheduleWatchdog();
     });
 
@@ -263,8 +263,8 @@ export class SocketTransport extends EventEmitter implements Transport {
     });
 
     if (this.socket.connected) {
-      this.connection.connected();
       void this._handshake().catch(() => {});
+      this.connection.connected();
     }
     this._scheduleWatchdog();
   }
