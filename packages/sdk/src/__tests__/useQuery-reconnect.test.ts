@@ -427,6 +427,45 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     release();
   });
 
+  it("keeps held rows a resync did not resend and merges the ones it did", async () => {
+    const client = new FakeClient();
+    const chain = makeChain({
+      results: [
+        { id: "p1", title: "one", updatedAt: "2026-10-26T00:00:00.000Z" },
+        { id: "p2", title: "two", updatedAt: "2026-10-26T00:00:01.000Z" },
+      ],
+      queryHash: "h-held",
+    });
+    const key = useQueryTest.buildKey("post", "u1", chain.__steps);
+    const release = useQueryTest.retain(client as any, key, () => {});
+    useQueryTest.fetch(key, chain, client as any);
+    await new Promise((resolve) => setImmediate(resolve));
+    const entry = useQueryTest.getEntry(client as any, key)!;
+    const [p1, p2] = entry.items;
+
+    const resync = deferred<any[]>();
+    client.resync.mockReturnValueOnce(resync.promise);
+    useQueryTest.onResyncRequired(client as any);
+    const [sent] = (client.resync.mock.calls[0] as any)[0];
+    expect(Object.keys(sent.have)).toEqual(["p1", "p2"]);
+    resync.resolve([
+      {
+        key,
+        hash: "h-held",
+        ids: ["p2", "p1"],
+        items: [{ id: "p2", title: "two, moved", updatedAt: "2026-10-26T00:00:02.000Z" }],
+        totalCount: 2,
+      },
+    ]);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(entry.items).toEqual([p2, p1]);
+    expect(entry.items[0]).toBe(p2);
+    expect(entry.items[1]).toBe(p1);
+    expect(p2.title).toBe("two, moved");
+    release();
+  });
+
   it("does not let a pre-resync fetch overwrite the resync result", async () => {
     const client = new FakeClient();
     const staleFetch = deferred<any[]>();

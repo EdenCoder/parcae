@@ -150,6 +150,8 @@ export function createServer_(options: ServerOptions): ServerContext {
     maxHttpBufferSize: 50e6, // 50 MB
     pingTimeout: 60000,
     pingInterval: 25000,
+    // Frames over 1 KB, plain RPC answers among them, are compressed natively.
+    perMessageDeflate: true,
   });
 
   return { polka: app, io, httpServer };

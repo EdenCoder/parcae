@@ -9,6 +9,5 @@ export default defineConfig({
   target: "es2022",
   splitting: true,
   treeshake: true,
-  noExternal: ["fast-json-patch"],
-  external: ["@parcae/model", "react", "react-dom"],
+  external: ["@parcae/model", "@preact/signals-core", "react", "react-dom"],
 });

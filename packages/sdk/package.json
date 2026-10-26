@@ -1,7 +1,7 @@
 {
   "name": "@parcae/sdk",
   "version": "0.8.1",
-  "description": "Parcae SDK — client transport and React hooks for Parcae backends",
+  "description": "Parcae SDK \u2014 client transport and React hooks for Parcae backends",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -30,11 +30,10 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@observ33r/object-equals": "^1.1.6",
     "@parcae/model": "workspace:*",
+    "@preact/signals-core": "^1.14.3",
     "compress-json": "^3.4.0",
     "eventemitter3": "^5.0.4",
-    "fast-json-patch": "^3.1.1",
     "pako": "^2.1.0",
     "short-unique-id": "^5.3.2",
     "socket.io-client": "^4.8.3"

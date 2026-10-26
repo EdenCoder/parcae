@@ -12,3 +12,4 @@ export type {
   ResyncResult,
   TransportDiagnostics,
 } from "./transports/socket";
+export { field, keyed, revision, settled } from "./signals";

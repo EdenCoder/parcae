@@ -101,7 +101,7 @@ The only built-in transport. Socket.IO over WebSocket.
 - One socket owned by each client
 - Hello/resync handshake — server confirms `userId` on every connect/reconnect
 - Request/response via `"call"` event with short unique request IDs
-- gzip + `compress-json` response encoding (`pako.ungzip` → `JSON.parse` → `compress-json.decompress`)
+- Plain answers: the socket connects with `answers=json` and the WebSocket compresses frames over 1 KB; an API from before still sends gzip + `compress-json`, which the transport also reads
 - GET request deduplication (in-flight coalescing)
 - 120s default timeout for pending requests, overridable per request
 - Token rotation triggers `refreshSession()`; explicit sign-out triggers `terminateSession()`
@@ -187,9 +187,9 @@ const { items } = useQuery(userId ? Post.where({ user: userId }) : null);
 
 Pass `{ subscribe: false }` for static queries that don't need realtime push.
 
-### useModel / useModelAtomic
+### useModelAtomic
 
-Subscribe to a single model instance and re-render on change.
+Read one field of a model and re-render when it moves.
 
 ```tsx
 import { useModelAtomic } from "@parcae/sdk/react";
@@ -201,7 +201,11 @@ function VideoPlayer({ block }: { block: Block }) {
 }
 ```
 
-`useModel` re-renders on any change to the model. `useModelAtomic(model, path)` narrows re-renders to a single dot-notation path (`"content"`, `"video.url"`, `"blocks.0.name"`). The default comparator is structural deep equality — pass `Object.is` as the third arg for hot primitive paths.
+`useModelAtomic(model, path)` reads a dot-notation path (`"content"`, `"video.url"`, `"blocks.0.name"`). Row data keeps the identity of every value a write did not change, so the read compares with `Object.is`. `useModelsAtomic(models, path)` reads one path of many models.
+
+### Signals
+
+`useLive(chain)` mounts a live query and returns its signals (`state`, `items`, `loading`, `version`) for stores and `computed`s. From `@parcae/sdk`: `field(row, path)` and `revision(row)` read rows as signals, `settled(source)` moves a signal once per settle window, and `keyed(make)` shares one value per key.
 
 ### useApi
 
@@ -288,6 +292,10 @@ import {
   SocketTransport,
   SessionMachine,
   ConnectionMachine,
+  field,
+  revision,
+  settled,
+  keyed,
 } from "@parcae/sdk";
 import type {
   ClientConfig,
@@ -306,8 +314,8 @@ import {
   ParcaeProvider,
   useParcae,
   useQuery,
+  useLive,
   prefetch,
-  useModel,
   useModelAtomic,
   useModelsAtomic,
   useApi,

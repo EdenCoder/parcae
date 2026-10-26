@@ -125,6 +125,8 @@ export interface ResyncEntry {
    * (legacy behaviour), so older backends remain compatible.
    */
   subscribe?: boolean;
+  /** The rows this client holds, by id, at their `rowVersion`. */
+  have?: Record<string, string>;
 }
 
 /** Wire shape for a single resolved entry coming back from the server. */
@@ -139,6 +141,8 @@ export interface ResyncResult {
   hash: string | null;
   items: any[];
   totalCount: number;
+  /** Every id in the result, in order, when the entry said what it holds; `items` are then the rest. */
+  ids?: string[];
 }
 
 interface PendingWaiter {
@@ -223,6 +227,8 @@ export class SocketTransport extends EventEmitter implements Transport {
       transports,
       withCredentials: true,
       autoConnect,
+      // RPC answers come as plain objects, which the WebSocket compresses.
+      query: { answers: "json" },
       ...(extraHeaders ? { extraHeaders } : {}),
     });
 
@@ -883,8 +889,11 @@ export class SocketTransport extends EventEmitter implements Transport {
         this._scheduleWatchdog();
         const ms = (performance.now() - t0).toFixed(0);
         try {
-          const uncompressed = pako.ungzip(msg, { to: "string" });
-          const parsed = decompress(JSON.parse(uncompressed));
+          // An API from before plain answers still sends gzipped compress-json.
+          const parsed =
+            msg instanceof ArrayBuffer || msg instanceof Uint8Array
+              ? decompress(JSON.parse(pako.ungzip(msg, { to: "string" })))
+              : msg;
           if (parsed.success) {
             log.debug(`← ${method.toUpperCase()} ${fullPath} (${ms}ms)`);
             resolve(parsed.result);

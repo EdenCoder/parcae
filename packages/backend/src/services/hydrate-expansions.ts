@@ -275,18 +275,15 @@ export async function projectForWire(
 /**
  * Project a sanitized linked row down to the requested field set.
  * `id` and `type` are always included so a heavily-projected payload
- * still carries stable ref identity.
+ * still carries stable ref identity, and `updatedAt` so the parent's
+ * `rowVersion` moves when the linked row does.
  */
 function projectFields(
   sanitized: Record<string, any>,
   projection: ReadonlySet<string>,
 ): Record<string, any> {
   const out: Record<string, any> = {};
-  // id + type are non-negotiable identity columns for inline refs.
-  if (sanitized.id !== undefined) out.id = sanitized.id;
-  if (sanitized.type !== undefined) out.type = sanitized.type;
-  for (const field of projection) {
-    if (field === "id" || field === "type") continue;
+  for (const field of ["id", "type", "updatedAt", ...projection]) {
     if (field in sanitized) out[field] = sanitized[field];
   }
   return out;

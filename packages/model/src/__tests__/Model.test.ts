@@ -468,31 +468,6 @@ describe("Model", () => {
       expect(adapter.patched.length).toBe(0);
     });
 
-    // DOL-1040: the patch ack path used to `structuredClone` the
-    // whole snapshot before applying ops, then reassign the cloned
-    // copy back to the symbol slot. The snapshot is private and the
-    // public `__serverSnapshot` getter is documented `Readonly`, so
-    // there's no consumer that needs the immutability — the defensive
-    // clone was pure waste. After the fix we mutate in place; this
-    // test pins that behaviour so we don't silently regress it.
-    it("mutates __serverSnapshot in place across patches — identity stable, no allocation", async () => {
-      const post = Post.create({ title: "x", views: 0 });
-      await post.save();
-      const before = (post as any).__serverSnapshot;
-      await post.patch([{ op: "replace", path: "/title", value: "y" }]);
-      await post.patch([{ op: "replace", path: "/views", value: 7 }]);
-      const after = (post as any).__serverSnapshot;
-      // Same object reference — no defensive structuredClone allocation
-      // happened during the ack.
-      expect(after).toBe(before);
-      // Values still tracked correctly so a subsequent flush is a no-op.
-      expect(after.title).toBe("y");
-      expect(after.views).toBe(7);
-      adapter.patched.length = 0;
-      await post.flush();
-      expect(adapter.patched.length).toBe(0);
-    });
-
     // Regression — DOL-553. A patch like
     // `replace /tags/0/text` on a model with no prior `tags` field
     // used to auto-vivify `tags` as `{}`, leaving the field as
@@ -707,7 +682,9 @@ describe("Model", () => {
         const writing = post.patch([
           { op: "replace", path: "/profile/name", value: "client" },
         ]);
-        (post as any).profile.theme = "local while writing";
+        post.stage([
+          { op: "replace", path: "/profile/theme", value: "local while writing" },
+        ]);
 
         response.resolve({
           ...post.__data,
@@ -1028,7 +1005,40 @@ describe("Model", () => {
     });
   });
 
-  describe("get / set dot-path accessors", () => {
+  describe("structural sharing", () => {
+    it("a server patch copies only the path it changes", () => {
+      const post = Post.hydrate(adapter, {
+        id     : "p1",
+        meta   : { theme: "light" },
+        blocks : { a: { text: "one" }, b: { text: "two" } },
+      });
+      const before = post.__data;
+
+      post[SYM_SERVER_PATCH]([{ op: "replace", path: "/blocks/a/text", value: "edited" }]);
+
+      expect((post as any).blocks.a.text).toBe("edited");
+      expect((post as any).blocks).not.toBe(before.blocks);
+      expect((post as any).blocks.b).toBe(before.blocks.b);
+      expect((post as any).meta).toBe(before.meta);
+      expect(before.blocks.a.text).toBe("one");
+    });
+
+    it("an equal server row keeps every value and changes nothing", () => {
+      const post = Post.hydrate(adapter, {
+        id     : "p1",
+        blocks : { a: { text: "one", at: new Date(0) } },
+      });
+      const blocks = (post as any).blocks;
+      const version = post[SYM_VERSION];
+
+      post[SYM_SERVER_MERGE](JSON.parse(JSON.stringify(post.__data)));
+
+      expect((post as any).blocks).toBe(blocks);
+      expect(post[SYM_VERSION]).toBe(version);
+    });
+  });
+
+  describe("get dot-path accessor", () => {
     it("get() reads nested fields by dot-path", () => {
       const post = Post.create();
       (post as any).nested = { a: { b: "deep" } };
@@ -1038,22 +1048,6 @@ describe("Model", () => {
     it("get() returns undefined for missing paths", () => {
       const post = Post.create();
       expect(post.get("nope.nothing")).toBeUndefined();
-    });
-
-    it("set() writes nested fields and auto-creates intermediates", () => {
-      const post = Post.create();
-      post.set("nested.a.b", 42);
-      expect((post as any).nested.a.b).toBe(42);
-    });
-
-    it("set() does NOT emit 'change' and does NOT call the adapter", () => {
-      const post = Post.create();
-      let fired = 0;
-      post.on("change", () => fired++);
-      post.set("title", "typed");
-      expect(post.title).toBe("typed");
-      expect(fired).toBe(0);
-      expect(adapter.patched.length).toBe(0);
     });
   });
 

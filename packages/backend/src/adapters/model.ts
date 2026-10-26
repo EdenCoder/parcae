@@ -12,7 +12,12 @@ import { loadCachedSchemas } from "../schema/generate";
 
 import {
   CHAINABLE_METHODS,
+  diff,
+  encodePointerSegment,
   isArrayIndexSegment,
+  patched,
+  pointerSegments,
+  same,
   SYM_SERVER_MERGE,
   type ColumnType,
   type ModelAdapter,
@@ -35,9 +40,7 @@ import {
   type FieldPolicy,
 } from "../services/field-policy";
 import equal from "deep-equal";
-import fastJsonPatch from "fast-json-patch";
 import type { Operation as PatchOp } from "fast-json-patch";
-const { applyPatch } = fastJsonPatch;
 import pluralize from "pluralize";
 import { ClientError } from "../helpers";
 import type { HookAction, HookTiming } from "../routing/hook";
@@ -133,10 +136,7 @@ function parsePatchPath(path: string): string[] {
   if (!path.startsWith("/")) {
     throw new ClientError(`patch: invalid path "${path}"`);
   }
-  return path
-    .slice(1)
-    .split("/")
-    .map((segment) => segment.replace(/~1/g, "/").replace(/~0/g, "~"));
+  return pointerSegments(path);
 }
 
 function assertSupportedPatchOps(ops: readonly PatchOp[]): void {
@@ -158,12 +158,8 @@ function assertSupportedPatchOps(ops: readonly PatchOp[]): void {
   }
 }
 
-function encodePatchSegment(segment: string): string {
-  return segment.replace(/~/g, "~0").replace(/\//g, "~1");
-}
-
 function prefixPatchOps(field: string, ops: readonly PatchOp[]): PatchOp[] {
-  const prefix = `/${encodePatchSegment(field)}`;
+  const prefix = `/${encodePointerSegment(field)}`;
   return ops.map((op) => ({
     ...op,
     path: `${prefix}${op.path}`,
@@ -202,7 +198,7 @@ function saveConflictTests(
 ): PatchOp[] {
   const tests = new Map<string, PatchOp>();
   const addTest = (segments: string[], value: unknown): void => {
-    const path = `/${segments.map(encodePatchSegment).join("/")}`;
+    const path = `/${segments.map(encodePointerSegment).join("/")}`;
     tests.set(path, { op: "test", path, value: dateSafeClone(value) });
   };
 
@@ -252,31 +248,23 @@ function saveDiff(
   for (const [field, column] of Object.entries(patchSchema)) {
     const previous = state[field];
     const next = current[field];
-    if (equal(previous, next, { strict: true })) continue;
+    if (same(previous, next)) continue;
     if (resolveColType(column) === "json") {
       if (previous === undefined) {
-        ops.push({ op: "add", path: `/${encodePatchSegment(field)}`, value: next });
+        ops.push({ op: "add", path: `/${encodePointerSegment(field)}`, value: next });
       } else if (next === undefined) {
-        ops.push({ op: "remove", path: `/${encodePatchSegment(field)}` });
+        ops.push({ op: "remove", path: `/${encodePointerSegment(field)}` });
       } else if (
         previous !== null &&
         next !== null &&
         typeof previous === "object" &&
         typeof next === "object"
       ) {
-        ops.push(
-          ...prefixPatchOps(
-            field,
-            fastJsonPatch.compare(
-              dateSafeClone(previous),
-              dateSafeClone(next),
-            ),
-          ),
-        );
+        ops.push(...prefixPatchOps(field, diff(previous, next)));
       } else {
         ops.push({
           op: "replace",
-          path: `/${encodePatchSegment(field)}`,
+          path: `/${encodePointerSegment(field)}`,
           value: next,
         });
       }
@@ -284,10 +272,10 @@ function saveDiff(
     }
     ops.push(
       next === undefined
-        ? { op: "remove", path: `/${encodePatchSegment(field)}` }
+        ? { op: "remove", path: `/${encodePointerSegment(field)}` }
         : {
             op: previous === undefined ? "add" : "replace",
-            path: `/${encodePatchSegment(field)}`,
+            path: `/${encodePointerSegment(field)}`,
             value: next,
           },
     );
@@ -685,7 +673,7 @@ export class BackendAdapter implements ModelAdapter {
     const action = creating ? "create" : "save";
     const cleanups: Array<() => Promise<void> | void> = [];
     const operationModel = this._captureSaveModel(model, data, creating);
-    const serverSnapshot = structuredClone(model.__serverSnapshot ?? data);
+    const serverSnapshot = model.__serverSnapshot ?? data;
     const schema = (ModelClass.__schema as SchemaDefinition) ?? {};
     let ops = creating ? undefined : saveDiff(schema, serverSnapshot, data).ops;
     let persistedData: Record<string, any>;
@@ -700,7 +688,7 @@ export class BackendAdapter implements ModelAdapter {
           (operationModel as any).createdAt = new Date();
         }
 
-        const writeData = structuredClone(operationModel.__data);
+        const writeData = operationModel.__data;
         if (creating) {
           const inserted = await this.write(table)
             .insert(serialize(operationModel, writeData))
@@ -2175,31 +2163,22 @@ export class BackendAdapter implements ModelAdapter {
     ops: PatchOp[],
     failureStatus = 400,
   ): void {
-    const state = structuredClone(data);
+    // A test reads the row after the ops before it.
+    let state = data;
+    const before: PatchOp[] = [];
     for (const op of ops) {
-      if (op.op === "test") {
-        let actual: any = state;
-        for (const segment of parsePatchPath(op.path)) {
-          actual = actual?.[segment];
-        }
-        if (!equal(actual, op.value)) {
-          throw new ClientError(`patch test failed at ${op.path}`, failureStatus);
-        }
+      if (op.op !== "test") {
+        before.push(op);
         continue;
       }
-      if (op.op !== "add" && op.op !== "replace" && op.op !== "remove") {
-        continue;
+      state = patched(state, before.splice(0));
+      let actual: any = state;
+      for (const segment of parsePatchPath(op.path)) {
+        actual = actual?.[segment];
       }
-      const segments = parsePatchPath(op.path);
-      let parent = state;
-      for (let i = 0; i < segments.length - 1; i++) {
-        const segment = segments[i]!;
-        if (parent[segment] == null || typeof parent[segment] !== "object") {
-          parent[segment] = isArrayIndexSegment(segments[i + 1]) ? [] : {};
-        }
-        parent = parent[segment];
+      if (!equal(actual, op.value)) {
+        throw new ClientError(`patch test failed at ${op.path}`, failureStatus);
       }
-      applyPatch(state, [op], false, true);
     }
   }
 
@@ -2389,10 +2368,7 @@ export class BackendAdapter implements ModelAdapter {
   ): any {
     const ModelClass = model.constructor as typeof Model;
     if (typeof (ModelClass as any).hydrate === "function") {
-      const captured = (ModelClass as any).hydrate(
-        this,
-        structuredClone(data),
-      );
+      const captured = (ModelClass as any).hydrate(this, data);
       captured.__isNew = creating;
       // hydrate() seeds `__serverSnapshot` from `data` — the POST-edit
       // state — which would make every save-hook before/after diff a
@@ -2408,7 +2384,7 @@ export class BackendAdapter implements ModelAdapter {
       return captured;
     }
 
-    const state = structuredClone(data);
+    const state = { ...data };
     const target = Object.assign(
       Object.create(Object.getPrototypeOf(model)),
       model,
@@ -2444,7 +2420,7 @@ export class BackendAdapter implements ModelAdapter {
       if (!(key in data)) delete model[key];
     }
     for (const [key, value] of Object.entries(data)) {
-      model[key] = structuredClone(value);
+      model[key] = value;
     }
   }
 

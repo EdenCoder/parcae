@@ -32,8 +32,11 @@
  * `"operations"` synchronously reports staged, patched, and effective remote
  * RFC 6902 changes with the current model revision. Direct field writes do
  * NOT emit; use stage() / patch(), or flush() to persist them.
- * `useModel` / `useModelAtomic` subscribe to `"change"`; reference identity
- * across merges is stable.
+ *
+ * Row data is immutable: write it with stage() / patch() or a top-level
+ * assignment, never in place. Every write and merge copies only the path it
+ * changes and keeps each equal value, so `===` says whether a value changed,
+ * and the snapshot shares every value the server and the row agree on.
  *
  * `stage()` / `patch()` / `flush()` emit synchronously (optimistic UI relies on
  * the immediate update). `SYM_SERVER_MERGE` emits via a microtask-
@@ -44,8 +47,15 @@
 
 import { EventEmitter } from "eventemitter3";
 import ShortId from "short-unique-id";
-import { applyPatch, compare } from "fast-json-patch";
-import { dedupOps } from "./patch";
+import {
+  diff,
+  same,
+  share,
+  patched,
+  dedupOps,
+  pointerSegments,
+  encodePointerSegment,
+} from "./patch";
 import {
   CHAINABLE_METHODS,
   type ModelAdapter,
@@ -124,8 +134,7 @@ export const SYM_SERVER_PATCH = Symbol("parcae:serverPatch");
 
 /**
  * Monotonic version counter bumped on every `"change"` emit. Exported so
- * `useModel(model)` / `useModelAtomic(model, path)` can use it as a
- * `useSyncExternalStore` snapshot.
+ * the SDK's `revision(row)` signal can read it.
  */
 export const SYM_VERSION = Symbol("parcae:version");
 
@@ -216,7 +225,6 @@ const INSTANCE_METHODS = new Set([
   "sanitize",
   "toJSON",
   "get",
-  "set",
   "constructor",
   "__savingCount",
   "__isNew",
@@ -400,32 +408,6 @@ function lazyQuery<T extends Model>(
 
 // ─── Patch helpers ──────────────────────────────────────────────────────────
 
-/**
- * RFC 6901 array-index segment: numeric string (`"0"`, `"12"`) or
- * the append-marker `"-"`. When the NEXT path segment after a
- * missing intermediate is one of these, the intermediate must be an
- * array, not an object — otherwise `applyPatch`'s array-add /
- * array-replace branch can't do its splice / index assignment, and
- * a downstream `for…of` would crash with "object is not iterable".
- */
-export function isArrayIndexSegment(seg: string | undefined): boolean {
-  return seg === "-" || (seg !== undefined && /^\d+$/.test(seg));
-}
-
-/** Decode one RFC 6901 JSON Pointer segment. */
-function decodePointerSegment(segment: string): string {
-  return segment.replace(/~1/g, "/").replace(/~0/g, "~");
-}
-
-function encodePointerSegment(segment: string): string {
-  return segment.replace(/~/g, "~0").replace(/\//g, "~1");
-}
-
-function pointerSegments(path: string): string[] {
-  if (!path.startsWith("/")) return [];
-  return path.slice(1).split("/").map(decodePointerSegment);
-}
-
 function prefixPatchOps(field: string, ops: readonly PatchOp[]): PatchOp[] {
   const prefix = `/${encodePointerSegment(field)}`;
   // boundary: spreading the fast-json-patch discriminated union preserves it.
@@ -439,51 +421,9 @@ function prefixPatchOps(field: string, ops: readonly PatchOp[]): PatchOp[] {
 }
 
 /**
- * `fast-json-patch` doesn't auto-vivify parent objects. Walk every op's
- * path and ensure intermediate segments exist so applyPatch doesn't
- * blow up on a missing parent.
- *
- * Vivification shape is decided by looking at the NEXT path segment:
- * a numeric index (or `-`) means the intermediate is an array; any
- * other key means it's a plain object. Without the array branch,
- * patches like `replace /blocks/<id>/shots/0/panel` on a block with
- * no prior `shots` field would create `block.shots = {}` and then
- * set `block.shots["0"]…` — leaving a `{ "0": {…} }` shape that
- * looks like an array but throws `object is not iterable` on the
- * very next `for (const s of block.shots)`.
- */
-export function ensureIntermediates(
-  doc: Record<string, any>,
-  ops: readonly PatchOp[],
-): void {
-  for (const { op, path } of ops) {
-    if (op === "test") continue;
-    const segments = pointerSegments(path);
-    let cursor: any = doc;
-    for (let i = 0; i < segments.length - 1; i++) {
-      const seg = segments[i]!;
-      const val = cursor[seg];
-      if (val === null || val === undefined || typeof val !== "object") {
-        cursor[seg] = isArrayIndexSegment(segments[i + 1]) ? [] : {};
-      }
-      cursor = cursor[seg];
-    }
-  }
-}
-
-/**
- * Produce a JSON-safe deep copy of `value` where `Date` instances are
- * serialised to ISO strings and arrays/objects are recursively cloned.
- *
- * Used by `_doFlush()` to feed `fast-json-patch.compare()` a Date-free
- * structure. Without this coercion, `compare()` walks each `Date` as a
- * string-iterable and emits ~24 char-level `add` ops per Date field
- * instead of detecting equality. One recursive walk per side drops
- * two string-allocation passes per flush.
- *
- * Semantics match `JSON.parse(JSON.stringify(value))`'s own-enumerable
- * traversal (we use `Object.keys` not `for...in` so prototype-chain
- * properties stay absent from the clone, same as the JSON round-trip).
+ * A JSON-safe deep copy of `value`: `Date` instances become ISO strings and
+ * arrays/objects are cloned, matching `JSON.parse(JSON.stringify(value))`'s
+ * own-enumerable traversal.
  */
 export function dateSafeClone(value: any): any {
   if (value === null || value === undefined) return value;
@@ -505,19 +445,19 @@ export function dateSafeClone(value: any): any {
   return value;
 }
 
-function dataValuesEqual(left: any, right: any): boolean {
-  if (Object.is(left, right)) return true;
-  if (
-    left === null ||
-    right === null ||
-    left === undefined ||
-    right === undefined ||
-    typeof left !== "object" ||
-    typeof right !== "object"
-  ) {
-    return false;
-  }
-  return compare(dateSafeClone(left), dateSafeClone(right)).length === 0;
+/**
+ * The version of one row as a client holds it: its `updatedAt` and each
+ * expanded ref's, in `refs` order. A resync compares it to skip rows
+ * the client already has. A write in the same millisecond as the last
+ * one keeps the version, so it reaches a client only as a patch.
+ */
+export function rowVersion(row: Record<string, any>, refs: readonly string[]): string {
+  const stamp = (value: unknown) => {
+    if (value === null || value === undefined) return "";
+    const time = new Date(value as string).getTime();
+    return Number.isFinite(time) ? String(time) : String(value);
+  };
+  return [row.updatedAt, ...refs.map((ref) => row[ref]?.updatedAt)].map(stamp).join(":");
 }
 
 function rawReferenceId(value: unknown): string | null {
@@ -528,20 +468,14 @@ function rawReferenceId(value: unknown): string | null {
   return null;
 }
 
+/** The server's row with the local edits made since `baselineData` replayed on top. */
 function mergeServerWithLocalChanges(
   serverData: Record<string, any>,
   baselineData: Record<string, any>,
   currentData: Record<string, any>,
 ): Record<string, any> {
-  const localOps = compare(
-    dateSafeClone(baselineData),
-    dateSafeClone(currentData),
-  ) as unknown as PatchOp[];
-  if (localOps.length === 0) return structuredClone(serverData);
-  const merged = structuredClone(serverData);
-  ensureIntermediates(merged, localOps);
-  applyPatch(merged, localOps, false, true);
-  return merged;
+  const localOps = diff(baselineData, currentData);
+  return localOps.length === 0 ? serverData : patched(serverData, localOps);
 }
 
 /** Return the top-level fields written by a batch of ops. */
@@ -966,7 +900,7 @@ export class Model extends EventEmitter {
     // __isNew routes flush() → save() in that case, so the snapshot
     // contents don't matter until after the first save ack refreshes
     // it. For hydrate() the snapshot correctly mirrors the server.
-    this[SYM_SNAPSHOT] = structuredClone(this.__data);
+    this[SYM_SNAPSHOT] = this.__data;
   }
 
   /** Keep an expanded object or raw id on the field and expose its raw id at `$field`. */
@@ -1078,7 +1012,7 @@ export class Model extends EventEmitter {
    * captured model with the caller's true pre-save snapshot so save
    * hooks can diff before → after. */
   set __serverSnapshot(data: Readonly<Record<string, any>>) {
-    this[SYM_SNAPSHOT] = structuredClone(data) as Record<string, any>;
+    this[SYM_SNAPSHOT] = { ...data };
   }
 
   // ── Dot-path Accessors ──────────────────────────────────────────────
@@ -1099,31 +1033,6 @@ export class Model extends EventEmitter {
     return cur as V;
   }
 
-  /**
-   * Write a nested field by dot-path. Pure write — does NOT emit
-   * `"change"` and does NOT send to the server. Call `.flush()` (or an
-   * explicit `.patch([...])`) to persist. Missing intermediate objects
-   * are auto-created.
-   *
-   *   project.set("blocks.abc.image.url", "https://...");
-   *   await project.flush();
-   */
-  set(path: string, value: unknown): void {
-    if (!path) return;
-    const parts = path.split(".");
-    if (parts.length === 1) {
-      (this as any)[parts[0]!] = value;
-      return;
-    }
-    let cur: any = this;
-    for (let i = 0; i < parts.length - 1; i++) {
-      const p = parts[i]!;
-      if (cur[p] == null || typeof cur[p] !== "object") cur[p] = {};
-      cur = cur[p];
-    }
-    cur[parts[parts.length - 1]!] = value;
-  }
-
   // ── Persistence ──────────────────────────────────────────────────────
 
   /**
@@ -1136,7 +1045,7 @@ export class Model extends EventEmitter {
    */
   save(): Promise<void> {
     (this as any).updatedAt = new Date().toISOString();
-    const data = structuredClone(this.__data);
+    const data = this.__data;
     return this._enqueueWrite(() => this._writeSave(data));
   }
 
@@ -1162,7 +1071,7 @@ export class Model extends EventEmitter {
     const ops = this._applyLocalOperations(rawOps);
     if (ops.length === 0) return Promise.resolve();
 
-    const expectedData = structuredClone(this.__data);
+    const expectedData = this.__data;
     const paths = this._beginPatch(ops);
     return this._enqueueWrite(() =>
       this._writePatch(ops, expectedData, paths),
@@ -1175,18 +1084,12 @@ export class Model extends EventEmitter {
     // op in the same batch. Without this, fast-json-patch crashes
     // on the sub-path op when its parent has just been removed.
     // Callers can freely compose helpers — the framework keeps the
-    // batch consistent. See `patch.ts:dedupOps` for the contract.
+    // batch consistent. See `patch.ts:dedupOps` for the contract. The
+    // row owns its copy of the values the ops carry.
     const ops = structuredClone(dedupOps(rawOps)) as PatchOp[];
     if (ops.length === 0) return ops;
 
-    // Published field snapshots must survive later nested writes.
-    const snap = this.__data;
-    for (const key of topLevelKeys(ops)) {
-      snap[key] = structuredClone(snap[key]);
-    }
-    ensureIntermediates(snap, ops);
-    applyPatch(snap, ops, false, true);
-    this._copyPatchedTopLevels(snap, ops);
+    this._copyPatchedTopLevels(patched(this.__data, ops), ops);
 
     (this as any)[SYM_VERSION] = (this as any)[SYM_VERSION] + 1;
     this._emitOperations(ops, "local");
@@ -1294,11 +1197,7 @@ export class Model extends EventEmitter {
   }
 
   private _replaceServerSnapshot(data: Record<string, any>): void {
-    const snapshot = this[SYM_SNAPSHOT];
-    for (const key of Object.keys(snapshot)) delete snapshot[key];
-    for (const [key, value] of Object.entries(data)) {
-      snapshot[key] = structuredClone(value);
-    }
+    this[SYM_SNAPSHOT] = { ...data };
   }
 
   /**
@@ -1316,21 +1215,11 @@ export class Model extends EventEmitter {
    * flush computes its diff only after prior writes acknowledge, so it
    * captures edits made while those writes were awaiting the adapter.
    *
-   * ## Pre-processing before diff
-   *
-   *   1. `SYSTEM_DATA_KEYS` (`id`, `type`, `createdAt`, `updatedAt`,
-   *      `tmp`) are stripped from both sides. These are framework-
-   *      managed: `updatedAt` is stamped by the adapter on every
-   *      save / patch, `id` / `type` / `createdAt` never change, and
-   *      `tmp` is client-only. The schema resolver deliberately
-   *      excludes them from `__schema`, so emitting patch ops for
-   *      them would throw `unknown column` at the backend adapter.
-   *
-   *   2. Both sides are JSON round-tripped to serialize Date objects
-   *      (and other non-JSON natives) to stable string form. Without
-   *      this, `fast-json-patch.compare` treats Date as a string
-   *      iterable and produces 24 character-level `add` ops per Date
-   *      field instead of equality.
+   * `SYSTEM_DATA_KEYS` (`id`, `type`, `createdAt`, `updatedAt`, `tmp`)
+   * are framework-managed and never in the diff: the schema resolver
+   * excludes them from `__schema`, so the backend adapter would reject
+   * their ops as unknown columns. The snapshot shares every value the
+   * row did not change, so the diff walks only what did.
    */
   flush(): Promise<void> {
     return this._enqueueWrite(() => this._doFlush());
@@ -1341,31 +1230,14 @@ export class Model extends EventEmitter {
   private async _doFlush(): Promise<void> {
     if (this.__isNew) {
       (this as any).updatedAt = new Date().toISOString();
-      return this._writeSave(structuredClone(this.__data));
+      return this._writeSave(this.__data);
     }
 
-    // Strip framework-managed columns AND coerce Date instances to
-    // ISO strings in one pass — see the file-level `dateSafeClone`
-    // for the why. Previously this was a separate `strip()` (one
-    // walk) followed by `JSON.parse(JSON.stringify(...))` (one
-    // walk + two string allocations) per side. The combined helper
-    // collapses to one recursive walk per side and skips the
-    // string allocations entirely.
-    const stripAndDateClone = (
-      data: Record<string, any>,
-    ): Record<string, any> => {
-      const out: Record<string, any> = {};
-      for (const key of Object.keys(data)) {
-        if (SYSTEM_DATA_KEYS.has(key)) continue;
-        out[key] = dateSafeClone((data as any)[key]);
-      }
-      return out;
-    };
-    const snap = stripAndDateClone(this[SYM_SNAPSHOT] ?? {});
-    const current = stripAndDateClone(this.__data);
-    const ops = compare(snap, current) as unknown as PatchOp[];
+    const owned = (data: Record<string, any>) =>
+      Object.fromEntries(Object.entries(data).filter(([key]) => !SYSTEM_DATA_KEYS.has(key)));
+    const ops = diff(owned(this[SYM_SNAPSHOT] ?? {}), owned(this.__data));
     if (ops.length === 0) return;
-    const expectedData = structuredClone(this.__data);
+    const expectedData = this.__data;
     const paths = this._beginPatch(ops);
     (this as any)[SYM_VERSION] = (this as any)[SYM_VERSION] + 1;
     this.emit("change");
@@ -1382,10 +1254,7 @@ export class Model extends EventEmitter {
     expectedData?: Record<string, any>,
     removedFields?: ReadonlySet<string>,
   ): this {
-    const previousEffectiveData =
-      this.listenerCount("operations") > 0
-        ? dateSafeClone(this.__data)
-        : null;
+    const before = this.listenerCount("operations") > 0 ? this.__data : null;
     const sourceModel = serverValue instanceof Model ? serverValue : null;
     const incomingData: Record<string, any> = sourceModel
       ? sourceModel.__data
@@ -1400,9 +1269,7 @@ export class Model extends EventEmitter {
       if (Object.prototype.hasOwnProperty.call(incomingData, field)) refFields.add(field);
     }
     this[SYM_REF_FIELDS] = refFields;
-    const authoritativeData: Record<string, any> = expectedData
-      ? structuredClone(expectedData)
-      : {};
+    const authoritativeData: Record<string, any> = { ...expectedData };
 
     for (const [key, value] of Object.entries(incomingData)) {
       if (key.startsWith("$")) continue;
@@ -1438,7 +1305,7 @@ export class Model extends EventEmitter {
       if (isRef) {
         let incoming: unknown = nextVal ?? null;
         let isUnavailableExpansion = false;
-        if (dataValuesEqual(nextVal, authoritativeData[key])) {
+        if (same(nextVal, authoritativeData[key])) {
           const source = sourceModel ? (sourceModel as any)[key] : incomingData[key];
           if (source instanceof Model || (source && typeof source === "object")) {
             incoming = source;
@@ -1464,12 +1331,14 @@ export class Model extends EventEmitter {
           !isUnavailableExpansion
         ) {
           if (incoming && typeof incoming === "object" && incoming !== current) {
-            didExpandedChange = !dataValuesEqual(current, incoming);
+            didExpandedChange = !same(current, incoming);
             if (!didExpandedChange) {
               incoming = current;
             } else if (current instanceof Model && incoming instanceof Model) {
               current[SYM_SERVER_MERGE](incoming);
               incoming = current;
+            } else if (!(current instanceof Model) && !(incoming instanceof Model)) {
+              incoming = share(current, incoming);
             }
           } else {
             incoming = current;
@@ -1487,8 +1356,9 @@ export class Model extends EventEmitter {
         continue;
       }
 
-      if (!Object.is((this as any)[key], nextVal)) {
-        (this as any)[key] = nextVal;
+      const value = share((this as any)[key], nextVal);
+      if (!Object.is((this as any)[key], value)) {
+        (this as any)[key] = value;
         didChange = true;
       }
       if (!SYSTEM_DATA_KEYS.has(key)) this._installRawAccessor(key);
@@ -1512,27 +1382,22 @@ export class Model extends EventEmitter {
       didChange = true;
     }
 
-    const snapshot = this[SYM_SNAPSHOT];
-    for (const key of Object.keys(snapshot)) {
+    // The snapshot is the server's row, sharing each value the row agrees with.
+    const snapshot: Record<string, any> = {};
+    for (const [key, value] of Object.entries(this[SYM_SNAPSHOT])) {
       if (serverKeys.has(key)) continue;
-      if (removedFields?.has(key)) {
-        snapshot[key] = null;
-      } else if (!refFields.has(key)) {
-        delete snapshot[key];
-      }
+      if (removedFields?.has(key)) snapshot[key] = null;
+      else if (refFields.has(key)) snapshot[key] = value;
     }
-    for (const [key, value] of Object.entries(authoritativeData)) {
-      snapshot[key] = structuredClone(value);
-    }
+    for (const [key, value] of Object.entries(authoritativeData))
+      snapshot[key] = refFields.has(key) ? value : share((this as any)[key], value);
     for (const field of removedFields ?? []) snapshot[field] = null;
+    this[SYM_SNAPSHOT] = snapshot;
 
     if (didChange) {
       (this as any)[SYM_VERSION] = (this as any)[SYM_VERSION] + 1;
-      if (previousEffectiveData) {
-        const ops = compare(
-          previousEffectiveData,
-          dateSafeClone(this.__data),
-        ) as unknown as PatchOp[];
+      if (before) {
+        const ops = diff(before, this.__data);
         if (ops.length > 0) this._emitOperations(ops, "remote");
       }
       scheduleChangeEmit(this);
@@ -1576,13 +1441,10 @@ export class Model extends EventEmitter {
     for (const [field, patches] of refOps) {
       const loaded = (this as any)[field];
       if (loaded instanceof Model) {
-        const previous = dateSafeClone(loaded.__data);
+        const previous = loaded.__data;
         const previousVersion = loaded[SYM_VERSION];
         loaded[SYM_SERVER_PATCH](patches);
-        const effective = compare(
-          previous,
-          dateSafeClone(loaded.__data),
-        ) as unknown as PatchOp[];
+        const effective = diff(previous, loaded.__data);
         if (loaded[SYM_VERSION] !== previousVersion) {
           didRefChange = true;
           changedRefOps.push(
@@ -1592,14 +1454,8 @@ export class Model extends EventEmitter {
         continue;
       }
       if (!loaded || typeof loaded !== "object") continue;
-      const previous = dateSafeClone(loaded);
-      const next = dateSafeClone(previous);
-      ensureIntermediates(next, patches);
-      applyPatch(next, patches, false, true);
-      const effective = compare(
-        previous,
-        next,
-      ) as unknown as PatchOp[];
+      const next = patched(loaded, patches);
+      const effective = diff(loaded, next);
       if (effective.length > 0) {
         this._installRefField(field, next);
         didRefChange = true;
@@ -1609,7 +1465,7 @@ export class Model extends EventEmitter {
 
     const previousVersion = this[SYM_VERSION];
     if (outerOps.length > 0) {
-      const snapshot = structuredClone(this[SYM_SNAPSHOT]);
+      const base: Record<string, any> = { ...this[SYM_SNAPSHOT] };
       const removedValueFields = new Set<string>();
       const removedRawFields = new Set<string>();
       for (const op of outerOps) {
@@ -1636,11 +1492,10 @@ export class Model extends EventEmitter {
           return (op.op === "add" || op.op === "replace") && op.value == null;
         });
         if (!hasRawPatch && clearsExpandedField) {
-          snapshot[`$${field}`] = (this as any)[`$${field}`];
+          base[`$${field}`] = (this as any)[`$${field}`];
         }
       }
-      ensureIntermediates(snapshot, outerOps);
-      applyPatch(snapshot, outerOps, false, true);
+      const snapshot = patched(base, outerOps);
       for (const field of removedValueFields) {
         if (!removedFields.has(field)) snapshot[field] = null;
       }

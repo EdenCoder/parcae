@@ -113,7 +113,7 @@ function createQuerySource(initialResults: Record<string, any>[] = []) {
 function createTrackedQuerySource(
   modelType: string,
   initialResults: Record<string, any>[],
-  options: { adapter?: any; sql?: string } = {},
+  options: { adapter?: any; sql?: string; limit?: number } = {},
 ) {
   let currentResults = initialResults;
   let nextFirstError: Error | null = null;
@@ -130,6 +130,8 @@ function createTrackedQuerySource(
       clearLimit: () => chain,
       clone: () => makeChain(id),
       exec: () => ({
+        // Where Knex keeps the limit a builder applies.
+        _single: { limit: options.limit },
         toSQL: () => ({
           sql: options.sql ?? `SELECT * FROM ${modelType}s`,
           bindings: [],
@@ -884,7 +886,7 @@ describe("QuerySubscriptionManager", () => {
       expect(emitted).toHaveLength(0);
     });
 
-    it("should strip updatedAt paths from mixed update patches", async () => {
+    it("should keep updatedAt paths in a patch that changes more", async () => {
       source.setResults([
         row("p1", {
           name: "A",
@@ -912,9 +914,18 @@ describe("QuerySubscriptionManager", () => {
       await tick();
 
       expect(emitted).toHaveLength(1);
-      expect(emitted[0]!.data.ops[0].patch).toEqual([
-        { op: "replace", path: "/name", value: "A-updated" },
-      ]);
+      expect(emitted[0]!.data.ops[0].patch).toEqual(
+        expect.arrayContaining([
+          { op: "replace", path: "/name", value: "A-updated" },
+          { op: "replace", path: "/updatedAt", value: "2026-05-15T07:58:00.000Z" },
+          {
+            op: "replace",
+            path: "/references/nodes/0/updatedAt",
+            value: "2026-05-15T07:58:01.000Z",
+          },
+        ]),
+      );
+      expect(emitted[0]!.data.ops[0].patch).toHaveLength(3);
     });
 
     it("should emit multiple ops in a single event (add + remove + update)", async () => {
@@ -1062,7 +1073,7 @@ describe("QuerySubscriptionManager", () => {
       });
     });
 
-    it("falls back to a full query when the changed row leaves membership", async () => {
+    it("removes a row that leaves a complete result without a full query", async () => {
       const tracked = createTrackedQuerySource("project", [
         row("p1", { name: "A" }),
         row("p2", { name: "B" }),
@@ -1078,8 +1089,70 @@ describe("QuerySubscriptionManager", () => {
       });
       await tick();
 
-      expect(tracked.calls).toEqual({ find: 2, first: ["p1"] });
+      expect(tracked.calls).toEqual({ find: 1, first: ["p1"] });
       expect(emitted[0]!.data.ops).toEqual([{ op: "remove", id: "p1" }]);
+    });
+
+    it("adds an inserted row to a complete unordered result without a full query", async () => {
+      const tracked = createTrackedQuerySource("project", [row("p1", { name: "A" })]);
+      await manager.subscribe({ socketId: "s1", query: tracked.query });
+      tracked.setResults([row("p1", { name: "A" }), row("p2", { name: "B" })]);
+
+      manager.onModelChange("project", {
+        table: "projects",
+        op: "insert",
+        id: "p2",
+        changedFields: null,
+      });
+      await tick();
+
+      expect(tracked.calls).toEqual({ find: 1, first: ["p2"] });
+      expect(emitted[0]!.data.ops).toEqual([
+        { op: "add", id: "p2", data: row("p2", { name: "B" }) },
+      ]);
+    });
+
+    it("turns away a changed row its own steps reject without a scoped read", async () => {
+      const stored = new Map([["p2", { __data: { id: "p2", owner: "other" } }]]);
+      const tracked = createTrackedQuerySource("project", [row("p1", { owner: "me" })], {
+        adapter: { batchFindByTypeOnWrite: async () => stored },
+      });
+      await manager.subscribe({
+        socketId: "s1",
+        query: tracked.query,
+        steps: [{ method: "where", args: ["owner", "me"] }],
+      });
+
+      manager.onModelChange("project", {
+        table: "projects",
+        op: "insert",
+        id: "p2",
+        changedFields: null,
+      });
+      await tick();
+
+      expect(tracked.calls).toEqual({ find: 1, first: [] });
+      expect(emitted).toEqual([]);
+    });
+
+    it("counts a result at its limit to tell that it holds every match", async () => {
+      const tracked = createTrackedQuerySource("project", [row("p1", { name: "A" })], {
+        sql: "SELECT * FROM projects LIMIT 1",
+        limit: 1,
+        adapter: { executeSubscriptionCount: async () => 1 },
+      });
+      await manager.subscribe({ socketId: "s1", query: tracked.query });
+      tracked.setResults([row("p1", { name: "A2" })]);
+
+      manager.onModelChange("project", {
+        table: "projects",
+        op: "update",
+        id: "p1",
+        changedFields: ["name"],
+      });
+      await tick();
+
+      expect(tracked.calls).toEqual({ find: 1, first: ["p1"] });
     });
 
     it("fully re-evaluates updates that can change explicit ordering", async () => {
@@ -1109,11 +1182,11 @@ describe("QuerySubscriptionManager", () => {
       expect(emitted[0]!.data.order).toEqual(["p2", "p1"]);
     });
 
-    it("fully re-evaluates limited queries without stable ordering", async () => {
+    it("fully re-evaluates an unordered result that reaches its limit", async () => {
       const tracked = createTrackedQuerySource(
         "project",
         [row("p1", { name: "A" })],
-        { sql: "SELECT * FROM projects LIMIT 25" },
+        { sql: "SELECT * FROM projects LIMIT 1", limit: 1 },
       );
       await manager.subscribe({ socketId: "s1", query: tracked.query });
       tracked.setResults([row("p1", { name: "A2" })]);
@@ -1129,12 +1202,40 @@ describe("QuerySubscriptionManager", () => {
       expect(tracked.calls).toEqual({ find: 2, first: [] });
     });
 
+    it("targets an update to an unordered result under its limit", async () => {
+      const tracked = createTrackedQuerySource(
+        "project",
+        [row("p1", { name: "A" }), row("p2", { name: "B" })],
+        { sql: "SELECT * FROM projects LIMIT 25", limit: 25 },
+      );
+      await manager.subscribe({ socketId: "s1", query: tracked.query });
+      tracked.setResults([row("p1", { name: "A2" }), row("p2", { name: "B" })]);
+
+      manager.onModelChange("project", {
+        table: "projects",
+        op: "update",
+        id: "p1",
+        changedFields: ["name"],
+      });
+      await tick();
+
+      expect(tracked.calls).toEqual({ find: 1, first: ["p1"] });
+      expect(emitted[0]!.data.ops).toEqual([
+        {
+          op: "update",
+          id: "p1",
+          patch: [{ op: "replace", path: "/name", value: "A2" }],
+        },
+      ]);
+    });
+
     it("fully re-evaluates a limited non-unique order", async () => {
       const tracked = createTrackedQuerySource(
         "project",
         [row("p1", { name: "A", rank: 1 })],
         {
           sql: 'SELECT * FROM projects ORDER BY "rank" ASC LIMIT 25',
+          limit: 25,
         },
       );
       await manager.subscribe({
@@ -1161,6 +1262,7 @@ describe("QuerySubscriptionManager", () => {
         [row("p1", { name: "A", rank: 1 })],
         {
           sql: 'SELECT * FROM projects ORDER BY "rank" ASC, "id" ASC LIMIT 25',
+          limit: 25,
         },
       );
       await manager.subscribe({

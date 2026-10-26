@@ -1,21 +1,25 @@
 "use client";
 
 import {
-  ensureIntermediates,
   generateId,
   Model,
+  patched,
+  rowVersion,
   SESSION_BOUNDARY_ERRORS,
   serializeLazyQueryArgs,
   SYM_SERVER_MERGE,
   SYM_SERVER_PATCH,
   SYM_VERSION,
+  type PatchOp,
 } from "@parcae/model";
-import { applyPatch, type Operation } from "fast-json-patch";
-import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+import { computed, effect, signal, type ReadonlySignal, type Signal } from "@preact/signals-core";
+import { useEffect, useMemo, useRef } from "react";
 import type { ParcaeClient } from "../client";
 import { log } from "../log";
 import { useParcae } from "./context";
 import { useSession } from "./useSession";
+import { revision } from "../signals";
+import { useSignalValue } from "./useSignalValue";
 
 interface QueryChain<T> {
   find(): Promise<T[]>;
@@ -32,8 +36,8 @@ interface QueryChain<T> {
 interface UseQueryOptions {
   /**
    * Drift-detection refetch interval, in ms. Pauses while the tab is
-   * hidden or the transport is disconnected. Default 60_000, set to
-   * 0 to disable.
+   * hidden or the transport is disconnected. Default 0, which never
+   * polls.
    */
   poll?: number;
   /**
@@ -48,17 +52,33 @@ interface UseQueryOptions {
   subscribe?: boolean;
 }
 
-interface UseQueryResult<T> {
+/** What a query holds; a new state replaces it whenever any part moves, a row's fields included. */
+export interface QueryState<T = any> {
   items: T[];
   loading: boolean;
   error: Error | null;
   /** Total matching records on the server (before limit/offset). */
   total: number;
+  version: number;
+}
+
+interface QueryActions<T> {
   refetch: () => void;
   addOptimistic: (item: T | Record<string, any>) => T;
   removeOptimistic: (item: T | string) => void;
   onOps: (listener: (ops: QueryOp[]) => void) => () => void;
 }
+
+/** A live query as signals, shared by every reader of its cache entry. */
+export interface Live<T> extends QueryActions<T> {
+  readonly state: ReadonlySignal<QueryState<T>>;
+  readonly items: ReadonlySignal<T[]>;
+  readonly loading: ReadonlySignal<boolean>;
+  /** Moves once per tick in which any row's fields moved, local writes included. */
+  readonly version: ReadonlySignal<number>;
+}
+
+type UseQueryResult<T> = Omit<QueryState<T>, "version"> & QueryActions<T>;
 
 // ── Cache ────────────────────────────────────────────────────────────────────
 
@@ -70,10 +90,10 @@ interface CacheEntry {
   mergedKey: string;
   loading: boolean;
   error: Error | null;
-  hash: string;
+  state: Signal<QueryState>;
+  live: Live<any> | null;
   version: number;
   refs: number;
-  listeners: Set<() => void>;
   dispose: (() => void) | null;
   gcTimer: ReturnType<typeof setTimeout> | null;
   queryHash: string | null;
@@ -118,7 +138,7 @@ let caches = new WeakMap<ParcaeClient, Map<string, CacheEntry>>();
 const GC_DELAY = 60_000;
 const QUERY_STUCK_MS = 10_000;
 const EMPTY: any[] = [];
-const INITIAL_HASH = "L";
+const INITIAL_STATE: QueryState = { items: EMPTY, loading: true, error: null, total: 0, version: 0 };
 
 /**
  * Drop this client's entries for the identity that just ended.
@@ -257,12 +277,6 @@ function purgeCacheForUser(
 const MAX_RETRIES = 3;
 const RETRY_DELAYS = [1_000, 3_000, 10_000];
 
-function buildHash(e: CacheEntry): string {
-  if (e.loading) return "L";
-  if (e.error) return `E:${e.error.message}`;
-  return `D:v${e.version}:o${e.optimistic.length}:i${e.items.length}`;
-}
-
 export function getMergedItems(entry: CacheEntry): any[] {
   if (entry.optimistic.length === 0) {
     if (entry.mergedItems !== entry.items) {
@@ -314,10 +328,10 @@ function getOrCreate(
       mergedKey: "0:0",
       loading: true,
       error: null,
-      hash: INITIAL_HASH,
+      state: signal(INITIAL_STATE),
+      live: null,
       version: 0,
       refs: 0,
-      listeners: new Set(),
       dispose: null,
       gcTimer: null,
       queryHash: null,
@@ -348,7 +362,7 @@ function getOrCreate(
       e.loaded = true;
       e.loading = false;
       e.version = stale.version;
-      e.hash = buildHash(e);
+      notify(e);
     }
     cache.set(key, e);
   }
@@ -356,10 +370,51 @@ function getOrCreate(
 }
 
 function notify(e: CacheEntry): void {
-  const next = buildHash(e);
-  if (next !== e.hash) {
-    e.hash = next;
-    for (const fn of e.listeners) fn();
+  const now = e.state.peek();
+  const items = getMergedItems(e);
+  if (
+    now.items === items &&
+    now.loading === e.loading &&
+    now.error === e.error &&
+    now.total === e.totalCount &&
+    now.version === e.version
+  )
+    return;
+  e.state.value = {
+    items,
+    loading: e.loading,
+    error: e.error,
+    total: e.totalCount,
+    version: e.version,
+  };
+}
+
+/** Collect an entry nothing holds once the grace period passes. */
+function collectLater(e: CacheEntry): void {
+  if (e.gcTimer || e.refs > 0 || !isLive(e)) return;
+  e.gcTimer = setTimeout(() => {
+    e.gcTimer = null;
+    if (e.refs > 0 || !isLive(e)) return;
+    caches.get(e.client)?.delete(e.key);
+    disposeEntry(e);
+  }, GC_DELAY);
+}
+
+function release(e: CacheEntry): void {
+  e.refs--;
+  if (e.refs > 0) return;
+  if (e.retryTimer) {
+    clearTimeout(e.retryTimer);
+    e.retryTimer = null;
+  }
+  collectLater(e);
+}
+
+function hold(e: CacheEntry): void {
+  e.refs++;
+  if (e.gcTimer) {
+    clearTimeout(e.gcTimer);
+    e.gcTimer = null;
   }
 }
 
@@ -378,7 +433,7 @@ function detachSubscription(entry: CacheEntry): void {
 type QueryOp =
   | { op: "add"; id: string; data: Record<string, any> }
   | { op: "remove"; id: string }
-  | { op: "update"; id: string; patch: Operation[] };
+  | { op: "update"; id: string; patch: PatchOp[] };
 
 function pathsOverlap(a: string, b: string): boolean {
   return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
@@ -448,7 +503,7 @@ function applyOps(
   if (ops.length === 0) return { items, changed: false };
 
   const addOps = new Map<string, Record<string, any>>();
-  const updateOps = new Map<string, Operation[]>();
+  const updateOps = new Map<string, PatchOp[]>();
   const removeIds = new Set<string>();
 
   for (const op of ops) {
@@ -505,10 +560,7 @@ function applyOps(
     if (typeof existing[SYM_SERVER_PATCH] === "function") {
       existing[SYM_SERVER_PATCH](filtered);
     } else {
-      const snapshot = structuredClone(existing.__data ?? {});
-      ensureIntermediates(snapshot, filtered);
-      applyPatch(snapshot, filtered, false, true);
-      for (const [k, v] of Object.entries(snapshot)) {
+      for (const [k, v] of Object.entries(patched(existing.__data ?? {}, filtered))) {
         existing[k] = v;
       }
     }
@@ -520,22 +572,16 @@ function applyOps(
   }
 
   if (!hasRemoves && !hasAdds) {
-    // Update-only frame. The models in the array were mutated in
-    // place via `SYM_SERVER_MERGE`; the array slot identity doesn't
-    // need to flip, so memoized children keyed on item references
-    // bail out, and field-level consumers wake through parcae's
-    // per-model `change` events (`useModel` / `useModelAtomic`).
+    // Update-only frame. The models in the array merged the patch in
+    // place, so the array keeps its identity and field readers wake
+    // through each row's own signals (`field` / `useModelAtomic`).
     //
-    // `changed: true` still bumps `entry.version` and notifies —
-    // and because the store snapshot is the hash string (which
-    // embeds the version), every component calling `useQuery` on
-    // this entry DOES re-render; useSyncExternalStore cannot bail
-    // here. That's deliberate: consumers rendering row fields
-    // straight off `items` (`items.map(i => i.title)`) must stay
-    // live without a per-model hook. The cost is one container
-    // re-render per server re-eval window — bounded by the
-    // backend's debounce and `Model.realtime` overrides — so keep
-    // heavy row UIs in memoized children if that matters.
+    // `changed: true` still bumps `entry.version`, which replaces the
+    // entry's state, so every `useQuery` caller of this entry renders
+    // again. That's deliberate: consumers rendering row fields straight
+    // off `items` (`items.map(i => i.title)`) stay live without a field
+    // read. The cost is one container render per server re-eval window,
+    // bounded by the backend's debounce and `Model.realtime` overrides.
     return { items, changed: true };
   }
 
@@ -603,7 +649,8 @@ function reconcile(
       optimisticById.get(fresh.id) ??
       (fresh.tmp ? optimisticByTmp.get(fresh.tmp) : undefined);
     if (existing) {
-      if (typeof existing[SYM_SERVER_MERGE] === "function") {
+      // A held row a resync did not resend is already current.
+      if (existing !== fresh && typeof existing[SYM_SERVER_MERGE] === "function") {
         const previousVersion = existing[SYM_VERSION];
         existing[SYM_SERVER_MERGE](fresh);
         if (existing[SYM_VERSION] !== previousVersion) scalarChanged = true;
@@ -888,6 +935,26 @@ function doFetch(
 
 // ── Resync handler ──────────────────────────────────────────────────────────
 
+/** The rows a loaded entry holds, by id, at the version a resync compares. */
+function holdings(entry: CacheEntry): Record<string, string> {
+  const refs = [
+    ...new Set(
+      (entry.chain?.__steps ?? []).flatMap((step: any) =>
+        step?.method === "expand"
+          ? (step.args ?? []).map((arg: unknown) => String(arg).split(".")[0])
+          : []),
+    ),
+  ].sort();
+  return Object.fromEntries(entry.items.map((row: any) => [row.id, rowVersion(row, refs)]));
+}
+
+/** The server's order of rows it resent, else held; null when it names a row neither has. */
+function heldInOrder(held: any[], fresh: any[], ids: string[]): any[] | null {
+  const byId = new Map<string, any>([...held, ...fresh].map((row) => [row.id, row]));
+  const next = ids.map((id) => byId.get(id));
+  return next.every(Boolean) ? next : null;
+}
+
 /**
  * Called by ParcaeProvider after the transport's hello handshake
  * lands on a (re)connection. Fires a batched `resync` RPC for every
@@ -906,6 +973,7 @@ export function _onResyncRequired(client: ParcaeClient): void {
     steps: unknown[];
     queryHash: string | null;
     subscribe: boolean;
+    have: Record<string, string> | null;
   }[] = [];
 
   for (const [cacheKey, entry] of cache) {
@@ -923,6 +991,7 @@ export function _onResyncRequired(client: ParcaeClient): void {
       steps: entry.chain.__steps ?? [],
       queryHash: entry.queryHash,
       subscribe: entry.subscribe,
+      have: entry.loaded ? holdings(entry) : null,
     });
   }
 
@@ -939,6 +1008,7 @@ export function _onResyncRequired(client: ParcaeClient): void {
         // don't know the field continue to work — they treat absence
         // as subscribed, which is the existing behaviour.
         ...(e.subscribe === false ? { subscribe: false } : {}),
+        ...(e.have ? { have: e.have } : {}),
       })),
     )
     .then((results) => {
@@ -967,8 +1037,20 @@ export function _onResyncRequired(client: ParcaeClient): void {
         const hydrated = ModelClass
           ? items.map((row) => ModelClass.hydrate(adapter, row))
           : items;
+        // An answer to what this entry holds resends only the rows that moved.
+        const next = Array.isArray(result.ids)
+          ? heldInOrder(entry.items, hydrated, result.ids)
+          : hydrated;
+        if (!next) {
+          recoverResyncEntry(
+            e.cacheKey,
+            entry,
+            new Error("Incomplete query resync response"),
+          );
+          continue;
+        }
 
-        const reconciled = reconcile(entry.items, hydrated, entry);
+        const reconciled = reconcile(entry.items, next, entry);
         entry.items = reconciled.items;
         if (reconciled.changed) entry.version++;
         if (entry.totalCount !== result.totalCount) {
@@ -1103,10 +1185,92 @@ function registerPoll(entry: CacheEntry, pollMs: number): () => void {
   };
 }
 
-export function useQuery<T>(
+function liveOf(entry: CacheEntry): Live<any> {
+  if (entry.live) return entry.live;
+  const { state } = entry;
+  const items = computed(() => state.value.items);
+  // Any row's change, a merge or a local write, and any membership move count once.
+  let count = 0;
+  const version = computed(() => {
+    for (const row of items.value) void revision(row).value;
+    return ++count;
+  });
+  entry.live = {
+    state,
+    items,
+    version,
+    loading: computed(() => state.value.loading),
+    refetch: () => {
+      if (!entry.chain || !isLive(entry)) return;
+      entry.retryCount = 0;
+      if (entry.retryTimer) {
+        clearTimeout(entry.retryTimer);
+        entry.retryTimer = null;
+      }
+      void doFetch(entry.key, entry, entry.chain, entry.client);
+    },
+    addOptimistic: (item) => {
+      const ModelClass = entry.chain?.__modelClass;
+      const instance: any =
+        item instanceof Model
+          ? item
+          : ModelClass
+            ? entry.client.bind(ModelClass).create(item)
+            : item;
+      if (!instance.tmp) instance.tmp = generateId();
+      entry.optimistic.push(instance);
+      entry.version++;
+      notify(entry);
+      return instance;
+    },
+    removeOptimistic: (item) => {
+      const match =
+        typeof item === "string"
+          ? (o: any) => o.tmp !== item && o.id !== item
+          : (o: any) => o !== item && o.tmp !== (item as any).tmp;
+      const before = entry.optimistic.length;
+      entry.optimistic = entry.optimistic.filter(match);
+      if (entry.optimistic.length === before) return;
+      entry.version++;
+      notify(entry);
+    },
+    onOps: (listener) => {
+      entry.opsListeners.add(listener);
+      return () => {
+        entry.opsListeners.delete(listener);
+      };
+    },
+  };
+  return entry.live;
+}
+
+/** A query no session can run yet: empty, and loading until the session resolves. */
+function idleLive(loading: boolean): Live<any> {
+  const state = signal<QueryState>({ ...INITIAL_STATE, loading });
+  return {
+    state,
+    items: computed(() => state.value.items),
+    loading: computed(() => state.value.loading),
+    version: signal(0),
+    refetch: () => {},
+    addOptimistic: (item) => item,
+    removeOptimistic: () => {},
+    onOps: () => () => {},
+  };
+}
+
+const PENDING = idleLive(true);
+const IDLE = idleLive(false);
+
+/**
+ * The live query of `chain`, as signals. The mount holds the cache entry and starts its fetch;
+ * readers read the signals in render (`useSignals`) or in `computed`s, so a row write wakes only
+ * what reads it.
+ */
+export function useLive<T>(
   chain: QueryChain<T> | null | undefined,
   options: UseQueryOptions = {},
-): UseQueryResult<T> {
+): Live<T> {
   const client = useParcae();
   const { status: sessionStatus, userId } = useSession();
 
@@ -1126,49 +1290,13 @@ export function useQuery<T>(
 
   const chainRef = useRef(chain);
   chainRef.current = chain;
-  const clientRef = useRef(client);
-  clientRef.current = client;
-  const keyRef = useRef(key);
-  keyRef.current = key;
 
-  const subscribeToCache = useCallback(
-    (onChange: () => void) => {
-      if (!key) return () => {};
-      const e = getOrCreate(client, key, subscribe);
-      e.refs++;
-      e.listeners.add(onChange);
-      if (e.gcTimer) {
-        clearTimeout(e.gcTimer);
-        e.gcTimer = null;
-      }
-      return () => {
-        e.listeners.delete(onChange);
-        e.refs--;
-        if (e.refs <= 0) {
-          if (e.retryTimer) {
-            clearTimeout(e.retryTimer);
-            e.retryTimer = null;
-          }
-          if (!isLive(e)) return;
-          e.gcTimer = setTimeout(() => {
-            if (e.refs > 0) return;
-            const cache = caches.get(client);
-            if (cache?.get(key) !== e) return;
-            cache.delete(key);
-            disposeEntry(e);
-          }, GC_DELAY);
-        }
-      };
-    },
-    [client, key, subscribe],
-  );
-
-  const getSnapshot = useCallback((): string => {
-    if (!key) return INITIAL_HASH;
-    return caches.get(client)?.get(key)?.hash ?? INITIAL_HASH;
-  }, [client, key]);
-
-  useSyncExternalStore(subscribeToCache, getSnapshot, getSnapshot);
+  useEffect(() => {
+    if (!key) return;
+    const entry = getOrCreate(client, key, subscribe);
+    hold(entry);
+    return () => release(entry);
+  }, [client, key, subscribe]);
 
   // First-time fetch on key change.
   useEffect(() => {
@@ -1191,37 +1319,42 @@ export function useQuery<T>(
     // process. Ownership is what the guard has to test, not appearance.
     const idle = !entry.fetchPromise && !entry.retryTimer && !entry.resyncPending;
     if (!entry.chain) {
-      void doFetch(key, entry, currentChain, clientRef.current);
+      void doFetch(key, entry, currentChain, client);
     } else if (!entry.loaded && idle) {
-      void doFetch(key, entry, currentChain, clientRef.current);
+      void doFetch(key, entry, currentChain, client);
     }
   }, [client, key, subscribe]);
 
+  // A render reads its entry before the mount holds it; an entry no mount claims is collected.
+  const entry = key ? getOrCreate(client, key, subscribe) : null;
+  if (entry) collectLater(entry);
+  const live: Live<T> = entry ? liveOf(entry) : sessionReady ? IDLE : PENDING;
+
   // ── Stuck-loading diagnostic ───────────────────────────────────
-  // A hook continuously loading this long is stuck: the session never
-  // resolved (no key can be built) or the fetch/subscribe hung. Emit
-  // once per mount through the client; the app decides how to report.
-  const isLoading = key
-    ? (caches.get(client)?.get(key)?.loading ?? true)
-    : !sessionReady;
-  useEffect(() => {
-    if (!isLoading) return;
-    if (typeof setTimeout !== "function") return;
-    const startedAt = Date.now();
-    const timer = setTimeout(() => {
-      const currentClient: any = clientRef.current;
-      try {
-        currentClient?._emitDiagnostic?.("query-stuck", {
-          modelType: chainRef.current?.__modelType ?? "unknown",
-          elapsedMs: Date.now() - startedAt,
-          sessionStatus: currentClient?.session?.state?.status ?? "unknown",
-        });
-      } catch {
-        log.warn("useQuery: stuck diagnostic emit failed");
-      }
-    }, QUERY_STUCK_MS);
-    return () => clearTimeout(timer);
-  }, [isLoading]);
+  // A query loading this long is stuck: the session never resolved
+  // (no key can be built) or the fetch/subscribe hung. Emit once per
+  // mount through the client; the app decides how to report.
+  useEffect(
+    () =>
+      effect(() => {
+        if (!live.loading.value) return;
+        const startedAt = Date.now();
+        const timer = setTimeout(() => {
+          const currentClient: any = client;
+          try {
+            currentClient?._emitDiagnostic?.("query-stuck", {
+              modelType: chainRef.current?.__modelType ?? "unknown",
+              elapsedMs: Date.now() - startedAt,
+              sessionStatus: currentClient?.session?.state?.status ?? "unknown",
+            });
+          } catch {
+            log.warn("useQuery: stuck diagnostic emit failed");
+          }
+        }, QUERY_STUCK_MS);
+        return () => clearTimeout(timer);
+      }),
+    [client, live],
+  );
 
   // ── Drift poll ─────────────────────────────────────────────────
   const pollMs = options.poll ?? 0;
@@ -1231,123 +1364,29 @@ export function useQuery<T>(
     return registerPoll(entry, pollMs);
   }, [client, key, pollMs, subscribe]);
 
-  const refetch = useCallback(() => {
-    const k = keyRef.current;
-    const currentChain = chainRef.current;
-    if (!k || !currentChain) return;
-    const entry = getOrCreate(clientRef.current, k);
-    entry.retryCount = 0;
-    if (entry.retryTimer) {
-      clearTimeout(entry.retryTimer);
-      entry.retryTimer = null;
-    }
-    void doFetch(k, entry, currentChain, clientRef.current);
-  }, []);
+  return live;
+}
 
-  const addOptimistic = useCallback((item: T | Record<string, any>): T => {
-    const k = keyRef.current;
-    if (!k) return item as T;
-    const entry = getOrCreate(clientRef.current, k);
-    const ModelClass = chainRef.current?.__modelClass;
-
-    let instance: any;
-    if (item instanceof Model) {
-      instance = item;
-    } else if (ModelClass) {
-      instance = clientRef.current.bind(ModelClass).create(item);
-    } else {
-      instance = item;
-    }
-
-    if (!instance.tmp) instance.tmp = generateId();
-
-    entry.optimistic.push(instance);
-    entry.version++;
-    notify(entry);
-    return instance as T;
-  }, []);
-
-  const removeOptimistic = useCallback((item: T | string): void => {
-    const k = keyRef.current;
-    if (!k) return;
-    const entry = caches.get(clientRef.current)?.get(k);
-    if (!entry) return;
-
-    const match =
-      typeof item === "string"
-        ? (o: any) => o.tmp !== item && o.id !== item
-        : (o: any) => o !== item && o.tmp !== (item as any).tmp;
-
-    const before = entry.optimistic.length;
-    entry.optimistic = entry.optimistic.filter(match);
-    if (entry.optimistic.length !== before) {
-      entry.version++;
-      notify(entry);
-    }
-  }, []);
-
-  const noop = useCallback(() => {}, []);
-  const noopAdd = useCallback((item: T | Record<string, any>) => item as T, []);
-
-  const entryForOps = key ? caches.get(client)?.get(key) : undefined;
-  const onOps = useCallback(
-    (listener: (ops: QueryOp[]) => void): (() => void) => {
-      if (!entryForOps) return () => {};
-      entryForOps.opsListeners.add(listener);
-      return () => {
-        entryForOps.opsListeners.delete(listener);
-      };
-    },
-    [entryForOps],
+/** The live query of `chain`; the component renders again whenever its state moves. */
+export function useQuery<T>(
+  chain: QueryChain<T> | null | undefined,
+  options: UseQueryOptions = {},
+): UseQueryResult<T> {
+  const live = useLive(chain, options);
+  const state = useSignalValue(live.state);
+  return useMemo(
+    () => ({
+      items: state.items,
+      loading: state.loading,
+      error: state.error,
+      total: state.total,
+      refetch: live.refetch,
+      addOptimistic: live.addOptimistic,
+      removeOptimistic: live.removeOptimistic,
+      onOps: live.onOps,
+    }),
+    [live, state],
   );
-
-  // ── Stable result memoization ─────────────────────────────────
-  const resultRef = useRef<UseQueryResult<T> | null>(null);
-  const resultHashRef = useRef<string>("");
-  const resultClientRef = useRef<ParcaeClient | null>(null);
-  const resultEntryRef = useRef<CacheEntry | undefined>(undefined);
-  const entry = key ? caches.get(client)?.get(key) : undefined;
-  const observableHash = `${key ?? ""}|${entry?.hash ?? "L"}`;
-
-  if (
-    resultRef.current &&
-    resultHashRef.current === observableHash &&
-    resultClientRef.current === client &&
-    resultEntryRef.current === entry
-  ) {
-    return resultRef.current;
-  }
-
-  let next: UseQueryResult<T>;
-  if (!key) {
-    next = {
-      items: EMPTY as T[],
-      loading: !sessionReady,
-      error: null,
-      total: 0,
-      refetch: noop,
-      addOptimistic: noopAdd,
-      removeOptimistic: noop,
-      onOps,
-    };
-  } else {
-    const items: T[] = entry ? (getMergedItems(entry) as T[]) : (EMPTY as T[]);
-    next = {
-      items,
-      loading: entry?.loading ?? true,
-      error: entry?.error ?? null,
-      total: entry?.totalCount ?? 0,
-      refetch,
-      addOptimistic,
-      removeOptimistic,
-      onOps,
-    };
-  }
-  resultRef.current = next;
-  resultHashRef.current = observableHash;
-  resultClientRef.current = client;
-  resultEntryRef.current = entry;
-  return next;
 }
 
 // ── prefetch ───────────────────────────────────────────────────────────────
@@ -1394,42 +1433,19 @@ export async function prefetch<T>(
   if (!key) throw new Error("prefetch: failed to build cache key");
 
   const entry = getOrCreate(client, key, subscribe);
-
-  entry.refs++;
-  if (entry.gcTimer) {
-    clearTimeout(entry.gcTimer);
-    entry.gcTimer = null;
-  }
+  hold(entry);
 
   return new Promise<T[]>((resolve, reject) => {
     let settled = false;
-
-    const release = () => {
-      entry.refs--;
-      if (entry.refs <= 0) {
-        if (!isLive(entry)) return;
-        entry.gcTimer = setTimeout(() => {
-          if (entry.refs > 0) return;
-          const cache = caches.get(client);
-          if (cache?.get(key) !== entry) return;
-          cache.delete(key);
-          disposeEntry(entry);
-        }, GC_DELAY);
-      }
-    };
+    let stop: (() => void) | undefined;
 
     const settle = (value: T[] | Error) => {
       if (settled) return;
       settled = true;
-      entry.listeners.delete(onChange);
-      release();
+      release(entry);
+      stop?.();
       if (value instanceof Error) reject(value);
       else resolve(value);
-    };
-
-    const onChange = () => {
-      if (entry.error) settle(entry.error);
-      else if (!entry.loading) settle(entry.items as T[]);
     };
 
     if (entry.error) {
@@ -1438,13 +1454,18 @@ export async function prefetch<T>(
     }
     // A completed list response is usable even when an older backend
     // does not return a subscription hash.
-    const fullyLoaded = !entry.loading && entry.chain !== null;
-    if (fullyLoaded) {
+    if (!entry.loading && entry.chain !== null) {
       settle(entry.items as T[]);
       return;
     }
 
-    entry.listeners.add(onChange);
+    let first = true;
+    stop = effect(() => {
+      void entry.state.value;
+      if (first) first = false;
+      else if (entry.error) settle(entry.error);
+      else if (!entry.loading) settle(entry.items as T[]);
+    });
 
     if (!entry.chain) {
       void doFetch(key, entry, chain as any, client);
@@ -1496,9 +1517,14 @@ export const __test = {
   ): () => void {
     const entry = getOrCreate(client, key, subscribe);
     entry.refs++;
-    entry.listeners.add(onChange);
+    let first = true;
+    const stop = effect(() => {
+      void entry.state.value;
+      if (first) first = false;
+      else onChange();
+    });
     return () => {
-      entry.listeners.delete(onChange);
+      stop();
       entry.refs--;
     };
   },

@@ -345,39 +345,6 @@ describe('mounted React SDK hooks', () => {
     expect(renders).toBe(2);
   });
 
-  it('honors an explicit atomic comparator override', async () => {
-    const fake = new FakeClient();
-    const project = Project.hydrate(fake.adapter, {
-      id: 'project-1',
-      blocks: { A: { id: 'A', text: 'alpha' } },
-    });
-    let latest: BlockData | undefined;
-    let renders = 0;
-
-    function Capture() {
-      renders++;
-      latest = useModelAtomic<BlockData>(project, 'blocks.A', Object.is);
-      return null;
-    }
-
-    await act(async () => {
-      renderer = create(<Capture />);
-    });
-    const initial = latest;
-
-    await act(async () => {
-      project[SYM_SERVER_MERGE]({
-        id: 'project-1',
-        blocks: { A: { id: 'A', text: 'alpha' } },
-      });
-      await Promise.resolve();
-    });
-
-    expect(renders).toBe(2);
-    expect(latest).not.toBe(initial);
-    expect(latest).toEqual(initial);
-  });
-
   it('does not fetch a query after the session is terminated', async () => {
     const fake = new FakeClient();
     fake.session.terminate();

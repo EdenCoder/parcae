@@ -43,6 +43,7 @@
  * submission.
  */
 
+import { applyOperation } from "fast-json-patch";
 import type { PatchOp } from "./adapters/types";
 
 /** Op builder — every method returns a ready-to-submit `PatchOp`. */
@@ -156,4 +157,121 @@ export function dedupOps(ops: readonly PatchOp[]): PatchOp[] {
     }
     return true;
   });
+}
+
+// ─── Pointers ────────────────────────────────────────────────────────────────
+
+/**
+ * RFC 6901 array-index segment: a numeric string (`"0"`, `"12"`) or the append-marker `"-"`. A
+ * missing intermediate before one is an array, so the array-add branch can splice into it.
+ */
+export function isArrayIndexSegment(seg: string | undefined): boolean {
+  return seg === "-" || (seg !== undefined && /^\d+$/.test(seg));
+}
+
+export function encodePointerSegment(segment: string): string {
+  return segment.replace(/~/g, "~0").replace(/\//g, "~1");
+}
+
+/** The decoded RFC 6901 segments of a JSON Pointer. */
+export function pointerSegments(path: string): string[] {
+  if (!path.startsWith("/")) return [];
+  return path
+    .slice(1)
+    .split("/")
+    .map((segment) => segment.replace(/~1/g, "/").replace(/~0/g, "~"));
+}
+
+// ─── Structural sharing ──────────────────────────────────────────────────────
+//
+// Row data is immutable. A write copies the containers on its path and keeps every other value,
+// so a value that did not change keeps its identity and `===` says whether it changed.
+
+const stamp = (value: unknown) => (value instanceof Date ? value.toISOString() : value);
+
+function container(value: unknown): boolean {
+  if (Array.isArray(value)) return true;
+  if (value === null || typeof value !== "object") return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/** `ops` applied to `root` without writing to it; every value the ops do not reach keeps its identity. */
+export function patched<T extends object>(root: T, ops: readonly PatchOp[]): T {
+  const made = new WeakSet<object>();
+  const own = (value: any): any => {
+    if (made.has(value)) return value;
+    const copy = Array.isArray(value) ? value.slice() : { ...value };
+    made.add(copy);
+    return copy;
+  };
+  const next = own(root);
+  for (const op of ops) {
+    if (op.op !== "test")
+      for (const path of op.op === "move" ? [op.from, op.path] : [op.path]) {
+        const segments = pointerSegments(path);
+        let cursor = next;
+        for (let at = 0; at < segments.length - 1; at++) {
+          const child = cursor[segments[at]!];
+          cursor = cursor[segments[at]!] = own(
+            child !== null && typeof child === "object"
+              ? child
+              : isArrayIndexSegment(segments[at + 1])
+                ? []
+                : {},
+          );
+        }
+      }
+    applyOperation(next, op, false, true);
+  }
+  return next;
+}
+
+/** Whether two values hold the same data; equal references answer without a walk. */
+export function same(left: any, right: any): boolean {
+  if (Object.is(stamp(left), stamp(right))) return true;
+  if (!container(left) || !container(right) || Array.isArray(left) !== Array.isArray(right))
+    return false;
+  const keys = Object.keys(right);
+  return (
+    keys.length === Object.keys(left).length &&
+    keys.every((key) => key in left && same(left[key], right[key]))
+  );
+}
+
+/** `next`, keeping every part of `previous` it equals; `previous` itself when it equals all of it. */
+export function share<T>(previous: any, next: T): T {
+  if (same(previous, next)) return previous;
+  if (!container(previous) || !container(next) || Array.isArray(previous) !== Array.isArray(next))
+    return next;
+  const after: any = next;
+  const made: any = Array.isArray(after) ? [...after] : { ...after };
+  for (const key of Object.keys(after)) made[key] = share(previous[key], after[key]);
+  return made;
+}
+
+/** The RFC 6902 ops that turn `before` into `after`; an equal reference is skipped without a walk. */
+export function diff(before: unknown, after: unknown): PatchOp[] {
+  const ops: PatchOp[] = [];
+  const walk = (left: any, right: any, path: string): void => {
+    if (Object.is(stamp(left), stamp(right))) return;
+    if (!container(left) || !container(right) || Array.isArray(left) !== Array.isArray(right)) {
+      ops.push({ op: "replace", path, value: right });
+      return;
+    }
+    const keys = Object.keys(left);
+    for (let at = keys.length - 1; at >= 0; at--) {
+      const key = keys[at]!;
+      const gone =
+        !Object.prototype.hasOwnProperty.call(right, key) ||
+        (right[key] === undefined && left[key] !== undefined && !Array.isArray(right));
+      if (gone) ops.push({ op: "remove", path: `${path}/${encodePointerSegment(key)}` });
+      else walk(left[key], right[key], `${path}/${encodePointerSegment(key)}`);
+    }
+    for (const key of Object.keys(right))
+      if (!Object.prototype.hasOwnProperty.call(left, key) && right[key] !== undefined)
+        ops.push({ op: "add", path: `${path}/${encodePointerSegment(key)}`, value: right[key] });
+  };
+  walk(before, after, "");
+  return ops;
 }

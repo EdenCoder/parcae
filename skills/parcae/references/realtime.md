@@ -342,8 +342,10 @@ socket.on("call", async (requestId, method, path, data) => {
 - `writeHead` / `end` are **idempotent** and honour `writableEnded`, so a step-up gate that
   calls `error(res, 403, …)` (setting `writableEnded`, which `onAuthenticatedRequest`
   middleware checks) can't be clobbered by a downstream handler.
-- `end(body)` parses the JSON body, structurally compresses it with `compress-json`,
-  gzips with `pako`, and emits the bytes back as `socket.emit(requestId, compressed)`.
+- `end(body)` parses the JSON body and emits the answer on `requestId`. A socket that
+  connected with `answers=json` gets the object itself, which the WebSocket compresses
+  (`perMessageDeflate`); any other socket (a store build from before) gets it
+  compressed with `compress-json` and gzipped with `pako`.
 
 ### Socket connection / handshake flow
 
@@ -402,12 +404,13 @@ Entries are ref-counted and shared across components issuing the same query.
    the entry subscribes to `query:${hash}`.
 3. **Apply ops** — each incoming envelope is **applied synchronously** (no client-side
    debounce). `normalizeOpsPayload` accepts either a bare `ops` array or a `{ ops, order? }`
-   envelope; `applyOps` coalesces add/update/remove and merges JSON Patch `update` ops via
-   `applyPatch` + `SYM_SERVER_MERGE`. Update-only frames mutate models in place and keep the
-   array identity stable (so order-insensitive consumers skip the re-render). When `order` is
-   present, `reorderByIds` re-sequences the array.
-4. **Render** — `entry.version++` + `notify()` drive `useSyncExternalStore` re-renders. The
-   hook returns `{ items, loading, error, total, refetch, addOptimistic, removeOptimistic, onOps }`.
+   envelope; `applyOps` coalesces add/update/remove and merges each `update`'s JSON Patch into
+   its row through `SYM_SERVER_PATCH`, which copies only the paths it changes. Update-only
+   frames keep the row instances and the array identity (so order-insensitive consumers skip
+   the re-render). When `order` is present, `reorderByIds` re-sequences the array.
+4. **Render** — `entry.version++` + `notify()` replace the entry's state signal, which
+   `useQuery` reads with `useSyncExternalStore`. The hook returns
+   `{ items, loading, error, total, refetch, addOptimistic, removeOptimistic, onOps }`.
 
 ### Optimistic updates
 

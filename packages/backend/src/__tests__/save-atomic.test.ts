@@ -64,8 +64,8 @@ describePostgres("atomic save", () => {
   it("preserves unrelated concurrent scalar, JSONB, and overflow changes", async () => {
     const model = await adapter.findById(AtomicRecord, "r1");
     expect(model).not.toBeNull();
-    model!.profile.local = "saved";
-    model!.settings.local = "saved";
+    model!.profile = { ...model!.profile, local: "saved" };
+    model!.settings = { ...model!.settings, local: "saved" };
 
     await db("atomicRecords").where("id", "r1").update({
       title: "concurrent",
@@ -92,7 +92,7 @@ describePostgres("atomic save", () => {
   it("includes save-hook edits without dispatching patch hooks", async () => {
     const patchHook = vi.fn();
     hook.before(AtomicRecord, "save", ({ model }) => {
-      model.profile.fromHook = "saved";
+      model.profile = { ...model.profile, fromHook: "saved" };
     });
     hook.before(AtomicRecord, "patch", patchHook);
     const model = await adapter.findById(AtomicRecord, "r1");
@@ -106,7 +106,7 @@ describePostgres("atomic save", () => {
 
   it("rejects a stale positional save after a concurrent array edit", async () => {
     const model = await adapter.findById(AtomicRecord, "r1");
-    model!.items[1] = "saved";
+    model!.items = [model!.items[0]!, "saved"];
     await db("atomicRecords").where("id", "r1").update({
       items: db.raw(`jsonb_insert("items", '{0}', ?::jsonb, false)`, [
         JSON.stringify("concurrent"),
@@ -125,7 +125,7 @@ describePostgres("atomic save", () => {
       seen.push(model.title);
     });
     const model = await adapter.findById(AtomicRecord, "r1");
-    model!.profile.local = "saved";
+    model!.profile = { ...model!.profile, local: "saved" };
     await db("atomicRecords").where("id", "r1").update({
       title: "concurrent",
     });

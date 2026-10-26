@@ -9,8 +9,6 @@
 
 import { resolve, join } from "node:path";
 import { readdirSync, existsSync } from "node:fs";
-import pako from "pako";
-import { compress } from "compress-json";
 import pluralize from "pluralize";
 import { createSocketFakeRes } from "./socket-fake-res";
 import { SocketSessionReconciler } from "./socket-session-reconciler";
@@ -19,7 +17,7 @@ import {
   createSessionFencedEmitter,
   createSessionFencedSocket,
 } from "./socket-session-facade";
-import { Model, SESSION_BOUNDARY_ERRORS } from "@parcae/model";
+import { Model, rowVersion, SESSION_BOUNDARY_ERRORS } from "@parcae/model";
 import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
 import { log } from "./logger";
 import { ClientError } from "./helpers";
@@ -397,6 +395,17 @@ interface ResyncEntry {
   steps: unknown[];
   queryHash?: string | null;
   subscribe?: boolean;
+  /** The rows the client holds, by id, at their `rowVersion`. */
+  have?: Record<string, string>;
+}
+
+interface ResyncResult {
+  key: string;
+  hash: string | null;
+  items: any[];
+  totalCount: number;
+  /** Every id in the result, in order, when the entry said what it holds; `items` are then the rest. */
+  ids?: string[];
 }
 
 interface ResyncOptions {
@@ -473,7 +482,7 @@ export async function resyncQueries(
   entries: ResyncEntry[],
   adapter: BackendAdapter,
   options: ResyncOptions = {},
-): Promise<Array<{ key: string; hash: string | null; items: any[]; totalCount: number }>> {
+): Promise<ResyncResult[]> {
   const maxEntries = parsePositiveInteger(
     options.maxEntries ?? DEFAULT_MAX_RESYNC_QUERIES,
     "maxEntries",
@@ -489,12 +498,7 @@ export async function resyncQueries(
     );
   }
 
-  const results: Array<{
-    key: string;
-    hash: string | null;
-    items: any[];
-    totalCount: number;
-  }> = entries.map((entry) => ({
+  const results: ResyncResult[] = entries.map((entry) => ({
     key: entry.key,
     hash: null,
     items: [],
@@ -533,6 +537,23 @@ export async function resyncQueries(
             adapter,
             ctx,
           });
+          // A client that says what it holds gets the order and only the rows that moved.
+          const have = entry.have && typeof entry.have === "object" ? entry.have : null;
+          const refs = [...new Set(prep.expandResolved.map((exp) => exp.refField))].sort();
+          const answer = (hash: string | null, items: any[], totalCount: number): ResyncResult =>
+            have
+              ? {
+                  key   : entry.key,
+                  hash,
+                  totalCount,
+                  ids   : items.map((row) => row.id),
+                  items : items.filter(
+                    (row) =>
+                      !Object.prototype.hasOwnProperty.call(have, row.id) ||
+                      have[row.id] !== rowVersion(row, refs),
+                  ),
+                }
+              : { key: entry.key, hash, items, totalCount };
 
           if (entry.subscribe === false) {
             const { items, totalCount } = await runQueryStatic({
@@ -540,7 +561,7 @@ export async function resyncQueries(
               user,
               adapter,
             });
-            return { key: entry.key, hash: null, items, totalCount };
+            return answer(null, items, totalCount);
           }
 
           if (!adapter.subscriptions) return results[index]!;
@@ -550,7 +571,7 @@ export async function resyncQueries(
             user,
             adapter,
           });
-          return { key: entry.key, hash, items, totalCount };
+          return answer(hash, items, totalCount);
         },
       );
     }
@@ -1322,6 +1343,19 @@ export function createApp(config: AppConfig): ParcaeApp {
             const sessionOperation = sessionSnapshot.operation;
             const isSessionCurrent = () =>
               socketSession.isOperationCurrent(sessionOperation);
+            // Build fake res that captures the response. See
+            // `socket-fake-res.ts` for the full contract — short
+            // version: a step-up gate that writes 403 to res via
+            // `error(res, 403, …)` sets `writableEnded`, which the
+            // `onAuthenticatedRequest` polka middleware checks to
+            // short-circuit. `writeHead`/`end` are idempotent so a
+            // late write from a downstream handler can't clobber the
+            // first response.
+            const fakeRes = createSocketFakeRes(
+              socket,
+              requestId,
+              isSessionCurrent,
+            );
             try {
               // Parse query string from path
               const [pathname, qs] = path.split("?");
@@ -1362,40 +1396,21 @@ export function createApp(config: AppConfig): ParcaeApp {
                 _parsedUrl: { pathname, query: qs || "", _raw: path },
               };
 
-              // Build fake res that captures the response. See
-              // `socket-fake-res.ts` for the full contract — short
-              // version: a step-up gate that writes 403 to res via
-              // `error(res, 403, …)` sets `writableEnded`, which the
-              // `onAuthenticatedRequest` polka middleware checks to
-              // short-circuit. `writeHead`/`end` are idempotent so a
-              // late write from a downstream handler can't clobber the
-              // first response.
-              const fakeRes = createSocketFakeRes(
-                socket,
-                requestId,
-                isSessionCurrent,
-              );
-
               // Run through Polka's full handler (includes middleware, auth, auto-CRUD, custom routes)
               (server!.polka as any).handler(fakeReq, fakeRes);
             } catch (err: any) {
               log.error(`[socket] RPC error:`, err);
-              const compressed = pako.gzip(
-                JSON.stringify(
-                  compress({
-                    result: null,
-                    success: false,
-                    status: err instanceof ClientError ? err.status : 500,
-                    error:
-                      err instanceof ClientError
-                        ? err.message
-                        : "An error occurred while processing your request",
-                  }),
-                ),
+              fakeRes.writeHead(err instanceof ClientError ? err.status : 500);
+              fakeRes.end(
+                JSON.stringify({
+                  result: null,
+                  success: false,
+                  error:
+                    err instanceof ClientError
+                      ? err.message
+                      : "An error occurred while processing your request",
+                }),
               );
-              if (isSessionCurrent()) {
-                socket.emit(requestId, compressed);
-              }
             }
           },
         );

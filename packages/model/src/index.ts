@@ -7,11 +7,10 @@
 
 export {
   dateSafeClone,
-  ensureIntermediates,
   flushChangeEmits,
   generateId,
-  isArrayIndexSegment,
   Model,
+  rowVersion,
   serializeLazyQueryArgs,
   SYM_EXPANDED_REF,
   SYM_SERVER_MERGE,
@@ -26,7 +25,16 @@ export type {
   WithRefs,
 } from "./Model";
 
-export { ops, dedupOps } from "./patch";
+export {
+  ops,
+  patched,
+  dedupOps,
+  diff,
+  same,
+  isArrayIndexSegment,
+  encodePointerSegment,
+  pointerSegments,
+} from "./patch";
 export type { OpBuilder } from "./patch";
 
 /**

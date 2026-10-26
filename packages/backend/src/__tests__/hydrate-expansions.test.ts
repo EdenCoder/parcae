@@ -304,7 +304,7 @@ describe("hydrateExpansions", () => {
     expect(items[1]!.$file).toBe("f2");
   });
 
-  it("projects to the requested fields, always including id + type", async () => {
+  it("projects to the requested fields, always including id, type and updatedAt", async () => {
     const items: any[] = [{ id: "a1", type: "asset", file: "f1" }];
     const loader = new RefLoader(async (_type, ids) => {
       const m = new Map<string, unknown>();
@@ -323,6 +323,7 @@ describe("hydrateExpansions", () => {
     expect(items[0]!.file).toEqual({
       id: "f1",
       type: "file",
+      updatedAt: expect.any(String),
       url: "https://x",
     });
     expect(items[0]!.file.mime).toBeUndefined();

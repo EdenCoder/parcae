@@ -20,7 +20,7 @@ import { EventEmitter } from "eventemitter3";
 import { createElement } from "react";
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Model, SESSION_BOUNDARY_ERRORS } from "@parcae/model";
+import { Model } from "@parcae/model";
 
 import { ConnectionMachine } from "../connection-machine";
 import { ParcaeContext } from "../react/context";

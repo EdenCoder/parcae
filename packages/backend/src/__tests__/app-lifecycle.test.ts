@@ -152,6 +152,7 @@ import {
 } from "../app";
 import type { AuthSession } from "../auth";
 import { getPubSub, getQueue } from "../services/context";
+import { rowVersion } from "@parcae/model";
 
 const claim = Symbol.for("@parcae/backend/app-start-claimed");
 
@@ -412,5 +413,37 @@ describe("resyncQueries limits", () => {
       { key: "no-read-key", hash: null, items: [], totalCount: 0 },
       { key: "denied-key", hash: null, items: [], totalCount: 0 },
     ]);
+  });
+
+  it("answers an entry that says what it holds with the order and the rows that moved", async () => {
+    const rows = [
+      { id: "a", updatedAt: "2026-10-26T00:00:00.000Z" },
+      { id: "b", updatedAt: "2026-10-26T00:00:01.000Z" },
+    ];
+    const Thing = { type: "thing", scope: { read: () => ({ allowed: true }) } };
+    const adapter = {
+      modelsByType: new Map([["thing", Thing]]),
+      queryFromClient: vi.fn(() => ({ find: async () => rows, count: async () => 2 })),
+      batchFindByType: vi.fn(async () => new Map()),
+      subscriptions: null,
+    };
+
+    const [result] = await resyncQueries(
+      "socket",
+      null,
+      [
+        {
+          key: "k",
+          modelType: "thing",
+          steps: [],
+          subscribe: false,
+          have: { a: rowVersion(rows[0]!, []), b: "older" },
+        },
+      ],
+      adapter as any,
+    );
+
+    expect(result!.ids).toEqual(["a", "b"]);
+    expect(result!.items.map((row) => row.id)).toEqual(["b"]);
   });
 });

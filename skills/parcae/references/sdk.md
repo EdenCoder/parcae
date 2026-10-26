@@ -109,9 +109,11 @@ Source: `packages/sdk/src/transports/socket.ts` (exported as `SocketTransport`)
   anonymous session, to avoid 403 storms).
 - **RPC**: emits `"call"` with `(id, METHOD, "/<version><path>", data)`, where `id` is a
   10-char ShortId. Response lands on the `id` event.
-- **Response decode**: `pako.ungzip(msg, { to: "string" })` → `JSON.parse` →
-  `compress-json` `decompress()`. Resolves `parsed.result` when `parsed.success`,
-  otherwise rejects with `parsed.message || parsed.error`.
+- **Response decode**: the socket connects with `query: { answers: "json" }`, so an
+  answer arrives as the object itself. A binary answer (an API from before) is
+  `pako.ungzip` → `JSON.parse` → `compress-json` `decompress()`. Resolves
+  `parsed.result` when `parsed.success`, otherwise rejects with
+  `parsed.message || parsed.error`.
 - **GET deduplication**: in-flight GETs are coalesced by `${path}:${JSON.stringify(data)}`
   via an `inflight` Map.
 - **Timeout**: `DEFAULT_TIMEOUT` is **120_000 ms** (120 s) for RPC calls and resync,
@@ -332,14 +334,16 @@ at 10,000 as a safety net).
    ```
    Update patches are RFC 6902 JSON Patch applied via `fast-json-patch`. An optional
    `order: string[]` envelope reorders rows.
-5. **`update`-only frames keep the `items` array reference stable.** They mutate the model
-   instances in place (via `SYM_SERVER_MERGE`); the `items` array identity does **not**
+5. **`update`-only frames keep the `items` array reference stable.** They merge into the
+   model instances (via `SYM_SERVER_PATCH`); the `items` array identity does **not**
    change, so child components memoized on the array don't reconcile. `useQuery` itself
-   still re-renders (the entry's version bumps and its snapshot hash changes), so for
-   field-level reactivity in a row, read the fields through `useModel(item)` (or
-   `useModelAtomic`) rather than relying on the parent's `useQuery` re-render.
-6. Uses `useSyncExternalStore` for tear-safe rendering, backed by a global query cache
-   with **ref-counting and a 60 s GC timeout** after the last subscriber unmounts.
+   still re-renders (the entry's state is replaced), so for field-level reactivity in a
+   row, read the fields through `useModelAtomic(item, path)` or `field(item, path)`.
+6. Each cache entry holds its state in one signal; `useQuery` reads it with
+   `useSyncExternalStore`. Entries are **ref-counted with a 60 s GC timeout** after the last
+   mount releases them. `useLive(chain)` mounts the same entry and returns its signals
+   (`state`, `items`, `loading`, `version`) for stores and `computed`s; `version` moves when
+   any row's fields move, local writes included.
 7. On reconnect the Provider calls the batched `resync` RPC to restore subscriptions for
    all live entries in one round trip.
 8. Failed fetches retry up to 3 times with backoff (`[1s, 3s, 10s]`).
@@ -414,35 +418,32 @@ const { isConnected, sessionStatus } = useConnectionStatus();
 // sessionStatus: "pending" | "anonymous" | "authenticated" | "terminated"
 ```
 
-### useModel / useModelAtomic / useModelsAtomic
+### useModelAtomic / useModelsAtomic and signals
 
-Source: `packages/sdk/src/react/useModel.ts`, `useModelAtomic.ts`
+Source: `packages/sdk/src/react/useModelAtomic.ts`, `packages/sdk/src/signals.ts`
 
-`useModel(model)` re-renders the component whenever **any** data property on `model`
-mutates (driven by the model's `"change"` event). Pairs with `useQuery` for row-level
-reactivity:
+`useModelAtomic(model, path)` re-renders **only** when the value at a dot-notation `path`
+moves (`"video.url"`, `"items.0.name"`) and returns it. Row data keeps the identity of every
+value a write did not change, so the read compares with `Object.is`; there are no
+comparator, debounce or coalesce options.
 
-```tsx
-function Row({ post }: { post: Post }) {
-  useModel(post);
-  return <div>{post.title}</div>;
-}
-```
+`useModelsAtomic(models, path)` reads the same `path` from N models in one
+rules-of-hooks-safe call; the array keeps its identity until a value moves. Pass an
+identity-stable `models` array.
 
-`useModelAtomic(model, path, compareFnOrOptions?, options?)` re-renders **only** when the
-value at a dot-notation `path` changes (`"video.url"`, `"items.0.name"`). Returns the
-value at that path. The default comparator is structural deep equality
-(`@observ33r/object-equals`; the module-internal `defaultEqual` is not re-exported from
-`@parcae/sdk/react`) — necessary because the server-merge path deep-clones, so `Object.is`
-on a sub-path would fire on every push.
-Options: `{ compareFn, debounce, coalesced }` (`coalesced` batches notifications to one
-per animation frame via the shared `scheduleCoalesced` / `cancelCoalesced` batcher).
+Both read the framework-agnostic signals in `@parcae/sdk` (`@preact/signals-core`, shared
+with the app):
 
-`useModelsAtomic(models, path, ...)` reads the same `path` from N models in one
-rules-of-hooks-safe call, returning an identity-stable array.
+- `field(row, path)` — one signal per row and path, shared by every reader.
+- `revision(row)` — moves on every change of the row, any field.
+- `settled(source)` — `source` on the settle lane: it moves at once after a quiet 500 ms
+  window, else at the window's end, with every other settled signal, reading the latest
+  value. Projections over many rows read settled signals so they move once per burst.
+- `keyed(make)` — one value per key (a computed per line, per owner), shared by every
+  reader; an object key does not keep its value alive.
 
-All three accept `null`/`undefined` (inert) and tolerate plain-object projections that
-lack the model EventEmitter surface (no-op subscription).
+All accept `null`/`undefined` models (inert) and tolerate plain-object projections that lack
+the model EventEmitter surface.
 
 ### useSocket
 

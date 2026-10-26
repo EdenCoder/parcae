@@ -36,7 +36,7 @@
  */
 
 import type { ModelConstructor, ScopeContext } from "@parcae/model";
-import { Model } from "@parcae/model";
+import { Model, pointerSegments } from "@parcae/model";
 import pluralize from "pluralize";
 import { ClientError, json, notFound, forbidden } from "../helpers";
 import { log } from "../logger";
@@ -616,11 +616,7 @@ export function registerModelRoutes(
           const deny = readonlyFieldsForUpdate(ModelClass, ctx);
           for (const op of data.ops) {
             if (!op?.path || typeof op.path !== "string") continue;
-            const column = op.path
-              .slice(1)
-              .split("/")[0]
-              ?.replace(/~1/g, "/")
-              .replace(/~0/g, "~");
+            const column = pointerSegments(op.path)[0];
             if (column && (column.startsWith("$") || deny.has(column))) {
               return json(res, 403, {
                 result: null,

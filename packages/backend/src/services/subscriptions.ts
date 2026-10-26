@@ -52,6 +52,9 @@ type DiffOp =
 
 type SanitizerUser = { id: string; [key: string]: unknown } | null;
 
+/** A changed row as stored: null once deleted, undefined when the adapter cannot read it. */
+type ChangedRow = Record<string, unknown> | null | undefined;
+
 /** Wire envelope sent on `query:{hash}`. */
 export interface QueryEmitEnvelope {
   ops: DiffOp[];
@@ -82,6 +85,8 @@ interface CachedQuery {
    * server-side source of truth for that ordering.
    */
   result: Map<string, Record<string, any>>;
+  /** The result holds every matching row: the limit cuts none of them. */
+  complete: boolean;
   subscribers: Set<string>;
   /**
    * Whether to emit the `order` field on the wire envelope. `false`
@@ -100,11 +105,13 @@ interface CachedQuery {
    */
   emitOrder: boolean;
   dependency: {
-    hasLimit: boolean;
+    limit: number | null;
     hasOffset: boolean;
     hasOpaqueOrder: boolean;
     hasStableOrder: boolean;
     orderFields: ReadonlySet<string>;
+    /** The query's own steps on one row; false only when they reject it. */
+    admits: (row: Record<string, unknown>) => boolean;
   };
   creationReconcile: Promise<void> | null;
   needsCreationReconcile: boolean;
@@ -286,7 +293,8 @@ function dependencyPlan(
   sql: string,
 ): CachedQuery["dependency"] {
   const orderFields = new Set<string>();
-  const hasLimit = /\blimit\b/i.test(sql);
+  // boundary: Knex keeps the limit it applies on the builder and has no public reader.
+  const limit: unknown = query.exec()._single?.limit;
   let hasOffset = /\boffset\b/i.test(sql);
   for (const step of steps ?? []) {
     if (step.method === "offset" && Number(step.args[0]) > 0) hasOffset = true;
@@ -323,7 +331,7 @@ function dependencyPlan(
     if (!parsedOrderFields.has("id")) hasOpaqueOrder = true;
   }
   return {
-    hasLimit,
+    limit: typeof limit === "number" ? limit : null,
     hasOffset,
     hasOpaqueOrder,
     hasStableOrder:
@@ -331,7 +339,76 @@ function dependencyPlan(
       !hasOpaqueOrder &&
       parsedOrderFields.has("id"),
     orderFields,
+    admits: filterOf(steps),
   };
+}
+
+/**
+ * The query's own steps as a test on one stored row. A client's
+ * predicates reach SQL as one AND group beside the scope, so a plain
+ * equality, list or null step that rejects a row rejects it for the
+ * query; an `orWhere` can admit what the others reject. Steps this
+ * cannot read, and the scope, are left to the scoped one-row read.
+ */
+function filterOf(
+  steps: readonly QueryStep[] | undefined,
+): (row: Record<string, unknown>) => boolean {
+  const tests: Array<(row: Record<string, unknown>) => boolean> = [];
+  const column = (name: unknown): name is string =>
+    typeof name === "string" && name.length > 0 && !name.includes(".");
+  const plain = (value: unknown): value is string | number =>
+    typeof value === "string" || typeof value === "number";
+  // A ref field is stored as its id; an expanded one carries it.
+  const stored = (row: Record<string, unknown>, name: string): unknown => {
+    const value = row[name];
+    return value && typeof value === "object" && plain((value as { id?: unknown }).id)
+      ? (value as { id: unknown }).id
+      : value;
+  };
+  const equals = (name: unknown, value: unknown) => {
+    if (!column(name)) return;
+    if (value === null)
+      tests.push((row) => {
+        const found = stored(row, name);
+        return found === undefined || found === null;
+      });
+    else if (plain(value))
+      tests.push((row) => {
+        const found = stored(row, name);
+        return !plain(found) || String(found) === String(value);
+      });
+  };
+  for (const step of steps ?? []) {
+    const [name, ...rest] = step.args ?? [];
+    switch (step.method) {
+      case "where":
+      case "andWhere":
+        if (name && typeof name === "object" && !("__nested" in name)) {
+          for (const [field, value] of Object.entries(name)) equals(field, value);
+        } else if (rest.length === 1) equals(name, rest[0]);
+        else if (rest.length === 2 && rest[0] === "=") equals(name, rest[1]);
+        break;
+      case "whereIn": {
+        const values = rest[0];
+        if (!column(name) || !Array.isArray(values) || !values.every(plain)) break;
+        const allowed = new Set(values.map(String));
+        tests.push((row) => {
+          const found = stored(row, name);
+          return !plain(found) || allowed.has(String(found));
+        });
+        break;
+      }
+      case "whereNull":
+        equals(name, null);
+        break;
+      case "whereNotNull":
+        if (column(name)) tests.push((row) => stored(row, name) !== null);
+        break;
+      default:
+        if (step.method.startsWith("orWhere")) return () => true;
+    }
+  }
+  return (row) => tests.every((test) => test(row));
 }
 
 function mergeChange(previous: Change | undefined, next: Change): Change {
@@ -400,8 +477,13 @@ function isUpdatedAtPath(path: string): boolean {
   return segments[segments.length - 1] === "updatedAt";
 }
 
-function stripVolatilePatchOps(patch: Operation[]): Operation[] {
-  return patch.filter((op) => !isUpdatedAtPath(op.path));
+/**
+ * A patch that only moves `updatedAt` shows a reader nothing, so it is not
+ * sent. Any other patch keeps it, so a client's copy stays the version a
+ * resync compares (`rowVersion`).
+ */
+function visiblePatch(patch: Operation[]): Operation[] {
+  return patch.every((op) => isUpdatedAtPath(op.path)) ? [] : patch;
 }
 
 /**
@@ -680,6 +762,7 @@ export class QuerySubscriptionManager {
       const clean = dateSafeClone(row);
       result.set(clean.id, clean);
     }
+    const complete = await this._complete(query, rows.length, dependency.limit);
 
     const overrides = realtimeOverridesFor(query);
     const cached: CachedQuery = {
@@ -690,6 +773,7 @@ export class QuerySubscriptionManager {
       user,
       expand,
       result,
+      complete,
       subscribers: new Set(),
       emitOrder,
       dependency,
@@ -830,15 +914,19 @@ export class QuerySubscriptionManager {
     );
     const direct = this.typeIndex.get(modelType);
     if (direct) {
+      const absent: CachedQuery[] = [];
       for (const hash of direct) {
         const cached = this.queries.get(hash);
         if (!cached) continue;
         if (!change || this._requiresFullReeval(cached, change)) {
           this._scheduleFullReeval(cached);
-        } else {
+        } else if (cached.result.has(change.id)) {
           this._scheduleRootRefresh(cached, change);
+        } else if (change.op !== "delete") {
+          absent.push(cached);
         }
       }
+      if (change && absent.length > 0) void this._admit(modelType, change, absent);
     }
 
     const viaExpand = this.expandTargetIndex.get(modelType);
@@ -872,21 +960,14 @@ export class QuerySubscriptionManager {
   // ── Re-evaluation ──────────────────────────────────────────────────
 
   private _requiresFullReeval(cached: CachedQuery, change: Change): boolean {
-    if (change.op !== "update") return true;
-    if (cached.dependency.hasOffset || cached.dependency.hasOpaqueOrder) {
-      return true;
-    }
-    if (
-      cached.dependency.hasLimit &&
-      !cached.dependency.hasStableOrder
-    ) {
-      return true;
-    }
+    const { hasOffset, hasOpaqueOrder, hasStableOrder, orderFields } = cached.dependency;
+    if (hasOffset || hasOpaqueOrder) return true;
+    // An unordered result its limit cuts cannot tell which rows the limit keeps.
+    if (!cached.complete && !hasStableOrder) return true;
+    // A row that enters or leaves is placed by `_refreshRoot`.
+    if (change.op !== "update") return false;
     if (change.changedFields === null) return true;
-    return change.changedFields.some(
-      (field) =>
-        field === "id" || cached.dependency.orderFields.has(field),
-    );
+    return change.changedFields.some((field) => field === "id" || orderFields.has(field));
   }
 
   private _scheduleFullReeval(cached: CachedQuery): void {
@@ -900,6 +981,25 @@ export class QuerySubscriptionManager {
     const c = cached.coalesce;
     if (!c.full) c.root.set(change.id, mergeChange(c.root.get(change.id), change));
     this._schedule(cached);
+  }
+
+  /**
+   * One read of a changed row serves every query that does not hold it.
+   * A query whose own steps turn the row away is not scheduled; a row the
+   * adapter cannot read gets the scoped read in each.
+   */
+  private async _admit(
+    modelType: string,
+    change: Change,
+    absent: readonly CachedQuery[],
+  ): Promise<void> {
+    const row = await this._readRow(absent[0]!.query, modelType, change.id);
+    if (row === null) return;
+    for (const cached of absent) {
+      if (row === undefined || cached.dependency.admits(row)) {
+        this._scheduleRootRefresh(cached, change);
+      }
+    }
   }
 
   private _scheduleExpandRefresh(
@@ -1032,12 +1132,7 @@ export class QuerySubscriptionManager {
         this.reevalSemaphore.release();
         c.inFlight = null;
       }
-      if (
-        c.needsFollowup ||
-        c.full ||
-        c.root.size > 0 ||
-        c.expand.size > 0
-      ) {
+      if (c.needsFollowup || this._hasPendingRefresh(cached)) {
         c.needsFollowup = false;
         this._schedule(cached);
       }
@@ -1103,21 +1198,73 @@ export class QuerySubscriptionManager {
     if (!this._isCurrent(cached, generation)) return false;
 
     const previous = cached.result.get(id);
-    if (!model || !previous) {
-      if (model || previous) await this._reeval(cached);
-      return Boolean(model || previous);
+    if (!model && !previous) return false;
+    if (!this._placesInPlace(cached, !!model, !!previous)) {
+      await this._reeval(cached);
+      return true;
+    }
+    if (!model) {
+      cached.result.delete(id);
+      this._emit(cached, { ops: [{ op: "remove", id }] });
+      return false;
     }
 
     const rows = [await projectForWire(model, cached.user)];
     await this._hydrateRows(cached.query, rows, cached.expand, cached.user);
     if (!this._isCurrent(cached, generation)) return false;
     const data = dateSafeClone(rows[0]!);
-    const patch = stripVolatilePatchOps(fastJsonPatch.compare(previous, data));
     cached.result.set(id, data);
+    if (!previous) {
+      this._emit(cached, { ops: [{ op: "add", id, data }] });
+      return false;
+    }
+    const patch = visiblePatch(fastJsonPatch.compare(previous, data));
     if (patch.length > 0) {
       this._emit(cached, { ops: [{ op: "update", id, patch }] });
     }
     return false;
+  }
+
+  /**
+   * Whether a row that stays, leaves or enters can be placed without
+   * reading the whole query. Leaving needs only a complete result. An
+   * entering row also needs no order to find its place and room under
+   * the limit, else the full read decides.
+   */
+  private _placesInPlace(cached: CachedQuery, found: boolean, held: boolean): boolean {
+    if (found && held) return true;
+    if (!cached.complete) return false;
+    if (held) return true;
+    const { limit, hasStableOrder } = cached.dependency;
+    return !hasStableOrder && (limit === null || cached.result.size < limit);
+  }
+
+  /** The changed row as stored, read once and never sent; the scope is checked per query. */
+  private async _readRow(
+    query: QueryChain<any>,
+    modelType: string,
+    id: string,
+  ): Promise<ChangedRow> {
+    const adapter = this._queryAdapter(query);
+    if (!adapter?.batchFindByTypeOnWrite) return undefined;
+    try {
+      const model = (await adapter.batchFindByTypeOnWrite(modelType, [id])).get(id);
+      return model ? ((model.__data ?? model) as Record<string, unknown>) : null;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** A result under its limit holds every match; at the limit, a count says. */
+  private async _complete(
+    query: QueryChain<any>,
+    size: number,
+    limit: number | null,
+  ): Promise<boolean> {
+    if (limit === null || size < limit) return true;
+    const adapter = this._queryAdapter(query);
+    if (!adapter?.executeSubscriptionCount) return false;
+    return (await adapter.executeSubscriptionCount(query)) <= limit;
   }
 
   /** Rehydrate only cached parents that point at the changed target row. */
@@ -1146,7 +1293,7 @@ export class QuerySubscriptionManager {
     for (const data of rows) {
       const previous = cached.result.get(data.id);
       if (!previous) continue;
-      const patch = stripVolatilePatchOps(fastJsonPatch.compare(previous, data));
+      const patch = visiblePatch(fastJsonPatch.compare(previous, data));
       cached.result.set(data.id, data);
       if (patch.length > 0) {
         ops.push({ op: "update", id: data.id, patch });
@@ -1173,6 +1320,9 @@ export class QuerySubscriptionManager {
       cached.user,
     );
     if (!this._isCurrent(cached, generation)) return;
+    const complete = await this._complete(cached.query, rows.length, cached.dependency.limit);
+    if (!this._isCurrent(cached, generation)) return;
+    cached.complete = complete;
     const newResult = new Map<string, Record<string, any>>();
     for (const row of rows) {
       const clean = dateSafeClone(row);
@@ -1186,7 +1336,7 @@ export class QuerySubscriptionManager {
       if (!prev) {
         ops.push({ op: "add", id, data });
       } else {
-        const patch = stripVolatilePatchOps(fastJsonPatch.compare(prev, data));
+        const patch = visiblePatch(fastJsonPatch.compare(prev, data));
         if (patch.length > 0) {
           ops.push({ op: "update", id, patch });
         }
@@ -1301,6 +1451,7 @@ export class QuerySubscriptionManager {
       ids: string[],
     ) => Promise<Map<string, any>>;
     executeSubscriptionQuery?: (query: QueryChain<any>) => Promise<any[]>;
+    executeSubscriptionCount?: (query: QueryChain<any>) => Promise<number>;
   } | null {
     return (query as any).__adapter ?? null;
   }

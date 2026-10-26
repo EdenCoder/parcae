@@ -6,6 +6,8 @@ Source: `packages/model/src/Model.ts`, `patch.ts`, `adapters/types.ts`, `adapter
 
 Extends `EventEmitter` (eventemitter3). **The instance IS the data store** — there is no Proxy wrapper and no write interception. Plain field assignment (`post.title = "x"`) mutates the instance directly. It does NOT emit `"change"` and does NOT persist. Persistence and reactivity flow only through the three explicit write primitives below.
 
+**Row data is immutable.** Write a field with `stage()` / `patch()` or a top-level assignment (`post.meta = { ...post.meta, x }`), never in place (`post.meta.x = 1`, `Object.assign(post.meta, …)`, `push`). Every write and merge copies only the containers on its path and keeps every value it did not change, so `===` says whether a value changed. `__serverSnapshot` shares every value the server and the row agree on: an in-place edit also edits the snapshot, and `flush()` / `save()` then find nothing to send.
+
 Reference fields are the one exception: `_apply()` installs getter/setter accessor pairs for them (see Reference Fields). Everything else is an ordinary own property.
 
 > Never call `new Post(...)` directly — the constructor stages data but does not apply it (ES2022 subclass field initializers run after `super()` and would clobber it). Use `Post.create(data)` or `Post.hydrate(adapter, data)`; both run `_apply()` for you.
@@ -54,7 +56,7 @@ Internal state uses Symbols so it never collides with data properties:
 - `SYM_PENDING_DATA` — constructor data staged until subclass field initializers finish; consumed by `_apply()`
 - `SYM_FLUSH_INFLIGHT` / `SYM_FLUSH_TRAILING` — concurrency control for `flush()` coalescing
 - `SYM_SERVER_MERGE` (exported) — method symbol; atomically merges server-authoritative data
-- `SYM_VERSION` (exported) — monotonic counter bumped on every `"change"` emit; backs `useModel` / `useModelAtomic` via `useSyncExternalStore`
+- `SYM_VERSION` (exported) — monotonic counter bumped on every `"change"` emit; the SDK's `revision(row)` signal reads it
 
 ## Write Primitives
 
@@ -72,29 +74,27 @@ Upsert the entire current document. No diffing, no dirty-tracking, no debounce �
 
 ### `patch(ops: PatchOp[])`
 
-Apply a batch of RFC 6902 ops to the instance optimistically, then send them. Empty batches are a no-op. Ops are normalized via `dedupOps` (any op whose path lives under another `remove` in the same batch is dropped, plus duplicate identical removes). Missing intermediate objects/arrays are auto-vivified before `applyPatch`. Emits `"change"` **synchronously** (optimistic UI), bumps `SYM_VERSION`, records the op paths in `SYM_PATCHING` for the round-trip, then replays the ops onto `__serverSnapshot` so a later `flush()` won't re-emit them.
+Apply a batch of RFC 6902 ops to the instance optimistically, then send them. Empty batches are a no-op. Ops are normalized via `dedupOps` (any op whose path lives under another `remove` in the same batch is dropped, plus duplicate identical removes). `patched()` applies them by copying only the containers on each op path, vivifying missing intermediates (an array before a numeric or `-` segment, else an object). Emits `"change"` **synchronously** (optimistic UI), bumps `SYM_VERSION`, records the op paths in `SYM_PATCHING` for the round-trip, then replays the ops onto `__serverSnapshot` so a later `flush()` won't re-emit them.
 
 ### `flush()`
 
-The canonical "persist my edits" call. Diffs `__serverSnapshot` against the current `__data` (via `fast-json-patch.compare`) and sends the delta through `patch()` (which is what emits `"change"`). Routes to `save()` when `__isNew` (a PATCH to a nonexistent id would 404). No-op on an empty diff. Before diffing, both sides have `SYSTEM_DATA_KEYS` (`id`, `type`, `createdAt`, `updatedAt`, `tmp`) stripped and `Date` values coerced to ISO strings (otherwise `compare` emits ~24 char-level ops per Date field).
+The canonical "persist my edits" call. Diffs `__serverSnapshot` against the current `__data` with `diff()` (an equal reference is skipped without a walk; `Date`s compare by time) and sends the delta through `patch()` (which is what emits `"change"`). Routes to `save()` when `__isNew` (a PATCH to a nonexistent id would 404). No-op on an empty diff. `SYSTEM_DATA_KEYS` (`id`, `type`, `createdAt`, `updatedAt`, `tmp`) are never in the diff.
 
 **Self-serializing:** concurrent `flush()` calls coalesce to at most two round-trips per burst — the first runs on the leading edge; all callers arriving while it is in flight share one "trailing" flush that captures changes made during the window. Streaming call sites can fire `flush()` per delta and `await Promise.all(...)` at the end without rolling their own debounce.
 
 ### Reactivity
 
-`"change"` fires from exactly three sites: `patch()`, `flush()` (via its inner `patch()`), and `SYM_SERVER_MERGE`. **Plain field writes do not emit and do not re-render.** `patch()` / `flush()` emit synchronously; `SYM_SERVER_MERGE` emits via a microtask-batched queue (`scheduleChangeEmit`) so N per-row merges in one server frame coalesce into one commit per instance — critical for large `useQuery` list re-syncs. `flushChangeEmits()` (exported) force-drains the batched queue synchronously (tests, server coordinators).
+`"change"` fires from exactly three sites: `patch()` / `stage()`, `flush()` (via its inner `patch()`), and `SYM_SERVER_MERGE`. A merge keeps each old value the server row equals (`share()`), so an echo of the row's own write changes nothing and emits nothing. **Plain field writes do not emit and do not re-render.** `patch()` / `flush()` emit synchronously; `SYM_SERVER_MERGE` emits via a microtask-batched queue (`scheduleChangeEmit`) so N per-row merges in one server frame coalesce into one commit per instance — critical for large `useQuery` list re-syncs. `flushChangeEmits()` (exported) force-drains the batched queue synchronously (tests, server coordinators).
 
-## Dot-path Accessors
+## Dot-path Read
 
-Both are **pure** — no I/O, no events, no persistence. Call `flush()` (or `patch([...])`) afterward to persist.
+`get()` is a **pure** read — no I/O, no events.
 
 ```typescript
-const url = project.get<string>("blocks.abc.image.url"); // pure read; undefined if any segment missing
-project.set("blocks.abc.image.url", "https://...");        // pure write; auto-vivifies intermediate objects
-await project.flush();                                     // now persist
+const url = project.get<string>("blocks.abc.image.url"); // undefined if any segment missing
 ```
 
-`set()` with a single-segment path is a plain top-level assignment; multi-segment paths walk and create missing intermediate objects (always objects, not arrays).
+`patched(root, ops)` (from `@parcae/model`) applies ops the same way for other callers.
 
 ## Other Instance Methods
 

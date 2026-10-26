@@ -8,6 +8,8 @@ import { compress } from "compress-json";
 // biome-ignore lint/suspicious/noExplicitAny: socket.io Socket payload is unknown
 export interface SocketEmitter {
   emit(event: string, payload: any): unknown;
+  /** A client that connects with `answers=json` reads an answer as a plain object. */
+  handshake?: { query?: Record<string, unknown> };
 }
 
 /**
@@ -31,6 +33,8 @@ export function createSocketFakeRes(
   requestId: string,
   isSessionCurrent: () => boolean = () => true,
 ): any {
+  // Store builds from before plain answers read only gzipped compress-json.
+  const plain = socket.handshake?.query?.answers === "json";
   // biome-ignore lint/suspicious/noExplicitAny: parsed JSON of any shape
   let responseBody: any = null;
   return {
@@ -67,10 +71,12 @@ export function createSocketFakeRes(
       ) {
         responseBody = { ...responseBody, status: this.statusCode };
       }
-      const compressed = pako.gzip(
-        JSON.stringify(compress(responseBody ?? { result: null, success: true })),
+      const answer = responseBody ?? { result: null, success: true };
+      // A plain answer rides Socket.IO's own JSON, which the WebSocket compresses.
+      socket.emit(
+        requestId,
+        plain ? answer : pako.gzip(JSON.stringify(compress(answer))),
       );
-      socket.emit(requestId, compressed);
     },
   };
 }

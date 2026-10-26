@@ -1,17 +1,9 @@
 /**
  * useQuery — hot-path optimisations (DOL-1041).
  *
- * Two perf invariants pinned here:
- *
- *   1. `entry.hash` is O(1) regardless of items count. The previous
- *      implementation concatenated every item id into the hash string,
- *      making `buildHash` O(N) and triggering an allocation proportional
- *      to the result-set size on every subscription op.
- *
- *   2. `entry.mergedItems` (the cached server + optimistic merge) is
- *      reference-stable across reads when neither side changed. The
- *      previous implementation recomputed the merge on every render
- *      via an O(N×M) `.reduce` + `acc.some` scan.
+ * A field update replaces the entry's state, so consumers render again, and
+ * `entry.mergedItems` (the cached server + optimistic merge) keeps its
+ * reference across reads when neither side changed.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -90,44 +82,12 @@ describe("useQuery hot-path optimisations (DOL-1041)", () => {
   beforeEach(() => useQueryTest.resetCache());
   afterEach(() => useQueryTest.resetCache());
 
-  // ── 1. Hash is O(1) regardless of items count ─────────────────────
-
-  it("entry.hash length stays bounded as items count grows", async () => {
-    // Two cache entries: one with 5 items, one with 500. The hash
-    // must not embed per-item ids — its length should be the same
-    // within a few characters regardless of result size.
-    const client = new FakeClient();
-    const small = await primeCache(
-      client,
-      "h-small",
-      Array.from({ length: 5 }, (_, i) => ({ id: `p${i}`, title: `t${i}` })),
-    );
-    const big = await primeCache(
-      client,
-      "h-big",
-      Array.from({ length: 500 }, (_, i) => ({ id: `p${i}`, title: `t${i}` })),
-    );
-
-    // The old O(N) hash for 500 items was ~3.5KB of string per
-    // re-eval. The new hash should be < 50 chars regardless.
-    expect(small.entry.hash.length).toBeLessThan(50);
-    expect(big.entry.hash.length).toBeLessThan(50);
-    // And the ratio should be near 1 (the difference is just the
-    // changing `i500` vs `i5` digit count).
-    const ratio = big.entry.hash.length / small.entry.hash.length;
-    expect(ratio).toBeGreaterThan(0.5);
-    expect(ratio).toBeLessThan(2);
-
-    small.release();
-    big.release();
-  });
-
-  it("hash still changes when a subscription op mutates an item (so consumers re-render)", async () => {
+  it("state still changes when a subscription op mutates an item (so consumers re-render)", async () => {
     const client = new FakeClient();
     const { entry, release } = await primeCache(client, "h-change", [
       { id: "p1", title: "first" },
     ]);
-    const beforeHash = entry.hash;
+    const before = entry.state.peek();
 
     client.emitQueryOps("h-change", [
       {
@@ -137,7 +97,7 @@ describe("useQuery hot-path optimisations (DOL-1041)", () => {
       },
     ]);
 
-    expect(entry.hash).not.toBe(beforeHash);
+    expect(entry.state.peek()).not.toBe(before);
     release();
   });
 
