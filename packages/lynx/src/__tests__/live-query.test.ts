@@ -82,6 +82,7 @@ function makeChain(
       const page = pages[Math.min(call, pages.length - 1)] ?? [];
       call++;
       const result = page.map((r) => ({ ...r }));
+      Object.defineProperty(result, "__rows", { value: page });
       if (hash) {
         Object.defineProperty(result, "__queryHash", { value: hash });
       }
@@ -239,15 +240,17 @@ describe("fetch", () => {
     let call = 0;
     const chain: QueryChain<Article> = {
       find: async () => {
-        const rows = [
-          Article.hydrate(adapter, {
+        const sent = [
+          {
             id: "article-1",
             author: {
               id: "author-1",
               name: call++ === 0 ? "stale" : "fresh",
             },
-          }),
+          },
         ];
+        const rows = sent.map((row) => Article.hydrate(adapter, row));
+        Object.defineProperty(rows, "__rows", { value: sent });
         Object.defineProperty(rows, "__queryHash", { value: "expanded" });
         return rows;
       },
@@ -292,13 +295,10 @@ describe("fetch", () => {
     expect(store.snapshot()).toMatchObject({ status: "ready", total: 1 });
     const release = store.retain(() => {});
     article.stage([{ op: "replace", path: "/title", value: "my draft" }]);
-    fetched.resolve([
-      Article.hydrate(adapter, {
-        id: "a",
-        title: "before",
-        progress: { phase: "working", done: 1 },
-      }),
-    ]);
+    const sent = { id: "a", title: "before", progress: { phase: "working", done: 1 } };
+    fetched.resolve(
+      Object.defineProperty([Article.hydrate(adapter, sent)], "__rows", { value: [sent] }),
+    );
     await flush();
     expect(store.snapshot().items[0]).toBe(article);
     expect(article.title).toBe("my draft");
@@ -364,13 +364,16 @@ describe("ops", () => {
     const article = Article.hydrate(
       { patch: () => acknowledged.promise } as any,
       {
-        id: "a",
+        id: "p",
         title: "before",
         progress: { phase: "waiting", done: 0 },
       },
     );
     const find = vi.fn(async () =>
-      Object.defineProperty([article], "__queryHash", { value: "H1" }));
+      Object.defineProperties([article], {
+        __queryHash: { value: "H1" },
+        __rows: { value: [{ id: "p", title: "before", progress: { phase: "waiting", done: 0 } }] },
+      }));
     const store = createLiveQuery(() => ({ find }));
     const release = store.retain(() => {});
     await vi.runAllTimersAsync();
@@ -383,7 +386,7 @@ describe("ops", () => {
     fakeClient.emit("query:H1", [
       {
         op: "update",
-        id: "a",
+        id: "p",
         patch: [
           { op: "replace", path: "/title", value: "older draft" },
           {
@@ -397,7 +400,7 @@ describe("ops", () => {
     fakeClient.emit("query:H1", [
       {
         op: "update",
-        id: "a",
+        id: "p",
         patch: [{ op: "replace", path: "/progress/done", value: 2 }],
       },
     ]);

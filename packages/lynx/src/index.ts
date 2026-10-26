@@ -12,6 +12,9 @@ export type {
   QueryChain,
 } from "./live-query";
 
+export { provideRowStorage } from "./rows";
+export type { AnsweredRow, RowStorage, ServerRow, StoredList, StoredRow } from "./rows";
+
 export { useLiveQuery } from "./use-live-query";
 
 export { startLifecycle } from "./lifecycle";

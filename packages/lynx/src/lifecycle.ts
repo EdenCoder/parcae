@@ -50,7 +50,7 @@ export function startLifecycle(
       lastStatus = status;
       lastUserId = userId;
       const isReady = status === "anonymous" || status === "authenticated";
-      resetLiveQueries(isReady);
+      resetLiveQueries(isReady, userId ?? null);
       if (isReady) {
         didResetThisTurn = true;
         queueMicrotask(() => {
