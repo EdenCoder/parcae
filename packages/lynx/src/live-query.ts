@@ -21,21 +21,40 @@
  * lives in `use-live-query.ts`.
  */
 
-import { Model, patched, SYM_SERVER_MERGE, SYM_SERVER_PATCH, type PatchOp } from "@parcae/model";
+import { Model, patched, SYM_SERVER_MERGE, SYM_SERVER_PATCH, serializeLazyQueryArgs, type PatchOp } from "@parcae/model";
 
 import { requireClient } from "./client-registry";
+import {
+  hold,
+  fieldsOf,
+  mergeRow,
+  recordFor,
+  writeRows,
+  rowStorage,
+  forgetRecords,
+  sharesRecords,
+  type ServerRow,
+} from "./rows";
 
 export type LiveStatus = "loading" | "ready" | "error";
 
+/**
+ * `status` turns `ready` only on a server answer; rows drawn from storage come with `loading`.
+ * `total` is the last answer's count, stored or the server's. Draw what a snapshot holds, and open
+ * a page from a drawn row; act, charge or count only on `ready`.
+ */
 export interface LiveSnapshot<T> {
   items: T[];
   status: LiveStatus;
   error: Error | null;
   /** Rows the server matched at the last fetch, before any limit or offset. */
   total: number;
+  /** How many answers the server has given this read, its fetches and its pushed changes; another read's answer redraws without one. */
+  answers: number;
 }
 
 export interface QueryChain<T> {
+  /** The hydrated rows, with the server's own beside them as `__rows`. */
   find(): Promise<T[]>;
   /** A sibling chain whose `find()` leaves no server subscription behind. */
   withSubscribe?(subscribe: boolean): QueryChain<T>;
@@ -44,16 +63,7 @@ export interface QueryChain<T> {
   __modelClass?: unknown;
   __adapter?: unknown;
   __steps?: Array<{ method: string; args: unknown[] }>;
-}
-
-export interface LiveQueryOptions<T = LiveRow> {
-  /** Hydrated rows to draw while the first subscribed fetch is in flight. */
-  initial?: T[];
-  /**
-   * `false` reads the query without a server subscription, so no ops
-   * follow it: the SDK's `useQuery({ subscribe: false })`. Default `true`.
-   */
-  subscribe?: boolean;
+  __modelType?: string;
 }
 
 interface HydratingClass<T> {
@@ -75,12 +85,26 @@ export interface LiveRow {
 
 export interface LiveQueryStore<T> {
   snapshot(): LiveSnapshot<T>;
-  /** Subscribe + refcount. First retainer triggers the fetch. */
+  /** Subscribe + refcount. First retainer triggers the fetch, and reads storage while the store is empty. */
   retain(onChange: () => void): () => void;
   refetch(): void;
   /** Insert a locally-created row until the server echoes it back. */
   addOptimistic(item: T): void;
   removeOptimistic(id: string): void;
+}
+
+export interface LiveQueryOptions<T = LiveRow> {
+  /** Hydrated rows to draw while the first subscribed fetch is in flight. */
+  initial?: T[];
+  /**
+   * `false` reads the query without a server subscription, so no ops
+   * follow it: the SDK's `useQuery({ subscribe: false })`. Default `true`.
+   */
+  subscribe?: boolean;
+  /** The records the read is expected to hold, drawn from storage before its own list is kept. */
+  ids?: readonly string[];
+  /** Whether an answer goes to storage, read from its rows; storage keeps what it had for one that doesn't. */
+  keeps?: (items: readonly T[]) => boolean;
 }
 
 interface StoreInternal {
@@ -91,12 +115,19 @@ interface StoreInternal {
 const registry = new Set<StoreInternal>();
 let isSuspended = false;
 let identityEpoch = 0;
+/** The account the settled session reads as; null while it settles or reads anonymously. */
+let readAs: string | null = null;
 
-/** Drop all store state (identity changed — rows belong to another user). */
-export function resetLiveQueries(refetchActive = true): void {
+/**
+ * Drop all store state (identity changed — rows belong to another user). Rows drawn from storage
+ * stay while the session settles, and after only if they were kept for `userId`.
+ */
+export function resetLiveQueries(refetchActive = true, userId: string | null = null): void {
   "background only";
   identityEpoch++;
   isSuspended = !refetchActive;
+  readAs = refetchActive ? userId : null;
+  forgetRecords();
   for (const s of registry) s.reset(refetchActive);
 }
 
@@ -107,16 +138,33 @@ export function refetchLiveQueries(): void {
   for (const s of registry) s.refetchIfActive();
 }
 
+/** A read's list in storage: its model type and steps. */
+function listOf(chain: QueryChain<unknown>): { key: string; type: string } | null {
+  const type = chain.__modelType;
+  if (!type) return null;
+  const steps = (chain.__steps ?? []).map((step) => ({
+    method: step.method,
+    args: serializeLazyQueryArgs(step.args),
+  }));
+  return { key: `${type}:${JSON.stringify(steps)}`, type };
+}
+
 export function createLiveQuery<T extends LiveRow>(
   chainFactory: () => QueryChain<T>,
-  { subscribe = true, initial }: LiveQueryOptions<T> = {},
+  { subscribe = true, initial, ...options }: LiveQueryOptions<T> = {},
 ): LiveQueryStore<T> {
   let items: T[] = initial ?? [];
   let optimistic: T[] = [];
   let status: LiveStatus = initial ? "ready" : "loading";
   let error: Error | null = null;
   let total = items.length;
+  let answers = 0;
   let snap: LiveSnapshot<T> | null = null;
+  let fields: ReadonlySet<string> | null = null;
+  let answered = false;
+  let storageRead = false;
+  /** The account storage kept the drawn rows for, until the server answers. */
+  let storedUser: string | null = null;
 
   let refs = 0;
   let storeIdentityEpoch = identityEpoch;
@@ -132,6 +180,7 @@ export function createLiveQuery<T extends LiveRow>(
     snap = null;
     for (const fn of listeners) fn();
   };
+  const holder = { republish: notify };
 
   const merged = (): T[] => {
     if (optimistic.length === 0) return items;
@@ -155,9 +204,7 @@ export function createLiveQuery<T extends LiveRow>(
     );
   };
 
-  const reconcile = (next: T[]): T[] => {
-    if (items.length === 0 && optimistic.length === 0) return next;
-
+  const reconcile = (next: T[], rows: readonly ServerRow[]): T[] => {
     const byId = new Map(
       items.filter((item) => item.id).map((item) => [item.id, item]),
     );
@@ -170,24 +217,15 @@ export function createLiveQuery<T extends LiveRow>(
     let membershipChanged = items.length !== next.length;
     const result = next.map((fresh, index) => {
       const existing =
-        (fresh.id && (byId.get(fresh.id) ?? optimisticById.get(fresh.id))) ||
+        (fresh.id &&
+          (recordFor(fresh, fields) ?? byId.get(fresh.id) ?? optimisticById.get(fresh.id))) ||
         (fresh.tmp && optimisticByTmp.get(fresh.tmp));
       if (!existing) {
         membershipChanged = true;
         return fresh;
       }
 
-      const serverData =
-        fresh instanceof Model
-          ? fresh
-          : (fresh.__data ?? Object.fromEntries(Object.entries(fresh)));
-      const mergeFn = existing[SYM_SERVER_MERGE];
-      if (typeof mergeFn === "function") {
-        mergeFn.call(existing, serverData as Record<string, unknown>);
-      } else {
-        Object.assign(existing, serverData);
-      }
-
+      mergeRow(existing, fresh, rows[index]!, fields, holder);
       if (items[index] !== existing) membershipChanged = true;
       return existing;
     });
@@ -241,6 +279,7 @@ export function createLiveQuery<T extends LiveRow>(
   const applyOps = (chain: QueryChain<T>, ops: QueryOp[], order?: string[]) => {
     "background only";
     let changed = false;
+    const added: ServerRow[] = [];
 
     for (const op of ops) {
       if (op.op === "remove") {
@@ -261,13 +300,12 @@ export function createLiveQuery<T extends LiveRow>(
         const local = optimistic.find(
           (o) => o.id === op.id || (tmp && o.tmp === tmp),
         );
-        const mergeFn = local?.[SYM_SERVER_MERGE];
-        if (local && typeof mergeFn === "function") {
-          items = [...items, mergeFn.call(local, op.data) as T];
-        } else {
-          const row = hydrate(chain, op.data);
-          if (row) items = [...items, row];
-        }
+        const row = hydrate(chain, op.data);
+        if (!row) continue;
+        const existing = recordFor(row, fields) ?? local;
+        if (existing) mergeRow(existing, row, op.data, fields, holder);
+        items = [...items, existing ?? row];
+        added.push(op.data);
         changed = true;
       } else if (op.op === "update") {
         items = items.map((row) => {
@@ -297,7 +335,10 @@ export function createLiveQuery<T extends LiveRow>(
     }
 
     if (changed) {
+      answers++;
       drainOptimistic();
+      hold(holder, items, fields);
+      keep(chain, added);
       notify();
     }
   };
@@ -318,12 +359,18 @@ export function createLiveQuery<T extends LiveRow>(
       .withQuerySubscriptions(async () => {
         const result = await chain.find();
         if (fetchGeneration !== generation) return;
-        items = reconcile(result);
+        const rows = (result as unknown as { __rows: ServerRow[] }).__rows;
+        fields = fieldsOf(chain.__steps);
+        items = reconcile(result, rows);
+        answers++;
         status = "ready";
         error = null;
-        total =
-          (result as { __totalCount?: number }).__totalCount ?? result.length;
+        total = (result as { __totalCount?: number }).__totalCount ?? items.length;
+        answered = true;
+        storedUser = null;
         drainOptimistic();
+        hold(holder, items, fields);
+        keep(chain, rows);
 
         const hash = (result as { __queryHash?: string }).__queryHash;
         if (hash && hash !== queryHash) {
@@ -348,7 +395,7 @@ export function createLiveQuery<T extends LiveRow>(
       .catch((err: Error) => {
         if (fetchGeneration !== generation) return;
         error = err;
-        status = items.length ? "ready" : "error";
+        status = answered && items.length ? "ready" : "error";
         notify();
       })
       .finally(() => {
@@ -358,6 +405,53 @@ export function createLiveQuery<T extends LiveRow>(
           fetchQueued = false;
           doFetch();
         }
+      });
+  };
+
+  /** Every answer its read keeps is stored: its `rows` and the read's list, as the account read as. */
+  const keep = (chain: QueryChain<T>, rows: readonly ServerRow[]) => {
+    const list = listOf(chain);
+    if (!readAs || !list || !sharesRecords(fields) || options.keeps?.(items) === false) return;
+    const ids = JSON.stringify(items.map((item) => item.id));
+    writeRows(readAs, rows, fields, { ...list, ids, total });
+  };
+
+  // A stored answer draws only while no server answer has, only for the account the session may
+  // settle on, and only if the account hasn't changed since storage was asked.
+  const readStored = () => {
+    "background only";
+    const storage = rowStorage();
+    if (!storage || storageRead || answered || items.length) return;
+    storageRead = true;
+    const epoch = identityEpoch;
+    const chain = bindChain(chainFactory());
+    const list = listOf(chain);
+    const readFields = fieldsOf(chain.__steps);
+    if (!list || !sharesRecords(readFields)) return;
+    storage
+      .read({ type: list.type, key: list.key, ids: options.ids ?? [] })
+      .then(({ user, list: kept, rows }) => {
+        if (epoch !== identityEpoch || answered || items.length || !user) return;
+        if (!isSuspended && user !== readAs) return;
+        const data = new Map(rows.map((row) => [row.id, row.data]));
+        const order: string[] = kept ? JSON.parse(kept.ids) : [...(options.ids ?? [])];
+        const drawn = order.flatMap((id) => {
+          const stored = data.get(id);
+          const row = stored ? hydrate(chain, JSON.parse(stored)) : null;
+          return row ? [recordFor(row, readFields) ?? row] : [];
+        });
+        if (drawn.length === 0) return;
+        items = drawn;
+        fields = readFields;
+        total = kept?.total ?? drawn.length;
+        storedUser = user;
+        hold(holder, items, fields);
+        notify();
+      })
+      .catch((err: Error) => {
+        if (answered) return;
+        error = err;
+        notify();
       });
   };
 
@@ -373,11 +467,19 @@ export function createLiveQuery<T extends LiveRow>(
     if (storeIdentityEpoch === identityEpoch) return;
     stop();
     storeIdentityEpoch = identityEpoch;
+    if (storedUser !== null && (isSuspended || storedUser === readAs)) {
+      hold(holder, items, fields);
+      return;
+    }
     items = [];
     optimistic = [];
     status = "loading";
     error = null;
     total = 0;
+    answered = false;
+    storageRead = false;
+    storedUser = null;
+    hold(holder, items, fields);
     notify();
   };
 
@@ -400,7 +502,7 @@ export function createLiveQuery<T extends LiveRow>(
   return {
     snapshot() {
       invalidateIdentity();
-      if (!snap) snap = { items: merged(), status, error, total };
+      if (!snap) snap = { items: merged(), status, error, total, answers };
       return snap;
     },
     retain(onChange: () => void) {
@@ -409,6 +511,7 @@ export function createLiveQuery<T extends LiveRow>(
       listeners.add(onChange);
       refs++;
       registry.add(internal);
+      readStored();
       if (!started && !isSuspended) {
         started = true;
         doFetch();
@@ -437,7 +540,9 @@ export function createLiveQuery<T extends LiveRow>(
       const before = items.length + optimistic.length;
       items = items.filter((i) => i.id !== id);
       optimistic = optimistic.filter((o) => o.id !== id && o.tmp !== id);
-      if (items.length + optimistic.length !== before) notify();
+      if (items.length + optimistic.length === before) return;
+      hold(holder, items, fields);
+      notify();
     },
   };
 }

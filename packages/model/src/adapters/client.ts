@@ -231,6 +231,8 @@ export class FrontendAdapter implements ModelAdapter {
       const models = items.map((row: any) =>
         (modelClass as any).hydrate(this, row),
       );
+      // The rows as the server sent them; hydrating fills each field a row lacks with its default.
+      Object.defineProperty(models, "__rows", { value: items, enumerable: false });
       // Attach query subscription hash if backend provided one
       if (result?.__queryHash) {
         Object.defineProperty(models, "__queryHash", {
