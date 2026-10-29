@@ -535,6 +535,8 @@ export function createLiveQuery<T extends LiveRow>(
   const internal: StoreInternal = {
     reset(refetchActive) {
       invalidateIdentity();
+      // A stored read the reset overtook draws nothing; a retained store reads storage again.
+      if (refs > 0) readStored();
       if (refs > 0 && refetchActive) {
         started = true;
         doFetch();
