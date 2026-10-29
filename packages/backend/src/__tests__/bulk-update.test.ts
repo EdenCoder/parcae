@@ -110,17 +110,28 @@ describePostgres("QueryChain.update — bulk UPDATE terminal", () => {
     expect(after[2]).toEqual(before[2]);
   });
 
-  it("serializes json columns and merges unknown keys into the data overflow", async () => {
+  it('applies distinct sparse patches without changing other fields or rows outside the query', async () => {
+    await db(TABLE).where({ id: 'b' }).update({ data: null });
+    const before = await db(TABLE).orderBy('id');
     const n = await adapter
       .query(JobModel)
-      .where({ id: "a" })
-      .update({ meta: { resolution: "4k" }, flagged: true });
-    expect(n).toBe(1);
+      .whereIn('id', ['a', 'b'])
+      .update([
+        { id: 'a', meta: { resolution: '4k' }, flagged: true },
+        { id: 'b', title: 'retained', lockedAt: null },
+        { id: 'c', title: 'outside the query' },
+      ]);
+    expect(n).toBe(2);
 
-    const row: any = await db(TABLE).where({ id: "a" }).first();
-    expect(row.meta).toEqual({ resolution: "4k" });
-    // Overflow merge preserves pre-existing overflow keys.
-    expect(row.data).toEqual({ keep: "me", flagged: true });
+    const rows = await db(TABLE).orderBy('id');
+    expect(rows[0]).toMatchObject({
+      title: before[0].title,
+      lockedAt: before[0].lockedAt,
+      meta: { resolution: '4k' },
+      data: { keep: 'me', flagged: true },
+    });
+    expect(rows[1]).toMatchObject({ title: 'retained', lockedAt: null, data: null });
+    expect(rows[2]).toEqual(before[2]);
   });
 
   it("supports orderBy + limit via the id-subquery shape", async () => {

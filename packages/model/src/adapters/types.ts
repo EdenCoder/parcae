@@ -390,6 +390,10 @@ export interface QueryChain<T> {
    * updated.
    *
    *   Scene.whereNotNull("generatingAt").update({ generatingAt: null })
+   *   Scene.where({ project }).update([{ id: first, title: "First" }, { id: second, title: "Second" }])
+   *
+   * An array applies each patch to its id within the chain's filters.
+   * Omitted fields stay unchanged; duplicate ids are rejected.
    *
    * Semantics (server adapter):
    * - Schema columns are set directly; unknown keys are merged into
@@ -404,7 +408,11 @@ export interface QueryChain<T> {
    *
    * The frontend adapter throws — there is no auto-CRUD bulk route.
    */
-  update(patch: Partial<T> & Record<string, any>): Promise<number>;
+  update(
+    patch:
+      | (Partial<T> & Record<string, any>)
+      | Array<Partial<T> & Record<string, any> & { id: string }>,
+  ): Promise<number>;
 
   // Introspection — access underlying query builder
   /** @internal Return the underlying query builder (e.g. Knex QueryBuilder). */

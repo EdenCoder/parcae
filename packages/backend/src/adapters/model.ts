@@ -1646,77 +1646,111 @@ export class BackendAdapter implements ModelAdapter {
     // - Postgres UPDATE has no ORDER BY/LIMIT, but an id-subquery may —
     //   so `.orderBy(...).limit(100).update(...)` works ("update the
     //   100 stalest rows") instead of erroring.
-    chain.update = async (patch: Record<string, any>): Promise<number> =>
+    chain.update = async (patch: Record<string, any> | Record<string, any>[]): Promise<number> => {
+      if (Array.isArray(patch) && !patch.length) return 0;
       // One statement, but still wrapped: the transaction prelude
       // publishes session state (e.g. an audit actor) that database-side
       // code needs and cannot derive, and a bulk write is exactly the
       // case where losing that attribution matters most. Hooks and
       // scopes still do not run — that remains this primitive's
       // documented contract.
-      this._withTransaction(async () => {
+      return this._withTransaction(async () => {
         const table = tableName(modelClass);
         const schema = (modelClass.__schema as SchemaDefinition) ?? {};
-        const entries = Object.entries(patch);
-        if (entries.length === 0) {
-          throw new Error("bulk update requires a non-empty patch");
-        }
-
-        const protectedKeys = new Set([
-          "id",
-          "createdAt",
-          "updatedAt",
-          "type",
-          "tmp",
-        ]);
-        const row: Record<string, any> = {};
-        const overflow: Record<string, any> = {};
-        for (const [key, value] of entries) {
-          if (protectedKeys.has(key)) {
-            throw new Error(
-              `bulk update cannot set system field "${key}" — ` +
-                "updatedAt is stamped automatically; id/createdAt/type are immutable",
-            );
+        const batch = Array.isArray(patch);
+        const patches = batch ? patch : [patch];
+        const ids = new Set<string>();
+        const protectedKeys = new Set(['id', 'createdAt', 'updatedAt', 'type', 'tmp']);
+        const now = new Date();
+        const rows = patches.map((input) => {
+          const { id, ...fields } = input;
+          if (batch) {
+            if (typeof id !== 'string' || !id || ids.has(id))
+              throw new Error('bulk update requires distinct non-empty ids');
+            ids.add(id);
           }
-          const colDef = schema[key];
-          if (colDef !== undefined) {
-            const colType = resolveColType(colDef);
-            if (colType === "json" && value != null) {
-              row[key] = JSON.stringify(value);
-            } else if (colType === "datetime" && value != null) {
-              row[key] = new Date(value as string);
-            } else if (
-              typeof colDef === "object" &&
-              colDef.kind === "ref" &&
-              value != null &&
-              typeof value === "object"
-            ) {
-              // Accept a model instance where a ref id is expected.
-              row[key] = (value as any).id ?? value;
-            } else {
-              row[key] = value;
+          const entries = Object.entries(batch ? fields : input);
+          if (!entries.length) throw new Error('bulk update requires a non-empty patch');
+          const row: Record<string, any> = batch ? { id } : {};
+          const overflow: Record<string, any> = {};
+          for (const [key, value] of entries) {
+            if (protectedKeys.has(key)) {
+              throw new Error(
+                `bulk update cannot set system field "${key}" — ` +
+                  'updatedAt is stamped automatically; id/createdAt/type are immutable',
+              );
             }
-          } else {
-            overflow[key] = value;
+            const colDef = schema[key];
+            if (colDef !== undefined) {
+              const colType = resolveColType(colDef);
+              if (colType === 'json' && value != null && !batch) {
+                row[key] = JSON.stringify(value);
+              } else if (colType === 'datetime' && value != null) {
+                row[key] = new Date(value as string);
+              } else if (
+                typeof colDef === 'object' &&
+                colDef.kind === 'ref' &&
+                value != null &&
+                typeof value === 'object'
+              ) {
+                // Accept a model instance where a ref id is expected.
+                row[key] = (value as any).id ?? value;
+              } else {
+                row[key] = value;
+              }
+            } else {
+              overflow[key] = value;
+            }
           }
-        }
-        row.updatedAt = new Date();
-
-        if (Object.keys(overflow).length > 0) {
-          // Merge into the JSONB overflow without clobbering its other
-          // keys. A null value stores a JSON null rather than removing
-          // the key; both read back as null-ish through hydrate().
-          const json = JSON.stringify(overflow);
-          row.data = this.write.raw(
-            `COALESCE(data, '{}'::jsonb) || ?::jsonb`,
-            [json],
-          );
-        }
+          row.updatedAt = now;
+          if (Object.keys(overflow).length > 0)
+            row.data = batch
+              ? overflow
+              : this.write.raw(`COALESCE(data, '{}'::jsonb) || ?::jsonb`, [
+                  JSON.stringify(overflow),
+                ]);
+          return row;
+        });
 
         const idSubquery = knexQuery.clone().clearSelect().select(`${table}.id`);
-        return await this.write(table)
-          .whereIn("id", idSubquery)
-          .update(row);
+        const query = this.write(table).whereIn(`${table}.id`, idSubquery);
+        if (!batch) return await query.update(rows[0]);
+
+        // The table's composite type owns casts; key presence distinguishes
+        // an omitted column from an explicit null in each row's patch.
+        const fields = new Set(rows.flatMap(Object.keys));
+        fields.delete('id');
+        const update = Object.fromEntries(
+          [...fields].map((field) => [
+            field,
+            field === 'data'
+              ? this.write.raw(
+                  "CASE WHEN incoming.data IS NULL THEN ?? ELSE COALESCE(??, '{}'::jsonb) || incoming.data END",
+                  [`${table}.data`, `${table}.data`],
+                )
+              : this.write.raw(
+                  'CASE WHEN jsonb_exists(__parcae_changes.value, ?) THEN ?? ELSE ?? END',
+                  [field, `incoming.${field}`, `${table}.${field}`],
+                ),
+          ]),
+        );
+        return await query
+          .with(
+            '__parcae_changes',
+            this.write.raw('SELECT value FROM jsonb_array_elements(?::jsonb)', [
+              JSON.stringify(rows),
+            ]),
+          )
+          .updateFrom(
+            this.write.raw(
+              '__parcae_changes CROSS JOIN LATERAL jsonb_populate_record(NULL::??, __parcae_changes.value) AS incoming',
+              [table],
+            ),
+          )
+          .whereRaw('?? = ??', [`${table}.id`, 'incoming.id'])
+          .update(update);
       });
+    };
 
     chain.exec = () => knexQuery;
     chain.clone = () => this._buildQuery(modelClass, knexQuery.clone(), expand);
