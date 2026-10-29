@@ -188,6 +188,16 @@ describe("storage slot", () => {
     expect(drawn!.title).toBe("Fresh");
   });
 
+  it("draws stored rows when the session's reset overtakes the stored read", async () => {
+    storage({ user: "u1", list: null, rows: [stored("s1", "Kept")] });
+    const unanswered = { ...read(() => []), find: () => new Promise<Show[]>(() => {}) };
+    const store = createLiveQuery(() => unanswered, { ids: ["s1"] });
+    retain(store);
+    resetLiveQueries(false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(store.snapshot().items[0]!.title).toBe("Kept");
+  });
+
   it("drops stored rows when the session settles as another account", async () => {
     storage({ user: "u1", list: null, rows: [stored("s1", "Kept")] });
     resetLiveQueries(false);
