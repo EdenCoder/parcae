@@ -57,7 +57,7 @@ beforeEach(() => {
         session                : { state: { status: "authenticated", userId: "u1" } },
         isConnected            : true,
         adapter                : new FrontendAdapter({ patch, delete: remove } as never),
-        _emitDiagnostic        : (_event: string, moment: unknown) => moments.push(moment),
+        _emitDiagnostic        : (event: string, moment: unknown) => event === "write" && moments.push(moment),
       }) as never,
   );
   provideRowStorage(storage);
