@@ -1,56 +1,10 @@
 /**
- * Client-query orchestration — the canonical pipeline for "client
- * `__query` steps → either a subscribed result with expand or a raw
- * query."
- *
- * Three helpers, each owning a discrete slice of the work:
- *
- *   prepareClientQuery({ ModelClass, scopeResult, rawSteps, ... })
- *     → { query, countQuery, expandResolved, steps }
- *
- *   runQuerySubscription({ ...prep, socketId, user, force? })
- *     → { items, hash, totalCount }
- *
- *   runQueryStatic({ ...prep, user })
- *     → { items, totalCount }
- *
- * `prepareClientQuery` is pure step-manipulation + query construction —
- * no I/O, no subscription side effects. It normalises raw steps, peels
- * off `.expand(...)`, strips expand from the SQL replay, and builds the
- * count companion. Four call sites use it: the LIST handler's
- * count-short-circuit, the LIST handler's static and subscribed fetch
- * paths, and the socket-RPC resync handler.
- *
- * `runQuerySubscription` consumes a prep result, reads the primary-backed
- * cache from `adapter.subscriptions`, and returns the wire-ready row set.
- * Two call sites use it: the LIST handler (when
- * `req._socketId` is set AND the request didn't opt out via
- * `__subscribe: false`) and the socket-RPC `resync` handler (for
- * dynamic entries).
- *
- * `runQueryStatic` mirrors `runQuerySubscription` for the static
- * path — plain find + sanitise + expand hydrate, no subscription
- * registered. Used by the LIST handler when `__subscribe: false`
- * (set by `useQuery({ subscribe: false })` / `prefetch(...,
- * { subscribe: false })`), the LIST handler's non-socket fallback,
- * and the socket-RPC `resync` handler for static entries on
- * reconnect.
- *
- * Before this consolidation, the LIST handler's non-socket path and
- * the resync handler's pipeline each had their own diverged copies of
- * the subscribe path. The resync copy skipped `parseExpandSpecs`,
- * `validateExpandSpecs`, `stripExpandSteps`, `expand:` on `subscribe`,
- * and `hydrateExpansions` entirely — which meant every WebSocket
- * reconnect served un-expanded rows to clients that had originally
- * requested `.expand("file")`. The editor's `useAssetFile` snapped to
- * `null` on every reconnect until a manual refetch.
+ * HTTP lists and socket resync share query preparation, scopes and expansions.
+ * The subscription manager owns live rows and their count. Static responses
+ * execute the prepared query and its count directly.
  */
 
-import type {
-  ModelConstructor,
-  QueryChain,
-  ScopeContext,
-} from "@parcae/model";
+import type { ModelConstructor, QueryChain, ScopeContext } from "@parcae/model";
 import { extractExpandFields, stripExpandSteps } from "@parcae/model";
 import type { BackendAdapter } from "../adapters/model";
 import { getRefLoader } from "./context";
@@ -134,9 +88,7 @@ function ensureIdSelected(steps: any[]): any[] {
   });
 }
 
-export function prepareClientQuery(
-  opts: PrepareClientQueryOptions,
-): PreparedClientQuery {
+export function prepareClientQuery(opts: PrepareClientQueryOptions): PreparedClientQuery {
   const { ModelClass, scopeResult, rawSteps, modelByType, adapter, ctx } = opts;
 
   const normalised = normaliseSteps(rawSteps);
@@ -147,11 +99,7 @@ export function prepareClientQuery(
   // immediate responses; via the subscription manager's per-emit
   // hydrate for ongoing diffs).
   const expandSpecs = parseExpandSpecs(extractExpandFields(normalised));
-  const expandResolved = validateExpandSpecs(
-    expandSpecs,
-    ModelClass,
-    modelByType,
-  );
+  const expandResolved = validateExpandSpecs(expandSpecs, ModelClass, modelByType);
   const steps = ensureIdSelected(
     expandResolved.length > 0 ? stripExpandSteps(normalised) : normalised,
   );
@@ -164,12 +112,7 @@ export function prepareClientQuery(
   const stepsWithoutPagination = steps.filter(
     (s: any) => s?.method !== "limit" && s?.method !== "offset",
   );
-  const countQuery = adapter.queryFromClient(
-    ModelClass,
-    scopeResult,
-    stepsWithoutPagination,
-    ctx,
-  );
+  const countQuery = adapter.queryFromClient(ModelClass, scopeResult, stepsWithoutPagination, ctx);
 
   return { query, countQuery, expandResolved, steps, denied };
 }
@@ -215,17 +158,11 @@ export async function runQuerySubscription(
     );
   }
 
-  const { query, countQuery, expandResolved, steps } = prep;
-
-  const [sub, totalCount] = await Promise.all([
-    adapter.subscriptions.subscribe(
-      { socketId, query, expand: expandResolved, steps, user },
-      { force },
-    ),
-    adapter.executeSubscriptionCount(countQuery),
-  ]);
-
-  return { items: [...sub.items], hash: sub.hash, totalCount };
+  const { query, expandResolved, steps } = prep;
+  return adapter.subscriptions.subscribe(
+    { socketId, query, expand: expandResolved, steps, user },
+    { force },
+  );
 }
 
 // ─── runQueryStatic ──────────────────────────────────────────────────────────
@@ -253,24 +190,17 @@ export interface RunQueryStaticResult {
  * socket-RPC resync handler uses it for entries the client marked
  * static.
  */
-export async function runQueryStatic(
-  opts: RunQueryStaticOptions,
-): Promise<RunQueryStaticResult> {
+export async function runQueryStatic(opts: RunQueryStaticOptions): Promise<RunQueryStaticResult> {
   const { prep, user } = opts;
   const { query, countQuery, expandResolved } = prep;
 
-  const [rawItems, totalCount] = await Promise.all([
-    query.find(),
-    countQuery.count(),
-  ]);
+  const [rawItems, totalCount] = await Promise.all([query.find(), countQuery.count()]);
 
   // Sanitise to wire shape — mirrors routes.ts's `projectForWire`.
   // Models that ship a `sanitize(user)` method honour their declared
   // privateFields; the fallback covers test fixtures and oddball
   // model implementations that don't define sanitize.
-  const items = await Promise.all(
-    rawItems.map((model) => projectForWire(model, user)),
-  );
+  const items = await Promise.all(rawItems.map((model) => projectForWire(model, user)));
 
   if (expandResolved.length > 0) {
     const loader = getRefLoader();

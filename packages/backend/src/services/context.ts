@@ -212,6 +212,34 @@ export async function enqueue(
   });
 }
 
+/**
+ * Enqueue one job name as a native BullMQ batch. Existing IDs, including retained
+ * completed or failed jobs, remain unchanged. Use removal options when IDs must be reusable.
+ */
+export async function enqueueMany(
+  name: string,
+  items: readonly { data: any; options?: EnqueueOptions }[],
+): Promise<Job[]> {
+  if (!items.length) return [];
+  const queue = _queue?.get(_queue.queueNameFor(name));
+  if (!queue) {
+    log.warn(`[parcae] enqueueMany("${name}"): queue not available`);
+    return [];
+  }
+  return queue.addBulk(
+    items.map(({ data, options = {} }) => ({
+      name,
+      data,
+      opts: {
+        ...options,
+        jobId: options.jobId?.replace(/:/g, "."),
+        removeOnComplete: options.removeOnComplete ?? 100,
+        removeOnFail: options.removeOnFail ?? 50,
+      },
+    })),
+  );
+}
+
 // ─── lock() ──────────────────────────────────────────────────────────────────
 
 /**

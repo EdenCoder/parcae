@@ -51,6 +51,7 @@ export {
   withTransaction,
   getActiveTransactionFrame,
   activeTransactionHandle,
+  runAfterCommitIfActive,
   setTransactionPrelude,
 } from "./services/transactionContext";
 export type {
@@ -60,6 +61,7 @@ export type {
 } from "./services/transactionContext";
 export {
   enqueue,
+  enqueueMany,
   lock,
   getQueue,
   getPubSub,

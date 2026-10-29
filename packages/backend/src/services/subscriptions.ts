@@ -1,47 +1,23 @@
-import { dateSafeClone } from "@parcae/model";
-import { log } from "../logger";
 /**
- * QuerySubscriptionManager — server-side realtime query subscriptions.
- *
- * Clients subscribe to queries. On model changes, queries are re-evaluated,
- * diffed against cached results, and surgical add/remove/update ops are
- * emitted to subscribers.
- *
- * Update ops carry RFC 6902 JSON Patch arrays — only the changed fields are
- * sent over the wire, not the entire document.
- *
- * The emitted envelope is `{ ops, order? }`:
- *   - `ops` — `add` / `remove` / `update` ops (existing contract).
- *   - `order` — the new ordered id list, included whenever membership
- *     changed or the previous order differs from the new order. Lets
- *     ordered queries (`.orderBy(...)`) place freshly-added rows in
- *     the right slot client-side rather than appending to the end.
- *
- * Re-eval is debounced per-query — bursts of writes (e.g. a job
- * patching every block in a project) collapse into one re-eval per
- * `debounceMs` window, with a `maxWaitMs` ceiling so changes never
- * stall on a sustained write loop. Per-Model overrides via
- * `static realtime = { debounceMs, maxWaitMs }` on the Model class.
- *
- * Extracted from Dollhouse Studio's adapters/subscriptions.ts (308 lines).
+ * Scoped query caches emit add/remove operations and RFC 6902 update patches.
+ * Each cache batches pending row changes with one refresh in flight. Queries
+ * whose order or membership cannot be placed locally require a full read.
  */
 
 import { createHash } from "node:crypto";
-import {
-  orderEmissionDisabled,
-  type QueryChain,
-  type QueryStep,
-} from "@parcae/model";
 import fastJsonPatch from "fast-json-patch";
 import type { Operation } from "fast-json-patch";
+import { type QueryStep, type QueryChain, dateSafeClone, orderEmissionDisabled } from "@parcae/model";
+
+import { log } from "../logger";
+import type { Change } from "./change-bus";
 import { RefLoader } from "./ref-loader";
 import {
   getWireRefId,
-  hydrateExpansions,
   projectForWire,
   type ResolvedExpand,
+  hydrateExpansions,
 } from "./hydrate-expansions";
-import type { Change } from "./change-bus";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -85,14 +61,14 @@ interface CachedQuery {
    * server-side source of truth for that ordering.
    */
   result: Map<string, Record<string, any>>;
-  /** The result holds every matching row: the limit cuts none of them. */
-  complete: boolean;
+  /** Matching rows at the last full read; targeted membership changes adjust this count. */
+  totalCount: number;
   subscribers: Set<string>;
   /**
    * Whether to emit the `order` field on the wire envelope. `false`
    * when the query carries `.orderBy(false)` — consumers don't
    * care about the ordered id list and we save bytes + spare the
-    * client a `reorderByIds` pass.
+   * client a `reorderByIds` pass.
    *
    * Always `true` for the first subscriber's `subscribe()` call; if
    * a later subscriber for the same hash opts out, we honour the
@@ -272,17 +248,11 @@ function hashFrom(
 
 function stableStringify(value: unknown): string {
   return JSON.stringify(value, (_key, current: unknown) => {
-    if (
-      !current ||
-      typeof current !== "object" ||
-      Array.isArray(current)
-    ) {
+    if (!current || typeof current !== "object" || Array.isArray(current)) {
       return current;
     }
     return Object.fromEntries(
-      Object.entries(current as Record<string, unknown>).sort(([a], [b]) =>
-        a.localeCompare(b),
-      ),
+      Object.entries(current as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)),
     );
   });
 }
@@ -310,16 +280,16 @@ function dependencyPlan(
       for (const field of searchFields) orderFields.add(field);
     }
   }
-  const orderClause = sql.match(
-    /\border\s+by\s+(.+?)(?:\s+limit\b|\s+offset\b|$)/i,
-  )?.[1];
+  const orderClause = sql.match(/\border\s+by\s+(.+?)(?:\s+limit\b|\s+offset\b|$)/i)?.[1];
   const parsedOrderFields = new Set<string>();
   let hasOpaqueOrder = false;
   if (orderClause) {
     for (const term of orderClause.split(",")) {
-      const match = term.trim().match(
-        /^(?:(?:"[^"]+"|[a-zA-Z_]\w*)\.)?(?:"([^"]+)"|([a-zA-Z_]\w*))(?:\s+(?:asc|desc))?(?:\s+nulls\s+(?:first|last))?$/i,
-      );
+      const match = term
+        .trim()
+        .match(
+          /^(?:(?:"[^"]+"|[a-zA-Z_]\w*)\.)?(?:"([^"]+)"|([a-zA-Z_]\w*))(?:\s+(?:asc|desc))?(?:\s+nulls\s+(?:first|last))?$/i,
+        );
       const field = match?.[1] ?? match?.[2];
       if (!field || !orderFields.has(field)) {
         hasOpaqueOrder = true;
@@ -334,10 +304,7 @@ function dependencyPlan(
     limit: typeof limit === "number" ? limit : null,
     hasOffset,
     hasOpaqueOrder,
-    hasStableOrder:
-      Boolean(orderClause) &&
-      !hasOpaqueOrder &&
-      parsedOrderFields.has("id"),
+    hasStableOrder: Boolean(orderClause) && !hasOpaqueOrder && parsedOrderFields.has("id"),
     orderFields,
     admits: filterOf(steps),
   };
@@ -416,9 +383,7 @@ function mergeChange(previous: Change | undefined, next: Change): Change {
   const changedFields =
     previous.changedFields === null || next.changedFields === null
       ? null
-      : Array.from(
-          new Set([...previous.changedFields, ...next.changedFields]),
-        );
+      : Array.from(new Set([...previous.changedFields, ...next.changedFields]));
   return { ...next, changedFields };
 }
 
@@ -555,6 +520,7 @@ export class QuerySubscriptionManager {
   private typeIndex = new Map<string, Set<string>>();
   private changeRevisions = new Map<string, number>();
   private refreshRevision = 0;
+  private admissionLoaders = new WeakMap<object, RefLoader>();
   /**
    * Secondary index from expanded-target-type → cached query hashes.
    * When a `File` row changes, every cached query that expanded
@@ -613,10 +579,11 @@ export class QuerySubscriptionManager {
 
   // ── Subscribe ──────────────────────────────────────────────────────
 
+  /** Return scoped rows and their count. A reused cache reads a fresh count for pagination. */
   async subscribe(
     opts: SubscriptionOptions,
     extra: SubscribeExtraOptions = {},
-  ): Promise<{ hash: string; items: Record<string, any>[] }> {
+  ): Promise<{ hash: string; items: Record<string, any>[]; totalCount: number }> {
     const { socketId, query, steps } = opts;
     const user: SanitizerUser = opts.user ? dateSafeClone(opts.user) : null;
     const expand = opts.expand ?? EMPTY_EXPAND;
@@ -636,14 +603,11 @@ export class QuerySubscriptionManager {
     // query across many sockets is fine and intentional.
     let socketHashes = this.socketQueries.get(socketId);
     const alreadySubscribed = socketHashes?.has(hash) ?? false;
-    if (
-      !alreadySubscribed &&
-      (socketHashes?.size ?? 0) >= this.maxSubscriptionsPerSocket
-    ) {
+    if (!alreadySubscribed && (socketHashes?.size ?? 0) >= this.maxSubscriptionsPerSocket) {
       log.warn(
         `subscriptions: socket ${socketId} hit the ${this.maxSubscriptionsPerSocket} subscription cap — refusing new query for ${modelType}`,
       );
-      return { hash, items: [] };
+      return { hash, items: [], totalCount: 0 };
     }
 
     const reserved = !alreadySubscribed;
@@ -654,13 +618,11 @@ export class QuerySubscriptionManager {
       }
       socketHashes.add(hash);
     }
-    this.pendingSockets.set(
-      socketId,
-      (this.pendingSockets.get(socketId) ?? 0) + 1,
-    );
+    this.pendingSockets.set(socketId, (this.pendingSockets.get(socketId) ?? 0) + 1);
 
     try {
       let cached = this.queries.get(hash);
+      const reused = Boolean(cached);
       let created = false;
       if (!cached) {
         let creation = this.creating.get(hash);
@@ -689,7 +651,7 @@ export class QuerySubscriptionManager {
         !this.socketQueries.get(socketId)?.has(hash)
       ) {
         this._deleteCachedIfUnused(cached);
-        return { hash, items: [] };
+        return { hash, items: [], totalCount: 0 };
       }
 
       cached.subscribers.add(socketId);
@@ -698,13 +660,15 @@ export class QuerySubscriptionManager {
       if (orderOptedOut) cached.emitOrder = false;
       await this._reconcileCreation(cached);
       if (extra.force && !created) await this._forceReeval(cached);
+      const totalCount =
+        reused && !extra.force ? await this._count(cached.query) : cached.totalCount;
       if (
         (this.socketGenerations.get(socketId) ?? 0) !== socketGeneration ||
         !this.socketQueries.get(socketId)?.has(hash)
       ) {
         cached.subscribers.delete(socketId);
         this._deleteCachedIfUnused(cached);
-        return { hash, items: [] };
+        return { hash, items: [], totalCount: 0 };
       }
 
       // When the IO backend supports rooms, join the socket so the
@@ -715,7 +679,7 @@ export class QuerySubscriptionManager {
         this.joinRoom(socketId, this._roomFor(hash));
       }
 
-      return { hash, items: [...cached.result.values()] };
+      return { hash, items: [...cached.result.values()], totalCount };
     } catch (err) {
       if (reserved) this._releaseReservation(socketId, hash);
       throw err;
@@ -745,25 +709,17 @@ export class QuerySubscriptionManager {
     dependency: CachedQuery["dependency"];
   }): Promise<CachedQuery> {
     const { hash, modelType, query, user, expand, emitOrder, dependency } = opts;
-    const watchedTypes = new Set([
-      modelType,
-      ...expand.map((entry) => entry.targetType),
-    ]);
+    const watchedTypes = new Set([modelType, ...expand.map((entry) => entry.targetType)]);
     const revisions = new Map(
-      [...watchedTypes].map((type) => [
-        type,
-        this.changeRevisions.get(type) ?? 0,
-      ]),
+      [...watchedTypes].map((type) => [type, this.changeRevisions.get(type) ?? 0]),
     );
     const refreshRevision = this.refreshRevision;
-    const rows = await this._execQuery(query, expand, user);
+    const { rows, totalCount } = await this._execQuery(opts);
     const result = new Map<string, Record<string, any>>();
     for (const row of rows) {
       const clean = dateSafeClone(row);
       result.set(clean.id, clean);
     }
-    const complete = await this._complete(query, rows.length, dependency.limit);
-
     const overrides = realtimeOverridesFor(query);
     const cached: CachedQuery = {
       hash,
@@ -773,7 +729,7 @@ export class QuerySubscriptionManager {
       user,
       expand,
       result,
-      complete,
+      totalCount,
       subscribers: new Set(),
       emitOrder,
       dependency,
@@ -808,10 +764,7 @@ export class QuerySubscriptionManager {
     }
     cached.needsCreationReconcile =
       refreshRevision !== this.refreshRevision ||
-      [...revisions].some(
-        ([type, revision]) =>
-          (this.changeRevisions.get(type) ?? 0) !== revision,
-      );
+      [...revisions].some(([type, revision]) => (this.changeRevisions.get(type) ?? 0) !== revision);
     return cached;
   }
 
@@ -861,10 +814,7 @@ export class QuerySubscriptionManager {
   }
 
   unsubscribeAll(socketId: string): void {
-    this.socketGenerations.set(
-      socketId,
-      (this.socketGenerations.get(socketId) ?? 0) + 1,
-    );
+    this.socketGenerations.set(socketId, (this.socketGenerations.get(socketId) ?? 0) + 1);
     const hashes = this.socketQueries.get(socketId);
     if (!hashes) {
       if (!this.pendingSockets.has(socketId)) {
@@ -908,10 +858,7 @@ export class QuerySubscriptionManager {
 
   /** Route one committed Postgres row change to affected local caches. */
   onModelChange(modelType: string, change?: Change): void {
-    this.changeRevisions.set(
-      modelType,
-      (this.changeRevisions.get(modelType) ?? 0) + 1,
-    );
+    this.changeRevisions.set(modelType, (this.changeRevisions.get(modelType) ?? 0) + 1);
     const direct = this.typeIndex.get(modelType);
     if (direct) {
       const absent: CachedQuery[] = [];
@@ -941,9 +888,7 @@ export class QuerySubscriptionManager {
       const referencesRow = cached.expand.some(
         (exp) =>
           exp.targetType === modelType &&
-          [...cached.result.values()].some(
-            (row) => getWireRefId(row, exp.refField) === change.id,
-          ),
+          [...cached.result.values()].some((row) => getWireRefId(row, exp.refField) === change.id),
       );
       if (referencesRow) this._scheduleExpandRefresh(cached, modelType, change);
     }
@@ -963,8 +908,8 @@ export class QuerySubscriptionManager {
     const { hasOffset, hasOpaqueOrder, hasStableOrder, orderFields } = cached.dependency;
     if (hasOffset || hasOpaqueOrder) return true;
     // An unordered result its limit cuts cannot tell which rows the limit keeps.
-    if (!cached.complete && !hasStableOrder) return true;
-    // A row that enters or leaves is placed by `_refreshRoot`.
+    if (cached.result.size !== cached.totalCount && !hasStableOrder) return true;
+    // The scoped batch decides whether a row enters or leaves.
     if (change.op !== "update") return false;
     if (change.changedFields === null) return true;
     return change.changedFields.some((field) => field === "id" || orderFields.has(field));
@@ -1002,11 +947,7 @@ export class QuerySubscriptionManager {
     }
   }
 
-  private _scheduleExpandRefresh(
-    cached: CachedQuery,
-    modelType: string,
-    change: Change,
-  ): void {
+  private _scheduleExpandRefresh(cached: CachedQuery, modelType: string, change: Change): void {
     const c = cached.coalesce;
     if (!c.full) {
       const key = `${modelType}\0${change.id}`;
@@ -1095,20 +1036,13 @@ export class QuerySubscriptionManager {
         if (full) {
           await this._reeval(cached);
         } else {
-          for (const change of root) {
-            if (await this._refreshRoot(cached, change.id)) {
-              didFullReeval = true;
-              break;
-            }
-          }
+          if (root.length)
+            didFullReeval = await this._refreshRoots(
+              cached,
+              root.map((change) => change.id),
+            );
           if (!didFullReeval) {
-            for (const pending of expand) {
-              await this._refreshExpand(
-                cached,
-                pending.modelType,
-                pending.change,
-              );
-            }
+            await this._refreshExpand(cached, expand);
           }
         }
       } catch (err) {
@@ -1120,10 +1054,7 @@ export class QuerySubscriptionManager {
           try {
             await this._reeval(cached);
           } catch (fallbackError) {
-            log.error(
-              `subscriptions: fallback re-eval failed for ${cached.hash}:`,
-              fallbackError,
-            );
+            log.error(`subscriptions: fallback re-eval failed for ${cached.hash}:`, fallbackError);
           }
         } else {
           log.error(`subscriptions: re-eval failed for ${cached.hash}:`, err);
@@ -1183,45 +1114,62 @@ export class QuerySubscriptionManager {
     c.expand.clear();
   }
 
-  /** Refresh one row through the original scoped query. Returns true on fallback. */
-  private async _refreshRoot(cached: CachedQuery, id: string): Promise<boolean> {
+  /** Read changed roots in one scoped query; decide membership before applying the batch. */
+  private async _refreshRoots(cached: CachedQuery, ids: readonly string[]): Promise<boolean> {
     if (cached.subscribers.size === 0) return false;
     const generation = cached.generation;
     const query = cached.query
       .clone()
-      .where("id", id)
+      .whereIn("id", [...ids])
       .clearLimit();
     const adapter = this._queryAdapter(cached.query);
-    const model = adapter?.executeSubscriptionQuery
-      ? (await adapter.executeSubscriptionQuery(query.limit(1)))[0] ?? null
-      : await query.first();
+    const models = adapter?.executeSubscriptionQuery
+      ? await adapter.executeSubscriptionQuery(query)
+      : await query.find();
     if (!this._isCurrent(cached, generation)) return false;
 
-    const previous = cached.result.get(id);
-    if (!model && !previous) return false;
-    if (!this._placesInPlace(cached, !!model, !!previous)) {
+    const found = new Set(models.map((model) => String(model.id ?? model.__data.id)));
+    const changeInSize = ids.reduce(
+      (delta, id) => delta + Number(found.has(id)) - Number(cached.result.has(id)),
+      0,
+    );
+    const limit = cached.dependency.limit;
+    if (
+      ids.some(
+        (id) =>
+          (found.has(id) || cached.result.has(id)) &&
+          !this._placesInPlace(cached, found.has(id), cached.result.has(id)),
+      ) ||
+      (limit !== null && cached.result.size + changeInSize > limit)
+    ) {
       await this._reeval(cached);
       return true;
     }
-    if (!model) {
-      cached.result.delete(id);
-      this._emit(cached, { ops: [{ op: "remove", id }] });
-      return false;
-    }
 
-    const rows = [await projectForWire(model, cached.user)];
+    const rows = await Promise.all(models.map((model) => projectForWire(model, cached.user)));
     await this._hydrateRows(cached.query, rows, cached.expand, cached.user);
     if (!this._isCurrent(cached, generation)) return false;
-    const data = dateSafeClone(rows[0]!);
-    cached.result.set(id, data);
-    if (!previous) {
-      this._emit(cached, { ops: [{ op: "add", id, data }] });
-      return false;
+    const updated = new Map(rows.map((row) => [row.id, dateSafeClone(row)]));
+    const ops: DiffOp[] = [];
+    for (const id of ids) {
+      const previous = cached.result.get(id);
+      const data = updated.get(id);
+      if (!data) {
+        if (previous) {
+          cached.result.delete(id);
+          ops.push({ op: "remove", id });
+        }
+      } else {
+        cached.result.set(id, data);
+        if (!previous) ops.push({ op: "add", id, data });
+        else {
+          const patch = visiblePatch(fastJsonPatch.compare(previous, data));
+          if (patch.length > 0) ops.push({ op: "update", id, patch });
+        }
+      }
     }
-    const patch = visiblePatch(fastJsonPatch.compare(previous, data));
-    if (patch.length > 0) {
-      this._emit(cached, { ops: [{ op: "update", id, patch }] });
-    }
+    cached.totalCount += changeInSize;
+    if (ops.length > 0) this._emit(cached, { ops });
     return false;
   }
 
@@ -1233,13 +1181,13 @@ export class QuerySubscriptionManager {
    */
   private _placesInPlace(cached: CachedQuery, found: boolean, held: boolean): boolean {
     if (found && held) return true;
-    if (!cached.complete) return false;
+    if (cached.result.size !== cached.totalCount) return false;
     if (held) return true;
     const { limit, hasStableOrder } = cached.dependency;
     return !hasStableOrder && (limit === null || cached.result.size < limit);
   }
 
-  /** The changed row as stored, read once and never sent; the scope is checked per query. */
+  /** Batch admission reads per adapter; only a scoped refresh can send the row. */
   private async _readRow(
     query: QueryChain<any>,
     modelType: string,
@@ -1248,42 +1196,48 @@ export class QuerySubscriptionManager {
     const adapter = this._queryAdapter(query);
     if (!adapter?.batchFindByTypeOnWrite) return undefined;
     try {
-      const model = (await adapter.batchFindByTypeOnWrite(modelType, [id])).get(id);
+      let loader = this.admissionLoaders.get(adapter);
+      if (!loader) {
+        loader = new RefLoader(async (type, ids) => {
+          await this.reevalSemaphore.acquire();
+          try {
+            return await adapter.batchFindByTypeOnWrite!(type, ids);
+          } finally {
+            this.reevalSemaphore.release();
+          }
+        });
+        this.admissionLoaders.set(adapter, loader);
+      }
+      const model = (await loader.load(modelType, id)) as {
+        __data?: Record<string, unknown>;
+      } | null;
       return model ? ((model.__data ?? model) as Record<string, unknown>) : null;
     } catch {
       return undefined;
     }
   }
 
-  /** A result under its limit holds every match; at the limit, a count says. */
-  private async _complete(
-    query: QueryChain<any>,
-    size: number,
-    limit: number | null,
-  ): Promise<boolean> {
-    if (limit === null || size < limit) return true;
+  private async _count(query: QueryChain<any>): Promise<number> {
     const adapter = this._queryAdapter(query);
-    if (!adapter?.executeSubscriptionCount) return false;
-    return (await adapter.executeSubscriptionCount(query)) <= limit;
+    return adapter?.executeSubscriptionCount
+      ? adapter.executeSubscriptionCount(query)
+      : query.clone().count();
   }
 
-  /** Rehydrate only cached parents that point at the changed target row. */
+  /** Rehydrate affected parents together so linked rows load once per target type. */
   private async _refreshExpand(
     cached: CachedQuery,
-    modelType: string,
-    change: Change,
+    changes: readonly { modelType: string; change: Change }[],
   ): Promise<void> {
-    if (cached.subscribers.size === 0) return;
+    if (cached.subscribers.size === 0 || changes.length === 0) return;
     const generation = cached.generation;
-    const expand = cached.expand.filter(
-      (entry) => entry.targetType === modelType,
-    );
+    const changed = new Set(changes.map(({ modelType, change }) => `${modelType}\0${change.id}`));
+    const types = new Set(changes.map(({ modelType }) => modelType));
+    const expand = cached.expand.filter((entry) => types.has(entry.targetType));
     const rows = [...cached.result.values()]
       .filter((row) =>
-        expand.some(
-          (entry) => getWireRefId(row, entry.refField) === change.id,
-        ),
-      )
+        expand.some((entry) =>
+          changed.has(`${entry.targetType}\0${getWireRefId(row, entry.refField)}`)))
       .map((row) => dateSafeClone(row));
     if (rows.length === 0) return;
 
@@ -1314,15 +1268,9 @@ export class QuerySubscriptionManager {
     if (cached.subscribers.size === 0) return;
     const generation = cached.generation;
 
-    const rows = await this._execQuery(
-      cached.query,
-      cached.expand,
-      cached.user,
-    );
+    const { rows, totalCount } = await this._execQuery(cached);
     if (!this._isCurrent(cached, generation)) return;
-    const complete = await this._complete(cached.query, rows.length, cached.dependency.limit);
-    if (!this._isCurrent(cached, generation)) return;
-    cached.complete = complete;
+    cached.totalCount = totalCount;
     const newResult = new Map<string, Record<string, any>>();
     for (const row of rows) {
       const clean = dateSafeClone(row);
@@ -1361,9 +1309,7 @@ export class QuerySubscriptionManager {
     if (cached.emitOrder) {
       const prevOrder = [...cached.result.keys()];
       newOrder = [...newResult.keys()];
-      const hasMembershipChange = ops.some(
-        (o) => o.op === "add" || o.op === "remove",
-      );
+      const hasMembershipChange = ops.some((o) => o.op === "add" || o.op === "remove");
       const orderChanged = !ordersEqual(prevOrder, newOrder);
       includeOrder = hasMembershipChange || orderChanged;
     }
@@ -1372,9 +1318,7 @@ export class QuerySubscriptionManager {
 
     if (ops.length === 0 && !includeOrder) return;
 
-    const envelope: QueryEmitEnvelope = includeOrder
-      ? { ops, order: newOrder }
-      : { ops };
+    const envelope: QueryEmitEnvelope = includeOrder ? { ops, order: newOrder } : { ops };
 
     this._emit(cached, envelope);
   }
@@ -1395,28 +1339,29 @@ export class QuerySubscriptionManager {
 
   // ── Query Execution ────────────────────────────────────────────────
 
-  private async _execQuery(
-    query: QueryChain<any>,
-    expand: readonly ResolvedExpand[],
-    user: SanitizerUser,
-  ): Promise<Record<string, any>[]> {
+  private async _execQuery({
+    query,
+    expand,
+    user,
+    dependency,
+  }: Pick<CachedQuery, "query" | "expand" | "user" | "dependency">): Promise<{
+    rows: Record<string, any>[];
+    totalCount: number;
+  }> {
     const cloned = query.clone();
     const adapter = this._queryAdapter(query);
     const models = adapter?.executeSubscriptionQuery
       ? await adapter.executeSubscriptionQuery(cloned)
       : await cloned.find();
-    // `query.find()` returns `Promise<any[]>` (the chain's generic is
-    // `any`); the projection runs `sanitize()` for every Model row
-    // and falls back to `__data` for any non-Model row that snuck
-    // through (defensive — the default `sanitize` is now on Model
-    // itself, so the fallback is effectively unreachable for real
-    // model classes).
-    const wireRows = await Promise.all(
-      models.map((model) => projectForWire(model, user)),
-    );
+    const wireRows = await Promise.all(models.map((model) => projectForWire(model, user)));
 
-    await this._hydrateRows(query, wireRows, expand, user);
-    return wireRows;
+    const [totalCount] = await Promise.all([
+      !dependency.hasOffset && (dependency.limit === null || models.length < dependency.limit)
+        ? models.length
+        : this._count(query),
+      this._hydrateRows(query, wireRows, expand, user),
+    ]);
+    return { rows: wireRows, totalCount };
   }
 
   private async _hydrateRows(
@@ -1427,29 +1372,18 @@ export class QuerySubscriptionManager {
   ): Promise<void> {
     if (expand.length === 0 || wireRows.length === 0) return;
 
-    // Build an ephemeral RefLoader pointed at the adapter's batch
-    // entrypoint. This runs OUTSIDE a request scope (re-eval fires
-    // on `onModelChange`, which has no AsyncLocalStorage frame), so
-    // we can't reuse `getRefLoader()`. The per-reeval loader still
-    // collapses every ref-id-per-row into one query per target
-    // type via the same microtask batching.
+    // Change notifications have no request context. This loader belongs to
+    // the refresh and reads the primary, as the root query does.
     const adapter = this._queryAdapter(query);
-    const batch =
-      adapter?.batchFindByTypeOnWrite ?? adapter?.batchFindByType;
+    const batch = adapter?.batchFindByTypeOnWrite ?? adapter?.batchFindByType;
     if (!batch) return;
     const loader = new RefLoader((type, ids) => batch.call(adapter, type, ids));
     await hydrateExpansions(wireRows, expand, loader, user ?? undefined);
   }
 
   private _queryAdapter(query: QueryChain<any>): {
-    batchFindByType?: (
-      type: string,
-      ids: string[],
-    ) => Promise<Map<string, any>>;
-    batchFindByTypeOnWrite?: (
-      type: string,
-      ids: string[],
-    ) => Promise<Map<string, any>>;
+    batchFindByType?: (type: string, ids: string[]) => Promise<Map<string, any>>;
+    batchFindByTypeOnWrite?: (type: string, ids: string[]) => Promise<Map<string, any>>;
     executeSubscriptionQuery?: (query: QueryChain<any>) => Promise<any[]>;
     executeSubscriptionCount?: (query: QueryChain<any>) => Promise<number>;
   } | null {
@@ -1460,8 +1394,7 @@ export class QuerySubscriptionManager {
 
   get stats() {
     let totalSubscribers = 0;
-    for (const cached of this.queries.values())
-      totalSubscribers += cached.subscribers.size;
+    for (const cached of this.queries.values()) totalSubscribers += cached.subscribers.size;
     return {
       queries: this.queries.size,
       subscribers: totalSubscribers,

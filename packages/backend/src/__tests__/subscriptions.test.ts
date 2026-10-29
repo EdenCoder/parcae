@@ -1,8 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import {
-  QuerySubscriptionManager,
-  parsePositiveInteger,
-} from "../services/subscriptions";
+import { QuerySubscriptionManager, parsePositiveInteger } from "../services/subscriptions";
 
 // ─── Mock Data ───────────────────────────────────────────────────────────────
 
@@ -37,9 +34,7 @@ function makeMockQuery(
         if (prop === "first") {
           return async () => {
             const rows = getResults();
-            return rows[0]
-              ? { __data: rows[0], sanitize: () => rows[0] }
-              : null;
+            return rows[0] ? { __data: rows[0], sanitize: () => rows[0] } : null;
           };
         }
         if (prop === "count") return async () => getResults().length;
@@ -116,19 +111,19 @@ function createTrackedQuerySource(
   options: { adapter?: any; sql?: string; limit?: number } = {},
 ) {
   let currentResults = initialResults;
-  let nextFirstError: Error | null = null;
-  const calls = { find: 0, first: [] as Array<string | null> };
+  let nextTargetedError: Error | null = null;
+  const calls = { find: 0, targeted: [] as string[][] };
   const wrap = (item: Record<string, any>) => ({
     __data: item,
     sanitize: () => item,
   });
-  const makeChain = (id: string | null = null): any => {
+  const makeChain = (ids: string[] | null = null): any => {
     const chain: any = {
       __adapter: options.adapter,
       __modelClass: { type: modelType },
       __modelType: modelType,
       clearLimit: () => chain,
-      clone: () => makeChain(id),
+      clone: () => makeChain(ids),
       exec: () => ({
         // Where Knex keeps the limit a builder applies.
         _single: { limit: options.limit },
@@ -137,29 +132,28 @@ function createTrackedQuerySource(
           bindings: [],
         }),
       }),
+      count: async () => currentResults.length,
       find: async () => {
+        if (ids) {
+          calls.targeted.push(ids);
+          if (nextTargetedError) {
+            const error = nextTargetedError;
+            nextTargetedError = null;
+            throw error;
+          }
+          return currentResults.filter((row) => ids.includes(row.id)).map(wrap);
+        }
         calls.find++;
         return currentResults.map(wrap);
       },
-      first: async () => {
-        calls.first.push(id);
-        if (nextFirstError) {
-          const error = nextFirstError;
-          nextFirstError = null;
-          throw error;
-        }
-        const item = currentResults.find((row) => row.id === id);
-        return item ? wrap(item) : null;
-      },
-      where: (field: string, value: unknown) =>
-        field === "id" ? makeChain(String(value)) : chain,
+      whereIn: (field: string, values: string[]) => (field === "id" ? makeChain(values) : chain),
     };
     return chain;
   };
   return {
     calls,
-    failNextFirst(error: Error) {
-      nextFirstError = error;
+    failNextTargeted(error: Error) {
+      nextTargetedError = error;
     },
     query: makeChain(),
     setResults(results: Record<string, any>[]) {
@@ -197,10 +191,7 @@ describe("QuerySubscriptionManager", () => {
 
   describe("subscribe", () => {
     it("should return initial query results and a hash", async () => {
-      source.setResults([
-        row("p1", { name: "Project 1" }),
-        row("p2", { name: "Project 2" }),
-      ]);
+      source.setResults([row("p1", { name: "Project 1" }), row("p2", { name: "Project 2" })]);
 
       const sub = await manager.subscribe({
         socketId: "s1",
@@ -210,6 +201,7 @@ describe("QuerySubscriptionManager", () => {
       expect(sub.hash).toBeTruthy();
       expect(sub.hash.length).toBe(16);
       expect(sub.items).toHaveLength(2);
+      expect(sub.totalCount).toBe(2);
       expect(sub.items[0]).toEqual({ id: "p1", name: "Project 1" });
       expect(sub.items[1]).toEqual({ id: "p2", name: "Project 2" });
     });
@@ -394,15 +386,16 @@ describe("QuerySubscriptionManager", () => {
 
     it("hydrates initial expansions once through the primary adapter", async () => {
       const readBatch = vi.fn(async () => new Map());
-      const writeBatch = vi.fn(async () =>
-        new Map([
-          [
-            "f1",
-            {
-              sanitize: () => ({ id: "f1", type: "file", url: "/one" }),
-            },
-          ],
-        ]),
+      const writeBatch = vi.fn(
+        async () =>
+          new Map([
+            [
+              "f1",
+              {
+                sanitize: () => ({ id: "f1", type: "file", url: "/one" }),
+              },
+            ],
+          ]),
       );
       const query: any = {
         __modelType: "asset",
@@ -414,9 +407,7 @@ describe("QuerySubscriptionManager", () => {
           toSQL: () => ({ sql: "SELECT expanded", bindings: [] }),
         }),
         clone: () => query,
-        find: async () => [
-          { sanitize: () => ({ id: "a1", file: "f1" }) },
-        ],
+        find: async () => [{ sanitize: () => ({ id: "a1", file: "f1" }) }],
       };
       const expand: any = [
         {
@@ -539,8 +530,7 @@ describe("QuerySubscriptionManager", () => {
         cappedManager.subscribe({
           socketId: "resync-socket",
           query: makeQuery(`query_${index}`),
-        }),
-      );
+        }));
       await Promise.resolve();
 
       expect(findCalls).toBe(2);
@@ -571,9 +561,9 @@ describe("QuerySubscriptionManager", () => {
         },
       };
 
-      await expect(
-        cappedManager.subscribe({ socketId: "s1", query: failed }),
-      ).rejects.toThrow("query failed");
+      await expect(cappedManager.subscribe({ socketId: "s1", query: failed })).rejects.toThrow(
+        "query failed",
+      );
       const retry = await cappedManager.subscribe({
         socketId: "s1",
         query: source.query("project", "retry"),
@@ -694,7 +684,7 @@ describe("QuerySubscriptionManager", () => {
       manager.unsubscribe("s1", hash);
       release();
 
-      await expect(pending).resolves.toEqual({ hash, items: [] });
+      await expect(pending).resolves.toEqual({ hash, items: [], totalCount: 0 });
       expect(manager.stats).toEqual({ queries: 0, subscribers: 0, sockets: 0 });
     });
 
@@ -849,9 +839,7 @@ describe("QuerySubscriptionManager", () => {
       // Should carry a JSON Patch array, not the full data
       expect(ops[0].patch).toBeDefined();
       expect(ops[0].data).toBeUndefined();
-      expect(ops[0].patch).toEqual([
-        { op: "replace", path: "/views", value: 42 },
-      ]);
+      expect(ops[0].patch).toEqual([{ op: "replace", path: "/views", value: 42 }]);
       // Stable membership + stable order → no `order` envelope.
       expect(emitted[0]!.data.order).toBeUndefined();
     });
@@ -956,9 +944,7 @@ describe("QuerySubscriptionManager", () => {
 
       const p1Op = byOp.get("p1") as any;
       expect(p1Op.op).toBe("update");
-      expect(p1Op.patch).toEqual([
-        { op: "replace", path: "/name", value: "A-updated" },
-      ]);
+      expect(p1Op.patch).toEqual([{ op: "replace", path: "/name", value: "A-updated" }]);
       expect(p1Op.data).toBeUndefined();
 
       expect(byOp.get("p2")).toEqual({ op: "remove", id: "p2" });
@@ -1048,10 +1034,7 @@ describe("QuerySubscriptionManager", () => {
         row("p2", { name: "B" }),
       ]);
       await manager.subscribe({ socketId: "s1", query: tracked.query });
-      tracked.setResults([
-        row("p1", { name: "A2" }),
-        row("p2", { name: "B" }),
-      ]);
+      tracked.setResults([row("p1", { name: "A2" }), row("p2", { name: "B" })]);
 
       manager.onModelChange("project", {
         table: "projects",
@@ -1061,7 +1044,7 @@ describe("QuerySubscriptionManager", () => {
       });
       await tick();
 
-      expect(tracked.calls).toEqual({ find: 1, first: ["p1"] });
+      expect(tracked.calls).toEqual({ find: 1, targeted: [["p1"]] });
       expect(emitted[0]!.data).toEqual({
         ops: [
           {
@@ -1089,7 +1072,7 @@ describe("QuerySubscriptionManager", () => {
       });
       await tick();
 
-      expect(tracked.calls).toEqual({ find: 1, first: ["p1"] });
+      expect(tracked.calls).toEqual({ find: 1, targeted: [["p1"]] });
       expect(emitted[0]!.data.ops).toEqual([{ op: "remove", id: "p1" }]);
     });
 
@@ -1106,7 +1089,7 @@ describe("QuerySubscriptionManager", () => {
       });
       await tick();
 
-      expect(tracked.calls).toEqual({ find: 1, first: ["p2"] });
+      expect(tracked.calls).toEqual({ find: 1, targeted: [["p2"]] });
       expect(emitted[0]!.data.ops).toEqual([
         { op: "add", id: "p2", data: row("p2", { name: "B" }) },
       ]);
@@ -1131,7 +1114,7 @@ describe("QuerySubscriptionManager", () => {
       });
       await tick();
 
-      expect(tracked.calls).toEqual({ find: 1, first: [] });
+      expect(tracked.calls).toEqual({ find: 1, targeted: [] });
       expect(emitted).toEqual([]);
     });
 
@@ -1152,7 +1135,7 @@ describe("QuerySubscriptionManager", () => {
       });
       await tick();
 
-      expect(tracked.calls).toEqual({ find: 1, first: ["p1"] });
+      expect(tracked.calls).toEqual({ find: 1, targeted: [["p1"]] });
     });
 
     it("fully re-evaluates updates that can change explicit ordering", async () => {
@@ -1165,10 +1148,7 @@ describe("QuerySubscriptionManager", () => {
         query: tracked.query,
         steps: [{ method: "orderBy", args: ["rank", "asc"] }],
       });
-      tracked.setResults([
-        row("p2", { rank: 2 }),
-        row("p1", { rank: 3 }),
-      ]);
+      tracked.setResults([row("p2", { rank: 2 }), row("p1", { rank: 3 })]);
 
       manager.onModelChange("project", {
         table: "projects",
@@ -1178,16 +1158,16 @@ describe("QuerySubscriptionManager", () => {
       });
       await tick();
 
-      expect(tracked.calls).toEqual({ find: 2, first: [] });
+      expect(tracked.calls).toEqual({ find: 2, targeted: [] });
       expect(emitted[0]!.data.order).toEqual(["p2", "p1"]);
     });
 
     it("fully re-evaluates an unordered result that reaches its limit", async () => {
-      const tracked = createTrackedQuerySource(
-        "project",
-        [row("p1", { name: "A" })],
-        { sql: "SELECT * FROM projects LIMIT 1", limit: 1 },
-      );
+      const tracked = createTrackedQuerySource("project", [row("p1", { name: "A" })], {
+        sql: "SELECT * FROM projects LIMIT 1",
+        limit: 1,
+        adapter: { executeSubscriptionCount: async () => 2 },
+      });
       await manager.subscribe({ socketId: "s1", query: tracked.query });
       tracked.setResults([row("p1", { name: "A2" })]);
 
@@ -1199,7 +1179,7 @@ describe("QuerySubscriptionManager", () => {
       });
       await tick();
 
-      expect(tracked.calls).toEqual({ find: 2, first: [] });
+      expect(tracked.calls).toEqual({ find: 2, targeted: [] });
     });
 
     it("targets an update to an unordered result under its limit", async () => {
@@ -1219,7 +1199,7 @@ describe("QuerySubscriptionManager", () => {
       });
       await tick();
 
-      expect(tracked.calls).toEqual({ find: 1, first: ["p1"] });
+      expect(tracked.calls).toEqual({ find: 1, targeted: [["p1"]] });
       expect(emitted[0]!.data.ops).toEqual([
         {
           op: "update",
@@ -1230,14 +1210,10 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("fully re-evaluates a limited non-unique order", async () => {
-      const tracked = createTrackedQuerySource(
-        "project",
-        [row("p1", { name: "A", rank: 1 })],
-        {
-          sql: 'SELECT * FROM projects ORDER BY "rank" ASC LIMIT 25',
-          limit: 25,
-        },
-      );
+      const tracked = createTrackedQuerySource("project", [row("p1", { name: "A", rank: 1 })], {
+        sql: 'SELECT * FROM projects ORDER BY "rank" ASC LIMIT 25',
+        limit: 25,
+      });
       await manager.subscribe({
         socketId: "s1",
         query: tracked.query,
@@ -1253,18 +1229,14 @@ describe("QuerySubscriptionManager", () => {
       });
       await tick();
 
-      expect(tracked.calls).toEqual({ find: 2, first: [] });
+      expect(tracked.calls).toEqual({ find: 2, targeted: [] });
     });
 
     it("targets a limited query with an id order tie-breaker", async () => {
-      const tracked = createTrackedQuerySource(
-        "project",
-        [row("p1", { name: "A", rank: 1 })],
-        {
-          sql: 'SELECT * FROM projects ORDER BY "rank" ASC, "id" ASC LIMIT 25',
-          limit: 25,
-        },
-      );
+      const tracked = createTrackedQuerySource("project", [row("p1", { name: "A", rank: 1 })], {
+        sql: 'SELECT * FROM projects ORDER BY "rank" ASC, "id" ASC LIMIT 25',
+        limit: 25,
+      });
       await manager.subscribe({
         socketId: "s1",
         query: tracked.query,
@@ -1283,16 +1255,14 @@ describe("QuerySubscriptionManager", () => {
       });
       await tick();
 
-      expect(tracked.calls).toEqual({ find: 1, first: ["p1"] });
+      expect(tracked.calls).toEqual({ find: 1, targeted: [["p1"]] });
     });
 
     it("falls back to a full query when a targeted row read fails", async () => {
-      const tracked = createTrackedQuerySource("project", [
-        row("p1", { name: "A" }),
-      ]);
+      const tracked = createTrackedQuerySource("project", [row("p1", { name: "A" })]);
       await manager.subscribe({ socketId: "s1", query: tracked.query });
       tracked.setResults([row("p1", { name: "A2" })]);
-      tracked.failNextFirst(new Error("targeted read failed"));
+      tracked.failNextTargeted(new Error("targeted read failed"));
 
       manager.onModelChange("project", {
         table: "projects",
@@ -1302,23 +1272,21 @@ describe("QuerySubscriptionManager", () => {
       });
       await tick();
 
-      expect(tracked.calls).toEqual({ find: 2, first: ["p1"] });
+      expect(tracked.calls).toEqual({ find: 2, targeted: [["p1"]] });
       expect(emitted[0]!.data.ops[0].patch).toEqual([
         { op: "replace", path: "/name", value: "A2" },
       ]);
     });
 
     it("rebuilds every cache after a LISTEN reconnect", async () => {
-      const tracked = createTrackedQuerySource("project", [
-        row("p1", { name: "A" }),
-      ]);
+      const tracked = createTrackedQuerySource("project", [row("p1", { name: "A" })]);
       await manager.subscribe({ socketId: "s1", query: tracked.query });
       tracked.setResults([row("p1", { name: "reconciled" })]);
 
       manager.refreshAll();
       await tick();
 
-      expect(tracked.calls).toEqual({ find: 2, first: [] });
+      expect(tracked.calls).toEqual({ find: 2, targeted: [] });
       expect(emitted[0]!.data.ops[0].patch).toEqual([
         { op: "replace", path: "/name", value: "reconciled" },
       ]);
@@ -1333,9 +1301,7 @@ describe("QuerySubscriptionManager", () => {
         new Map(
           ids.flatMap((id) => {
             const file = files.get(id);
-            return file
-              ? [[id, { __data: file, sanitize: () => file }] as const]
-              : [];
+            return file ? [[id, { __data: file, sanitize: () => file }] as const] : [];
           }),
         );
       const adapter = {
@@ -1371,11 +1337,9 @@ describe("QuerySubscriptionManager", () => {
       });
       await tick();
 
-      expect(tracked.calls).toEqual({ find: 1, first: [] });
+      expect(tracked.calls).toEqual({ find: 1, targeted: [] });
       expect(adapter.batchFindByType).not.toHaveBeenCalled();
-      expect(adapter.batchFindByTypeOnWrite).toHaveBeenCalledWith("file", [
-        "f1",
-      ]);
+      expect(adapter.batchFindByTypeOnWrite).toHaveBeenCalledWith("file", ["f1"]);
       expect(emitted[0]!.data.ops).toEqual([
         {
           op: "update",
@@ -1411,9 +1375,7 @@ describe("QuerySubscriptionManager", () => {
 
       // Update op should carry a JSON Patch array, not the full data
       expect(updateOp.data).toBeUndefined();
-      expect(updateOp.patch).toEqual([
-        { op: "replace", path: "/name", value: "B-updated" },
-      ]);
+      expect(updateOp.patch).toEqual([{ op: "replace", path: "/name", value: "B-updated" }]);
     });
 
     it("should not re-send unchanged items", async () => {
@@ -1515,20 +1477,14 @@ describe("QuerySubscriptionManager", () => {
 
   describe("order envelope", () => {
     it("emits order array when only ordering changes (no membership change)", async () => {
-      source.setResults([
-        row("p1", { name: "A" }),
-        row("p2", { name: "B" }),
-      ]);
+      source.setResults([row("p1", { name: "A" }), row("p2", { name: "B" })]);
       await manager.subscribe({
         socketId: "s1",
         query: source.query("project"),
       });
 
       // Same membership, swapped order (e.g. orderBy on a mutable field).
-      source.setResults([
-        row("p2", { name: "B" }),
-        row("p1", { name: "A" }),
-      ]);
+      source.setResults([row("p2", { name: "B" }), row("p1", { name: "A" })]);
       manager.onModelChange("project");
       await tick();
 
@@ -1540,20 +1496,14 @@ describe("QuerySubscriptionManager", () => {
     });
 
     it("omits order when membership and order are both stable", async () => {
-      source.setResults([
-        row("p1", { name: "A" }),
-        row("p2", { name: "B" }),
-      ]);
+      source.setResults([row("p1", { name: "A" }), row("p2", { name: "B" })]);
       await manager.subscribe({
         socketId: "s1",
         query: source.query("project"),
       });
 
       // Only p1 contents change. Order is identical.
-      source.setResults([
-        row("p1", { name: "A2" }),
-        row("p2", { name: "B" }),
-      ]);
+      source.setResults([row("p1", { name: "A2" }), row("p2", { name: "B" })]);
       manager.onModelChange("project");
       await tick();
 
@@ -1586,9 +1536,7 @@ describe("QuerySubscriptionManager", () => {
       await new Promise((r) => setTimeout(r, 20));
 
       expect(emitted).toHaveLength(1);
-      expect(emitted[0]!.data.ops[0].patch).toEqual([
-        { op: "replace", path: "/name", value: "B" },
-      ]);
+      expect(emitted[0]!.data.ops[0].patch).toEqual([{ op: "replace", path: "/name", value: "B" }]);
     });
 
     it("collapses a burst of onModelChange into a single re-eval", async () => {
@@ -1837,10 +1785,7 @@ describe("QuerySubscriptionManager", () => {
       // result. It waits for the in-flight run, then runs a fresh
       // one: the in-flight read may predate the drift being polled.
       results = [row("p1", { name: "A-drifted" })];
-      const forcePromise = manager.subscribe(
-        { socketId: "s1", query: chain },
-        { force: true },
-      );
+      const forcePromise = manager.subscribe({ socketId: "s1", query: chain }, { force: true });
       await new Promise((r) => setTimeout(r, 5));
       expect(findCalls).toBe(2);
 
@@ -1897,18 +1842,14 @@ describe("QuerySubscriptionManager", () => {
       });
 
       const N = 6;
-      const queries = Array.from({ length: N }, (_, i) =>
-        makeGatedQuery(`sql_${i}`),
-      );
+      const queries = Array.from({ length: N }, (_, i) => makeGatedQuery(`sql_${i}`));
       for (const query of queries) {
         await m.subscribe({ socketId: "s1", query });
       }
 
       gateOpen = false;
       peak = 0;
-      const polls = queries.map((query) =>
-        m.subscribe({ socketId: "s1", query }, { force: true }),
-      );
+      const polls = queries.map((query) => m.subscribe({ socketId: "s1", query }, { force: true }));
       await new Promise((r) => setTimeout(r, 5));
       expect(peak).toBe(REEVAL_CAP);
 
@@ -1964,14 +1905,11 @@ describe("parsePositiveInteger", () => {
     expect(parsePositiveInteger(12, "limit")).toBe(12);
   });
 
-  it.each(["NaN", "Infinity", "1.5", "0", "-1"])(
-    "rejects invalid safeguard value %s",
-    (value) => {
-      expect(() => parsePositiveInteger(value, "limit")).toThrow(
-        "limit must be a finite positive integer",
-      );
-    },
-  );
+  it.each(["NaN", "Infinity", "1.5", "0", "-1"])("rejects invalid safeguard value %s", (value) => {
+    expect(() => parsePositiveInteger(value, "limit")).toThrow(
+      "limit must be a finite positive integer",
+    );
+  });
 });
 
 // ─── DOL-1047: concurrency cap + Socket.IO rooms ────────────────────────────
@@ -2021,9 +1959,7 @@ describe("QuerySubscriptionManager — re-eval concurrency cap (DOL-1047)", () =
                 inFlight++;
                 if (inFlight > peak) peak = inFlight;
                 if (!gateOpen) {
-                  await new Promise<void>((resolve) =>
-                    waiters.push(resolve),
-                  );
+                  await new Promise<void>((resolve) => waiters.push(resolve));
                 }
                 inFlight--;
                 return source.query("project").find();
@@ -2183,10 +2119,7 @@ describe("QuerySubscriptionManager — Date safety on re-eval clone (DOL-1047)",
         updatedAt: new Date("2024-01-01T00:00:00Z"),
       }),
     ]);
-    const m = new QuerySubscriptionManager(
-      () => {},
-      { debounceMs: 0, maxWaitMs: 0 },
-    );
+    const m = new QuerySubscriptionManager(() => {}, { debounceMs: 0, maxWaitMs: 0 });
 
     const sub = await m.subscribe({
       socketId: "s1",
