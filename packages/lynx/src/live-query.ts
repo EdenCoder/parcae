@@ -411,6 +411,8 @@ export function createLiveQuery<T extends LiveRow>(
       .withQuerySubscriptions(async () => {
         const result = await chain.find();
         if (fetchGeneration !== generation) return;
+        // Emitted on the client as "answer" for the app to time.
+        client._emitDiagnostic?.("answer", {});
         const rows = (result as unknown as { __rows: ServerRow[] }).__rows;
         fields = fieldsOf(chain.__steps);
         items = reconcile(result, rows);

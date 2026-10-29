@@ -59,7 +59,7 @@ beforeEach(() => {
         adapter                : { resolvePath: () => "/shows" },
         patch,
         delete                 : remove,
-        _emitDiagnostic        : (_event: string, moment: unknown) => moments.push(moment),
+        _emitDiagnostic        : (event: string, moment: unknown) => event === "write" && moments.push(moment),
       }) as never,
   );
   provideRowStorage(storage);
