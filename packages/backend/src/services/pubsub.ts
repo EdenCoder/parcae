@@ -210,19 +210,42 @@ export class PubSub {
     }
 
     // In-process fallback.
-    const now = Date.now();
-    const existing = this.__tryLocks.get(key);
-    if (existing && existing > now) return false;
-    this.__tryLocks.set(key, now + ttlMs);
-    if (this.__tryLocks.size > 1024) {
-      for (const [k, exp] of this.__tryLocks) {
-        if (exp <= now) this.__tryLocks.delete(k);
-      }
-    }
+    if (this.__held(key) !== null) return false;
+    this.__hold(key, "1", ttlMs);
     return true;
   }
 
-  private __tryLocks = new Map<string, number>();
+  /** Stores `value` under `key` for `ttlMs`. */
+  async remember(key: string, value: string, ttlMs: number): Promise<void> {
+    if (this.redisWrite) {
+      await this.redisWrite.set(key, value, "PX", ttlMs);
+      return;
+    }
+    this.__hold(key, value, ttlMs);
+  }
+
+  /** The value stored under `key`; a claim `tryLock` holds reads as "1". Null when none. */
+  async recall(key: string): Promise<string | null> {
+    if (this.redisWrite) return this.redisWrite.get(key);
+    return this.__held(key);
+  }
+
+  private __tryLocks = new Map<string, { value: string; until: number }>();
+
+  private __held(key: string): string | null {
+    const held = this.__tryLocks.get(key);
+    return held && held.until > Date.now() ? held.value : null;
+  }
+
+  private __hold(key: string, value: string, ttlMs: number): void {
+    const now = Date.now();
+    this.__tryLocks.set(key, { value, until: now + ttlMs });
+    if (this.__tryLocks.size > 1024) {
+      for (const [k, held] of this.__tryLocks) {
+        if (held.until <= now) this.__tryLocks.delete(k);
+      }
+    }
+  }
 
   // ── Cleanup ──────────────────────────────────────────────────────────
 

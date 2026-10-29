@@ -44,8 +44,13 @@ export type { OpBuilder } from "./patch";
  */
 export type Text = string & { readonly __brand: "Text" };
 
-export { FrontendAdapter } from "./adapters/client";
-export { isNotFoundError } from "./adapters/client";
+export {
+  WRITE_RUNNING,
+  FrontendAdapter,
+  isNotFoundError,
+  REQUEST_TIMEOUT_MS,
+  IDEMPOTENCY_TTL_MS,
+} from "./adapters/client";
 export type {
   Transport,
   TransportError,
@@ -71,6 +76,7 @@ export type {
 } from "./adapters/types";
 
 export {
+  SOCKET_NOT_RECONCILED,
   SESSION_BOUNDARY_ERRORS,
   isSessionBoundaryError,
 } from "./session-boundary";
