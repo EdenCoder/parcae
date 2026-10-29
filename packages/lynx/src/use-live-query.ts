@@ -14,6 +14,7 @@ const EMPTY_SNAPSHOT: LiveSnapshot<never> = {
   error: null,
   total: 0,
   answers: 0,
+  drawn: false,
 };
 
 interface HookState<T extends LiveRow> {
