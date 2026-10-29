@@ -56,6 +56,7 @@ function makeStore(id: string) {
     error: null,
     total: 1,
     answers: 1,
+    drawn: true,
   };
   const listeners = new Set<() => void>();
   const store: LiveQueryStore<Row> = {

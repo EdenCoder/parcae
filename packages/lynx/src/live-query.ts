@@ -60,6 +60,8 @@ export interface LiveSnapshot<T> {
   total: number;
   /** How many answers the server has given this read, its fetches and its pushed changes; another read's answer redraws without one. */
   answers: number;
+  /** `items` are an answer, the server's or a stored one, an empty answer too; until then the read holds nothing yet. */
+  drawn: boolean;
 }
 
 export interface QueryChain<T> {
@@ -187,6 +189,7 @@ export function createLiveQuery<T extends LiveRow>(
   let snap: LiveSnapshot<T> | null = null;
   let fields: ReadonlySet<string> | null = null;
   let answered = false;
+  let drawn = false;
   let storageRead = false;
   /** The account storage kept the drawn rows for, until the server answers. */
   let storedUser: string | null = null;
@@ -416,6 +419,7 @@ export function createLiveQuery<T extends LiveRow>(
         error = null;
         total = (result as { __totalCount?: number }).__totalCount ?? items.length;
         answered = true;
+        drawn = true;
         storedUser = null;
         drainOptimistic();
         holdItems();
@@ -484,15 +488,17 @@ export function createLiveQuery<T extends LiveRow>(
         if (!isSuspended && user !== readAs) return;
         const data = new Map(rows.map((row) => [row.id, row.data]));
         const order: string[] = kept ? JSON.parse(kept.ids) : [...(options.ids ?? [])];
-        const drawn = order.flatMap((id) => {
+        const found = order.flatMap((id) => {
           const stored = data.get(id);
           const row = stored ? hydrate(chain, JSON.parse(stored)) : null;
           return row ? [recordFor(row, readFields) ?? row] : [];
         });
-        if (drawn.length === 0) return;
-        items = drawn;
+        // A kept list is an answer even when empty; ids alone draw only what they find.
+        if (!kept && found.length === 0) return;
+        items = found;
         fields = readFields;
-        total = kept?.total ?? drawn.length;
+        total = kept?.total ?? found.length;
+        drawn = true;
         storedUser = user;
         holdItems();
         notify();
@@ -526,6 +532,7 @@ export function createLiveQuery<T extends LiveRow>(
     error = null;
     total = 0;
     answered = false;
+    drawn = false;
     storageRead = false;
     storedUser = null;
     holdItems();
@@ -555,7 +562,7 @@ export function createLiveQuery<T extends LiveRow>(
   const store: LiveQueryStore<T> = {
     snapshot() {
       invalidateIdentity();
-      if (!snap) snap = { items: merged(), status, error, total, answers };
+      if (!snap) snap = { items: merged(), status, error, total, answers, drawn };
       return snap;
     },
     retain(onChange: () => void) {

@@ -287,4 +287,15 @@ describe("storage slot", () => {
     expect(store.snapshot().items.map((show) => show.title)).toEqual(["Two", "One"]);
     expect(store.snapshot()).toMatchObject({ status: "loading", total: 2 });
   });
+
+  it("draws a kept empty list as an answer, which a read with nothing kept is not", async () => {
+    storage({ user: "u1", list: { key: "show:[]", type: "show", ids: "[]", total: 0 }, rows: [] });
+    const unanswered = { ...read(() => []), find: () => new Promise<Show[]>(() => {}) };
+    const store = createLiveQuery(() => unanswered);
+    resetLiveQueries(false);
+    retain(store);
+    expect(store.snapshot().drawn).toBe(false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(store.snapshot()).toMatchObject({ items: [], status: "loading", drawn: true });
+  });
 });
