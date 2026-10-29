@@ -384,29 +384,23 @@ export interface QueryChain<T> {
   sum(column: string): Promise<number>;
 
   /**
-   * Bulk UPDATE every row the chain matches, as ONE SQL statement —
-   * no per-row hydration, no per-model `save()` round-trips, no
-   * "model saved" log line per row. Returns the number of rows
-   * updated.
+   * Update selected rows in one SQL statement and return the affected row count.
+   * An object applies to every selected row; an array applies each patch only to its ID.
+   * Omitted fields stay unchanged. Array IDs must be distinct and non-empty.
    *
-   *   Scene.whereNotNull("generatingAt").update({ generatingAt: null })
-   *   Scene.where({ project }).update([{ id: first, title: "First" }, { id: second, title: "Second" }])
+   * Filters, ordering, limits, and offsets still apply; use clearLimit() for all matches.
+   * Array IDs intersect that selection after pagination. Unbounded batches lock only
+   * supplied IDs; pagination can also lock selected rows outside the batch.
+   * Predicates are rechecked after concurrent writes. Grouped queries are read-only.
    *
-   * An array applies each patch to its id within the chain's filters.
-   * Omitted fields stay unchanged; duplicate ids are rejected.
+   * Schema fields are replaced; unknown keys merge into the JSONB overflow column.
+   * Each changed row receives updatedAt. Patches cannot set id, createdAt, updatedAt, type, or tmp.
+   * Hooks and scopes are skipped: callers own authorization and required side effects.
+   * Database triggers still emit realtime changes. The frontend adapter rejects this operation.
    *
-   * Semantics (server adapter):
-   * - Schema columns are set directly; unknown keys are merged into
-   *   the `data` JSONB overflow (existing overflow keys survive).
-   * - `updatedAt` is stamped on every matched row; `id` / `createdAt`
-   *   / `type` / `updatedAt` in the patch are rejected.
-   * - Save hooks and scopes DO NOT run — this is a server-side bulk
-   *   primitive, the caller owns authorization and invariants.
-   * - Realtime change capture flows through the row-level DB triggers
-   *   (Postgres), so subscribers still receive per-id change events.
-   *   On SQLite no change events are emitted.
-   *
-   * The frontend adapter throws — there is no auto-CRUD bulk route.
+   * @example
+   * Scene.whereNotNull("generatingAt").clearLimit().update({ generatingAt: null });
+   * Scene.where({ project }).clearLimit().update([{ id: first, title: "First" }]);
    */
   update(
     patch:

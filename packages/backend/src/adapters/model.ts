@@ -126,6 +126,9 @@ const SYSTEM_DATA_KEYS = new Set([
   "tmp",
 ]);
 
+// PostgreSQL encodes the binding count in two bytes.
+const MAX_INSERT_BINDINGS = 65_535;
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function tableName(modelClass: ModelConstructor): string {
@@ -760,6 +763,37 @@ export class BackendAdapter implements ModelAdapter {
     );
     log.debug(`model saved model=${ModelClass.type}, id=${model.id}`);
     return persistedData;
+  }
+
+  // ── insertMany ───────────────────────────────────────────────────────
+
+  /**
+   * Insert new models of one class atomically, splitting statements at PostgreSQL's binding limit.
+   * Existing IDs fail; saved database values are merged into each model.
+   * Scopes and hooks are skipped: callers own authorization and side effects. Change capture still runs.
+   */
+  async insertMany(models: readonly Model[]): Promise<void> {
+    if (!models.length) return;
+    const modelClass = models[0]!.constructor as unknown as ModelConstructor;
+    if (models.some((model) => model.constructor !== modelClass || !model.__isNew))
+      throw new Error('bulk insert requires new models of one type');
+    const snapshots = models.map((model) => dateSafeClone(model.__data));
+    const rows = models.map((model, at) => serialize(model, snapshots[at]));
+    const batchSize = Math.floor(MAX_INSERT_BINDINGS / new Set(rows.flatMap(Object.keys)).size);
+    const saved = await this._withTransaction(async () => {
+      const found = new Map<string, Record<string, any>>();
+      for (let at = 0; at < rows.length; at += batchSize) {
+        const inserted = await this.write(tableName(modelClass))
+          .insert(rows.slice(at, at + batchSize))
+          .returning('*');
+        for (const row of inserted) found.set(row.id, row);
+      }
+      return found;
+    });
+    for (const [at, model] of models.entries()) {
+      model[SYM_SERVER_MERGE](hydrate(modelClass, this, saved.get(model.id)!).__data, snapshots[at]);
+      model.__isNew = false;
+    }
   }
 
   // ── remove ───────────────────────────────────────────────────────────
@@ -1634,26 +1668,11 @@ export class BackendAdapter implements ModelAdapter {
       return Number.isFinite(total) ? total : 0;
     };
 
-    // Bulk UPDATE — one SQL statement for every matched row. See the
-    // QueryChain interface doc for the full semantics (no hooks, no
-    // scopes, updatedAt stamped, change capture via DB triggers).
-    //
-    // Shape: `UPDATE t SET ... WHERE id IN (<this chain, selecting id>)`
-    // rather than mutating the chain's builder directly. Two reasons:
-    // - The chain builds on the READ pool; the id-subquery only
-    //   contributes SQL text, so the statement itself runs on the
-    //   WRITE pool where it belongs.
-    // - Postgres UPDATE has no ORDER BY/LIMIT, but an id-subquery may —
-    //   so `.orderBy(...).limit(100).update(...)` works ("update the
-    //   100 stalest rows") instead of erroring.
+    // The ID subquery preserves order and pagination. Only its SQL is used;
+    // the enclosing UPDATE runs on the write pool. QueryChain owns the public contract.
     chain.update = async (patch: Record<string, any> | Record<string, any>[]): Promise<number> => {
       if (Array.isArray(patch) && !patch.length) return 0;
-      // One statement, but still wrapped: the transaction prelude
-      // publishes session state (e.g. an audit actor) that database-side
-      // code needs and cannot derive, and a bulk write is exactly the
-      // case where losing that attribution matters most. Hooks and
-      // scopes still do not run — that remains this primitive's
-      // documented contract.
+      // The transaction prelude supplies session state required by database triggers.
       return this._withTransaction(async () => {
         const table = tableName(modelClass);
         const schema = (modelClass.__schema as SchemaDefinition) ?? {};
@@ -1712,7 +1731,14 @@ export class BackendAdapter implements ModelAdapter {
           return row;
         });
 
-        const idSubquery = knexQuery.clone().clearSelect().select(`${table}.id`);
+        // The selection must recheck its predicates after a concurrent writer releases the row.
+        const idSubquery = knexQuery.clone().clearSelect().select(`${table}.id`).forUpdate(table);
+        // Narrow batches before locking only when this cannot change a limited selection.
+        if (batch && knexQuery._single.limit == null && !knexQuery._single.offset)
+          idSubquery.whereIn(
+            `${table}.id`,
+            this.write.select(this.write.raw("value->>'id'")).from('__parcae_changes'),
+          );
         const query = this.write(table).whereIn(`${table}.id`, idSubquery);
         if (!batch) return await query.update(rows[0]);
 
