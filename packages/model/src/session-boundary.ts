@@ -22,3 +22,6 @@ export function isSessionBoundaryError(message: string): boolean {
     message.includes(SESSION_BOUNDARY_ERRORS.terminated)
   );
 }
+
+/** The socket's answer to a call that arrives before its session is reconciled: not run, try again. Not a boundary. */
+export const SOCKET_NOT_RECONCILED = "Socket session is not reconciled";

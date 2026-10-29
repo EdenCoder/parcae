@@ -26,7 +26,16 @@ import type { Model, WithRefs } from "../Model";
 export interface RequestOptions {
   /** Override the default RPC timeout (in milliseconds). */
   timeout?: number;
+  /** The server answers every repeat of this key within IDEMPOTENCY_TTL_MS of its first arrival with its first answer. */
+  idempotencyKey?: string;
 }
+
+/** How long a call may run before its caller gives up; the server's claim on a write's key lasts as long. */
+export const REQUEST_TIMEOUT_MS = 120_000;
+/** How long the server keeps a write's answer under its key. A client stops resending a write first sent longer ago. */
+export const IDEMPOTENCY_TTL_MS = 86_400_000;
+/** The `code` of the server's 409 to a repeat whose first send is still running: not run, try again. */
+export const WRITE_RUNNING = "WRITE_RUNNING";
 
 /**
  * Abstract transport layer. Decouples the Model system from the wire protocol.
@@ -374,7 +383,8 @@ export class FrontendAdapter implements ModelAdapter {
 
   // ── helpers ──────────────────────────────────────────────────────────
 
-  private resolvePath(modelClass: ModelConstructor): string {
+  /** The model's collection path, without the version: `/projects`. */
+  resolvePath(modelClass: ModelConstructor): string {
     if (!modelClass.path && !modelClass.type) {
       throw new Error("Model has no path or type");
     }

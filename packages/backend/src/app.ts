@@ -17,7 +17,7 @@ import {
   createSessionFencedEmitter,
   createSessionFencedSocket,
 } from "./socket-session-facade";
-import { Model, rowVersion, SESSION_BOUNDARY_ERRORS } from "@parcae/model";
+import { Model, rowVersion, SOCKET_NOT_RECONCILED, SESSION_BOUNDARY_ERRORS } from "@parcae/model";
 import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
 import { log } from "./logger";
 import { ClientError } from "./helpers";
@@ -41,6 +41,7 @@ import {
 import { BackendAdapter } from "./adapters/model";
 import { registerModelRoutes } from "./adapters/routes";
 import { PubSub } from "./services/pubsub";
+import { createIdempotencyMiddleware } from "./services/idempotency";
 import {
   QueueService,
   formatOrphanQueueWarning,
@@ -990,6 +991,8 @@ export function createApp(config: AppConfig): ParcaeApp {
         });
       });
 
+      server.polka.use(wrapHttpHandler(createIdempotencyMiddleware(pubsub)));
+
       if (config.middleware?.length) {
         for (const middleware of config.middleware) {
           server.polka.use(wrapHttpHandler(middleware));
@@ -1351,6 +1354,7 @@ export function createApp(config: AppConfig): ParcaeApp {
             method: string,
             path: string,
             data: any,
+            idempotencyKey?: string,
           ) => {
             const sessionSnapshot = socketSession.capture();
             if (!sessionSnapshot) {
@@ -1360,7 +1364,7 @@ export function createApp(config: AppConfig): ParcaeApp {
                 JSON.stringify({
                   result: null,
                   success: false,
-                  error: "Socket session is not reconciled",
+                  error: SOCKET_NOT_RECONCILED,
                 }),
               );
               return;
@@ -1410,6 +1414,7 @@ export function createApp(config: AppConfig): ParcaeApp {
                 headers: {
                   ...socket.handshake.headers,
                   "content-type": "application/json",
+                  ...(typeof idempotencyKey === "string" ? { "idempotency-key": idempotencyKey } : {}),
                 },
                 body: data,
                 query: mergedQuery,
