@@ -13,7 +13,10 @@ export type {
 } from "./live-query";
 
 export { provideRowStorage } from "./rows";
-export type { AnsweredRow, RowStorage, ServerRow, StoredList, StoredRow } from "./rows";
+export type { AnsweredRow, RowStorage, ServerRow, StoredList, StoredRow, StoredWrite } from "./rows";
+
+export { keep, refusalOf } from "./writes";
+export type { WriteMoment, WriteRefusal } from "./writes";
 
 export { useLiveQuery } from "./use-live-query";
 

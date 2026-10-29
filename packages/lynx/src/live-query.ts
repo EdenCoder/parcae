@@ -33,8 +33,17 @@ import {
   rowStorage,
   forgetRecords,
   sharesRecords,
+  type Holder,
   type ServerRow,
 } from "./rows";
+import {
+  layOver,
+  sendWrites,
+  rereadWrites,
+  refreshWrites,
+  waitingRemoves,
+  waitingCreates,
+} from "./writes";
 
 export type LiveStatus = "loading" | "ready" | "error";
 
@@ -110,6 +119,9 @@ export interface LiveQueryOptions<T = LiveRow> {
 interface StoreInternal {
   reset(refetchActive: boolean): void;
   refetchIfActive(): void;
+  holder: Holder;
+  /** The store's list in storage, once a background read has built its chain. */
+  listKey(): string | null;
 }
 
 const registry = new Set<StoreInternal>();
@@ -128,6 +140,7 @@ export function resetLiveQueries(refetchActive = true, userId: string | null = n
   isSuspended = !refetchActive;
   readAs = refetchActive ? userId : null;
   forgetRecords();
+  rereadWrites();
   for (const s of registry) s.reset(refetchActive);
 }
 
@@ -147,6 +160,18 @@ function listOf(chain: QueryChain<unknown>): { key: string; type: string } | nul
     args: serializeLazyQueryArgs(step.args),
   }));
   return { key: `${type}:${JSON.stringify(steps)}`, type };
+}
+
+const internals = new WeakMap<LiveQueryStore<any>, StoreInternal>();
+
+/** The store's list in storage; a kept create names it to show in the store from every page. */
+export function listKeyOf(store: LiveQueryStore<any>): string | null {
+  return internals.get(store)?.listKey() ?? null;
+}
+
+/** The holders of every retained store, redrawn when the page's waiting changes do. */
+export function retainedHolders(): Holder[] {
+  return [...registry].map((store) => store.holder);
 }
 
 export function createLiveQuery<T extends LiveRow>(
@@ -180,18 +205,41 @@ export function createLiveQuery<T extends LiveRow>(
     snap = null;
     for (const fn of listeners) fn();
   };
-  const holder = { republish: notify };
+  const unlist = (id: string) => {
+    const before = items.length + optimistic.length;
+    items = items.filter((i) => i.id !== id);
+    optimistic = optimistic.filter((o) => o.id !== id && o.tmp !== id);
+    if (items.length + optimistic.length === before) return;
+    holdItems();
+    notify();
+  };
+  const holder = { republish: notify, unlist };
+  /** The store's list in storage, known once a background read has built its chain. */
+  let storeList: { key: string; type: string } | null = null;
 
+  /** Its rows, its optimistic rows and waiting creates, less every row a waiting delete names. */
   const merged = (): T[] => {
-    if (optimistic.length === 0) return items;
+    const removes = waitingRemoves();
+    const creates = storeList
+      ? (waitingCreates(storeList.key, (data) => hydrate(bindChain(chainFactory()), data)) as T[])
+      : [];
+    if (optimistic.length === 0 && creates.length === 0 && removes.size === 0) return items;
     const ids = new Set(items.map((i) => i.id).filter(Boolean));
     const tmps = new Set(items.map((i) => i.tmp).filter(Boolean));
+    const removed = (row: T) =>
+      [row.id, row.tmp].some((id) => id && removes.has(`${storeList?.type}:${id}`));
     return [
       ...items,
-      ...optimistic.filter(
+      ...[...optimistic, ...creates].filter(
         (o) => !(o.id && ids.has(o.id)) && !(o.tmp && tmps.has(o.tmp)),
       ),
-    ];
+    ].filter((row) => !removed(row));
+  };
+
+  /** `holder` lists the store's items, with the page's waiting patches laid over them. */
+  const holdItems = () => {
+    hold(holder, items, fields);
+    layOver(items);
   };
 
   /** Server rows arrived — drop optimistic entries the server now owns. */
@@ -337,8 +385,8 @@ export function createLiveQuery<T extends LiveRow>(
     if (changed) {
       answers++;
       drainOptimistic();
-      hold(holder, items, fields);
-      keep(chain, added);
+      holdItems();
+      keepAnswer(chain, added);
       notify();
     }
   };
@@ -354,6 +402,7 @@ export function createLiveQuery<T extends LiveRow>(
     const fetchGeneration = generation;
     const bound = bindChain(chainFactory());
     const chain = subscribe ? bound : (bound.withSubscribe?.(false) ?? bound);
+    storeList ??= listOf(chain);
     const client = requireClient();
     client
       .withQuerySubscriptions(async () => {
@@ -369,8 +418,8 @@ export function createLiveQuery<T extends LiveRow>(
         answered = true;
         storedUser = null;
         drainOptimistic();
-        hold(holder, items, fields);
-        keep(chain, rows);
+        holdItems();
+        keepAnswer(chain, rows);
 
         const hash = (result as { __queryHash?: string }).__queryHash;
         if (hash && hash !== queryHash) {
@@ -409,7 +458,7 @@ export function createLiveQuery<T extends LiveRow>(
   };
 
   /** Every answer its read keeps is stored: its `rows` and the read's list, as the account read as. */
-  const keep = (chain: QueryChain<T>, rows: readonly ServerRow[]) => {
+  const keepAnswer = (chain: QueryChain<T>, rows: readonly ServerRow[]) => {
     const list = listOf(chain);
     if (!readAs || !list || !sharesRecords(fields) || options.keeps?.(items) === false) return;
     const ids = JSON.stringify(items.map((item) => item.id));
@@ -426,11 +475,11 @@ export function createLiveQuery<T extends LiveRow>(
     const epoch = identityEpoch;
     const chain = bindChain(chainFactory());
     const list = listOf(chain);
+    storeList ??= list;
     const readFields = fieldsOf(chain.__steps);
     if (!list || !sharesRecords(readFields)) return;
-    storage
-      .read({ type: list.type, key: list.key, ids: options.ids ?? [] })
-      .then(({ user, list: kept, rows }) => {
+    Promise.all([storage.read({ type: list.type, key: list.key, ids: options.ids ?? [] }), refreshWrites()])
+      .then(([{ user, list: kept, rows }]) => {
         if (epoch !== identityEpoch || answered || items.length || !user) return;
         if (!isSuspended && user !== readAs) return;
         const data = new Map(rows.map((row) => [row.id, row.data]));
@@ -445,7 +494,7 @@ export function createLiveQuery<T extends LiveRow>(
         fields = readFields;
         total = kept?.total ?? drawn.length;
         storedUser = user;
-        hold(holder, items, fields);
+        holdItems();
         notify();
       })
       .catch((err: Error) => {
@@ -468,7 +517,7 @@ export function createLiveQuery<T extends LiveRow>(
     stop();
     storeIdentityEpoch = identityEpoch;
     if (storedUser !== null && (isSuspended || storedUser === readAs)) {
-      hold(holder, items, fields);
+      holdItems();
       return;
     }
     items = [];
@@ -479,7 +528,7 @@ export function createLiveQuery<T extends LiveRow>(
     answered = false;
     storageRead = false;
     storedUser = null;
-    hold(holder, items, fields);
+    holdItems();
     notify();
   };
 
@@ -497,9 +546,11 @@ export function createLiveQuery<T extends LiveRow>(
         doFetch();
       }
     },
+    holder,
+    listKey: () => storeList?.key ?? null,
   };
 
-  return {
+  const store: LiveQueryStore<T> = {
     snapshot() {
       invalidateIdentity();
       if (!snap) snap = { items: merged(), status, error, total, answers };
@@ -511,6 +562,13 @@ export function createLiveQuery<T extends LiveRow>(
       listeners.add(onChange);
       refs++;
       registry.add(internal);
+      if (refs === 1) {
+        refreshWrites().then(sendWrites, (err: Error) => {
+          if (answered) return;
+          error = err;
+          notify();
+        });
+      }
       readStored();
       if (!started && !isSuspended) {
         started = true;
@@ -536,13 +594,8 @@ export function createLiveQuery<T extends LiveRow>(
       optimistic = [...optimistic, item];
       notify();
     },
-    removeOptimistic(id: string) {
-      const before = items.length + optimistic.length;
-      items = items.filter((i) => i.id !== id);
-      optimistic = optimistic.filter((o) => o.id !== id && o.tmp !== id);
-      if (items.length + optimistic.length === before) return;
-      hold(holder, items, fields);
-      notify();
-    },
+    removeOptimistic: unlist,
   };
+  internals.set(store, internal);
+  return store;
 }

@@ -56,7 +56,7 @@ function retain(store: { retain(fn: () => void): () => void }) {
 
 beforeEach(() => {
   vi.useFakeTimers();
-  provideClient(() => ({ subscribe: () => () => {}, withQuerySubscriptions: (run: () => Promise<unknown>) => run() }) as never);
+  provideClient(() => ({ subscribe: () => () => {}, withQuerySubscriptions: (run: () => Promise<unknown>) => run(), session: { state: {} } }) as never);
   resetLiveQueries(true, "u1");
 });
 
@@ -155,7 +155,11 @@ describe("projection-exact merge", () => {
 describe("storage slot", () => {
   function storage(kept: { user: string | null; list: StoredList | null; rows: StoredRow[] }) {
     const writes: Array<Parameters<RowStorage["write"]>[0]> = [];
-    const slot: RowStorage = { read: async () => kept, write: (batch) => writes.push(batch) };
+    const slot: RowStorage = {
+      read: async () => kept,
+      write: async (batch) => void writes.push(batch),
+      waiting: async () => ({ user: kept.user, writes: [] }),
+    };
     provideRowStorage(slot);
     return writes;
   }

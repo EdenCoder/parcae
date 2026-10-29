@@ -2,6 +2,7 @@
  * Each page observes the client's identity and reconnects for its own
  * live-query stores. Only the runtime that owns auth supplies an adapter.
  * Listeners stay attached until the page's last caller releases them.
+ * Signed in, or reconnected, it sends the account's kept writes.
  */
 
 import type {
@@ -12,6 +13,7 @@ import type {
 
 import { provideClient } from "./client-registry";
 import { refetchLiveQueries, resetLiveQueries } from "./live-query";
+import { sendWrites } from "./writes";
 
 let disposeLifecycle: (() => void) | null = null;
 const retainers = new Set<() => void>();
@@ -51,6 +53,7 @@ export function startLifecycle(
       lastUserId = userId;
       const isReady = status === "anonymous" || status === "authenticated";
       resetLiveQueries(isReady, userId ?? null);
+      if (status === "authenticated") sendWrites();
       if (isReady) {
         didResetThisTurn = true;
         queueMicrotask(() => {
@@ -66,6 +69,7 @@ export function startLifecycle(
     // up a fresh query hash + ops subscription).
     const handleResync = () => {
       const { status } = client.session.state;
+      if (status === "authenticated") sendWrites();
       if (status === "anonymous" || status === "authenticated") {
         if (didResetThisTurn) {
           didResetThisTurn = false;
