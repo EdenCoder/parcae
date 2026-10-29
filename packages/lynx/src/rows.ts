@@ -46,14 +46,45 @@ export interface RowStorage {
   /**
    * Keeps rows and lists read as `user`, in order; storage drops a batch for any other account.
    * A row with `fields` rewrites those fields of the kept row, `$field` ids included, and keeps
-   * the rest; a row without replaces it. Answers nothing.
+   * the rest; a row without replaces it. Keeps `writes` by key, in their place, and drops the
+   * `settled` keys. Resolves once kept.
    */
-  write(batch: { user: string; rows: readonly AnsweredRow[]; lists: readonly StoredList[] }): void;
+  write(batch: {
+    user     : string;
+    rows     : readonly AnsweredRow[];
+    lists    : readonly StoredList[];
+    writes?  : readonly StoredWrite[];
+    settled? : readonly string[];
+  }): Promise<void>;
+  /** The account's waiting changes, oldest first. */
+  waiting(): Promise<{ user: string | null; writes: StoredWrite[] }>;
+}
+
+/** A change as storage keeps it until the server answers: its request, and where a create shows. */
+export interface StoredWrite {
+  /** Its id in storage, sent as its idempotency key. */
+  key    : string;
+  type   : string;
+  /** The record's id; a create's own id, which it is also saved under as `tmp`. */
+  id     : string;
+  method : "POST" | "PUT" | "PATCH" | "DELETE";
+  /** The adapter's path, without the version: `/projects/<id>`. */
+  path   : string;
+  /** The request's body: the row, `{ ops }`, or `{}`. */
+  body   : Record<string, unknown>;
+  /** The stored lists (`StoredList.key`) a create is listed in until it's answered. */
+  lists  : readonly string[];
+  /** When it was kept, in ms; every report's wait counts from here. */
+  kept   : number;
+  /** When it was first sent, in ms; null while it never has been. */
+  sent   : number | null;
 }
 
 /** A store that lists records, redrawn when another store's answer changes one. */
 export interface Holder {
   republish(): void;
+  /** Leaves the record with `id` out of the store's rows. */
+  unlist(id: string): void;
 }
 
 // =============================================================================
@@ -96,7 +127,7 @@ function flush(): void {
   const batch = pending;
   pending = null;
   if (!batch || !storage) return;
-  storage.write({ user: batch.user, rows: batch.rows, lists: [...batch.lists.values()] });
+  void storage.write({ user: batch.user, rows: batch.rows, lists: [...batch.lists.values()] });
 }
 
 // =============================================================================
@@ -122,6 +153,11 @@ export function sharesRecords(fields: ReadonlySet<string> | null): boolean {
 export function recordFor<T extends LiveRow>(row: T, fields: ReadonlySet<string> | null): T | undefined {
   const key = sharesRecords(fields) ? keyOf(row) : null;
   return key ? (records.get(key)?.row as T | undefined) : undefined;
+}
+
+/** The page's object for the record `type` and `id`, while a store holds it. */
+export function recordOf(type: string, id: string): Model | undefined {
+  return records.get(`${type}:${id}`)?.row as Model | undefined;
 }
 
 /** `holder` now lists `rows`; a record lives while some store lists it. */
@@ -183,10 +219,10 @@ function ownFields(row: ServerRow, fields: ReadonlySet<string>): ServerRow {
   return Object.fromEntries(Object.entries(row).filter(([key]) => fields.has(key.replace(/^\$/, ""))));
 }
 
-function typeOf(row: Model): string {
+export function typeOf(row: Model): string {
   return (row.constructor as unknown as { type: string }).type;
 }
 
-function keyOf(row: LiveRow): string | null {
+export function keyOf(row: LiveRow): string | null {
   return row instanceof Model && row.id ? `${typeOf(row)}:${row.id}` : null;
 }
