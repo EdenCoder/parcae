@@ -13,9 +13,9 @@ import { json } from "../helpers";
 import type { PubSub } from "./pubsub";
 
 /**
- * A repeat gets the first answer, or 409 `NOT_RUN` while the first still runs. A write that
- * runs past REQUEST_TIMEOUT_MS, or a server that dies after saving but before answering, can run
- * twice.
+ * A repeat gets the first answer, or 409 `NOT_RUN` while the first still runs. A claim that can't
+ * be read or made answers 503 `NOT_RUN`, unremembered. A write that runs past REQUEST_TIMEOUT_MS,
+ * or a server that dies after saving but before answering, can run twice.
  */
 export function createIdempotencyMiddleware(
   pubsub: PubSub,
@@ -27,8 +27,17 @@ export function createIdempotencyMiddleware(
     const slot = `parcae:write:${user}:${key}`;
     const name = `${req.method} ${req.path ?? req.url}`;
 
-    if (!(await pubsub.tryLock(slot, REQUEST_TIMEOUT_MS))) {
-      const stored = await pubsub.recall(slot);
+    let claimed: boolean;
+    let stored: string | null = null;
+    try {
+      claimed = await pubsub.tryLock(slot, REQUEST_TIMEOUT_MS);
+      if (!claimed) stored = await pubsub.recall(slot);
+    } catch (err) {
+      log.warn(`[idempotency] ${name} claim failed, not run:`, err);
+      json(res, 503, { result: null, success: false, error: "This write did not run", code: NOT_RUN });
+      return;
+    }
+    if (!claimed) {
       if (stored && stored !== "1") {
         const { status, body } = JSON.parse(stored) as { status: number; body: string };
         log.info(`[idempotency] ${name} repeat answered ${status} from memory`);
