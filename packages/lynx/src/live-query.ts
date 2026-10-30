@@ -492,8 +492,13 @@ export function createLiveQuery<T extends LiveRow>(
         const order: string[] = kept ? JSON.parse(kept.ids) : [...(options.ids ?? [])];
         const found = order.flatMap((id) => {
           const stored = data.get(id);
-          const row = stored ? hydrate(chain, JSON.parse(stored)) : null;
-          return row ? [recordFor(row, readFields) ?? row] : [];
+          const saved: ServerRow | null = stored ? JSON.parse(stored) : null;
+          const row = saved && hydrate(chain, saved);
+          if (!row) return [];
+          // Another read's record takes the kept row over the fields this read asks for, as an answer would.
+          const existing = recordFor(row, readFields);
+          if (existing) mergeRow(existing, row, saved, readFields, holder);
+          return [existing ?? row];
         });
         // A kept list is an answer even when empty; ids alone draw only what they find.
         if (!kept && found.length === 0) return;
