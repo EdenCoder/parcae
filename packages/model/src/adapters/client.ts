@@ -132,9 +132,12 @@ function stripVersion(path: string): string {
 
 export class FrontendAdapter implements ModelAdapter {
   public transport: Transport;
+  /** Whether a chain's `find()` subscribes when it doesn't say: `ClientConfig.subscribe`. */
+  private readonly subscribes: boolean;
 
-  constructor(transport: Transport) {
+  constructor(transport: Transport, options: { subscribe?: boolean } = {}) {
     this.transport = transport;
+    this.subscribes = options.subscribe ?? true;
   }
 
   private p(modelPath: string): string {
@@ -226,8 +229,9 @@ export class FrontendAdapter implements ModelAdapter {
       // `QuerySubscriptionManager.subscribe` and omit `__queryHash`
       // from the response. The frontend `useQuery` hook uses this to
       // honour `{ subscribe: false }` — static queries that never
-      // need realtime push. Default (absent) means subscribed.
-      if (options.subscribe === false) requestData.__subscribe = false;
+      // need realtime push. Default (absent) means subscribed, unless
+      // the adapter was made not to subscribe.
+      if ((options.subscribe ?? this.subscribes) === false) requestData.__subscribe = false;
       const result = await this.transport.get(path, requestData);
       // Read the list envelope under the pluralized collection key
       // (matching the backend route). The `${type}s` key is kept as a
