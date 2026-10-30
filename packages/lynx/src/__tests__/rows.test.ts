@@ -288,6 +288,20 @@ describe("storage slot", () => {
     expect(store.snapshot()).toMatchObject({ status: "loading", total: 2 });
   });
 
+  it("draws nothing of a kept list storage lost a row of, and waits for the server", async () => {
+    storage({
+      user: "u1",
+      list: { key: "show:[]", type: "show", ids: '["s2","s1"]', total: 2 },
+      rows: [stored("s1", "One")],
+    });
+    const unanswered = { ...read(() => []), find: () => new Promise<Show[]>(() => {}) };
+    const store = createLiveQuery(() => unanswered);
+    resetLiveQueries(false);
+    retain(store);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(store.snapshot()).toMatchObject({ items: [], status: "loading", drawn: false });
+  });
+
   it("draws a kept empty list as an answer, which a read with nothing kept is not", async () => {
     storage({ user: "u1", list: { key: "show:[]", type: "show", ids: "[]", total: 0 }, rows: [] });
     const unanswered = { ...read(() => []), find: () => new Promise<Show[]>(() => {}) };
