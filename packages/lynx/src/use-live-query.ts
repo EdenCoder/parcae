@@ -12,6 +12,7 @@ const EMPTY_SNAPSHOT: LiveSnapshot<never> = {
   items: [],
   status: "loading",
   error: null,
+  total: 0,
 };
 
 interface HookState<T extends LiveRow> {

@@ -46,7 +46,12 @@ const KICK_FLOOR_MS = 2_000;
 const uid = new ShortId({ length: 10 });
 
 /** Errors that mean the wire dropped, not that the session ended. */
-const wireLoss = new WeakSet<Error>();
+const wireLoss = new WeakMap<Error, "connect" | "disconnect" | "request-disconnect">();
+
+/** A dispatched request lost its reply when the socket disconnected. */
+export function isDisconnectError(error: unknown): boolean {
+  return error instanceof Error && wireLoss.get(error) === "request-disconnect";
+}
 
 export interface SocketTransportConfig {
   url: string;
@@ -252,7 +257,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     });
 
     this.socket.on("connect_error", (err: Error) => {
-      wireLoss.add(err);
+      wireLoss.set(err, "connect");
       this._advanceGeneration(err);
       this.connection.disconnected(err);
       this.emit("error", err);
@@ -617,7 +622,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     const error = new Error(
       reason ? `Disconnected: ${reason}` : "Disconnected",
     );
-    wireLoss.add(error);
+    wireLoss.set(error, "disconnect");
     this._advanceGeneration(error);
     this.connection.disconnected();
     this.emit("disconnected");
@@ -638,10 +643,15 @@ export class SocketTransport extends EventEmitter implements Transport {
   }
 
   private _rejectPending(error: Error): void {
+    let requestError = error;
+    if (this.pendingCalls.size && wireLoss.get(error) === "disconnect") {
+      requestError = new Error(error.message);
+      wireLoss.set(requestError, "request-disconnect");
+    }
     for (const [id, call] of this.pendingCalls) {
       clearTimeout(call.timer);
       this.socket.off(id);
-      call.reject(error);
+      call.reject(requestError);
     }
     this.pendingCalls.clear();
     for (const waiter of [...this.pendingWaiters]) {

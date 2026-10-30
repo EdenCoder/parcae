@@ -21,7 +21,7 @@
  * lives in `use-live-query.ts`.
  */
 
-import { Model, SYM_SERVER_MERGE } from "@parcae/model";
+import { Model, patched, SYM_SERVER_MERGE, SYM_SERVER_PATCH, type PatchOp } from "@parcae/model";
 
 import { requireClient } from "./client-registry";
 
@@ -31,15 +31,29 @@ export interface LiveSnapshot<T> {
   items: T[];
   status: LiveStatus;
   error: Error | null;
+  /** Rows the server matched at the last fetch, before any limit or offset. */
+  total: number;
 }
 
 export interface QueryChain<T> {
   find(): Promise<T[]>;
+  /** A sibling chain whose `find()` leaves no server subscription behind. */
+  withSubscribe?(subscribe: boolean): QueryChain<T>;
   // ModelConstructor's static side is type-erased at the chain
   // boundary; hydrate is cast back on at the single call site.
   __modelClass?: unknown;
   __adapter?: unknown;
   __steps?: Array<{ method: string; args: unknown[] }>;
+}
+
+export interface LiveQueryOptions<T = LiveRow> {
+  /** Hydrated rows to draw while the first subscribed fetch is in flight. */
+  initial?: T[];
+  /**
+   * `false` reads the query without a server subscription, so no ops
+   * follow it: the SDK's `useQuery({ subscribe: false })`. Default `true`.
+   */
+  subscribe?: boolean;
 }
 
 interface HydratingClass<T> {
@@ -49,13 +63,14 @@ interface HydratingClass<T> {
 type QueryOp =
   | { op: "add"; id: string; data?: Record<string, unknown> }
   | { op: "remove"; id: string }
-  | { op: "update"; id: string };
+  | { op: "update"; id: string; patch: PatchOp[] };
 
 export interface LiveRow {
   id?: string;
   tmp?: string;
   __data?: Record<string, unknown>;
   [SYM_SERVER_MERGE]?: (data: Record<string, unknown>) => unknown;
+  [SYM_SERVER_PATCH]?: (ops: readonly PatchOp[]) => unknown;
 }
 
 export interface LiveQueryStore<T> {
@@ -92,16 +107,15 @@ export function refetchLiveQueries(): void {
   for (const s of registry) s.refetchIfActive();
 }
 
-/** How long update-op refetches coalesce before hitting the server. */
-const UPDATE_REFETCH_DELAY = 250;
-
 export function createLiveQuery<T extends LiveRow>(
   chainFactory: () => QueryChain<T>,
+  { subscribe = true, initial }: LiveQueryOptions<T> = {},
 ): LiveQueryStore<T> {
-  let items: T[] = [];
+  let items: T[] = initial ?? [];
   let optimistic: T[] = [];
-  let status: LiveStatus = "loading";
+  let status: LiveStatus = initial ? "ready" : "loading";
   let error: Error | null = null;
+  let total = items.length;
   let snap: LiveSnapshot<T> | null = null;
 
   let refs = 0;
@@ -112,7 +126,6 @@ export function createLiveQuery<T extends LiveRow>(
   let started = false;
   let disposeOps: (() => void) | null = null;
   let queryHash: string | null = null;
-  let updateTimer: ReturnType<typeof setTimeout> | null = null;
   const listeners = new Set<() => void>();
 
   const notify = () => {
@@ -218,7 +231,8 @@ export function createLiveQuery<T extends LiveRow>(
       return chain;
     }
     const BoundModel = client.bind(ModelClass);
-    if (chain.__adapter === client.adapter && ModelClass === BoundModel) return chain;
+    if (chain.__adapter === client.adapter && ModelClass === BoundModel)
+      return chain;
     let rebound = client.adapter.query(BoundModel) as unknown as QueryChain<T>;
     for (const step of chain.__steps ?? []) {
       const method = (rebound as any)[step.method];
@@ -232,13 +246,14 @@ export function createLiveQuery<T extends LiveRow>(
   const applyOps = (chain: QueryChain<T>, ops: QueryOp[], order?: string[]) => {
     "background only";
     let changed = false;
-    let needsRefetch = false;
 
     for (const op of ops) {
       if (op.op === "remove") {
         const before = items.length + optimistic.length;
         items = items.filter((i) => i.id !== op.id);
-        optimistic = optimistic.filter((o) => o.id !== op.id && o.tmp !== op.id);
+        optimistic = optimistic.filter(
+          (o) => o.id !== op.id && o.tmp !== op.id,
+        );
         if (items.length + optimistic.length !== before) changed = true;
       } else if (op.op === "add" && op.data) {
         if (items.some((i) => i.id === op.id)) continue;
@@ -260,11 +275,14 @@ export function createLiveQuery<T extends LiveRow>(
         }
         changed = true;
       } else if (op.op === "update") {
-        // Field patches ride on fast-json-patch in the SDK; a refetch
-        // keeps that dependency (and its regexes) away from Lynx's
-        // main-thread bytecode compiler. Update frames are rare on
-        // membership-style lists.
-        needsRefetch = true;
+        items = items.map((row) => {
+          if (row.id !== op.id) return row;
+          changed = true;
+          const apply = row[SYM_SERVER_PATCH];
+          if (!apply) return patched(row, op.patch);
+          apply.call(row, op.patch);
+          return row;
+        });
       }
     }
 
@@ -287,12 +305,6 @@ export function createLiveQuery<T extends LiveRow>(
       drainOptimistic();
       notify();
     }
-    if (needsRefetch && !updateTimer) {
-      updateTimer = setTimeout(() => {
-        updateTimer = null;
-        doFetch();
-      }, UPDATE_REFETCH_DELAY);
-    }
   };
 
   const doFetch = () => {
@@ -304,7 +316,8 @@ export function createLiveQuery<T extends LiveRow>(
     }
     fetching = true;
     const fetchGeneration = generation;
-    const chain = bindChain(chainFactory());
+    const bound = bindChain(chainFactory());
+    const chain = subscribe ? bound : (bound.withSubscribe?.(false) ?? bound);
     chain
       .find()
       .then((result) => {
@@ -312,24 +325,25 @@ export function createLiveQuery<T extends LiveRow>(
         items = reconcile(result);
         status = "ready";
         error = null;
+        total =
+          (result as { __totalCount?: number }).__totalCount ?? result.length;
         drainOptimistic();
 
         const hash = (result as { __queryHash?: string }).__queryHash;
         if (hash && hash !== queryHash) {
           releaseSubscription();
           queryHash = hash;
-          disposeOps = requireClient().subscribe(
-            `query:${hash}`,
-            (payload: unknown) => {
-              if (fetchGeneration !== generation) return;
-              const p = payload as
-                | { ops?: QueryOp[]; order?: string[] }
-                | QueryOp[];
-              const ops = Array.isArray(p) ? p : (p?.ops ?? []);
-              const order = Array.isArray(p) ? undefined : p?.order;
-              if (ops.length || order) applyOps(chain, ops, order);
-            },
-          );
+          disposeOps = requireClient().subscribe(`query:${hash}`, (
+            payload: unknown,
+          ) => {
+            if (fetchGeneration !== generation) return;
+            const p = payload as
+              | { ops?: QueryOp[]; order?: string[] }
+              | QueryOp[];
+            const ops = Array.isArray(p) ? p : (p?.ops ?? []);
+            const order = Array.isArray(p) ? undefined : p?.order;
+            if (ops.length || order) applyOps(chain, ops, order);
+          });
         } else if (!hash && queryHash) {
           releaseSubscription();
         }
@@ -357,8 +371,6 @@ export function createLiveQuery<T extends LiveRow>(
     fetchQueued = false;
     started = false;
     releaseSubscription();
-    if (updateTimer) clearTimeout(updateTimer);
-    updateTimer = null;
   };
 
   const invalidateIdentity = () => {
@@ -369,6 +381,7 @@ export function createLiveQuery<T extends LiveRow>(
     optimistic = [];
     status = "loading";
     error = null;
+    total = 0;
     notify();
   };
 
@@ -391,7 +404,7 @@ export function createLiveQuery<T extends LiveRow>(
   return {
     snapshot() {
       invalidateIdentity();
-      if (!snap) snap = { items: merged(), status, error };
+      if (!snap) snap = { items: merged(), status, error, total };
       return snap;
     },
     retain(onChange: () => void) {

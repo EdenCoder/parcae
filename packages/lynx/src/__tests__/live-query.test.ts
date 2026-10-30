@@ -3,7 +3,7 @@
  *
  * The scenarios mirror the on-device bugs that motivated this package:
  * optimistic echo reconciliation by adopted server id, remove ops,
- * membership-only updates via refetch, and reset/refetch registry
+ * live field patches, and reset/refetch registry
  * behaviour on identity changes and reconnects.
  */
 
@@ -37,6 +37,8 @@ class Article extends Model {
     author: { kind: "ref", target: Author },
   } as any;
   declare author: Ref<Author>;
+  title = "";
+  progress = { phase: "", done: 0 };
 }
 
 // ── Fakes ──────────────────────────────────────────────────────────
@@ -186,10 +188,7 @@ describe("fetch", () => {
   });
 
   it("reconciles server fields into existing rows and array identity", async () => {
-    const merge = vi.fn(function (
-      this: Row,
-      data: Record<string, unknown>,
-    ) {
+    const merge = vi.fn(function (this: Row, data: Record<string, unknown>) {
       Object.assign(this, data);
       return this;
     });
@@ -223,10 +222,7 @@ describe("fetch", () => {
         { id: "a", [SYM_SERVER_MERGE]: merge },
         { id: "b", project: "old", [SYM_SERVER_MERGE]: merge },
       ],
-      [
-        { id: "b", project: "new" },
-        { id: "c" },
-      ],
+      [{ id: "b", project: "new" }, { id: "c" }],
     ]);
     const store = createLiveQuery<Row>(() => chain);
     retainTracked(store);
@@ -243,7 +239,7 @@ describe("fetch", () => {
     expect(after.items[0]?.project).toBe("new");
   });
 
-  it("replaces a changed same-id expanded ref on a subscription refetch", async () => {
+  it("patches a changed expanded ref without fetching again", async () => {
     vi.useFakeTimers();
     const adapter = {} as any;
     let call = 0;
@@ -274,17 +270,45 @@ describe("fetch", () => {
       {
         op: "update",
         id: "article-1",
-        patch: [
-          { op: "replace", path: "/author/name", value: "fresh" },
-        ],
+        patch: [{ op: "replace", path: "/author/name", value: "fresh" }],
       },
     ]);
-    await vi.advanceTimersByTimeAsync(250);
+    await vi.runAllTimersAsync();
 
     expect((article as any).$author).toBe("author-1");
     expect(article.author).not.toBe(author);
-    if (typeof article.author === "string") throw new Error("author was not expanded");
+    if (typeof article.author === "string")
+      throw new Error("author was not expanded");
     expect(article.author.name).toBe("fresh");
+    expect(call).toBe(1);
+    release();
+  });
+
+  it("keeps bootstrap rows ready and preserves their local edits on the first fetch", async () => {
+    const adapter = {} as any;
+    const article = Article.hydrate(adapter, {
+      id: "a",
+      title: "before",
+      progress: { phase: "waiting", done: 0 },
+    });
+    const fetched = deferred<Article[]>();
+    const store = createLiveQuery(() => ({ find: () => fetched.promise }), {
+      initial: [article],
+    });
+    expect(store.snapshot()).toMatchObject({ status: "ready", total: 1 });
+    const release = store.retain(() => {});
+    article.stage([{ op: "replace", path: "/title", value: "my draft" }]);
+    fetched.resolve([
+      Article.hydrate(adapter, {
+        id: "a",
+        title: "before",
+        progress: { phase: "working", done: 1 },
+      }),
+    ]);
+    await flush();
+    expect(store.snapshot().items[0]).toBe(article);
+    expect(article.title).toBe("my draft");
+    expect(article.progress).toEqual({ phase: "working", done: 1 });
     release();
   });
 });
@@ -340,19 +364,86 @@ describe("ops", () => {
     expect(store.snapshot().items.map((i) => i.id)).toEqual(["c", "a", "b"]);
   });
 
-  it("coalesces update ops into one debounced refetch", async () => {
+  it("applies live fields while a local write is pending without fetching again", async () => {
     vi.useFakeTimers();
-    const { chain, calls } = makeChain([[{ id: "a" }], [{ id: "a" }]]);
+    const acknowledged = deferred<void>();
+    const article = Article.hydrate(
+      { patch: () => acknowledged.promise } as any,
+      {
+        id: "a",
+        title: "before",
+        progress: { phase: "waiting", done: 0 },
+      },
+    );
+    const find = vi.fn(async () =>
+      Object.defineProperty([article], "__queryHash", { value: "H1" }));
+    const store = createLiveQuery(() => ({ find }));
+    const release = store.retain(() => {});
+    await vi.runAllTimersAsync();
+    const before = store.snapshot();
+    const writing = article.patch([
+      { op: "replace", path: "/title", value: "my draft" },
+    ]);
+    expect(article.__patchingPaths.has("/title")).toBe(true);
+
+    fakeClient.emit("query:H1", [
+      {
+        op: "update",
+        id: "a",
+        patch: [
+          { op: "replace", path: "/title", value: "older draft" },
+          {
+            op: "replace",
+            path: "/progress",
+            value: { phase: "working", done: 1 },
+          },
+        ],
+      },
+    ]);
+    fakeClient.emit("query:H1", [
+      {
+        op: "update",
+        id: "a",
+        patch: [{ op: "replace", path: "/progress/done", value: 2 }],
+      },
+    ]);
+    await vi.runAllTimersAsync();
+
+    const after = store.snapshot();
+    expect(after.items).not.toBe(before.items);
+    expect(after.items[0]).toBe(article);
+    expect(article.title).toBe("my draft");
+    expect(article.progress).toEqual({ phase: "working", done: 2 });
+    expect(find).toHaveBeenCalledOnce();
+    acknowledged.resolve();
+    await writing;
+    release();
+  });
+
+  it("applies updates and membership changes in server order without fetching again", async () => {
+    const { chain, calls } = makeChain([
+      [{ id: "a", project: "old" }, { id: "b" }],
+    ]);
     const store = createLiveQuery<Row>(() => chain);
     retainTracked(store);
-    await vi.runAllTimersAsync();
+    await flush();
+    fakeClient.emit("query:H1", {
+      ops: [
+        {
+          op: "update",
+          id: "a",
+          patch: [{ op: "replace", path: "/project", value: "new" }],
+        },
+        { op: "remove", id: "b" },
+        { op: "add", id: "c", data: { id: "c" } },
+      ],
+      order: ["c", "a"],
+    });
+    expect(store.snapshot().items.map((row) => [row.id, row.project])).toEqual([
+      ["c", undefined],
+      ["a", "new"],
+    ]);
     expect(calls()).toBe(1);
-
-    fakeClient.emit("query:H1", [{ op: "update", id: "a" }]);
-    fakeClient.emit("query:H1", [{ op: "update", id: "a" }]);
-    await vi.runAllTimersAsync();
-
-    expect(calls()).toBe(2); // one refetch for both update frames
   });
 
   it("swaps the ops subscription when a refetch returns a new hash", async () => {
@@ -486,21 +577,6 @@ describe("registry", () => {
     second.release();
     expect(fakeClient.subscriberCount("query:H1")).toBe(0);
     expect(fakeClient.sentCount("unsubscribe:query", "H1")).toBe(1);
-  });
-
-  it("clears pending update timers on the last release", async () => {
-    vi.useFakeTimers();
-    const { chain, calls } = makeChain([[{ id: "a" }], [{ id: "a" }]]);
-    const store = createLiveQuery<Row>(() => chain);
-    const active = retained(store);
-    await vi.runAllTimersAsync();
-
-    fakeClient.emit("query:H1", [{ op: "update", id: "a" }]);
-    expect(vi.getTimerCount()).toBe(1);
-    active.release();
-    expect(vi.getTimerCount()).toBe(0);
-    await vi.runAllTimersAsync();
-    expect(calls()).toBe(1);
   });
 
   it("ignores a released fetch and safely restarts on retain", async () => {

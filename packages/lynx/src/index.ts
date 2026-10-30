@@ -4,6 +4,7 @@ export {
   resetLiveQueries,
 } from "./live-query";
 export type {
+  LiveQueryOptions,
   LiveQueryStore,
   LiveRow,
   LiveSnapshot,
