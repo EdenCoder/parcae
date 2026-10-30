@@ -8,22 +8,8 @@ import type {
   ConnectionStatus,
 } from "../connection-machine";
 
-const DEFAULT_SNAP: ConnectionState = {
-  status: "idle",
-  lastError: null,
-  version: 0,
-  lastConnectedAt: null,
-};
-
-function read(machine: ConnectionMachine | undefined): ConnectionState {
-  if (!machine) return DEFAULT_SNAP;
-  const s = machine.state;
-  return {
-    status: s.status,
-    lastError: s.lastError,
-    version: s.version,
-    lastConnectedAt: s.lastConnectedAt,
-  };
+function read(machine: ConnectionMachine): ConnectionState {
+  return { ...machine.state };
 }
 
 export interface UseConnectionResult {

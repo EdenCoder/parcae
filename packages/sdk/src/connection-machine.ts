@@ -26,6 +26,8 @@ export interface ConnectionState {
   version: number;
   /** Wall-clock ms of the most recent `connected` transition. */
   lastConnectedAt: number | null;
+  /** Wall-clock ms since which the wire has not been connected; null while connected. */
+  downSince: number | null;
 }
 
 export class ConnectionMachine {
@@ -34,6 +36,7 @@ export class ConnectionMachine {
     lastError: null,
     version: 0,
     lastConnectedAt: null,
+    downSince: Date.now(),
   };
 
   private _listeners = new Set<() => void>();
@@ -60,6 +63,8 @@ export class ConnectionMachine {
 
   private _set(status: ConnectionStatus, err: Error | null): void {
     if (this.state.status === status && this.state.lastError === err) return;
+    if (status === "connected") this.state.downSince = null;
+    else this.state.downSince ??= Date.now();
     this.state.status = status;
     this.state.lastError = err;
     this.state.version++;
