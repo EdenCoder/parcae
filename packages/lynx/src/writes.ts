@@ -2,10 +2,10 @@
  * A page's kept changes: stored, laid over what the page draws, sent oldest first with their key,
  * settled by the server's answer, and reported at each step.
  *
- * A kept change is its request. Every page reads the account's waiting changes from storage and
- * lays them over the records it holds until the server answers. Only an answer with a status
- * settles a change; a lost line, WRITE_RUNNING or an unreconciled socket means try again. Row data
- * is written only through `stage` and the server merge, never in place.
+ * A kept change is the adapter's request for it. Every page reads the account's waiting changes
+ * from storage and lays them over the records it holds until the server answers. Only an answer
+ * with a status settles a change; a lost line, WRITE_RUNNING or an unreconciled socket means try
+ * again. Row data is written only through `stage` and the server merge, never in place.
  */
 
 import {
@@ -20,6 +20,7 @@ import {
   IDEMPOTENCY_TTL_MS,
   SOCKET_NOT_RECONCILED,
   type PatchOp,
+  type WireRequest,
   type TransportError,
 } from "@parcae/model";
 
@@ -79,19 +80,20 @@ export function keep<T extends Model>(record: T): {
   save(...stores: LiveQueryStore<T>[]) : Promise<void>;
   remove()                             : Promise<void>;
 } {
+  const { adapter } = requireClient();
   return {
     patch(ops) {
       record.stage(ops);
-      return start(record, "PATCH", `/${record.id}`, { ops });
+      return start(record, adapter.request(record, "patch", ops));
     },
     save(...stores) {
       // A later patch or remove reaches the row by this id while the create still waits.
       record.tmp ??= record.id;
       for (const store of stores) store.addOptimistic(record);
-      return start(record, "POST", "", record.__data, stores);
+      return start(record, adapter.request(record, "save", record.__data), stores);
     },
     remove() {
-      return start(record, "DELETE", `/${record.id}`, {});
+      return start(record, adapter.request(record, "remove"));
     },
   };
 }
@@ -100,22 +102,13 @@ export function refusalOf(record: Model): WriteRefusal | null {
   return refusals.get(record) ?? null;
 }
 
-async function start(
-  record : Model,
-  method : StoredWrite["method"],
-  tail   : string,
-  body   : Record<string, unknown>,
-  stores : LiveQueryStore<any>[] = [],
-): Promise<void> {
+async function start(record: Model, request: WireRequest, stores: LiveQueryStore<any>[] = []): Promise<void> {
   "background only";
-  const client = requireClient();
   const write: StoredWrite = {
+    ...request,
     key   : generateId(),
     type  : typeOf(record),
     id    : record.id,
-    method,
-    path  : client.adapter.resolvePath(record.constructor as never) + tail,
-    body,
     lists : stores.flatMap((store) => listKeyOf(store) ?? []),
     kept  : Date.now(),
     sent  : null,
@@ -126,7 +119,7 @@ async function start(
   layOver([record]);
   republish();
   const storage = rowStorage();
-  const user = client.session.state.userId;
+  const user = requireClient().session.state.userId;
   if (!storage || !user) return settleNow(write);
   storing.add(write.key);
   try {
@@ -205,9 +198,8 @@ async function drain(storage: RowStorage, at: number): Promise<void> {
 }
 
 function send(write: StoredWrite): Promise<unknown> {
-  const verb = write.method.toLowerCase() as "post" | "put" | "patch" | "delete";
   return requireClient()
-    [verb](write.path, write.body, { idempotencyKey: write.key })
+    .adapter.send(write, { idempotencyKey: write.key })
     .catch((cause: unknown) => {
       if (write.method === "DELETE" && isNotFoundError(cause)) return null;
       throw cause;

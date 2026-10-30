@@ -53,6 +53,7 @@ export {
 } from "./adapters/client";
 export type {
   Transport,
+  WireRequest,
   TransportError,
   RequestOptions,
 } from "./adapters/client";

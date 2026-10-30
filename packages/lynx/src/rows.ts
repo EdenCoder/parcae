@@ -8,7 +8,7 @@
  * is authoritative.
  */
 
-import { Model, SYM_VERSION, SYM_SERVER_MERGE, extractExpandFields } from "@parcae/model";
+import { Model, SYM_VERSION, SYM_SERVER_MERGE, extractExpandFields, type WireRequest } from "@parcae/model";
 
 import type { LiveRow } from "./live-query";
 
@@ -61,17 +61,12 @@ export interface RowStorage {
 }
 
 /** A change as storage keeps it until the server answers: its request, and where a create shows. */
-export interface StoredWrite {
+export interface StoredWrite extends WireRequest {
   /** Its id in storage, sent as its idempotency key. */
   key    : string;
   type   : string;
   /** The record's id; a create's own id, which it is also saved under as `tmp`. */
   id     : string;
-  method : "POST" | "PUT" | "PATCH" | "DELETE";
-  /** The adapter's path, without the version: `/projects/<id>`. */
-  path   : string;
-  /** The request's body: the row, `{ ops }`, or `{}`. */
-  body   : Record<string, unknown>;
   /** The stored lists (`StoredList.key`) a create is listed in until it's answered. */
   lists  : readonly string[];
   /** When it was kept, in ms; every report's wait counts from here. */

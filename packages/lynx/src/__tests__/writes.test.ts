@@ -3,7 +3,7 @@
  * and put back on a refusal.
  */
 
-import { Model, type PatchOp } from "@parcae/model";
+import { Model, FrontendAdapter, type PatchOp } from "@parcae/model";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 import { keep, refusalOf } from "../writes";
@@ -56,9 +56,7 @@ beforeEach(() => {
         withQuerySubscriptions : (run: () => Promise<unknown>) => run(),
         session                : { state: { status: "authenticated", userId: "u1" } },
         isConnected            : true,
-        adapter                : { resolvePath: () => "/shows" },
-        patch,
-        delete                 : remove,
+        adapter                : new FrontendAdapter({ patch, delete: remove } as never),
         _emitDiagnostic        : (event: string, moment: unknown) => event === "write" && moments.push(moment),
       }) as never,
   );
@@ -122,3 +120,4 @@ it("keeps a waiting delete laid over the page when the same account's session se
   expect(store.snapshot().items).toHaveLength(0);
   release();
 });
+
