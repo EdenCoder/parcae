@@ -9,6 +9,8 @@ export {
   dateSafeClone,
   flushChangeEmits,
   generateId,
+  heldInOrder,
+  holdings,
   Model,
   rowVersion,
   serializeLazyQueryArgs,

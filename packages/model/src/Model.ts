@@ -58,12 +58,14 @@ import {
 } from "./patch";
 import {
   CHAINABLE_METHODS,
+  extractExpandFields,
   type DerivedField,
   type ModelAdapter,
   type ModelConstructor,
   type QueryChain,
   type SchemaDefinition,
   type PatchOp,
+  type QueryStep,
   type ScopeContext,
 } from "./adapters/types";
 
@@ -459,6 +461,26 @@ export function rowVersion(row: Record<string, any>, refs: readonly string[]): s
     return Number.isFinite(time) ? String(time) : String(value);
   };
   return [row.updatedAt, ...refs.map((ref) => row[ref]?.updatedAt)].map(stamp).join(":");
+}
+
+/** The rows a read holds, by id, at the version a resync compares; `steps` name the refs it expands. */
+export function holdings(
+  rows: readonly Record<string, any>[],
+  steps: QueryStep[] | undefined,
+): Record<string, string> {
+  const refs = [...new Set(extractExpandFields(steps).map((field) => field.split(".")[0]!))].sort();
+  return Object.fromEntries(rows.map((row) => [row.id, rowVersion(row, refs)]));
+}
+
+/** The server's order of rows it resent, else held; null when it names a row neither has. */
+export function heldInOrder<T extends { id?: string }>(
+  held: readonly T[],
+  fresh: readonly T[],
+  ids: readonly string[],
+): T[] | null {
+  const byId = new Map([...held, ...fresh].map((row) => [row.id, row]));
+  const next = ids.map((id) => byId.get(id));
+  return next.every(Boolean) ? (next as T[]) : null;
 }
 
 function rawReferenceId(value: unknown): string | null {
