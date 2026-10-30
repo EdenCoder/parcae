@@ -38,4 +38,21 @@ describe("idempotency middleware", () => {
     expect(repeat.frames[0]).toEqual(first.frames[0]);
     expect(runs).toBe(1);
   });
+
+  it("answers a claim it can't make with not run, and runs the key once the claim works", async () => {
+    const pubsub = new PubSub();
+    const tryLock = pubsub.tryLock.bind(pubsub);
+    pubsub.tryLock = async () => {
+      throw new Error("Connection is closed.");
+    };
+    const middleware = createIdempotencyMiddleware(pubsub);
+    let runs = 0;
+    const failed = plain();
+    await middleware(request("k2"), createSocketFakeRes(failed.socket, "a"), () => runs++);
+    expect(failed.frames[0]).toMatchObject({ success: false, code: NOT_RUN, status: 503 });
+
+    pubsub.tryLock = tryLock;
+    await middleware(request("k2"), createSocketFakeRes(plain().socket, "b"), () => runs++);
+    expect(runs).toBe(1);
+  });
 });

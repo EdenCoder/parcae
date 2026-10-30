@@ -989,8 +989,6 @@ export function createApp(config: AppConfig): ParcaeApp {
         });
       });
 
-      server.polka.use(wrapHttpHandler(createIdempotencyMiddleware(pubsub)));
-
       if (config.middleware?.length) {
         for (const middleware of config.middleware) {
           server.polka.use(wrapHttpHandler(middleware));
@@ -1026,6 +1024,9 @@ export function createApp(config: AppConfig): ParcaeApp {
           next();
         });
       }
+
+      // After the app's middleware, so only the write itself is remembered under its key.
+      server.polka.use(wrapHttpHandler(createIdempotencyMiddleware(pubsub)));
 
       // ── Step 11: Default routes ────────────────────────────────────
       server.polka.get(`/${version}/health`, (_req: any, res: any) => {
