@@ -6,14 +6,14 @@
  * for a day. Nothing frees a claim: once a write has started, its work may already be done.
  */
 
-import { WRITE_RUNNING, REQUEST_TIMEOUT_MS, IDEMPOTENCY_TTL_MS } from "@parcae/model";
+import { NOT_RUN, REQUEST_TIMEOUT_MS, IDEMPOTENCY_TTL_MS } from "@parcae/model";
 
 import { log } from "../logger";
 import { json } from "../helpers";
 import type { PubSub } from "./pubsub";
 
 /**
- * A repeat gets the first answer, or 409 `WRITE_RUNNING` while the first still runs. A write that
+ * A repeat gets the first answer, or 409 `NOT_RUN` while the first still runs. A write that
  * runs past REQUEST_TIMEOUT_MS, or a server that dies after saving but before answering, can run
  * twice.
  */
@@ -37,7 +37,7 @@ export function createIdempotencyMiddleware(
         return;
       }
       log.info(`[idempotency] ${name} repeat refused, first still running`);
-      json(res, 409, { result: null, success: false, error: "This write is still running", code: WRITE_RUNNING });
+      json(res, 409, { result: null, success: false, error: "This write is still running", code: NOT_RUN });
       return;
     }
 

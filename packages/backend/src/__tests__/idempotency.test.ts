@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { WRITE_RUNNING } from "@parcae/model";
+import { NOT_RUN } from "@parcae/model";
 
 import { PubSub } from "../services/pubsub";
 import { createSocketFakeRes } from "../socket-fake-res";
@@ -27,7 +27,7 @@ describe("idempotency middleware", () => {
 
     const running = plain();
     await middleware(request("k1"), createSocketFakeRes(running.socket, "b"), () => runs++);
-    expect(running.frames[0]).toMatchObject({ success: false, code: WRITE_RUNNING, status: 409 });
+    expect(running.frames[0]).toMatchObject({ success: false, code: NOT_RUN, status: 409 });
 
     firstRes.writeHead(422);
     firstRes.end(JSON.stringify({ result: null, success: false, error: "No" }));

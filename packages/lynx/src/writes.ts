@@ -4,21 +4,20 @@
  *
  * A kept change is the adapter's request for it. Every page reads the account's waiting changes
  * from storage and lays them over the records it holds until the server answers. Only an answer
- * with a status settles a change; a lost line, WRITE_RUNNING or an unreconciled socket means try
- * again. Row data is written only through `stage` and the server merge, never in place.
+ * with a status settles a change; a lost line or NOT_RUN means try again. Row data is written only
+ * through `stage` and the server merge, never in place.
  */
 
 import {
   same,
   Model,
+  NOT_RUN,
   patched,
   generateId,
-  WRITE_RUNNING,
   isNotFoundError,
   pointerSegments,
   SYM_SERVER_MERGE,
   IDEMPOTENCY_TTL_MS,
-  SOCKET_NOT_RECONCILED,
   type PatchOp,
   type WireRequest,
   type TransportError,
@@ -206,9 +205,9 @@ function send(write: StoredWrite): Promise<unknown> {
     });
 }
 
-/** Not run, try again: the line (no status), the key's first send still running, or a socket before its session. */
-function again({ status, code, message }: TransportError): boolean {
-  return status === undefined || code === WRITE_RUNNING || (status === 409 && message.includes(SOCKET_NOT_RECONCILED));
+/** Not run, try again: the line (no status), or the server's NOT_RUN. */
+function again({ status, code }: TransportError): boolean {
+  return status === undefined || code === NOT_RUN;
 }
 
 function retryLater(write?: StoredWrite): void {

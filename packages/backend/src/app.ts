@@ -17,7 +17,7 @@ import {
   createSessionFencedEmitter,
   createSessionFencedSocket,
 } from "./socket-session-facade";
-import { Model, rowVersion, SOCKET_NOT_RECONCILED, SESSION_BOUNDARY_ERRORS } from "@parcae/model";
+import { Model, NOT_RUN, rowVersion, SESSION_BOUNDARY_ERRORS } from "@parcae/model";
 import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
 import { log } from "./logger";
 import { ClientError } from "./helpers";
@@ -1364,7 +1364,8 @@ export function createApp(config: AppConfig): ParcaeApp {
                 JSON.stringify({
                   result: null,
                   success: false,
-                  error: SOCKET_NOT_RECONCILED,
+                  error: "Socket session is not reconciled",
+                  code: NOT_RUN,
                 }),
               );
               return;

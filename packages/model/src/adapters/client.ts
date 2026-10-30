@@ -34,8 +34,8 @@ export interface RequestOptions {
 export const REQUEST_TIMEOUT_MS = 120_000;
 /** How long the server keeps a write's answer under its key. A client stops resending a write first sent longer ago. */
 export const IDEMPOTENCY_TTL_MS = 86_400_000;
-/** The `code` of the server's 409 to a repeat whose first send is still running: not run, try again. */
-export const WRITE_RUNNING = "WRITE_RUNNING";
+/** The `code` of an answer that says the call did not run: try again. */
+export const NOT_RUN = "NOT_RUN";
 
 /** A model write as it goes over the wire: the one shape save, patch, remove and kept changes send. */
 export interface WireRequest {
