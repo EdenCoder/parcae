@@ -1,8 +1,8 @@
 /**
- * A derived field is picked in `select`, read from its `from` columns,
- * built on the sanitized row, and sent without the columns only it
- * asked for. Two picks of one field read the same SQL, so they must
- * not share a cached subscription.
+ * A read sends only what its `select` named: its columns, with `id`, and
+ * a derived field built on the sanitized row from its `from` columns.
+ * Two picks of one field read the same SQL, so they must not share a
+ * cached subscription.
  */
 
 import { describe, expect, it } from "vitest";
@@ -57,16 +57,17 @@ function query() {
 }
 
 describe("derived fields", () => {
-  it("reads a picked field's columns and sends it without them", async () => {
+  it("reads a picked field's columns and sends only what the read named", async () => {
     const { prep, select } = prepare([{ method: "select", args: ["title", "parts.text"] }]);
     expect(select).toEqual(["id", "title", "body"]);
-    const row = await projectForWire({ sanitize: () => ({ id: "n1", title: "Hi", body: BODY }) }, null, prep.derived);
+    const sanitized = { type: "note", id: "n1", title: "Hi", body: BODY, createdAt: "now" };
+    const row = await projectForWire({ sanitize: () => ({ ...sanitized }) }, null, prep.selection);
     expect(row).toEqual({ id: "n1", title: "Hi", parts: [{ kind: "text" }] });
   });
 
   it("takes every kind by its bare name and keeps a column the read selected", async () => {
     const { prep } = prepare([{ method: "select", args: ["body", "parts"] }]);
-    const row = await projectForWire({ sanitize: () => ({ id: "n1", body: BODY }) }, null, prep.derived);
+    const row = await projectForWire({ sanitize: () => ({ id: "n1", body: BODY }) }, null, prep.selection);
     expect(row).toEqual({ id: "n1", body: BODY, parts: [{ kind: "text" }, { kind: "step" }] });
   });
 
@@ -79,14 +80,14 @@ describe("derived fields", () => {
   it("caches two picks of one field apart, and one pick in any order together", async () => {
     const manager = new QuerySubscriptionManager(() => {}, { debounceMs: 0, maxWaitMs: 0 });
     const subscribe = (socketId: string, args: string[]) =>
-      manager.subscribe({ socketId, query: query(), derived: prepare([{ method: "select", args }]).prep.derived });
+      manager.subscribe({ socketId, query: query(), selection: prepare([{ method: "select", args }]).prep.selection });
     const text = await subscribe("s1", ["parts.text"]);
     const step = await subscribe("s2", ["parts.step"]);
     const both = await subscribe("s3", ["parts.text", "parts.step"]);
     const again = await subscribe("s4", ["parts.step", "parts.text"]);
     expect(text.hash).not.toBe(step.hash);
     expect(both.hash).toBe(again.hash);
-    expect(text.items).toEqual([{ id: "n1", title: "Hi", parts: [{ kind: "text" }] }]);
-    expect(step.items).toEqual([{ id: "n1", title: "Hi", parts: [{ kind: "step" }] }]);
+    expect(text.items).toEqual([{ id: "n1", parts: [{ kind: "text" }] }]);
+    expect(step.items).toEqual([{ id: "n1", parts: [{ kind: "step" }] }]);
   });
 });

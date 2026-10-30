@@ -9,7 +9,7 @@ import { extractExpandFields, stripExpandSteps } from "@parcae/model";
 import type { BackendAdapter } from "../adapters/model";
 import { getRefLoader } from "./context";
 import { deniedFields } from "./field-policy";
-import { pickDerived, type ResolvedDerived } from "./derived-fields";
+import { pickSelection, type Selection } from "./derived-fields";
 import {
   hydrateExpansions,
   parseExpandSpecs,
@@ -45,8 +45,8 @@ export interface PreparedClientQuery {
   countQuery: QueryChain<any>;
   /** Resolved expand projections, frozen by `validateExpandSpecs`. */
   expandResolved: readonly ResolvedExpand[];
-  /** The derived fields the read's `select` picked, built on each row after `sanitize()`. */
-  derived: readonly ResolvedDerived[];
+  /** What the read's `select` sends, kept on each row after `sanitize()`. */
+  selection: Selection;
   /** Normalised, expand-stripped step array — exposed for callers
    *  that want to introspect the SQL-side step list. */
   steps: any[];
@@ -103,7 +103,7 @@ export function prepareClientQuery(opts: PrepareClientQueryOptions): PreparedCli
   // hydrate for ongoing diffs).
   const expandSpecs = parseExpandSpecs(extractExpandFields(normalised));
   const expandResolved = validateExpandSpecs(expandSpecs, ModelClass, modelByType);
-  const picked = pickDerived(
+  const picked = pickSelection(
     ModelClass,
     expandResolved.length > 0 ? stripExpandSteps(normalised) : normalised,
   );
@@ -119,7 +119,7 @@ export function prepareClientQuery(opts: PrepareClientQueryOptions): PreparedCli
   );
   const countQuery = adapter.queryFromClient(ModelClass, scopeResult, stepsWithoutPagination, ctx);
 
-  return { query, countQuery, expandResolved, derived: picked.derived, steps, denied };
+  return { query, countQuery, expandResolved, selection: picked.selection, steps, denied };
 }
 
 // ─── runQuerySubscription ────────────────────────────────────────────────────
@@ -163,9 +163,9 @@ export async function runQuerySubscription(
     );
   }
 
-  const { query, expandResolved, derived, steps } = prep;
+  const { query, expandResolved, selection, steps } = prep;
   return adapter.subscriptions.subscribe(
-    { socketId, query, expand: expandResolved, derived, steps, user },
+    { socketId, query, expand: expandResolved, selection, steps, user },
     { force },
   );
 }
@@ -197,7 +197,7 @@ export interface RunQueryStaticResult {
  */
 export async function runQueryStatic(opts: RunQueryStaticOptions): Promise<RunQueryStaticResult> {
   const { prep, user } = opts;
-  const { query, countQuery, expandResolved, derived } = prep;
+  const { query, countQuery, expandResolved, selection } = prep;
 
   const [rawItems, totalCount] = await Promise.all([query.find(), countQuery.count()]);
 
@@ -206,7 +206,7 @@ export async function runQueryStatic(opts: RunQueryStaticOptions): Promise<RunQu
   // privateFields; the fallback covers test fixtures and oddball
   // model implementations that don't define sanitize.
   const items = await Promise.all(
-    rawItems.map((model) => projectForWire(model, user, derived)),
+    rawItems.map((model) => projectForWire(model, user, selection)),
   );
 
   if (expandResolved.length > 0) {
