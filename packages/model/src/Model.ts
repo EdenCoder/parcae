@@ -58,6 +58,7 @@ import {
 } from "./patch";
 import {
   CHAINABLE_METHODS,
+  type DerivedField,
   type ModelAdapter,
   type ModelConstructor,
   type QueryChain,
@@ -605,6 +606,13 @@ export class Model extends EventEmitter {
    * sensitive columns.
    */
   static readonly privateFields: readonly string[] = [];
+  /**
+   * Named shapes of a row, built from its columns on the server after
+   * `sanitize()` and never stored. A read picks one in `select`: by
+   * its name, or by `name.kind` for one of its `kinds`. Name a shape
+   * for what it is, never for the client that reads it.
+   */
+  static readonly derivedFields: Readonly<Record<string, DerivedField>> = {};
   /** @internal */
   static __schema?: SchemaDefinition;
 

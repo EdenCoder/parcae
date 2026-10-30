@@ -18,6 +18,7 @@ import {
   type ResolvedExpand,
   hydrateExpansions,
 } from "./hydrate-expansions";
+import { derivedKey, type ResolvedDerived } from "./derived-fields";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -53,6 +54,8 @@ interface CachedQuery {
    * expansions — identical to the no-expand emit path.
    */
   expand: readonly ResolvedExpand[];
+  /** The derived fields its `select` picked, built on every row it sends. */
+  derived: readonly ResolvedDerived[];
   /**
    * Iteration order of this Map IS the order rows came back from the
    * DB on the last re-eval (and therefore matches the orderBy spec
@@ -133,6 +136,8 @@ interface SubscriptionOptions {
    * consumer. Empty → no expansions.
    */
   expand?: readonly ResolvedExpand[];
+  /** The derived fields its `select` picked; picks apart are cached apart, like expand's. */
+  derived?: readonly ResolvedDerived[];
   /**
    * Raw client-sent steps. Used to detect `.orderBy(false)` so the
    * subscriptions manager skips order envelope emission for queries
@@ -220,6 +225,7 @@ interface IoBackend {
 function hashFrom(
   toSQL: { sql: string; bindings: any[] },
   expand: readonly ResolvedExpand[],
+  derived: readonly ResolvedDerived[],
   user: SanitizerUser,
 ): string {
   // Expand projections are part of the cache key: a `.find()` with
@@ -241,6 +247,8 @@ function hashFrom(
     sql: toSQL.sql,
     bindings: toSQL.bindings,
     expand: expandKey,
+    // Two picks of one derived field read the same SQL. Absent when none, so other hashes stay.
+    derived: derivedKey(derived) || undefined,
     user,
   });
   return createHash("sha256").update(payload).digest("hex").slice(0, 16);
@@ -587,13 +595,14 @@ export class QuerySubscriptionManager {
     const { socketId, query, steps } = opts;
     const user: SanitizerUser = opts.user ? dateSafeClone(opts.user) : null;
     const expand = opts.expand ?? EMPTY_EXPAND;
+    const derived = opts.derived ?? [];
     const orderOptedOut = orderEmissionDisabled(steps);
     // `__modelType` lives on the QueryChain interface as @internal —
     // populated by every chain factory (`Model._query` → `lazyQuery`
     // server-side, the adapter's `query()` factory client-side).
     const modelType = query.__modelType;
     const compiled = query.exec().toSQL();
-    const hash = hashFrom(compiled, expand, user);
+    const hash = hashFrom(compiled, expand, derived, user);
     const socketGeneration = this.socketGenerations.get(socketId) ?? 0;
 
     // Per-socket cap enforced BEFORE the cache lookup so a socket
@@ -634,6 +643,7 @@ export class QuerySubscriptionManager {
             query,
             user,
             expand,
+            derived,
             emitOrder: !orderOptedOut,
             dependency: dependencyPlan(query, steps, compiled.sql),
           });
@@ -705,10 +715,11 @@ export class QuerySubscriptionManager {
     query: QueryChain<any>;
     user: SanitizerUser;
     expand: readonly ResolvedExpand[];
+    derived: readonly ResolvedDerived[];
     emitOrder: boolean;
     dependency: CachedQuery["dependency"];
   }): Promise<CachedQuery> {
-    const { hash, modelType, query, user, expand, emitOrder, dependency } = opts;
+    const { hash, modelType, query, user, expand, derived, emitOrder, dependency } = opts;
     const watchedTypes = new Set([modelType, ...expand.map((entry) => entry.targetType)]);
     const revisions = new Map(
       [...watchedTypes].map((type) => [type, this.changeRevisions.get(type) ?? 0]),
@@ -728,6 +739,7 @@ export class QuerySubscriptionManager {
       query,
       user,
       expand,
+      derived,
       result,
       totalCount,
       subscribers: new Set(),
@@ -1146,7 +1158,9 @@ export class QuerySubscriptionManager {
       return true;
     }
 
-    const rows = await Promise.all(models.map((model) => projectForWire(model, cached.user)));
+    const rows = await Promise.all(
+      models.map((model) => projectForWire(model, cached.user, cached.derived)),
+    );
     await this._hydrateRows(cached.query, rows, cached.expand, cached.user);
     if (!this._isCurrent(cached, generation)) return false;
     const updated = new Map(rows.map((row) => [row.id, dateSafeClone(row)]));
@@ -1342,9 +1356,10 @@ export class QuerySubscriptionManager {
   private async _execQuery({
     query,
     expand,
+    derived,
     user,
     dependency,
-  }: Pick<CachedQuery, "query" | "expand" | "user" | "dependency">): Promise<{
+  }: Pick<CachedQuery, "query" | "expand" | "derived" | "user" | "dependency">): Promise<{
     rows: Record<string, any>[];
     totalCount: number;
   }> {
@@ -1353,7 +1368,9 @@ export class QuerySubscriptionManager {
     const models = adapter?.executeSubscriptionQuery
       ? await adapter.executeSubscriptionQuery(cloned)
       : await cloned.find();
-    const wireRows = await Promise.all(models.map((model) => projectForWire(model, user)));
+    const wireRows = await Promise.all(
+      models.map((model) => projectForWire(model, user, derived)),
+    );
 
     const [totalCount] = await Promise.all([
       !dependency.hasOffset && (dependency.limit === null || models.length < dependency.limit)

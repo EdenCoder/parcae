@@ -50,6 +50,7 @@ import type {
 } from "@parcae/model";
 import { ClientError } from "../helpers";
 import type { RefLoader } from "./ref-loader";
+import { projectDerived, type ResolvedDerived } from "./derived-fields";
 
 // ─── Spec parsing ────────────────────────────────────────────────────────────
 
@@ -247,10 +248,11 @@ export function getWireRefId(row: WireRow, refField: string): string | null {
   return null;
 }
 
-/** Sanitize one model and stamp raw companions for every visible ref field. */
+/** Sanitize one model, stamp raw companions for every visible ref field, and build the derived fields its read picked. */
 export async function projectForWire(
   item: unknown,
   user: { id: string } | null | undefined,
+  derived: readonly ResolvedDerived[] = [],
 ): Promise<WireRow> {
   // boundary: query rows are Model instances, with plain test doubles allowed.
   const model = item as {
@@ -262,13 +264,12 @@ export async function projectForWire(
     typeof model?.sanitize === "function"
       ? await model.sanitize(user ?? undefined)
       : (model?.__data ?? (item as WireRow));
-  const schema = model?.constructor?.__schema;
-  if (!schema) return row;
-  for (const [field, column] of Object.entries(schema)) {
+  for (const [field, column] of Object.entries(model?.constructor?.__schema ?? {})) {
     if (typeof column !== "object" || column.kind !== "ref") continue;
     if (!Object.prototype.hasOwnProperty.call(row, field)) continue;
     row[`$${field}`] = getWireRefId(row, field);
   }
+  projectDerived(row, derived);
   return row;
 }
 

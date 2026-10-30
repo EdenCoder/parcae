@@ -67,6 +67,7 @@ export {
 export type {
   ModelAdapter,
   ModelClass,
+  DerivedField,
   ModelConstructor,
   QueryChain,
   QueryStep,
