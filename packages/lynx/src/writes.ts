@@ -1,81 +1,36 @@
 /**
- * A page's kept changes: stored, laid over what the page draws, sent oldest first with their key,
- * settled by the server's answer, and reported at each step.
+ * A page's kept changes: applied at once, laid over what the page draws, handed to the engine,
+ * settled here when the engine tells the page.
  *
- * A kept change is the adapter's request for it. Every page reads the account's waiting changes
- * from storage and lays them over the records it holds until the server answers. Only an answer
- * with a status settles a change; a lost line or NOT_RUN means try again. Row data is written only
- * through `stage` and the server merge, never in place.
+ * A kept change is the adapter's request for it. The page that kept a change merges its answer,
+ * or takes it back and records the refusal; every other page lands or drops it as the engine says.
+ * Row data is written only through `stage` and the server merge, never in place.
  */
 
 import {
   same,
   Model,
-  NOT_RUN,
   patched,
   generateId,
-  isNotFoundError,
   pointerSegments,
   SYM_SERVER_MERGE,
-  IDEMPOTENCY_TTL_MS,
   type PatchOp,
   type WireRequest,
-  type TransportError,
 } from "@parcae/model";
 
-import { requireClient } from "./client-registry";
+import { page } from "./page";
+import type { WriteOutcome, WriteRefusal } from "./queue";
 import { listKeyOf, retainedHolders, type LiveRow, type LiveQueryStore } from "./live-query";
-import {
-  keyOf,
-  typeOf,
-  recordOf,
-  holdersOf,
-  storedRow,
-  rowStorage,
-  type RowBatch,
-  type ServerRow,
-  type RowStorage,
-  type StoredWrite,
-} from "./rows";
+import { keyOf, typeOf, recordOf, holdersOf, type ServerRow, type StoredWrite } from "./rows";
 
-/** The server's refusal of the last change kept for a record in this page, until another is kept. `status` is absent when the phone refused it itself. */
-export interface WriteRefusal {
-  method  : StoredWrite["method"];
-  status? : number;
-  code?   : string;
-  message : string;
-}
-
-/** What happened to a stored change, emitted on the client as "write" for the app to report. */
-export interface WriteMoment {
-  moment  : "sent" | "retried" | "refused";
-  type    : string;
-  method  : StoredWrite["method"];
-  /** Since it was kept. */
-  ms      : number;
-  /** The server's status, when it answered. */
-  status? : number;
-  /** The server's code for a refusal, when it gave one. */
-  code?   : string;
-}
-
-const SEND_BACKOFF_FLOOR_MS = 1_000;
-const SEND_BACKOFF_CAP_MS   = 60_000;
-
-/** The account's waiting changes as this page last read them, plus the ones it is storing. */
-let waiting: StoredWrite[] = [];
-const storing  = new Set<string>();
+/** The engine's waiting changes as it last told this page; none on the main thread. */
+let waiting: readonly StoredWrite[] = [];
 /** This page's records for the changes it kept, and the stores a create was listed in. */
 const own      = new Map<string, { record: Model; stores: LiveQueryStore<any>[] }>();
 /** Another page's waiting creates, hydrated once each. */
 const created  = new Map<string, LiveRow | null>();
 const refusals = new WeakMap<Model, WriteRefusal>();
 const watched  = new WeakSet<Model>();
-
-let epoch   = 0;
-let backoff = 0;
-let sending = false;
-let timer: ReturnType<typeof setTimeout> | null = null;
 
 // =============================================================================
 // Keep
@@ -90,7 +45,7 @@ export function keep<T extends Model>(record: T): {
   save(...stores: LiveQueryStore<T>[]) : Promise<void>;
   remove()                             : Promise<void>;
 } {
-  const { adapter } = requireClient();
+  const { adapter } = page().client;
   return {
     patch(ops) {
       record.stage(ops);
@@ -112,7 +67,7 @@ export function refusalOf(record: Model): WriteRefusal | null {
   return refusals.get(record) ?? null;
 }
 
-async function start(record: Model, request: WireRequest, stores: LiveQueryStore<any>[] = []): Promise<void> {
+function start(record: Model, request: WireRequest, stores: LiveQueryStore<any>[] = []): Promise<void> {
   "background only";
   const write: StoredWrite = {
     ...request,
@@ -125,144 +80,55 @@ async function start(record: Model, request: WireRequest, stores: LiveQueryStore
   };
   refusals.delete(record);
   own.set(write.key, { record, stores });
-  waiting = [...waiting, write];
-  layOver([record]);
-  republish();
-  const storage = rowStorage();
-  if (!storage) return settleNow(write);
-  storing.add(write.key);
-  try {
-    // Storage knows the signed-in account offline; the session learns it only from the server.
-    const { user } = await storage.waiting();
-    if (!user) throw new Error("Not signed in");
-    await storage.write({ user, rows: [], lists: [], writes: [write] });
-  } catch (cause) {
-    undo(write);
-    throw cause;
-  } finally {
-    storing.delete(write.key);
-  }
-  sendWrites();
-}
-
-/** With no storage, a change is sent once and answers its caller; a lost line refuses it. */
-async function settleNow(write: StoredWrite): Promise<void> {
-  try {
-    settle(write, await send(write));
-  } catch (cause) {
-    refuse(write, cause as TransportError);
-    throw cause;
-  }
-}
-
-// =============================================================================
-// Send
-// =============================================================================
-
-/**
- * Sends the oldest waiting change while a store is retained, the session signed in and the line
- * up. Only a page with open lists sends; a hidden page sends nothing.
- */
-export function sendWrites(): void {
-  "background only";
-  const storage = rowStorage();
-  if (!storage || sending || retainedHolders().length === 0) return;
-  const client = requireClient();
-  if (client.session.state.status !== "authenticated" || !client.isConnected) return;
-  if (timer) clearTimeout(timer);
-  timer = null;
-  sending = true;
-  const at = epoch;
-  drain(storage, at)
-    .catch(() => retryLater())
-    .finally(() => {
-      if (at === epoch) sending = false;
-    });
-}
-
-async function drain(storage: RowStorage, at: number): Promise<void> {
-  for (;;) {
-    const { user, writes } = await storage.waiting();
-    if (at !== epoch) return;
-    adopt(writes);
-    const write = writes[0];
-    if (!write || !user) return;
-    let answer: unknown;
-    let landed: Pick<RowBatch, "rows" | "removed"> = { rows: [] };
-    if (write.sent !== null && Date.now() - write.sent > IDEMPOTENCY_TTL_MS) {
-      // The server may have forgotten its key, so a resend could run it twice.
-      refuse(write, { message: "Kept longer than the server remembers it" });
-    } else {
-      if (write.sent === null)
-        await storage.write({ user, rows: [], lists: [], writes: [{ ...write, sent: Date.now() }] });
-      try {
-        answer = await send(write);
-      } catch (cause) {
-        if (at !== epoch) return;
-        if (again(cause as TransportError)) return retryLater(write);
-        refuse(write, cause as TransportError);
-      }
-      if (at !== epoch) return;
-      if (waiting.some((w) => w.key === write.key)) {
-        settle(write, answer);
-        landed = landedRows(write, answer);
-      }
-    }
-    backoff = 0;
-    await storage.write({ user, lists: [], ...landed, settled: [write.key] });
-  }
-}
-
-function send(write: StoredWrite): Promise<unknown> {
-  return requireClient()
-    .adapter.send(write, { idempotencyKey: write.key })
-    .catch((cause: unknown) => {
-      if (write.method === "DELETE" && isNotFoundError(cause)) return null;
-      throw cause;
-    });
-}
-
-/**
- * What storage keeps of a change's answer, so a row it draws is never older than what the page did:
- * a delete drops the row, a patch's answer rewrites the fields it changed, a save's the whole row.
- */
-function landedRows(write: StoredWrite, answer: unknown): Pick<RowBatch, "rows" | "removed"> {
-  if (write.method === "DELETE") return { rows: [], removed: [{ type: write.type, id: write.id }] };
-  if (!answer || typeof answer !== "object") return { rows: [] };
-  const ops = write.method === "PATCH" ? (write.body.ops as PatchOp[]) : null;
-  const fields = ops && new Set(["id", ...ops.map((op) => pointerSegments(op.path)[0]!)]);
-  return { rows: [storedRow(write.type, answer as ServerRow, fields)] };
-}
-
-/** Not run, try again: the line (no status), or the server's NOT_RUN. */
-function again({ status, code }: TransportError): boolean {
-  return status === undefined || code === NOT_RUN;
-}
-
-function retryLater(write?: StoredWrite): void {
-  if (write) report("retried", write);
-  backoff = Math.min(Math.max(backoff * 2, SEND_BACKOFF_FLOOR_MS), SEND_BACKOFF_CAP_MS);
-  timer = setTimeout(() => {
-    timer = null;
-    sendWrites();
-  }, backoff);
+  return page().keep(write);
 }
 
 // =============================================================================
 // Settle
 // =============================================================================
 
-function settle(write: StoredWrite, answer: unknown): void {
+/** This card's `PageHooks.moved`: the engine's waiting changes moved, settling `outcome`'s when given. */
+export function moved(outcome: WriteOutcome | null): void {
+  waiting = page().waiting();
+  if (outcome) {
+    const { write } = outcome;
+    const mine = own.has(write.key);
+    if ("refusal" in outcome) {
+      const record = undo(write);
+      if (mine && record) refusals.set(record, outcome.refusal);
+    } else if (mine) {
+      settle(write, outcome.answer);
+    } else {
+      settledElsewhere(write);
+    }
+  }
+  for (const write of waiting) {
+    const record = own.get(write.key)?.record ?? recordOf(write.type, write.id);
+    if (record) layOver([record]);
+  }
+  for (const holder of retainedHolders()) holder.republish();
+}
+
+function settle(write: StoredWrite, answer: ServerRow | null): void {
   const record = forget(write);
   if (write.method === "DELETE") {
     unlist(write, record);
-  } else if (record && answer && typeof answer === "object") {
-    record[SYM_SERVER_MERGE](answer as Record<string, unknown>);
+  } else if (record && answer) {
+    // A write's answer carries no derived field, so it merges over the fields it has.
+    record[SYM_SERVER_MERGE]({ ...record.__serverSnapshot, ...answer });
     record.__isNew = false;
     layOver([record]);
   }
-  report("sent", write);
-  republish();
+}
+
+/**
+ * Another page's change: here it counts as landed until the record's next answer says otherwise,
+ * so a delete leaves the page's lists and a patch's fields stay.
+ */
+function settledElsewhere(write: StoredWrite): void {
+  const record = forget(write);
+  if (write.method === "DELETE") unlist(write, record);
+  else if (write.method === "PATCH" && record) record[SYM_SERVER_MERGE](patched(record.__serverSnapshot, heldOps(record, write)));
 }
 
 /**
@@ -275,12 +141,6 @@ function unlist(write: StoredWrite, record: Model | undefined): void {
     for (const holder of new Set([...retainedHolders(), ...holdersOf(write.type, id)])) holder.unlist(id);
 }
 
-function refuse(write: StoredWrite, { status, code, message }: Partial<TransportError> & { message: string }): void {
-  const record = undo(write);
-  if (record) refusals.set(record, { method: write.method, status, code, message });
-  report("refused", write, { status, code });
-}
-
 /** Takes a change back out of this page: a patch's record goes back to the server's copy with what still waits. */
 function undo(write: StoredWrite): Model | undefined {
   const stores = own.get(write.key)?.stores ?? [];
@@ -290,71 +150,19 @@ function undo(write: StoredWrite): Model | undefined {
     layOver([record]);
   }
   for (const store of write.method === "POST" ? stores : []) store.removeOptimistic(write.id);
-  republish();
   return record;
 }
 
 function forget(write: StoredWrite): Model | undefined {
   const record = own.get(write.key)?.record ?? recordOf(write.type, write.id);
-  waiting = waiting.filter((w) => w.key !== write.key);
   own.delete(write.key);
   created.delete(write.key);
   return record;
 }
 
-/** The server's status and code go with a refusal; JSON leaves out the ones it didn't give. */
-function report(moment: WriteMoment["moment"], write: StoredWrite, answer: Pick<WriteMoment, "status" | "code"> = {}): void {
-  if (!rowStorage()) return;
-  const payload: WriteMoment = { moment, type: write.type, method: write.method, ms: Date.now() - write.kept, ...answer };
-  requireClient()._emitDiagnostic?.("write", { ...payload });
-}
-
 // =============================================================================
 // The page's view
 // =============================================================================
-
-/** Reads the account's waiting changes once per tick and lays them over this page. */
-let refreshing: Promise<void> | null = null;
-export function refreshWrites(): Promise<void> {
-  "background only";
-  const storage = rowStorage();
-  if (!storage) return Promise.resolve();
-  const at = epoch;
-  refreshing ??= storage
-    .waiting()
-    .then(({ writes }) => {
-      if (at === epoch) adopt(writes);
-    })
-    .finally(() => {
-      refreshing = null;
-    });
-  return refreshing;
-}
-
-/** Storage's list becomes the page's: a change that left it was settled by another page, a new one is laid over. */
-function adopt(writes: StoredWrite[]): void {
-  const listed = new Set(writes.map((write) => write.key));
-  const before = waiting.map((write) => write.key).join();
-  for (const write of waiting) if (!listed.has(write.key) && !storing.has(write.key)) settledElsewhere(write);
-  const known = new Set(waiting.map((write) => write.key));
-  const fresh = writes.filter((write) => !known.has(write.key));
-  waiting = [...writes, ...waiting.filter((write) => !listed.has(write.key))];
-  for (const write of fresh) {
-    const record = recordOf(write.type, write.id);
-    if (record) layOver([record]);
-  }
-  if (waiting.map((write) => write.key).join() !== before) republish();
-}
-
-/**
- * Only the page that settled a change knows its answer, so here it counts as landed until the
- * record's next answer says otherwise: a delete leaves the page's lists, a patch's fields stay.
- */
-function settledElsewhere(write: StoredWrite): void {
-  const record = forget(write);
-  if (write.method === "DELETE") unlist(write, record);
-  else if (write.method === "PATCH" && record) record[SYM_SERVER_MERGE](patched(record.__serverSnapshot, heldOps(record, write)));
-}
 
 /** A patch's ops on the fields `record` holds; the others it never drew. */
 function heldOps(record: Model, write: StoredWrite): PatchOp[] {
@@ -392,24 +200,4 @@ export function waitingCreates(listKey: string, hydrate: (data: Record<string, u
     if (!created.has(write.key)) created.set(write.key, hydrate(write.body));
     return created.get(write.key) ?? [];
   });
-}
-
-/**
- * The session settled or changed: the send in flight is dropped and the waiting changes are read
- * again. Storage answers only for the account the phone is signed in as, so the same account keeps
- * its changes and another's leave this page.
- */
-export function rereadWrites(): void {
-  "background only";
-  epoch++;
-  refreshing = null;
-  sending = false;
-  backoff = 0;
-  if (timer) clearTimeout(timer);
-  timer = null;
-  void refreshWrites().then(sendWrites);
-}
-
-function republish(): void {
-  for (const holder of retainedHolders()) holder.republish();
 }
