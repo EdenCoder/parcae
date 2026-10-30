@@ -46,16 +46,19 @@ const storage: RowStorage = {
 const patch = vi.fn();
 const remove = vi.fn();
 const moments: unknown[] = [];
+const line = { session: { state: { status: "authenticated", userId: "u1" as string | null } }, isConnected: true };
 
 beforeEach(() => {
   vi.useFakeTimers();
+  line.session.state = { status: "authenticated", userId: "u1" };
+  line.isConnected = true;
   provideClient(
     () =>
       ({
         subscribe              : () => () => {},
         withQuerySubscriptions : (run: () => Promise<unknown>) => run(),
-        session                : { state: { status: "authenticated", userId: "u1" } },
-        isConnected            : true,
+        session                : line.session,
+        get isConnected() { return line.isConnected; },
         adapter                : new FrontendAdapter({ patch, delete: remove } as never),
         _emitDiagnostic        : (event: string, moment: unknown) => event === "write" && moments.push(moment),
       }) as never,
@@ -121,3 +124,25 @@ it("keeps a waiting delete laid over the page when the same account's session se
   release();
 });
 
+it("keeps a change made offline before the server knows the account, and sends it once signed in", async () => {
+  remove.mockReset().mockResolvedValue(null);
+  const store = createLiveQuery(read);
+  const release = store.retain(() => {});
+  await vi.advanceTimersByTimeAsync(0);
+  line.session.state = { status: "pending", userId: null };
+  line.isConnected = false;
+
+  await keep(store.snapshot().items[0]!).remove();
+  expect(kept).toHaveLength(1);
+  expect(remove).not.toHaveBeenCalled();
+
+  line.session.state = { status: "authenticated", userId: "u1" };
+  line.isConnected = true;
+  resetLiveQueries(true, "u1");
+  await vi.advanceTimersByTimeAsync(0);
+  expect(remove).toHaveBeenCalledTimes(1);
+  expect(remove).toHaveBeenLastCalledWith("/shows/s1", {}, { idempotencyKey: expect.any(String) });
+  expect(kept).toHaveLength(0);
+  expect(store.snapshot().items).toHaveLength(0);
+  release();
+});
