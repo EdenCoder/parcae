@@ -25,7 +25,18 @@ import {
 
 import { requireClient } from "./client-registry";
 import { listKeyOf, retainedHolders, type LiveRow, type LiveQueryStore } from "./live-query";
-import { keyOf, typeOf, recordOf, holdersOf, rowStorage, type RowStorage, type StoredWrite } from "./rows";
+import {
+  keyOf,
+  typeOf,
+  recordOf,
+  holdersOf,
+  storedRow,
+  rowStorage,
+  type RowBatch,
+  type ServerRow,
+  type RowStorage,
+  type StoredWrite,
+} from "./rows";
 
 /** The server's refusal of the last change kept for a record in this page, until another is kept. `status` is absent when the phone refused it itself. */
 export interface WriteRefusal {
@@ -177,6 +188,7 @@ async function drain(storage: RowStorage, at: number): Promise<void> {
     const write = writes[0];
     if (!write || !user) return;
     let answer: unknown;
+    let landed: Pick<RowBatch, "rows" | "removed"> = { rows: [] };
     if (write.sent !== null && Date.now() - write.sent > IDEMPOTENCY_TTL_MS) {
       // The server may have forgotten its key, so a resend could run it twice.
       refuse(write, { message: "Kept longer than the server remembers it" });
@@ -191,10 +203,13 @@ async function drain(storage: RowStorage, at: number): Promise<void> {
         refuse(write, cause as TransportError);
       }
       if (at !== epoch) return;
-      if (waiting.some((w) => w.key === write.key)) settle(write, answer);
+      if (waiting.some((w) => w.key === write.key)) {
+        settle(write, answer);
+        landed = landedRows(write, answer);
+      }
     }
     backoff = 0;
-    await storage.write({ user, rows: [], lists: [], settled: [write.key] });
+    await storage.write({ user, lists: [], ...landed, settled: [write.key] });
   }
 }
 
@@ -205,6 +220,18 @@ function send(write: StoredWrite): Promise<unknown> {
       if (write.method === "DELETE" && isNotFoundError(cause)) return null;
       throw cause;
     });
+}
+
+/**
+ * What storage keeps of a change's answer, so a row it draws is never older than what the page did:
+ * a delete drops the row, a patch's answer rewrites the fields it changed, a save's the whole row.
+ */
+function landedRows(write: StoredWrite, answer: unknown): Pick<RowBatch, "rows" | "removed"> {
+  if (write.method === "DELETE") return { rows: [], removed: [{ type: write.type, id: write.id }] };
+  if (!answer || typeof answer !== "object") return { rows: [] };
+  const ops = write.method === "PATCH" ? (write.body.ops as PatchOp[]) : null;
+  const fields = ops && new Set(["id", ...ops.map((op) => pointerSegments(op.path)[0]!)]);
+  return { rows: [storedRow(write.type, answer as ServerRow, fields)] };
 }
 
 /** Not run, try again: the line (no status), or the server's NOT_RUN. */

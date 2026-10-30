@@ -46,18 +46,22 @@ export interface RowStorage {
   /**
    * Keeps rows and lists read as `user`, in order; storage drops a batch for any other account.
    * A row with `fields` rewrites those fields of the kept row, `$field` ids included, and keeps
-   * the rest; a row without replaces it. Keeps `writes` by key, in their place, and drops the
-   * `settled` keys. Resolves once kept.
+   * the rest; a row without replaces it. Drops the `removed` rows. Keeps `writes` by key, in
+   * their place, and drops the `settled` keys. Resolves once kept.
    */
-  write(batch: {
-    user     : string;
-    rows     : readonly AnsweredRow[];
-    lists    : readonly StoredList[];
-    writes?  : readonly StoredWrite[];
-    settled? : readonly string[];
-  }): Promise<void>;
+  write(batch: RowBatch): Promise<void>;
   /** The account's waiting changes, oldest first. */
   waiting(): Promise<{ user: string | null; writes: StoredWrite[] }>;
+}
+
+/** What `RowStorage.write` keeps in one go. */
+export interface RowBatch {
+  user     : string;
+  rows     : readonly AnsweredRow[];
+  lists    : readonly StoredList[];
+  removed? : readonly { type: string; id: string }[];
+  writes?  : readonly StoredWrite[];
+  settled? : readonly string[];
 }
 
 /** A change as storage keeps it until the server answers: its request, and where a create shows. */
@@ -111,11 +115,14 @@ export function writeRows(
     pending = { user, rows: [], lists: new Map() };
     setTimeout(flush, 0);
   }
-  for (const row of rows) {
-    const data = JSON.stringify(fields ? ownFields(row, fields) : row);
-    pending.rows.push({ type: list.type, id: String(row.id), data, fields: fields && [...fields] });
-  }
+  for (const row of rows) pending.rows.push(storedRow(list.type, row, fields));
   pending.lists.set(list.key, list);
+}
+
+/** `row` as storage keeps it: the fields its read asked for, or the whole row. */
+export function storedRow(type: string, row: ServerRow, fields: ReadonlySet<string> | null): AnsweredRow {
+  const data = JSON.stringify(fields ? ownFields(row, fields) : row);
+  return { type, id: String(row.id), data, fields: fields && [...fields] };
 }
 
 function flush(): void {
