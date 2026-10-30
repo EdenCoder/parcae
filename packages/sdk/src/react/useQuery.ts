@@ -2,9 +2,10 @@
 
 import {
   generateId,
+  heldInOrder,
+  holdings,
   Model,
   patched,
-  rowVersion,
   SESSION_BOUNDARY_ERRORS,
   serializeLazyQueryArgs,
   SYM_SERVER_MERGE,
@@ -931,26 +932,6 @@ function doFetch(
 
 // ── Resync handler ──────────────────────────────────────────────────────────
 
-/** The rows a loaded entry holds, by id, at the version a resync compares. */
-function holdings(entry: CacheEntry): Record<string, string> {
-  const refs = [
-    ...new Set(
-      (entry.chain?.__steps ?? []).flatMap((step: any) =>
-        step?.method === "expand"
-          ? (step.args ?? []).map((arg: unknown) => String(arg).split(".")[0])
-          : []),
-    ),
-  ].sort();
-  return Object.fromEntries(entry.items.map((row: any) => [row.id, rowVersion(row, refs)]));
-}
-
-/** The server's order of rows it resent, else held; null when it names a row neither has. */
-function heldInOrder(held: any[], fresh: any[], ids: string[]): any[] | null {
-  const byId = new Map<string, any>([...held, ...fresh].map((row) => [row.id, row]));
-  const next = ids.map((id) => byId.get(id));
-  return next.every(Boolean) ? next : null;
-}
-
 /**
  * Called by ParcaeProvider after the transport's hello handshake
  * lands on a (re)connection. Fires a batched `resync` RPC for every
@@ -987,7 +968,7 @@ export function _onResyncRequired(client: ParcaeClient): void {
       steps: entry.chain.__steps ?? [],
       queryHash: entry.queryHash,
       subscribe: entry.subscribe,
-      have: entry.loaded ? holdings(entry) : null,
+      have: entry.loaded ? holdings(entry.items, entry.chain.__steps) : null,
     });
   }
 
