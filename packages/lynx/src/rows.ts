@@ -1,5 +1,5 @@
 /**
- * The page's rows: one object per record, and the slot where the app keeps earlier ones.
+ * The page's rows: one object per record, and the shapes storage keeps them in.
  *
  * Every live query store in a page hands out the same object for the same record, its model type
  * and id. A read that selects columns without `id` mints local ids and shares nothing. An answer
@@ -35,7 +35,7 @@ export interface StoredList {
   total: number;
 }
 
-/** Where a page's earlier rows are kept. The app owns custody, as it owns the token. */
+/** Where the app's earlier rows are kept. The app owns custody, as it owns the token. */
 export interface RowStorage {
   /** The kept list `key` names and the rows of `type` it lists, plus `ids`, for the account the phone is signed in as. */
   read(request: { type: string; key: string; ids: readonly string[] }): Promise<{
@@ -90,46 +90,28 @@ export interface Holder {
 // Storage
 // =============================================================================
 
-let storage: RowStorage | null = null;
+/**
+ * Where a stored row keeps the version a read answered it at, named by that read's fields: another
+ * read rewrites only its own fields, so the row's `updatedAt` vouches for none but its own.
+ */
+const heldKey = (fields: ReadonlySet<string> | null) => `__held:${fields ? [...fields].sort().join() : "*"}`;
 
-export function provideRowStorage(next: RowStorage | null): void {
-  storage = next;
+/** `row` as storage keeps it: the fields its read asked for, or the whole row, with the `version` its read holds it at. */
+export function storedRow(type: string, row: ServerRow, fields: ReadonlySet<string> | null, version?: string): AnsweredRow {
+  const kept = fields ? ownFields(row, fields) : { ...row };
+  if (version !== undefined) kept[heldKey(fields)] = version;
+  return { type, id: String(row.id), data: JSON.stringify(kept), fields: fields && [...fields] };
 }
 
-export function rowStorage(): RowStorage | null {
-  return storage;
-}
-
-let pending: { user: string; rows: AnsweredRow[]; lists: Map<string, StoredList> } | null = null;
-
-/** Keeps the read's own fields of an answer's `rows`, and its list, as `user` read them; one batch per tick. */
-export function writeRows(
-  user: string,
-  rows: readonly ServerRow[],
-  fields: ReadonlySet<string> | null,
-  list: StoredList,
-): void {
-  if (!storage) return;
-  if (pending && pending.user !== user) flush();
-  if (!pending) {
-    pending = { user, rows: [], lists: new Map() };
-    setTimeout(flush, 0);
-  }
-  for (const row of rows) pending.rows.push(storedRow(list.type, row, fields));
-  pending.lists.set(list.key, list);
-}
-
-/** `row` as storage keeps it: the fields its read asked for, or the whole row. */
-export function storedRow(type: string, row: ServerRow, fields: ReadonlySet<string> | null): AnsweredRow {
-  const data = JSON.stringify(fields ? ownFields(row, fields) : row);
-  return { type, id: String(row.id), data, fields: fields && [...fields] };
-}
-
-function flush(): void {
-  const batch = pending;
-  pending = null;
-  if (!batch || !storage) return;
-  void storage.write({ user: batch.user, rows: batch.rows, lists: [...batch.lists.values()] });
+/**
+ * A stored row as a read of `fields` draws it, and the version it holds for them: only a read of the
+ * same fields vouches, since a whole row lacks the derived fields a read names (`parts`).
+ */
+export function drawnRow(data: string, fields: ReadonlySet<string> | null): { row: ServerRow; held?: string } {
+  const row = JSON.parse(data) as ServerRow;
+  const held = row[heldKey(fields)];
+  for (const key of Object.keys(row)) if (key.startsWith("__held:")) delete row[key];
+  return { row, held: typeof held === "string" ? held : undefined };
 }
 
 // =============================================================================
@@ -139,11 +121,15 @@ function flush(): void {
 const records = new Map<string, { row: LiveRow; holders: Set<Holder> }>();
 const held = new Map<Holder, Set<string>>();
 
-/** The columns a read asked for, or null when it reads whole rows. */
+/**
+ * The fields a read asked for; null when it reads whole rows. A picked derived field (`parts.text`)
+ * is held and stored as its whole field, so an app's reads pick one set of kinds per field.
+ */
 export function fieldsOf(steps: readonly { method: string; args: unknown[] }[] = []): ReadonlySet<string> | null {
   const selected = steps.filter((step) => step.method === "select").flatMap((step) => step.args.flat());
   if (selected.length === 0) return null;
-  return new Set([...selected.filter((field) => typeof field === "string"), ...extractExpandFields(steps as never)]);
+  const named = [...selected.filter((field) => typeof field === "string"), ...extractExpandFields(steps as never)];
+  return new Set(named.map((field) => field.split(".")[0]!));
 }
 
 /** Whether a read's rows are records: whole rows, or a selection that includes `id`. */

@@ -8,7 +8,7 @@
  * getter and a GlobalEventEmitter event announcing changes. The app
  * emits that event however fits its architecture: natively on
  * activity resume for cross-bundle sign-ins, locally from a sign-out
- * handler, etc. `startLifecycle` turns those signals into
+ * handler, etc. The engine turns those signals into
  * refreshSession / terminateSession calls.
  */
 

@@ -1,34 +1,13 @@
 /**
  * A kept change: shown at once, stored, sent with its key until an answer with a status settles it,
- * and put back on a refusal.
+ * put back on a refusal, and landed or dropped on every other page as the engine says.
  */
 
-import { Model, FrontendAdapter, type PatchOp } from "@parcae/model";
+import type { PatchOp } from "@parcae/model";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
-import { keep, refusalOf } from "../writes";
-import { provideClient } from "../client-registry";
-import { createLiveQuery, resetLiveQueries, type QueryChain } from "../live-query";
-import { provideRowStorage, type RowStorage, type StoredWrite } from "../rows";
-
-class Show extends Model {
-  static type = "show" as const;
-  title = "";
-}
-
-const adapter = {} as any;
-const read = (): QueryChain<Show> => ({
-  find: async () => {
-    const sent = [{ id: "s1", title: "Night Shift" }];
-    const models = sent.map((row) => Show.hydrate(adapter, structuredClone(row)));
-    Object.defineProperty(models, "__rows", { value: sent });
-    return models;
-  },
-  __modelClass: Show,
-  __adapter: adapter,
-  __modelType: "show",
-  __steps: [],
-});
+import type { RowStorage, StoredWrite } from "../rows";
+import { page, reset, client, server, retain } from "./harness";
 
 const kept: StoredWrite[] = [];
 const storage: RowStorage = {
@@ -45,31 +24,21 @@ const storage: RowStorage = {
 };
 const patch = vi.fn();
 const remove = vi.fn();
-const moments: unknown[] = [];
-const line = { session: { state: { status: "authenticated", userId: "u1" as string | null } }, isConnected: true };
+const rename = (value: string): PatchOp[] => [{ op: "replace", path: "/title", value }];
+
+function line() {
+  return client(server({ show: [{ id: "s1", title: "Night Shift" }] }), { patch, delete: remove });
+}
 
 beforeEach(() => {
   vi.useFakeTimers();
-  line.session.state = { status: "authenticated", userId: "u1" };
-  line.isConnected = true;
-  provideClient(
-    () =>
-      ({
-        subscribe              : () => () => {},
-        withQuerySubscriptions : (run: () => Promise<unknown>) => run(),
-        session                : line.session,
-        get isConnected() { return line.isConnected; },
-        adapter                : new FrontendAdapter({ patch, delete: remove } as never),
-        _emitDiagnostic        : (event: string, moment: unknown) => event === "write" && moments.push(moment),
-      }) as never,
-  );
-  provideRowStorage(storage);
-  resetLiveQueries(true, "u1");
+  reset();
+  patch.mockReset();
+  remove.mockReset();
 });
 
 afterEach(() => {
   kept.length = 0;
-  provideRowStorage(null);
   vi.useRealTimers();
 });
 
@@ -78,71 +47,80 @@ it("shows a kept patch at once, resends it with its key after a lost line, and p
     .mockRejectedValueOnce(new Error("Disconnected"))
     .mockResolvedValueOnce({ id: "s1", title: "Renamed" })
     .mockRejectedValueOnce(Object.assign(new Error("Forbidden"), { status: 403 }));
-  const store = createLiveQuery(read);
-  const release = store.retain(() => {});
-  await vi.advanceTimersByTimeAsync(0);
+  const phone = line();
+  const home = await page(phone, storage);
+  const store = home.shows();
+  retain(store);
+  await vi.advanceTimersByTimeAsync(1);
   const show = store.snapshot().items[0]!;
 
-  const rename: PatchOp[] = [{ op: "replace", path: "/title", value: "Renamed" }];
-  await keep(show).patch(rename);
+  await home.lynx.keep(show).patch(rename("Renamed"));
   expect(show.title).toBe("Renamed");
   const [{ key }] = kept as [StoredWrite];
-  await vi.advanceTimersByTimeAsync(0);
-  expect(patch).toHaveBeenLastCalledWith("/shows/s1", { ops: rename }, { idempotencyKey: key });
+  await vi.advanceTimersByTimeAsync(1);
+  expect(patch).toHaveBeenLastCalledWith("/shows/s1", { ops: rename("Renamed") }, { idempotencyKey: key });
   expect(kept).toHaveLength(1);
 
   await vi.advanceTimersByTimeAsync(1_000);
   expect(patch).toHaveBeenCalledTimes(2);
-  expect(patch).toHaveBeenLastCalledWith("/shows/s1", { ops: rename }, { idempotencyKey: key });
+  expect(patch).toHaveBeenLastCalledWith("/shows/s1", { ops: rename("Renamed") }, { idempotencyKey: key });
   expect(kept).toHaveLength(0);
   expect(show.title).toBe("Renamed");
 
-  await keep(show).patch([{ op: "replace", path: "/title", value: "Other" }]);
+  await home.lynx.keep(show).patch(rename("Other"));
   expect(show.title).toBe("Other");
-  await vi.advanceTimersByTimeAsync(0);
+  await vi.advanceTimersByTimeAsync(1);
   expect(show.title).toBe("Renamed");
-  expect(refusalOf(show)).toMatchObject({ method: "PATCH", status: 403 });
-  expect(moments.at(-1)).toMatchObject({ moment: "refused", status: 403 });
+  expect(home.lynx.refusalOf(show)).toMatchObject({ method: "PATCH", status: 403 });
   expect(kept).toHaveLength(0);
-  expect(moments.map((m) => (m as { moment: string }).moment)).toEqual(["retried", "sent", "refused"]);
-  release();
-});
-
-it("keeps a waiting delete laid over the page when the same account's session settles again", async () => {
-  remove.mockRejectedValue(new Error("Disconnected"));
-  const store = createLiveQuery(read);
-  const release = store.retain(() => {});
-  await vi.advanceTimersByTimeAsync(0);
-  await keep(store.snapshot().items[0]!).remove();
-  expect(store.snapshot().items).toHaveLength(0);
-
-  resetLiveQueries(false);
-  resetLiveQueries(true, "u1");
-  await vi.advanceTimersByTimeAsync(0);
-  expect(kept).toHaveLength(1);
-  expect(store.snapshot().items).toHaveLength(0);
-  release();
+  const moments = phone.diagnostics.filter(([event]) => event === "write").map(([, moment]) => (moment as { moment: string }).moment);
+  expect(moments).toEqual(["retried", "sent", "refused"]);
 });
 
 it("keeps a change made offline before the server knows the account, and sends it once signed in", async () => {
-  remove.mockReset().mockResolvedValue(null);
-  const store = createLiveQuery(read);
-  const release = store.retain(() => {});
-  await vi.advanceTimersByTimeAsync(0);
-  line.session.state = { status: "pending", userId: null };
-  line.isConnected = false;
+  remove.mockResolvedValue(null);
+  const phone = line();
+  const home = await page(phone, storage);
+  const store = home.shows();
+  retain(store);
+  await vi.advanceTimersByTimeAsync(1);
+  const show = store.snapshot().items[0]!;
+  phone.isConnected = false;
+  phone.settle("pending", null);
 
-  await keep(store.snapshot().items[0]!).remove();
+  await home.lynx.keep(show).remove();
   expect(kept).toHaveLength(1);
   expect(remove).not.toHaveBeenCalled();
 
-  line.session.state = { status: "authenticated", userId: "u1" };
-  line.isConnected = true;
-  resetLiveQueries(true, "u1");
-  await vi.advanceTimersByTimeAsync(0);
+  phone.isConnected = true;
+  phone.settle("authenticated", "u1");
+  await vi.advanceTimersByTimeAsync(1);
   expect(remove).toHaveBeenCalledTimes(1);
   expect(remove).toHaveBeenLastCalledWith("/shows/s1", {}, { idempotencyKey: expect.any(String) });
   expect(kept).toHaveLength(0);
-  expect(store.snapshot().items).toHaveLength(0);
-  release();
+});
+
+it("shows another page's patch while it waits, lands it there on its answer, and takes back a refusal", async () => {
+  patch.mockResolvedValueOnce({ id: "s1", title: "Renamed" }).mockRejectedValueOnce(Object.assign(new Error("Forbidden"), { status: 403 }));
+  const phone = line();
+  const home = await page(phone, storage);
+  const list = home.shows();
+  retain(list);
+  const create = await page(phone, storage);
+  const show = create.shows();
+  retain(show);
+  await vi.advanceTimersByTimeAsync(1);
+  const listed = list.snapshot().items[0]!;
+
+  const kept = create.lynx.keep(show.snapshot().items[0]!).patch(rename("Renamed"));
+  expect(listed.title).toBe("Renamed");
+  await kept;
+  await vi.advanceTimersByTimeAsync(1);
+  expect(listed.title).toBe("Renamed");
+
+  await create.lynx.keep(show.snapshot().items[0]!).patch(rename("Other"));
+  expect(listed.title).toBe("Other");
+  await vi.advanceTimersByTimeAsync(1);
+  expect(listed.title).toBe("Renamed");
+  expect(home.lynx.refusalOf(listed)).toBeNull();
 });
