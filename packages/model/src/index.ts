@@ -45,7 +45,7 @@ export type { OpBuilder } from "./patch";
 export type Text = string & { readonly __brand: "Text" };
 
 export {
-  WRITE_RUNNING,
+  NOT_RUN,
   FrontendAdapter,
   isNotFoundError,
   REQUEST_TIMEOUT_MS,
@@ -77,7 +77,6 @@ export type {
 } from "./adapters/types";
 
 export {
-  SOCKET_NOT_RECONCILED,
   SESSION_BOUNDARY_ERRORS,
   isSessionBoundaryError,
 } from "./session-boundary";
