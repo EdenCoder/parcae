@@ -118,10 +118,12 @@ async function start(record: Model, request: WireRequest, stores: LiveQueryStore
   layOver([record]);
   republish();
   const storage = rowStorage();
-  const user = requireClient().session.state.userId;
-  if (!storage || !user) return settleNow(write);
+  if (!storage) return settleNow(write);
   storing.add(write.key);
   try {
+    // Storage knows the signed-in account offline; the session learns it only from the server.
+    const { user } = await storage.waiting();
+    if (!user) throw new Error("Not signed in");
     await storage.write({ user, rows: [], lists: [], writes: [write] });
   } catch (cause) {
     undo(write);
