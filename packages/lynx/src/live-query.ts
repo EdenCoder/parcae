@@ -490,6 +490,8 @@ export function createLiveQuery<T extends LiveRow>(
         if (!isSuspended && user !== readAs) return;
         const data = new Map(rows.map((row) => [row.id, row.data]));
         const order: string[] = kept ? JSON.parse(kept.ids) : [...(options.ids ?? [])];
+        // A kept list draws whole or not at all: one missing a row waits for the server.
+        if (kept && !order.every((id) => data.has(id))) return;
         const found = order.flatMap((id) => {
           const stored = data.get(id);
           const saved: ServerRow | null = stored ? JSON.parse(stored) : null;
