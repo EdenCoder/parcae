@@ -50,7 +50,7 @@ import type {
 } from "@parcae/model";
 import { ClientError } from "../helpers";
 import type { RefLoader } from "./ref-loader";
-import { projectDerived, type ResolvedDerived } from "./derived-fields";
+import { projectSelection, WHOLE, type Selection } from "./derived-fields";
 
 // ─── Spec parsing ────────────────────────────────────────────────────────────
 
@@ -248,11 +248,11 @@ export function getWireRefId(row: WireRow, refField: string): string | null {
   return null;
 }
 
-/** Sanitize one model, stamp raw companions for every visible ref field, and build the derived fields its read picked. */
+/** Sanitize one model, stamp raw companions for every visible ref field, and keep what its read selected. */
 export async function projectForWire(
   item: unknown,
   user: { id: string } | null | undefined,
-  derived: readonly ResolvedDerived[] = [],
+  selection: Selection = WHOLE,
 ): Promise<WireRow> {
   // boundary: query rows are Model instances, with plain test doubles allowed.
   const model = item as {
@@ -269,7 +269,7 @@ export async function projectForWire(
     if (!Object.prototype.hasOwnProperty.call(row, field)) continue;
     row[`$${field}`] = getWireRefId(row, field);
   }
-  projectDerived(row, derived);
+  projectSelection(row, selection);
   return row;
 }
 
