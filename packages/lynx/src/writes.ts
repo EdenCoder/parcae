@@ -25,7 +25,7 @@ import {
 
 import { requireClient } from "./client-registry";
 import { listKeyOf, retainedHolders, type LiveRow, type LiveQueryStore } from "./live-query";
-import { keyOf, typeOf, recordOf, rowStorage, type RowStorage, type StoredWrite } from "./rows";
+import { keyOf, typeOf, recordOf, holdersOf, rowStorage, type RowStorage, type StoredWrite } from "./rows";
 
 /** The server's refusal of the last change kept for a record in this page, until another is kept. `status` is absent when the phone refused it itself. */
 export interface WriteRefusal {
@@ -228,7 +228,7 @@ function retryLater(write?: StoredWrite): void {
 function settle(write: StoredWrite, answer: unknown): void {
   const record = forget(write);
   if (write.method === "DELETE") {
-    for (const id of new Set([write.id, record?.id])) for (const holder of retainedHolders()) if (id) holder.unlist(id);
+    unlist(write, record);
   } else if (record && answer && typeof answer === "object") {
     record[SYM_SERVER_MERGE](answer as Record<string, unknown>);
     record.__isNew = false;
@@ -236,6 +236,16 @@ function settle(write: StoredWrite, answer: unknown): void {
   }
   report("sent", write);
   republish();
+}
+
+/**
+ * A deleted record leaves every open store, where a create the server hasn't echoed is only an
+ * optimistic row, and every store that holds it, released ones too, so a list reopened later
+ * doesn't show it again.
+ */
+function unlist(write: StoredWrite, record: Model | undefined): void {
+  for (const id of new Set([write.id, record?.id ?? write.id]))
+    for (const holder of new Set([...retainedHolders(), ...holdersOf(write.type, id)])) holder.unlist(id);
 }
 
 function refuse(write: StoredWrite, { status, code, message }: Partial<TransportError> & { message: string }): void {
@@ -294,11 +304,11 @@ export function refreshWrites(): Promise<void> {
   return refreshing;
 }
 
-/** Storage's list becomes the page's: a change that left it is undone here, a new one laid over. */
+/** Storage's list becomes the page's: a change that left it was settled by another page, a new one is laid over. */
 function adopt(writes: StoredWrite[]): void {
   const listed = new Set(writes.map((write) => write.key));
   const before = waiting.map((write) => write.key).join();
-  for (const write of waiting) if (!listed.has(write.key) && !storing.has(write.key)) undo(write);
+  for (const write of waiting) if (!listed.has(write.key) && !storing.has(write.key)) settledElsewhere(write);
   const known = new Set(waiting.map((write) => write.key));
   const fresh = writes.filter((write) => !known.has(write.key));
   waiting = [...writes, ...waiting.filter((write) => !listed.has(write.key))];
@@ -309,6 +319,21 @@ function adopt(writes: StoredWrite[]): void {
   if (waiting.map((write) => write.key).join() !== before) republish();
 }
 
+/**
+ * Only the page that settled a change knows its answer, so here it counts as landed until the
+ * record's next answer says otherwise: a delete leaves the page's lists, a patch's fields stay.
+ */
+function settledElsewhere(write: StoredWrite): void {
+  const record = forget(write);
+  if (write.method === "DELETE") unlist(write, record);
+  else if (write.method === "PATCH" && record) record[SYM_SERVER_MERGE](patched(record.__serverSnapshot, heldOps(record, write)));
+}
+
+/** A patch's ops on the fields `record` holds; the others it never drew. */
+function heldOps(record: Model, write: StoredWrite): PatchOp[] {
+  return (write.body.ops as PatchOp[]).filter((op) => Object.hasOwn(record.__serverSnapshot, pointerSegments(op.path)[0]!));
+}
+
 /** Stages each held record's waiting patch ops on the fields it holds, and again after another write's answer drops them. */
 export function layOver(records: readonly LiveRow[]): void {
   for (const record of records) {
@@ -316,8 +341,7 @@ export function layOver(records: readonly LiveRow[]): void {
     const key = keyOf(record);
     const ops = waiting
       .filter((write) => write.method === "PATCH" && `${write.type}:${write.id}` === key)
-      .flatMap((write) => write.body.ops as PatchOp[])
-      .filter((op) => Object.hasOwn(record.__serverSnapshot, pointerSegments(op.path)[0]!));
+      .flatMap((write) => heldOps(record, write));
     if (ops.length === 0) continue;
     const data = record.__data;
     if (!same(data, patched(data, ops))) record.stage(ops);

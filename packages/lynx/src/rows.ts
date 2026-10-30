@@ -155,6 +155,11 @@ export function recordOf(type: string, id: string): Model | undefined {
   return records.get(`${type}:${id}`)?.row as Model | undefined;
 }
 
+/** The stores that list the record `type` and `id`, retained or not. */
+export function holdersOf(type: string, id: string): Holder[] {
+  return [...(records.get(`${type}:${id}`)?.holders ?? [])];
+}
+
 /** `holder` now lists `rows`; a record lives while some store lists it. */
 export function hold(holder: Holder, rows: readonly LiveRow[], fields: ReadonlySet<string> | null): void {
   const keys = new Set<string>();
