@@ -476,13 +476,18 @@ export function mountAuthRoutes(
   app.all(basePath === "/" ? "/*" : `${basePath}/*`, handler);
 }
 
+/**
+ * Subscribes every entry, then resolves with the answer. A subscribed entry's rows are read from its
+ * cached query when the answer is called, so call it as the ack goes out: each frame sent before is
+ * in it, and each later one reaches the socket after it.
+ */
 export async function resyncQueries(
   socketId: string,
   socketSession: AuthSession | null,
   entries: ResyncEntry[],
   adapter: BackendAdapter,
   options: ResyncOptions = {},
-): Promise<ResyncResult[]> {
+): Promise<() => ResyncResult[]> {
   const maxEntries = parsePositiveInteger(
     options.maxEntries ?? DEFAULT_MAX_RESYNC_QUERIES,
     "maxEntries",
@@ -498,7 +503,7 @@ export async function resyncQueries(
     );
   }
 
-  const results: ResyncResult[] = entries.map((entry) => ({
+  const answers: Array<() => ResyncResult> = entries.map((entry) => () => ({
     key: entry.key,
     hash: null,
     items: [],
@@ -515,19 +520,19 @@ export async function resyncQueries(
       const refLoader = new RefLoader((type, ids) =>
         adapter.batchFindByType(type, ids),
       );
-      results[index] = await runWithRequestContext(
+      answers[index] = await runWithRequestContext(
         { user, refLoader },
         async () => {
           const ModelClass = adapter.modelsByType.get(entry.modelType);
-          if (!ModelClass) return results[index]!;
+          if (!ModelClass) return answers[index]!;
           const scope = (ModelClass as any).scope;
-          if (!scope?.read) return results[index]!;
+          if (!scope?.read) return answers[index]!;
 
           // One ctx for the row gate and the field policy — a resync
           // must not replay columns `scope.fields` would have withheld.
           const ctx = { user, params: {}, data: {} } as any;
           const scopeResult = scope.read(ctx);
-          if (!scopeResult) return results[index]!;
+          if (!scopeResult) return answers[index]!;
 
           const prep = prepareClientQuery({
             ModelClass,
@@ -561,17 +566,18 @@ export async function resyncQueries(
               user,
               adapter,
             });
-            return answer(null, items, totalCount);
+            return () => answer(null, items, totalCount);
           }
 
-          if (!adapter.subscriptions) return results[index]!;
-          const { items, hash, totalCount } = await runQuerySubscription({
+          const { subscriptions } = adapter;
+          if (!subscriptions) return answers[index]!;
+          const { hash, totalCount } = await runQuerySubscription({
             prep,
             socketId,
             user,
             adapter,
           });
-          return answer(hash, items, totalCount);
+          return () => answer(hash, subscriptions.rows(socketId, hash), totalCount);
         },
       );
     }
@@ -583,7 +589,7 @@ export async function resyncQueries(
       () => run(),
     ),
   );
-  return results;
+  return () => answers.map((each) => each());
 }
 
 // ─── createApp ───────────────────────────────────────────────────────────────
@@ -1479,7 +1485,7 @@ export function createApp(config: AppConfig): ParcaeApp {
               return;
             }
             try {
-              const results = await resyncQueries(
+              const answer = await resyncQueries(
                 socket.id,
                 sessionSnapshot.session,
                 entries,
@@ -1493,7 +1499,7 @@ export function createApp(config: AppConfig): ParcaeApp {
               // acknowledged into the next owner's cache.
               const acknowledged = socketSession.runIfOperationCurrent(
                 sessionOperation,
-                () => callback?.({ success: true, results }),
+                () => callback?.({ success: true, results: answer() }),
               );
               if (!acknowledged) {
                 callback?.({ success: false, error: SESSION_BOUNDARY_ERRORS.changed });
