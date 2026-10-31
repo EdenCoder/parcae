@@ -25,7 +25,7 @@ export type LiveStatus = "loading" | "ready" | "error";
 /**
  * `status` turns `ready` only on a server answer; rows drawn from storage come with `loading`.
  * `total` is the last answer's count, stored or the server's. Draw what a snapshot holds, and open
- * a page from a drawn row; act, charge or count only on `ready`.
+ * a page from a drawn row; act or count only on `ready`.
  */
 export interface LiveSnapshot<T> {
   items: T[];
