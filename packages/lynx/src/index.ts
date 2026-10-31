@@ -11,7 +11,6 @@ export type {
   LiveRow,
   LiveSnapshot,
   LiveStatus,
-  QueryChain,
 } from "./live-query";
 
 export type { AnsweredRow, RowStorage, ServerRow, StoredList, StoredRow, StoredWrite } from "./rows";
