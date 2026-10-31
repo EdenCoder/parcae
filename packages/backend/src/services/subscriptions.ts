@@ -705,6 +705,12 @@ export class QuerySubscriptionManager {
     }
   }
 
+  /** The rows `socketId` hears for `hash` as of now, with every frame sent so far; none unless it subscribes. */
+  rows(socketId: string, hash: string): Record<string, any>[] {
+    const cached = this.queries.get(hash);
+    return cached?.subscribers.has(socketId) ? [...cached.result.values()] : [];
+  }
+
   private _releaseReservation(socketId: string, hash: string): void {
     this.unsubscribe(socketId, hash);
   }
