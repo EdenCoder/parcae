@@ -13,7 +13,7 @@
  * unit-tested in node. The ReactLynx hook lives in `use-live-query.ts`.
  */
 
-import { Model, SYM_SERVER_MERGE, serializeLazyQueryArgs } from "@parcae/model";
+import { Model, SYM_SERVER_MERGE, serializeLazyQueryArgs, type QueryChain } from "@parcae/model";
 
 import { page } from "./page";
 import { layOver, waitingRemoves, waitingCreates } from "./writes";
@@ -36,19 +36,6 @@ export interface LiveSnapshot<T> {
   answers: number;
   /** `items` are an answer, the server's or a stored one, an empty answer too; until then the read holds nothing yet. */
   drawn: boolean;
-}
-
-export interface QueryChain<T> {
-  /** The hydrated rows, with the server's own beside them as `__rows`. */
-  find(): Promise<T[]>;
-  // ModelConstructor's static side is type-erased at the chain
-  // boundary; hydrate is cast back on at the single call site.
-  __modelClass?: unknown;
-  __adapter?: unknown;
-  __steps?: Array<{ method: string; args: unknown[] }>;
-  __modelType?: string;
-  /** False for a chain made with `withSubscribe(false)`. */
-  __subscribe?: boolean;
 }
 
 interface HydratingClass<T> {
@@ -118,8 +105,8 @@ function requestOf(
   chain: QueryChain<unknown>,
   { ids = [], subscribe: wanted }: Pick<LiveQueryOptions, "ids" | "subscribe">,
 ): ReadRequest {
-  const type = chain.__modelType ?? "";
-  const steps = (chain.__steps ?? []).map((step) => ({ method: step.method, args: serializeLazyQueryArgs(step.args) }));
+  const type = chain.__modelType;
+  const steps = chain.__steps.map((step) => ({ method: step.method, args: serializeLazyQueryArgs(step.args) }));
   const selects = steps.filter((step) => step.method === "select");
   const last = selects[selects.length - 1];
   if (last && !selects.some((step) => step.args.flat().includes("updatedAt"))) last.args = [...last.args, "updatedAt"];
@@ -201,7 +188,7 @@ export function createLiveQuery<T extends LiveRow>(
   };
 
   const hydrate = (data: Record<string, unknown>): T | null => {
-    const ModelClass = chain?.__modelClass as HydratingClass<T> | undefined;
+    const ModelClass = chain?.__modelClass as unknown as HydratingClass<T> | undefined;
     if (!ModelClass || typeof ModelClass.hydrate !== "function") return null;
     const { client } = page();
     const BoundModel = client.bind(ModelClass as unknown as typeof Model) as unknown as HydratingClass<T>;
