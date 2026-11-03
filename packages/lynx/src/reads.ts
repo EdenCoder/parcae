@@ -9,7 +9,7 @@
 import type { ParcaeClient } from "@parcae/sdk";
 import { patched, holdings, heldInOrder, type PatchOp, type QueryStep } from "@parcae/model";
 
-import { fieldsOf, drawnRow, storedRow, sharesRecords, type ServerRow, type StoredList, type RowStorage, type AnsweredRow } from "./rows";
+import { fieldsOf, drawnRow, storedRow, sharesRecords, STORAGE_FORMAT, type ServerRow, type StoredList, type RowStorage, type AnsweredRow } from "./rows";
 import type { LiveStatus } from "./live-query";
 
 /** A read as a page asks for it: plain data. */
@@ -343,7 +343,7 @@ function readStored(entry: Entry): void {
   if (!storage || entry.drawn || entry.storageRead || !sharesRecords(entry.fields)) return;
   entry.storageRead = true;
   entry.storing = storage
-    .read({ type: request.type, key: request.key, ids: request.ids })
+    .read({ type: request.type, key: request.key, ids: request.ids, format: STORAGE_FORMAT })
     .then(({ user, list: kept, rows }) => {
       if (entry.drawn || !user || (ready && user !== readAs)) return;
       const data = new Map(rows.map((row) => [row.id, row.data]));
@@ -394,5 +394,5 @@ function flush(): void {
   const batch = pending;
   pending = null;
   if (!batch || !storage) return;
-  void storage.write({ user: batch.user, rows: batch.rows, lists: [...batch.lists.values()] });
+  void storage.write({ format: STORAGE_FORMAT, user: batch.user, rows: batch.rows, lists: [...batch.lists.values()] });
 }
