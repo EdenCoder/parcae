@@ -13,6 +13,9 @@
  * Triggers are installed during schema setup and verified before a server
  * starts listening. `CREATE OR REPLACE` keeps schema installation idempotent
  * without opening a drop/recreate gap where committed writes go unseen.
+ * `ENABLE ALWAYS` makes them fire for rows a logical-replication apply worker
+ * writes too, so in a multi-master cluster every node notifies its listeners
+ * of writes made on any node.
  *
  * Why a STATEMENT-LEVEL trigger isn't enough: it fires once per
  * statement, not once per row. For a multi-row `UPDATE` we want one
@@ -90,12 +93,15 @@ export function triggerName(table: string): string {
  * onto the COMMIT boundary by Postgres itself, so listeners only see
  * the event if the trx actually committed (rolled-back trxs leak
  * nothing). Row-level so multi-row UPDATEs surface every affected id.
+ * Replacing a trigger resets it to `ENABLE`, so `ENABLE ALWAYS` rides in the
+ * same statement batch: one implicit transaction, with no window between.
  */
 export function createTriggerSql(table: string): string {
   const name = triggerName(table);
   return `CREATE OR REPLACE TRIGGER ${name}
     AFTER INSERT OR UPDATE OR DELETE ON "${table}"
-    FOR EACH ROW EXECUTE FUNCTION ${TRIGGER_FUNCTION_NAME}()`;
+    FOR EACH ROW EXECUTE FUNCTION ${TRIGGER_FUNCTION_NAME}();
+  ALTER TABLE "${table}" ENABLE ALWAYS TRIGGER ${name}`;
 }
 
 /**
@@ -150,7 +156,7 @@ export async function verifyChangeTriggers(opts: {
         (row: Record<string, unknown>) =>
           row.functionName === TRIGGER_FUNCTION_NAME &&
           row.functionSchema === row.tableSchema &&
-          (row.triggerEnabled === "O" || row.triggerEnabled === "A") &&
+          row.triggerEnabled === "A" &&
           Number(row.triggerType) === 29 &&
           row.triggerCondition === null &&
           typeof row.functionDefinition === "string" &&

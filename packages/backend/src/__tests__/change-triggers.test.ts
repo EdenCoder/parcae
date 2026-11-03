@@ -60,6 +60,12 @@ describe("createTriggerSql", () => {
     expect(sql).toContain('FOR EACH ROW EXECUTE FUNCTION parcae_change_notify()');
   });
 
+  it("fires on replicated rows too, in the same batch as the replace", () => {
+    expect(createTriggerSql("chat-messages")).toContain(
+      'ALTER TABLE "chat-messages" ENABLE ALWAYS TRIGGER parcae_change_chat_messages',
+    );
+  });
+
   it("quotes only the table name in DDL, not the sanitized trigger name", () => {
     const sql = createTriggerSql("chat-messages");
     expect(sql).toContain(
@@ -162,7 +168,7 @@ describe("verifyChangeTriggers", () => {
             tableName: "posts",
             tableSchema: "public",
             triggerName: "parcae_change_posts",
-            triggerEnabled: "O",
+            triggerEnabled: "A",
             triggerType: 29,
             triggerCondition: null,
             functionName: TRIGGER_FUNCTION_NAME,
@@ -176,6 +182,30 @@ describe("verifyChangeTriggers", () => {
     await expect(
       verifyChangeTriggers({ knex, tables: ["posts"] }),
     ).resolves.toBeUndefined();
+  });
+
+  it("rejects a trigger that does not fire on replicated rows", async () => {
+    const knex = {
+      raw: vi.fn(async () => ({
+        rows: [
+          {
+            tableName: "posts",
+            tableSchema: "public",
+            triggerName: "parcae_change_posts",
+            triggerEnabled: "O",
+            triggerType: 29,
+            triggerCondition: null,
+            functionName: TRIGGER_FUNCTION_NAME,
+            functionSchema: "public",
+            functionDefinition: `${TRIGGER_FUNCTION_VERSION}; SELECT pg_notify('parcae_change', '{}')`,
+          },
+        ],
+      })),
+    };
+
+    await expect(
+      verifyChangeTriggers({ knex, tables: ["posts"] }),
+    ).rejects.toThrow("missing realtime triggers for posts");
   });
 
   it("fails with migration guidance when a trigger is missing", async () => {
