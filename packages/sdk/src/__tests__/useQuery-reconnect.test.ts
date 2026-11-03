@@ -42,10 +42,13 @@ interface SubscriptionRegistration {
 }
 
 class FakeClient extends EventEmitter {
+  withQuerySubscriptions<T>(operation: () => Promise<T>): Promise<T> {
+    return operation();
+  }
+
   /** Map of event → set of handlers. Mirrors `transport.subscribe`. */
   public subscriptions: SubscriptionRegistration[] = [];
   public resync = vi.fn(async () => [] as any[]);
-  public send = vi.fn();
 
   subscribe(event: string, handler: (...args: any[]) => void): () => void {
     const entry = { event, handler };
@@ -327,7 +330,6 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     expect(after.queryHash).toBe("h-recon-2");
     expect(client.countSubs("query:h-recon-1")).toBe(0);
     expect(client.countSubs("query:h-recon-2")).toBe(1);
-    expect(client.send).toHaveBeenCalledWith("unsubscribe:query", "h-recon-1");
 
     release();
   });
@@ -552,7 +554,6 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     expect(entry.queryHash).toBeNull();
     expect(entry.retryTimer).not.toBeNull();
     expect(client.countSubs("query:old-hash")).toBe(0);
-    expect(client.send).toHaveBeenCalledWith("unsubscribe:query", "old-hash");
     release();
   });
 
@@ -576,10 +577,7 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     expect(entry.items.map((item: any) => item.id)).toEqual(["stale"]);
     expect(entry.loading).toBe(false);
     expect(entry.retryTimer).not.toBeNull();
-    expect(client.send).toHaveBeenCalledWith(
-      "unsubscribe:query",
-      "incomplete-hash",
-    );
+    expect(client.countSubs("query:incomplete-hash")).toBe(0);
     release();
   });
 
@@ -604,7 +602,6 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     expect(entry.items).toEqual([]);
     expect(entry.queryHash).toBeNull();
     expect(client.countSubs("query:denied-hash")).toBe(0);
-    expect(client.send).toHaveBeenCalledWith("unsubscribe:query", "denied-hash");
     release();
   });
 
@@ -628,7 +625,7 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     expect(entry.error?.message).toBe("batch failed");
     expect(entry.retryTimer).not.toBeNull();
     expect(entry.queryHash).toBeNull();
-    expect(client.send).toHaveBeenCalledWith("unsubscribe:query", "failed-hash");
+    expect(client.countSubs("query:failed-hash")).toBe(0);
     release();
   });
 
@@ -714,15 +711,19 @@ describe("useQuery — cache lifecycle across disconnect/reconnect", () => {
     const firstKey = useQueryTest.buildKey("post", "u1", first.__steps);
     const secondKey = useQueryTest.buildKey("post", "u1", second.__steps);
     const releaseFirst = useQueryTest.retain(client as any, firstKey, () => {});
-    const releaseSecond = useQueryTest.retain(client as any, secondKey, () => {});
+    const releaseSecond = useQueryTest.retain(
+      client as any,
+      secondKey,
+      () => {},
+    );
     useQueryTest.fetch(firstKey, first, client as any);
     useQueryTest.fetch(secondKey, second, client as any);
     await new Promise((resolve) => setImmediate(resolve));
 
     _purgeCacheForUser(client as any, "u1");
 
-    expect(client.send).toHaveBeenCalledWith("unsubscribe:query", "hash-a");
-    expect(client.send).toHaveBeenCalledWith("unsubscribe:query", "hash-b");
+    expect(client.countSubs("query:hash-a")).toBe(0);
+    expect(client.countSubs("query:hash-b")).toBe(0);
     expect(useQueryTest.getEntry(client as any, firstKey)).toBeUndefined();
     expect(useQueryTest.getEntry(client as any, secondKey)).toBeUndefined();
     releaseFirst();

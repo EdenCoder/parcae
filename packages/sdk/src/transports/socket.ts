@@ -115,6 +115,11 @@ export interface TransportDiagnostics {
   msSinceOldestPendingCall: number | null;
 }
 
+export interface SessionRefreshOptions {
+  /** Clear the prior identity immediately, including while disconnected. */
+  reset?: boolean;
+}
+
 /** Wire shape for a single `resync` entry. */
 export interface ResyncEntry {
   key: string;
@@ -214,6 +219,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     string,
     Map<(...args: any[]) => void, (...args: any[]) => void>
   >();
+  private pendingQueries = 0;
 
   constructor(config: SocketTransportConfig) {
     super();
@@ -501,6 +507,7 @@ export class SocketTransport extends EventEmitter implements Transport {
 
   private _handshake(fresh = false): Promise<void> {
     if (this.isDisposed) return Promise.reject(new Error("Transport disposed"));
+    if (fresh) this._advanceGeneration(new Error("Hello superseded"));
     if (!this.socket.connected) {
       return Promise.reject(new Error("Cannot handshake while disconnected"));
     }
@@ -512,7 +519,6 @@ export class SocketTransport extends EventEmitter implements Transport {
     ) {
       return this.helloReady;
     }
-    if (fresh) this._advanceGeneration(new Error("Hello superseded"));
     const generation = this.sessionGeneration;
     this.helloGeneration = generation;
     this.helloState = "pending";
@@ -692,28 +698,24 @@ export class SocketTransport extends EventEmitter implements Transport {
           reject(new Error(response?.error || "resync failed"));
           return;
         }
-        resolve(response?.results ?? []);
+        const results: ResyncResult[] = response?.results ?? [];
+        for (const result of results) this._trackQuery(result.hash);
+        resolve(results);
       });
     });
   }
 
   // ── Public API ───────────────────────────────────────────────────
 
-  /**
-   * Token rotation / explicit sign-in. Triggers a fresh hello on the
-   * existing socket so the server updates its socket→session mapping.
-   * Sign-out path (token === null) goes through `terminate()`.
-   *
-   * If the session was previously terminated (sign-out), this resets
-   * the machine back to "pending" before handshaking. That covers the
-   * sign-out → sign-in-again flow in long-lived single-page apps where
-   * the same SDK client is reused across multiple user identities.
-   */
-  async refreshSession(): Promise<{ userId: string | null }> {
-    if (this.session.state.status === "terminated") {
+  /** A fresh hello reads the current token. Explicit identity changes reset immediately;
+   * an offline reset stays pending until reconnect confirms the new or anonymous session. */
+  async refreshSession(options: SessionRefreshOptions = {}): Promise<{ userId: string | null }> {
+    if (options.reset) this.confirmedHelloToken = null;
+    const ready = this._handshake(true);
+    if (options.reset || this.session.state.status === "terminated") {
       this.session.reset();
     }
-    await this._handshake(true);
+    await ready;
     return { userId: this.session.state.userId };
   }
 
@@ -906,6 +908,7 @@ export class SocketTransport extends EventEmitter implements Transport {
               : msg;
           if (parsed.success) {
             log.debug(`← ${method.toUpperCase()} ${fullPath} (${ms}ms)`);
+            this._trackQuery(parsed.result?.__queryHash);
             resolve(parsed.result);
           } else {
             log.debug(
@@ -976,6 +979,27 @@ export class SocketTransport extends EventEmitter implements Transport {
     return this.fetch("DELETE", path, data, options);
   }
 
+  /** Hold server queries until every overlapping read has attached or discarded its result. */
+  async withQuerySubscriptions<T>(operation: () => Promise<T>): Promise<T> {
+    this.pendingQueries++;
+    try {
+      return await operation();
+    } finally {
+      this.pendingQueries--;
+      if (!this.pendingQueries && !this.isDisposed) {
+        for (const [event, listeners] of this.subscriptions) {
+          if (!listeners.size) this.unsubscribe(event);
+        }
+      }
+    }
+  }
+
+  private _trackQuery(hash: string | null | undefined): void {
+    if (!hash || !this.pendingQueries) return;
+    const event = `query:${hash}`;
+    if (!this.subscriptions.has(event)) this.subscriptions.set(event, new Map());
+  }
+
   subscribe(event: string, handler: (...args: any[]) => void): () => void {
     let eventSubscriptions = this.subscriptions.get(event);
     if (!eventSubscriptions) {
@@ -998,32 +1022,33 @@ export class SocketTransport extends EventEmitter implements Transport {
     this.socket.on(event, wrapper);
 
     return () => {
-      this.socket.off(event, wrapper);
       if (eventSubscriptions?.get(handler) === wrapper) {
-        eventSubscriptions.delete(handler);
-        if (eventSubscriptions.size === 0) this.subscriptions.delete(event);
+        this.unsubscribe(event, handler);
       }
     };
   }
 
   unsubscribe(event: string, handler?: (...args: any[]) => void): void {
     const eventSubscriptions = this.subscriptions.get(event);
-    if (!handler) {
-      if (eventSubscriptions) {
-        for (const wrapper of eventSubscriptions.values()) {
-          this.socket.off(event, wrapper);
-        }
-        this.subscriptions.delete(event);
-      } else {
-        this.socket.off(event);
-      }
+    if (!eventSubscriptions) {
+      if (!handler) this.socket.off(event);
       return;
     }
-    const wrapper = eventSubscriptions?.get(handler);
-    if (!wrapper) return;
-    this.socket.off(event, wrapper);
-    eventSubscriptions?.delete(handler);
-    if (eventSubscriptions?.size === 0) this.subscriptions.delete(event);
+    if (handler) {
+      const wrapper = eventSubscriptions.get(handler);
+      if (!wrapper) return;
+      this.socket.off(event, wrapper);
+      eventSubscriptions.delete(handler);
+    } else {
+      for (const wrapper of eventSubscriptions.values())
+        this.socket.off(event, wrapper);
+      eventSubscriptions.clear();
+    }
+    if (eventSubscriptions.size > 0 || (this.pendingQueries && event.startsWith("query:"))) return;
+    this.subscriptions.delete(event);
+    // The server holds a query per socket; every page using it must release first.
+    if (event.startsWith("query:"))
+      this.socket.emit("unsubscribe:query", event.slice(6));
   }
 
   send(event: string, ...args: any[]): void {

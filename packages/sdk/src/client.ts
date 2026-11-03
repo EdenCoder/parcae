@@ -14,6 +14,7 @@ import type {
   ResyncEntry,
   ResyncResult,
   TransportDiagnostics,
+  SessionRefreshOptions,
 } from "./transports/socket";
 import type { SessionMachine } from "./session-machine";
 import type { ConnectionMachine } from "./connection-machine";
@@ -67,13 +68,15 @@ export interface ParcaeClient {
   send(event: string, ...args: any[]): void;
   readonly isConnected: boolean;
   /** Re-run the hello handshake on the current socket. */
-  refreshSession(): Promise<{ userId: string | null }>;
+  refreshSession(options?: SessionRefreshOptions): Promise<{ userId: string | null }>;
   /** @internal The token the server last validated at hello, if any. */
   _lastConfirmedToken?(): string | null;
   /** Explicit sign-out — terminates the session machine. */
   terminateSession(): Promise<void>;
   /** Server resync RPC — batched query subscription restore. */
   resync(entries: ResyncEntry[]): Promise<ResyncResult[]>;
+  /** Run query reads and attach their listeners before releasing unused server subscriptions. */
+  withQuerySubscriptions<T>(operation: () => Promise<T>): Promise<T>;
   /** Watchdog foreground gate — the consumer's app-active signal. */
   setActive?(active: boolean): void;
   /** Watchdog "conditions changed, try now" signal. */
@@ -121,10 +124,11 @@ export function createClient(config: ClientConfig): ParcaeClient {
     get isConnected() {
       return transport.isConnected;
     },
-    refreshSession: () => transport.refreshSession(),
+    refreshSession: (options) => transport.refreshSession(options),
     _lastConfirmedToken: () => transport.lastConfirmedToken(),
     terminateSession: () => transport.terminateSession(),
     resync: (entries) => transport.resync(entries),
+    withQuerySubscriptions: (operation) => transport.withQuerySubscriptions(operation),
     setActive: (active) => transport.setActive(active),
     kick: () => transport.kick(),
     diagnostics: () => transport.diagnostics(),

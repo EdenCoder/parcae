@@ -37,8 +37,8 @@
     "@parcae/sdk": "workspace:*"
   },
   "devDependencies": {
-    "@lynx-js/react": "^0.116.2",
-    "@lynx-js/types": "^3.8.0",
+    "@lynx-js/react": "^0.129.1",
+    "@lynx-js/types": "^4.4.2",
     "@parcae/sdk": "workspace:*",
     "tsup": "^8.5.1",
     "typescript": "^6.0.3",

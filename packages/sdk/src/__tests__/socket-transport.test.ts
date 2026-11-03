@@ -239,7 +239,7 @@ describe("SocketTransport — hello/resync protocol", () => {
     expect(onResync).toHaveBeenCalledTimes(2);
   });
 
-  it("refreshSession() re-emits hello and updates the session", async () => {
+  it("clears an explicit identity change offline and reconnects anonymously", async () => {
     let token: string | null = "tok-1";
     const t = makeTransport(async () => token);
     currentSocket.connect();
@@ -247,15 +247,19 @@ describe("SocketTransport — hello/resync protocol", () => {
     await Promise.resolve();
     ackHello("u-1");
 
-    token = "tok-2";
-    const promise = t.refreshSession();
-    await Promise.resolve();
-    await Promise.resolve();
-    ackHello("u-2");
-    const result = await promise;
+    currentSocket.disconnect();
+    token = null;
+    const promise = t.refreshSession({ reset: true });
+    expect(t.session.state).toMatchObject({ status: "pending", userId: null });
+    expect(t.lastConfirmedToken()).toBeNull();
+    await expect(promise).rejects.toThrow("Cannot handshake while disconnected");
 
-    expect(result).toEqual({ userId: "u-2" });
-    expect(t.session.state.userId).toBe("u-2");
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello(null);
+
+    expect(t.session.state).toMatchObject({ status: "anonymous", userId: null });
   });
 
   it("terminateSession() locks the session machine", async () => {
@@ -792,23 +796,44 @@ describe("SocketTransport — hello/resync protocol", () => {
     expect(received).toEqual([{ op: "live" }]);
   });
 
-  it("unsubscribe detaches the gated wrapper", async () => {
-    const t = makeTransport(async () => "tok");
+  it("keeps a shared query while another page is still acquiring it", async () => {
+    const client = createClient({ url: "http://localhost:0", getToken: async () => "tok" });
     currentSocket.connect();
     await Promise.resolve();
     await Promise.resolve();
     ackHello("user-1");
 
     const received: any[] = [];
+    const first = vi.fn();
     const handler = (frame: any) => received.push(frame);
-    const off = t.subscribe("query:h3", handler);
-    off();
-    currentSocket._fire("query:h3", { op: "after-off" });
+    const releaseFirst = client.subscribe("query:h3", first);
+    let releaseLast!: () => void;
+    const opening = client.withQuerySubscriptions(async () => {
+      const rows = await client.bind(Post).where({}).find();
+      const hash = (rows as unknown as { __queryHash: string }).__queryHash;
+      releaseLast = client.subscribe(`query:${hash}`, handler);
+    });
+    await tick();
+    releaseFirst();
+    expect(currentSocket.emits.some((e) => e.event === "unsubscribe:query")).toBe(false);
 
-    t.subscribe("query:h3", handler);
-    t.unsubscribe("query:h3", handler);
+    respondToLatestCall({ success: true, result: { posts: [{ id: "one" }], __queryHash: "h3" } });
+    await opening;
+    currentSocket._fire("query:h3", { op: "still-live" });
+    expect(first).not.toHaveBeenCalled();
+    expect(received).toEqual([{ op: "still-live" }]);
+    expect(currentSocket.emits.some((e) => e.event === "unsubscribe:query")).toBe(false);
+
+    client.unsubscribe("query:h3", handler);
     currentSocket._fire("query:h3", { op: "after-unsubscribe" });
+    releaseFirst();
+    releaseLast();
 
-    expect(received).toEqual([]);
+    expect(received).toEqual([{ op: "still-live" }]);
+    expect(currentSocket.emits.filter((e) => e.event === "unsubscribe:query")).toEqual([
+      { event: "unsubscribe:query", args: ["h3"] },
+    ]);
+    expect(currentSocket.disconnectCalls).toBe(0);
+    client.dispose();
   });
 });

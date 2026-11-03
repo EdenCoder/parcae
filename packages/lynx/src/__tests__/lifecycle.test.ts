@@ -28,6 +28,9 @@ function makeFakeClient(
   const events = new Map<string, Set<() => void>>();
   const state = { userId: initialUserId, status: initialStatus, version: 0 };
   return {
+    withQuerySubscriptions<T>(operation: () => Promise<T>): Promise<T> {
+      return operation();
+    },
     refreshSession: vi.fn().mockResolvedValue({ userId: "u1" }),
     terminateSession: vi.fn().mockResolvedValue(undefined),
     subscribe: vi.fn().mockReturnValue(() => {}),
@@ -106,11 +109,18 @@ afterEach(() => {
 });
 
 describe("startLifecycle", () => {
-  it("is idempotent", () => {
-    const second = makeAdapter();
-    expect(startLifecycle(() => client as never, second.adapter)).toBe(dispose);
-    second.changeToken("tok");
-    expect(client.refreshSession).not.toHaveBeenCalled();
+  it("keeps shared listeners until the last caller releases", () => {
+    const release = startLifecycle(() => client as never);
+    expect(client.sessionListenerCount()).toBe(1);
+    dispose();
+    dispose();
+    auth.changeToken("tok");
+    expect(client.refreshSession).toHaveBeenCalledOnce();
+    expect(client.sessionListenerCount()).toBe(1);
+    release();
+    expect(auth.listenerCount()).toBe(0);
+    expect(client.sessionListenerCount()).toBe(0);
+    expect(client.eventListenerCount("resync-required")).toBe(0);
   });
 
   it("disposes every listener and __resetLifecycleForTests tears down", () => {
@@ -164,6 +174,8 @@ describe("startLifecycle", () => {
   });
 
   it("resets live stores when the session identity changes", async () => {
+    dispose();
+    dispose = startLifecycle(() => client as never);
     let calls = 0;
     const chain: QueryChain<Row> = {
       find: async () => {

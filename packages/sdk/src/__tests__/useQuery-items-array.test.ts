@@ -74,6 +74,10 @@ interface SubscriptionRegistration {
 }
 
 class FakeClient extends EventEmitter {
+  withQuerySubscriptions<T>(operation: () => Promise<T>): Promise<T> {
+    return operation();
+  }
+
   public subscriptions: SubscriptionRegistration[] = [];
   public send = vi.fn();
 

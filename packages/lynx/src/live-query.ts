@@ -214,14 +214,9 @@ export function createLiveQuery<T extends LiveRow>(
   };
 
   const releaseSubscription = () => {
-    const hash = queryHash;
     disposeOps?.();
     disposeOps = null;
     queryHash = null;
-    const client = requireClient();
-    if (hash && typeof client.send === "function") {
-      client.send("unsubscribe:query", hash);
-    }
   };
 
   const bindChain = (chain: QueryChain<T>): QueryChain<T> => {
@@ -318,9 +313,10 @@ export function createLiveQuery<T extends LiveRow>(
     const fetchGeneration = generation;
     const bound = bindChain(chainFactory());
     const chain = subscribe ? bound : (bound.withSubscribe?.(false) ?? bound);
-    chain
-      .find()
-      .then((result) => {
+    const client = requireClient();
+    client
+      .withQuerySubscriptions(async () => {
+        const result = await chain.find();
         if (fetchGeneration !== generation) return;
         items = reconcile(result);
         status = "ready";
@@ -333,7 +329,7 @@ export function createLiveQuery<T extends LiveRow>(
         if (hash && hash !== queryHash) {
           releaseSubscription();
           queryHash = hash;
-          disposeOps = requireClient().subscribe(`query:${hash}`, (
+          disposeOps = client.subscribe(`query:${hash}`, (
             payload: unknown,
           ) => {
             if (fetchGeneration !== generation) return;

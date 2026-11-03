@@ -54,6 +54,7 @@ function deferred<T>() {
 }
 
 interface FakeClient extends EventEmitter {
+  withQuerySubscriptions<T>(operation: () => Promise<T>): Promise<T>;
   session: StubSession;
   subscriptions: Array<{
     event: string;
@@ -67,6 +68,7 @@ function makeFakeClient(session: StubSession): FakeClient {
   const subs: Array<{ event: string; handler: (...args: any[]) => void }> = [];
   const ee = new EventEmitter() as any as FakeClient;
   ee.session = session;
+  ee.withQuerySubscriptions = (operation) => operation();
   ee.subscriptions = subs;
   ee.subscribe = (event: string, handler: (...args: any[]) => void) => {
     const entry = { event, handler };

@@ -419,13 +419,9 @@ function hold(e: CacheEntry): void {
 }
 
 function detachSubscription(entry: CacheEntry): void {
-  const hash = entry.queryHash;
   entry.dispose?.();
   entry.dispose = null;
   entry.queryHash = null;
-  if (hash && typeof entry.client.send === "function") {
-    entry.client.send("unsubscribe:query", hash);
-  }
 }
 
 // ── Ops application ─────────────────────────────────────────────────────────
@@ -892,7 +888,7 @@ function doFetch(
 
   const generation = ++entry.generation;
   let request!: Promise<void>;
-  request = (async () => {
+  request = client.withQuerySubscriptions(async () => {
     try {
       const result = await fetchChain.find();
       if (!isLive(entry) || entry.generation !== generation) return;
@@ -928,7 +924,7 @@ function doFetch(
     } finally {
       if (entry.fetchPromise === request) entry.fetchPromise = null;
     }
-  })();
+  });
   entry.fetchPromise = request;
   return request;
 }
@@ -997,21 +993,21 @@ export function _onResyncRequired(client: ParcaeClient): void {
 
   if (entries.length === 0) return;
 
-  client
-    .resync(
-      entries.map((e) => ({
-        key: e.cacheKey,
-        modelType: e.modelType,
-        steps: e.steps,
-        queryHash: e.queryHash,
-        // Omit `subscribe` when default `true` so older backends that
-        // don't know the field continue to work — they treat absence
-        // as subscribed, which is the existing behaviour.
-        ...(e.subscribe === false ? { subscribe: false } : {}),
-        ...(e.have ? { have: e.have } : {}),
-      })),
-    )
-    .then((results) => {
+  void client.withQuerySubscriptions(async () => {
+    try {
+      const results = await client.resync(
+        entries.map((e) => ({
+          key: e.cacheKey,
+          modelType: e.modelType,
+          steps: e.steps,
+          queryHash: e.queryHash,
+          // Omit `subscribe` when default `true` so older backends that
+          // don't know the field continue to work — they treat absence
+          // as subscribed, which is the existing behaviour.
+          ...(e.subscribe === false ? { subscribe: false } : {}),
+          ...(e.have ? { have: e.have } : {}),
+        })),
+      );
       const byKey = new Map(results.map((r) => [r.key, r]));
       for (const e of entries) {
         const result = byKey.get(e.cacheKey);
@@ -1077,8 +1073,7 @@ export function _onResyncRequired(client: ParcaeClient): void {
 
         notify(entry);
       }
-    })
-    .catch((reason: unknown) => {
+    } catch (reason) {
       const error =
         reason instanceof Error ? reason : new Error(String(reason));
       log.error("useQuery: resync failed:", error.message);
@@ -1086,8 +1081,7 @@ export function _onResyncRequired(client: ParcaeClient): void {
         if (!isLive(e.entry) || e.entry.generation !== e.generation) continue;
         recoverResyncEntry(e.cacheKey, e.entry, error);
       }
-    })
-    .finally(() => {
+    } finally {
       // Release every entry this batch claimed, including the ones both
       // handlers skipped on a generation mismatch — a flag left set
       // there would block the mount effect from ever restarting them.
@@ -1097,7 +1091,8 @@ export function _onResyncRequired(client: ParcaeClient): void {
         if (e.entry.generation !== e.generation) continue;
         e.entry.resyncPending = false;
       }
-    });
+    }
+  });
 }
 
 // ── useQuery ───────────────────────────────────────────────────────────────

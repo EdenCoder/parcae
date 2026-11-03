@@ -47,8 +47,10 @@ type OpsHandler = (payload: unknown) => void;
 
 function makeFakeClient() {
   const subs = new Map<string, Set<OpsHandler>>();
-  const sent: Array<{ event: string; args: unknown[] }> = [];
   const client = {
+    withQuerySubscriptions<T>(operation: () => Promise<T>): Promise<T> {
+      return operation();
+    },
     subscribe(event: string, handler: OpsHandler) {
       if (!subs.has(event)) subs.set(event, new Set());
       subs.get(event)!.add(handler);
@@ -59,14 +61,6 @@ function makeFakeClient() {
     },
     subscriberCount(event: string) {
       return subs.get(event)?.size ?? 0;
-    },
-    send(event: string, ...args: unknown[]) {
-      sent.push({ event, args });
-    },
-    sentCount(event: string, value: unknown) {
-      return sent.filter(
-        (entry) => entry.event === event && entry.args[0] === value,
-      ).length;
     },
   };
   return client;
@@ -523,7 +517,7 @@ describe("registry", () => {
 
     resetLiveQueries();
     expect(store.snapshot().status).toBe("loading");
-    expect(fakeClient.sentCount("unsubscribe:query", "H1")).toBe(1);
+    expect(fakeClient.subscriberCount("query:H1")).toBe(0);
     await flush();
 
     expect(calls()).toBe(2);
@@ -576,7 +570,6 @@ describe("registry", () => {
     second.release();
     second.release();
     expect(fakeClient.subscriberCount("query:H1")).toBe(0);
-    expect(fakeClient.sentCount("unsubscribe:query", "H1")).toBe(1);
   });
 
   it("ignores a released fetch and safely restarts on retain", async () => {

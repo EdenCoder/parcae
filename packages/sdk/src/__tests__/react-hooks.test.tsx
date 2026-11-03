@@ -17,6 +17,10 @@ import { SessionMachine } from '../session-machine';
   true;
 
 class FakeClient extends EventEmitter {
+  withQuerySubscriptions<T>(operation: () => Promise<T>): Promise<T> {
+    return operation();
+  }
+
   transport = this as any;
   adapter = new FrontendAdapter(this as any);
   session = new SessionMachine();

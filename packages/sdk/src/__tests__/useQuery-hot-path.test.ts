@@ -18,6 +18,10 @@ class Post extends Model {
 }
 
 class FakeClient extends EventEmitter {
+  withQuerySubscriptions<T>(operation: () => Promise<T>): Promise<T> {
+    return operation();
+  }
+
   public subscriptions: Array<{
     event: string;
     handler: (...args: any[]) => void;

@@ -37,6 +37,10 @@ class Post extends Model {
 }
 
 class FakeClient extends EventEmitter {
+  withQuerySubscriptions<T>(operation: () => Promise<T>): Promise<T> {
+    return operation();
+  }
+
   session = new SessionMachine();
   connection = new ConnectionMachine();
   isConnected = true;

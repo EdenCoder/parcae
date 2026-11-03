@@ -45,6 +45,10 @@ interface SubscriptionRegistration {
 }
 
 class FakeClient extends EventEmitter {
+  withQuerySubscriptions<T>(operation: () => Promise<T>): Promise<T> {
+    return operation();
+  }
+
   public subscriptions: SubscriptionRegistration[] = [];
   public resync = vi.fn(async (_entries: any[]) => [] as any[]);
   public session = {
