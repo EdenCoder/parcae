@@ -507,7 +507,6 @@ export class SocketTransport extends EventEmitter implements Transport {
 
   private _handshake(fresh = false): Promise<void> {
     if (this.isDisposed) return Promise.reject(new Error("Transport disposed"));
-    if (fresh) this._advanceGeneration(new Error("Hello superseded"));
     if (!this.socket.connected) {
       return Promise.reject(new Error("Cannot handshake while disconnected"));
     }
@@ -519,6 +518,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     ) {
       return this.helloReady;
     }
+    if (fresh) this._advanceGeneration(new Error("Hello superseded"));
     const generation = this.sessionGeneration;
     this.helloGeneration = generation;
     this.helloState = "pending";
@@ -710,7 +710,12 @@ export class SocketTransport extends EventEmitter implements Transport {
   /** A fresh hello reads the current token. Explicit identity changes reset immediately;
    * an offline reset stays pending until reconnect confirms the new or anonymous session. */
   async refreshSession(options: SessionRefreshOptions = {}): Promise<{ userId: string | null }> {
-    if (options.reset) this.confirmedHelloToken = null;
+    if (options.reset) {
+      this.confirmedHelloToken = null;
+      // Work queued for the old identity must not run as the next one, even offline. A plain
+      // token refresh leaves it waiting for the next hello, which reads the new token.
+      this._advanceGeneration(new Error("Hello superseded"));
+    }
     const ready = this._handshake(true);
     if (options.reset || this.session.state.status === "terminated") {
       this.session.reset();

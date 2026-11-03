@@ -262,6 +262,70 @@ describe("SocketTransport — hello/resync protocol", () => {
     expect(t.session.state).toMatchObject({ status: "anonymous", userId: null });
   });
 
+  it("refreshSession() re-emits hello on a connected socket and updates the session", async () => {
+    let token = "tok-1";
+    const t = makeTransport(async () => token);
+    currentSocket.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("u-1");
+
+    token = "tok-2";
+    const promise = t.refreshSession();
+    await Promise.resolve();
+    await Promise.resolve();
+    ackHello("u-2");
+
+    expect(await promise).toEqual({ userId: "u-2" });
+    expect(t.session.state.userId).toBe("u-2");
+  });
+
+  it("keeps a read waiting for reconnect when the token rotates offline", async () => {
+    let token = "tok-1";
+    const transport = makeTransport(async () => token);
+    currentSocket.connect();
+    await tick();
+    ackHello("user-1");
+
+    currentSocket.disconnect();
+    const read = transport.get("/posts");
+    await tick();
+    token = "tok-2";
+    await expect(transport.refreshSession()).rejects.toThrow(
+      "Cannot handshake while disconnected",
+    );
+
+    currentSocket.connect();
+    await tick();
+    const hello = [...currentSocket.emits].reverse().find((e) => e.event === "hello");
+    expect(hello?.args[0]).toEqual({ token: "tok-2" });
+    ackHello("user-1");
+    await tick();
+    respondToLatestCall({ success: true, result: [] });
+
+    await expect(read).resolves.toEqual([]);
+  });
+
+  it("drops a read queued for the old identity when it resets offline", async () => {
+    let token: string | null = "tok-1";
+    const transport = makeTransport(async () => token);
+    currentSocket.connect();
+    await tick();
+    ackHello("user-1");
+
+    currentSocket.disconnect();
+    const read = transport.get("/posts");
+    const rejection = expect(read).rejects.toThrow("Hello superseded");
+    await tick();
+    token = null;
+    await expect(transport.refreshSession({ reset: true })).rejects.toThrow(
+      "Cannot handshake while disconnected",
+    );
+
+    await rejection;
+    expect(currentSocket.emits.filter((e) => e.event === "call")).toHaveLength(0);
+  });
+
   it("terminateSession() locks the session machine", async () => {
     const t = makeTransport(async () => "tok");
     currentSocket.connect();
