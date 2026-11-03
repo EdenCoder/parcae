@@ -35,10 +35,13 @@ export interface StoredList {
   total: number;
 }
 
-/** Where the app's earlier rows are kept. The app owns custody, as it owns the token. */
+/**
+ * Where the app's earlier rows are kept. The app owns custody, as it owns the token. Every request
+ * names the format (`STORAGE_FORMAT`) it reads or writes.
+ */
 export interface RowStorage {
   /** The kept list `key` names and the rows of `type` it lists, plus `ids`, for the account the phone is signed in as. */
-  read(request: { type: string; key: string; ids: readonly string[] }): Promise<{
+  read(request: { type: string; key: string; ids: readonly string[]; format: number }): Promise<{
     user: string | null;
     list: StoredList | null;
     rows: StoredRow[];
@@ -51,11 +54,12 @@ export interface RowStorage {
    */
   write(batch: RowBatch): Promise<void>;
   /** The account's waiting changes, oldest first. */
-  waiting(): Promise<{ user: string | null; writes: StoredWrite[] }>;
+  waiting(request: { format: number }): Promise<{ user: string | null; writes: StoredWrite[] }>;
 }
 
 /** What `RowStorage.write` keeps in one go. */
 export interface RowBatch {
+  format   : number;
   user     : string;
   rows     : readonly AnsweredRow[];
   lists    : readonly StoredList[];
@@ -89,6 +93,14 @@ export interface Holder {
 // =============================================================================
 // Storage
 // =============================================================================
+
+/**
+ * The version of the rows and lists storage keeps (`StoredRow`, `StoredList`, the held key, a
+ * list's key); raise it when one changes, or a field of a model a kept row holds, and storage
+ * holding another drops them. The waiting changes outlive every format, so `StoredWrite` stays
+ * readable by every later build.
+ */
+export const STORAGE_FORMAT = 1;
 
 /**
  * Where a stored row keeps the version a read answered it at, named by that read's fields: another

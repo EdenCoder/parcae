@@ -17,7 +17,7 @@ import {
   type TransportError,
 } from "@parcae/model";
 
-import { storedRow, type RowBatch, type ServerRow, type RowStorage, type StoredWrite } from "./rows";
+import { storedRow, STORAGE_FORMAT, type RowBatch, type ServerRow, type RowStorage, type StoredWrite } from "./rows";
 import { listCreated } from "./reads";
 
 /** The server's refusal of the last change kept for a record in this page, until another is kept. `status` is absent when the phone refused it itself. */
@@ -87,9 +87,9 @@ export async function keepWrite(write: StoredWrite): Promise<void> {
   storing.add(write.key);
   try {
     // Storage knows the signed-in account offline; the session learns it only from the server.
-    const user = account ?? (await storage.waiting()).user;
+    const user = account ?? (await storage.waiting({ format: STORAGE_FORMAT })).user;
     if (!user) throw new Error("Not signed in");
-    await storage.write({ user, rows: [], lists: [], writes: [write] });
+    await storage.write({ format: STORAGE_FORMAT, user, rows: [], lists: [], writes: [write] });
     account ??= user;
   } catch (cause) {
     refuse(write, { message: (cause as Error).message });
@@ -123,7 +123,7 @@ export function readWaiting(): void {
   timer = null;
   if (!storage) return;
   const at = epoch;
-  void storage.waiting().then(({ user, writes }) => {
+  void storage.waiting({ format: STORAGE_FORMAT }).then(({ user, writes }) => {
     if (at !== epoch) return;
     const listed = new Set(writes.map((write) => write.key));
     account = user;
@@ -165,7 +165,7 @@ async function drain(storage: RowStorage, at: number): Promise<void> {
     } else {
       if (write.sent === null) {
         write.sent = Date.now();
-        await storage.write({ user, rows: [], lists: [], writes: [write] });
+        await storage.write({ format: STORAGE_FORMAT, user, rows: [], lists: [], writes: [write] });
       }
       let answer: unknown;
       try {
@@ -182,7 +182,7 @@ async function drain(storage: RowStorage, at: number): Promise<void> {
       }
     }
     backoff = 0;
-    await storage.write({ user, lists: [], ...landed, settled: [write.key] });
+    await storage.write({ format: STORAGE_FORMAT, user, lists: [], ...landed, settled: [write.key] });
   }
 }
 
