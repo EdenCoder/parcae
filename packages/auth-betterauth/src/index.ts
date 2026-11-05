@@ -76,6 +76,8 @@ export interface BetterAuthConfig {
   };
   /** Passthrough to Better Auth's `user.deleteUser`; account deletion is off unless set. */
   deleteUser?: NonNullable<BetterAuthOptions["user"]>["deleteUser"];
+  /** Passthrough to Better Auth's `databaseHooks`, run around its own user, session and account writes. */
+  databaseHooks?: BetterAuthOptions["databaseHooks"];
   /**
    * Explicit allowlists for custom User fields. Inferred fields are private
    * to Better Auth by default: they cannot be written through auth endpoints
@@ -327,6 +329,7 @@ export function betterAuth(config: BetterAuthConfig = {}): BetterAuthAdapter {
           Object.keys(socialProviders).length > 0 ? socialProviders : undefined,
 
         trustedOrigins,
+        databaseHooks: config.databaseHooks,
         plugins: [bearer()],
 
         // Use Parcae's ID generator for consistency
