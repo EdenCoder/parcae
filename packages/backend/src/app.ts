@@ -27,6 +27,7 @@ import {
   resolveRuntimeFlags,
 } from "./config";
 import type { Config, RuntimeFlags } from "./config";
+import { startDuration } from "./durations";
 import { createServer_, listenServer } from "./server";
 import type { ServerContext } from "./server";
 import {
@@ -862,7 +863,8 @@ export function createApp(config: AppConfig): ParcaeApp {
       }
 
       // ── Step 8: Create server ──────────────────────────────────────
-      server = createServer_({ config: envConfig, version });
+      const timed = Boolean(process.env.PARCAE_DURATIONS);
+      server = createServer_({ config: envConfig, version, timed });
       resources.io = server.io;
       resources.httpServer = server.httpServer;
       _setIo(server.io);
@@ -1106,7 +1108,16 @@ export function createApp(config: AppConfig): ParcaeApp {
         for (const entry of routes) {
           const method = entry.method.toLowerCase() as keyof typeof server.polka;
           if (typeof server.polka[method] === "function") {
-            const handlers = [...entry.middlewares, entry.handler];
+            // Polka matches the pattern but never puts it on the request.
+            const stamp = (req: any, _res: any, next: any) => {
+              req.route = entry;
+              next();
+            };
+            const handlers = [
+              ...(timed ? [stamp] : []),
+              ...entry.middlewares,
+              entry.handler,
+            ];
             (server.polka[method] as any)(entry.path, ...handlers);
           }
         }
@@ -1195,12 +1206,26 @@ export function createApp(config: AppConfig): ParcaeApp {
           queue.createWorker(
             queueName,
             async (bullJob, _token, signal) => {
-              return jobEntry.handler({
-                data: bullJob.data,
-                bullJob,
-                attempt: bullJob.attemptsMade,
-                signal,
-              });
+              const finish = startDuration();
+              let status: "completed" | "failed" = "failed";
+              try {
+                const result = await jobEntry.handler({
+                  data: bullJob.data,
+                  bullJob,
+                  attempt: bullJob.attemptsMade,
+                  signal,
+                });
+                status = "completed";
+                return result;
+              } finally {
+                finish({
+                  kind: "job",
+                  name: jobEntry.name,
+                  status,
+                  attempt: bullJob.attemptsMade,
+                  enqueuedAt: new Date(bullJob.timestamp).toISOString(),
+                });
+              }
             },
             {
               concurrency,

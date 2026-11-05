@@ -565,6 +565,7 @@ Read directly from `process.env` (not part of the Zod schema):
 | `ENSURE_SCHEMA`                     | —       | `"true"` to run auth migrations, user migrations, `ensureAllTables` |
 | `PARCAE_ALLOW_CHECKSUM_DRIFT`       | —       | `"true"` to bypass migration checksum-drift errors                |
 | `PARCAE_DROP_OBSOLETE_COLUMNS`      | —       | `"true"` to drop columns no longer declared on a model           |
+| `PARCAE_DURATIONS`                  | —       | File path. When set, each route call and job delivery appends one JSON line (`kind`, `name`, `startedAt`, `durationMs`, `status`; jobs add `attempt`, `enqueuedAt`) |
 | `PARCAE_MAX_SUBSCRIPTIONS_PER_SOCKET` | `500` | Per-socket subscription cap                                       |
 | `PARCAE_REEVAL_CONCURRENCY`         | —       | Subscription re-eval concurrency override                          |
 </content>
