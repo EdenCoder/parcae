@@ -46,10 +46,16 @@ export type { OpBuilder } from "./patch";
  */
 export type Text = string & { readonly __brand: "Text" };
 
-export { FrontendAdapter } from "./adapters/client";
-export { isNotFoundError } from "./adapters/client";
+export {
+  NOT_RUN,
+  FrontendAdapter,
+  isNotFoundError,
+  REQUEST_TIMEOUT_MS,
+  IDEMPOTENCY_TTL_MS,
+} from "./adapters/client";
 export type {
   Transport,
+  WireRequest,
   TransportError,
   RequestOptions,
 } from "./adapters/client";

@@ -18,7 +18,7 @@
  *   - reconnect emits a single `resync` event after `hello` resolves
  *   - session changes propagate through SessionMachine.resolve only
  *   - a GET the wire drops goes again after the next `hello`; any
- *     other call goes out once
+ *     other call goes out once, carrying the idempotency key it was given
  */
 
 import SocketIO from "socket.io-client";
@@ -27,12 +27,11 @@ import { decompress } from "compress-json";
 import { EventEmitter } from "eventemitter3";
 import ShortId from "short-unique-id";
 import type { Transport, RequestOptions } from "@parcae/model";
-import { SESSION_BOUNDARY_ERRORS } from "@parcae/model";
+import { REQUEST_TIMEOUT_MS, SESSION_BOUNDARY_ERRORS } from "@parcae/model";
 import { SessionMachine } from "../session-machine";
 import { ConnectionMachine } from "../connection-machine";
 import { log } from "../log";
 
-const DEFAULT_TIMEOUT = 120_000;
 const WATCHDOG_STALE_MS = 8_000;
 const WATCHDOG_BACKOFF_CAP_MS = 60_000;
 /**
@@ -226,7 +225,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     this.url = config.url;
     this.version = config.version ?? "v1";
     this.getToken = config.getToken;
-    this.handshakeTimeout = config.handshakeTimeout ?? DEFAULT_TIMEOUT;
+    this.handshakeTimeout = config.handshakeTimeout ?? REQUEST_TIMEOUT_MS;
     this.watchdogStaleMs = config.watchdogStaleMs ?? WATCHDOG_STALE_MS;
 
     const socketPath = config.path ?? "/ws";
@@ -686,7 +685,7 @@ export class SocketTransport extends EventEmitter implements Transport {
       };
       const timeout = setTimeout(() => {
         fail(new Error("resync timeout"));
-      }, DEFAULT_TIMEOUT);
+      }, REQUEST_TIMEOUT_MS);
       release = this._trackWaiter(fail, () => clearTimeout(timeout), Date.now());
       this._scheduleWatchdog();
       this.socket.emit("resync", { queries: entries }, (response: any) => {
@@ -795,7 +794,7 @@ export class SocketTransport extends EventEmitter implements Transport {
       };
       const timeout = setTimeout(() => {
         fail(new Error("Connection timeout"));
-      }, DEFAULT_TIMEOUT);
+      }, REQUEST_TIMEOUT_MS);
       const onConnect = () => {
         if (settled) return;
         settled = true;
@@ -829,7 +828,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     options?: RequestOptions,
   ): Promise<any> {
     const read = method.toUpperCase() === "GET";
-    const deadline = Date.now() + (options?.timeout ?? DEFAULT_TIMEOUT);
+    const deadline = Date.now() + (options?.timeout ?? REQUEST_TIMEOUT_MS);
     let session: number | undefined;
     let attempt = options;
     for (;;) {
@@ -871,7 +870,7 @@ export class SocketTransport extends EventEmitter implements Transport {
     const id = uid.rnd();
     const t0 = performance.now();
     const fullPath = `/${this.version}${path}`;
-    const timeoutMs = options?.timeout ?? DEFAULT_TIMEOUT;
+    const timeoutMs = options?.timeout ?? REQUEST_TIMEOUT_MS;
     log.debug(`→ ${method.toUpperCase()} ${fullPath}`);
 
     return new Promise((resolve, reject) => {
@@ -955,6 +954,7 @@ export class SocketTransport extends EventEmitter implements Transport {
         method.toUpperCase(),
         `/${this.version}${path}`,
         data,
+        options?.idempotencyKey,
       );
       this._scheduleWatchdog();
     });

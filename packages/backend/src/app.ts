@@ -17,7 +17,7 @@ import {
   createSessionFencedEmitter,
   createSessionFencedSocket,
 } from "./socket-session-facade";
-import { Model, rowVersion, SESSION_BOUNDARY_ERRORS } from "@parcae/model";
+import { Model, NOT_RUN, rowVersion, SESSION_BOUNDARY_ERRORS } from "@parcae/model";
 import type { ModelConstructor, SchemaDefinition } from "@parcae/model";
 import { log } from "./logger";
 import { ClientError } from "./helpers";
@@ -41,6 +41,7 @@ import {
 import { BackendAdapter } from "./adapters/model";
 import { registerModelRoutes } from "./adapters/routes";
 import { PubSub } from "./services/pubsub";
+import { createIdempotencyMiddleware } from "./services/idempotency";
 import {
   QueueService,
   formatOrphanQueueWarning,
@@ -1032,6 +1033,9 @@ export function createApp(config: AppConfig): ParcaeApp {
         });
       }
 
+      // After the app's middleware, so only the write itself is remembered under its key.
+      server.polka.use(wrapHttpHandler(createIdempotencyMiddleware(pubsub)));
+
       // ── Step 11: Default routes ────────────────────────────────────
       server.polka.get(`/${version}/health`, (_req: any, res: any) => {
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -1357,6 +1361,7 @@ export function createApp(config: AppConfig): ParcaeApp {
             method: string,
             path: string,
             data: any,
+            idempotencyKey?: string,
           ) => {
             const sessionSnapshot = socketSession.capture();
             if (!sessionSnapshot) {
@@ -1367,6 +1372,7 @@ export function createApp(config: AppConfig): ParcaeApp {
                   result: null,
                   success: false,
                   error: "Socket session is not reconciled",
+                  code: NOT_RUN,
                 }),
               );
               return;
@@ -1416,6 +1422,7 @@ export function createApp(config: AppConfig): ParcaeApp {
                 headers: {
                   ...socket.handshake.headers,
                   "content-type": "application/json",
+                  ...(typeof idempotencyKey === "string" ? { "idempotency-key": idempotencyKey } : {}),
                 },
                 body: data,
                 query: mergedQuery,

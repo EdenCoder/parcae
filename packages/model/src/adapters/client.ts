@@ -26,6 +26,23 @@ import type { Model, WithRefs } from "../Model";
 export interface RequestOptions {
   /** Override the default RPC timeout (in milliseconds). */
   timeout?: number;
+  /** The server answers every repeat of this key within IDEMPOTENCY_TTL_MS of its first arrival with its first answer. */
+  idempotencyKey?: string;
+}
+
+/** How long a call may run before its caller gives up; the server's claim on a write's key lasts as long. */
+export const REQUEST_TIMEOUT_MS = 120_000;
+/** How long the server keeps a write's answer under its key. A client stops resending a write first sent longer ago. */
+export const IDEMPOTENCY_TTL_MS = 86_400_000;
+/** The `code` of an answer that says the call did not run: try again. */
+export const NOT_RUN = "NOT_RUN";
+
+/** A model write as it goes over the wire: the one shape save, patch, remove and kept changes send. */
+export interface WireRequest {
+  method : "POST" | "PUT" | "PATCH" | "DELETE";
+  /** The adapter's path, without the version: `/projects/<id>`. */
+  path   : string;
+  body   : Record<string, unknown>;
 }
 
 /**
@@ -141,12 +158,7 @@ export class FrontendAdapter implements ModelAdapter {
     model: any,
     data: Record<string, any>,
   ): Promise<Record<string, any>> {
-    const ModelClass = model.constructor as ModelConstructor;
-    const path = this.resolvePath(ModelClass);
-    const response = model.__isNew
-      ? await this.transport.post(path, data)
-      : await this.transport.put(`${path}/${model.id}`, data);
-
+    const response = await this.send(this.request(model, "save", data));
     if (!response || typeof response !== "object" || Array.isArray(response)) {
       throw new Error("Model write returned no authoritative row");
     }
@@ -156,9 +168,7 @@ export class FrontendAdapter implements ModelAdapter {
   // ── remove ───────────────────────────────────────────────────────────
 
   async remove(model: any): Promise<void> {
-    const ModelClass = model.constructor as ModelConstructor;
-    const path = this.resolvePath(ModelClass);
-    await this.transport.delete(`${path}/${model.id}`);
+    await this.send(this.request(model, "remove"));
   }
 
   // ── findById ─────────────────────────────────────────────────────────
@@ -361,17 +371,37 @@ export class FrontendAdapter implements ModelAdapter {
     ops: PatchOp[],
     _data: Record<string, any>,
   ): Promise<Record<string, any>> {
-    const ModelClass = model.constructor as ModelConstructor;
-    const path = this.resolvePath(ModelClass);
-    const response = await this.transport.patch(`${path}/${model.id}`, { ops });
+    const response = await this.send(this.request(model, "patch", ops));
     if (!response || typeof response !== "object" || Array.isArray(response)) {
       throw new Error("Model patch returned no authoritative row");
     }
     return response;
   }
 
+  // ── the wire ─────────────────────────────────────────────────────────
+
+  /** The request a write of `model` sends: a save carries its row, a patch its ops. */
+  request(model: Model, kind: "save", data: Record<string, unknown>): WireRequest;
+  request(model: Model, kind: "patch", ops: PatchOp[]): WireRequest;
+  request(model: Model, kind: "remove"): WireRequest;
+  request(model: Model, kind: "save" | "patch" | "remove", payload?: unknown): WireRequest {
+    const path = this.resolvePath(model.constructor as ModelConstructor);
+    const one = `${path}/${model.id}`;
+    if (kind === "patch") return { method: "PATCH", path: one, body: { ops: payload } };
+    if (kind === "remove") return { method: "DELETE", path: one, body: {} };
+    const body = payload as Record<string, unknown>;
+    return model.__isNew ? { method: "POST", path, body } : { method: "PUT", path: one, body };
+  }
+
+  /** Sends a write's request; kept changes go with their idempotency key. */
+  send({ method, path, body }: WireRequest, options?: RequestOptions): Promise<any> {
+    const verb = method.toLowerCase() as "post" | "put" | "patch" | "delete";
+    return this.transport[verb](path, body, options);
+  }
+
   // ── helpers ──────────────────────────────────────────────────────────
 
+  /** The model's collection path, without the version: `/projects`. */
   private resolvePath(modelClass: ModelConstructor): string {
     if (!modelClass.path && !modelClass.type) {
       throw new Error("Model has no path or type");
