@@ -30,6 +30,7 @@ function emitter(): any {
   };
   Object.defineProperty(target, "volatile", {
     get: () => emitter(),
+    configurable: true,
   });
   return target;
 }
@@ -81,6 +82,29 @@ describe("session-fenced Socket.IO facades", () => {
     expect(raw.to).toHaveBeenCalledWith("care-team");
     expect(raw.broadcast.emit).toHaveBeenCalledOnce();
     expect(raw.join).toHaveBeenCalledWith("care-team");
+  });
+
+  it("reads the socket's volatile flag only when a handler asks for it", () => {
+    // Like Socket.IO, reading `volatile` marks the socket's next emit as droppable.
+    const raw = rawSocket();
+    const flags: { volatile?: boolean } = {};
+    Object.defineProperty(raw, "volatile", {
+      get: () => {
+        flags.volatile = true;
+        return raw;
+      },
+    });
+    const socket = createSessionFencedSocket(
+      raw,
+      () => true,
+      new SocketSessionRoomManager(raw),
+    );
+
+    socket.emit("session:ready", { ok: true });
+    expect(flags.volatile).toBeUndefined();
+    socket.volatile.emit("session:presence", { online: true });
+    expect(flags.volatile).toBe(true);
+    expect(raw.emit).toHaveBeenCalledTimes(2);
   });
 
   it("drops direct, room, broadcast, and server output after a session change", async () => {

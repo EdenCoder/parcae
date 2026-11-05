@@ -263,8 +263,17 @@ export function createSessionFencedSocket(
   const handshake = sanitizedHandshake(socket.handshake);
   const rooms = sessionRoomsView(socket.rooms, isSessionCurrent);
 
+  // Socket.IO's `volatile` getter marks the socket's next emit as droppable, so the members
+  // are listed rather than spread: a spread reads that getter while building the facade.
   return {
-    ...emitter,
+    emit: emitter.emit,
+    to: emitter.to,
+    in: emitter.in,
+    except: emitter.except,
+    timeout: emitter.timeout,
+    get volatile() {
+      return emitter.volatile;
+    },
     id: socket.id,
     handshake,
     rooms,
