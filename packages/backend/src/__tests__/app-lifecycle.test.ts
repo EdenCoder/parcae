@@ -378,7 +378,7 @@ describe("resyncQueries limits", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(peak).toBe(2);
     release();
-    await expect(resync).resolves.toHaveLength(6);
+    expect((await resync)()).toHaveLength(6);
     expect(peak).toBe(2);
   });
 
@@ -397,18 +397,17 @@ describe("resyncQueries limits", () => {
       subscriptions: null,
     };
 
-    await expect(
-      resyncQueries(
-        "socket",
-        null,
-        [
-          { key: "missing-key", modelType: "missing", steps: [] },
-          { key: "no-read-key", modelType: "noRead", steps: [] },
-          { key: "denied-key", modelType: "denied", steps: [] },
-        ],
-        adapter as any,
-      ),
-    ).resolves.toEqual([
+    const answer = await resyncQueries(
+      "socket",
+      null,
+      [
+        { key: "missing-key", modelType: "missing", steps: [] },
+        { key: "no-read-key", modelType: "noRead", steps: [] },
+        { key: "denied-key", modelType: "denied", steps: [] },
+      ],
+      adapter as any,
+    );
+    expect(answer()).toEqual([
       { key: "missing-key", hash: null, items: [], totalCount: 0 },
       { key: "no-read-key", hash: null, items: [], totalCount: 0 },
       { key: "denied-key", hash: null, items: [], totalCount: 0 },
@@ -428,7 +427,7 @@ describe("resyncQueries limits", () => {
       subscriptions: null,
     };
 
-    const [result] = await resyncQueries(
+    const answer = await resyncQueries(
       "socket",
       null,
       [
@@ -442,6 +441,7 @@ describe("resyncQueries limits", () => {
       ],
       adapter as any,
     );
+    const [result] = answer();
 
     expect(result!.ids).toEqual(["a", "b"]);
     expect(result!.items.map((row) => row.id)).toEqual(["b"]);
