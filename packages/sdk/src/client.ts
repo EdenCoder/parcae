@@ -51,6 +51,11 @@ export interface ClientConfig {
    * watchdog. Default 8000. See SocketTransportConfig.
    */
   watchdogStaleMs?: number;
+  /**
+   * Whether a plain `find()`/`first()` subscribes on the server (default `true`). Pass `false` for a
+   * client whose live reads go through `resync`: its one-off fetches end with their answer.
+   */
+  subscribe?: boolean;
 }
 
 export interface ParcaeClient {
@@ -106,7 +111,7 @@ export function createClient(config: ClientConfig): ParcaeClient {
     watchdogStaleMs: config.watchdogStaleMs,
   });
 
-  const adapter = new FrontendAdapter(transport);
+  const adapter = new FrontendAdapter(transport, { subscribe: config.subscribe });
 
   const client: ParcaeClient = {
     transport,

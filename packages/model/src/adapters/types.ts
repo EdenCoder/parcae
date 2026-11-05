@@ -42,6 +42,18 @@ export type SchemaDefinition = Record<string, ColumnType>;
  */
 export type IndexDefinition = string | string[];
 
+/**
+ * A named shape of a row, built from its own columns on the server and never stored.
+ * A read picks it in `select`, whole by its name or by `name.kind`.
+ */
+export interface DerivedField {
+  /** The columns it is built from; read with it, sent only when the read selects them too. */
+  from   : readonly string[];
+  /** The pieces a read may pick by `name.kind`; a bare `name` picks every one. */
+  kinds? : readonly string[];
+  read(row: Record<string, unknown>, kinds: ReadonlySet<string>): unknown;
+}
+
 // ─── Model Constructor ───────────────────────────────────────────────────────
 
 /**
@@ -111,6 +123,8 @@ export interface ModelConstructor<T = any> {
    * Default (empty) means every column is included.
    */
   privateFields?: readonly string[];
+  /** Shapes a read may select by name; see `DerivedField`. */
+  derivedFields?: Readonly<Record<string, DerivedField>>;
   __schema?: SchemaDefinition;
   new (adapter: ModelAdapter, data?: Record<string, any>): T;
 }
