@@ -13,37 +13,27 @@ const EMPTY_SNAPSHOT: LiveSnapshot<never> = {
   status: "loading",
   error: null,
   total: 0,
+  answers: 0,
+  drawn: false,
 };
 
-interface HookState<T extends LiveRow> {
-  store: LiveQueryStore<T>;
-  snapshot: LiveSnapshot<T>;
-}
-
 /**
- * Subscribe a component to a live store. `enabled: false` clears the
- * visible snapshot and does not retain or fetch the store.
+ * Subscribe a component to a live store. `enabled: false` draws nothing and does not retain or
+ * fetch the store; enabled again, it draws what the store holds at once.
  */
 export function useLiveQuery<T extends LiveRow>(
   store: LiveQueryStore<T>,
   enabled = true,
 ): LiveSnapshot<T> {
-  const [state, setState] = useState<HookState<T>>(() => ({
-    store,
-    snapshot: enabled ? store.snapshot() : EMPTY_SNAPSHOT,
-  }));
+  const [, redraw] = useState(0);
 
   useEffect(() => {
     "background only";
-    if (!enabled) {
-      setState({ store, snapshot: EMPTY_SNAPSHOT });
-      return;
-    }
-    const update = () => setState({ store, snapshot: store.snapshot() });
+    if (!enabled) return;
+    const update = () => redraw((count) => count + 1);
     update();
     return store.retain(update);
   }, [store, enabled]);
 
-  if (!enabled) return EMPTY_SNAPSHOT;
-  return state.store === store ? state.snapshot : store.snapshot();
+  return enabled ? store.snapshot() : EMPTY_SNAPSHOT;
 }

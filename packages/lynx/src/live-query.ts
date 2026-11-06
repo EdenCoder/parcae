@@ -1,81 +1,57 @@
 /**
- * Live query stores over the Parcae wire protocol, for runtimes where
- * `@parcae/sdk/react` can't run.
+ * A page's view of the engine's reads.
  *
- * ReactLynx executes component render code on the main (Lepus) thread
- * for first paint, where the socket client doesn't exist (`'background
- * only'`), and the SDK react hooks dereference `client.session` at
- * render time. This module keeps the protocol — `find()` returns
- * `__queryHash`, the backend streams add/remove/update ops on
- * `query:${hash}` — behind a store whose client access all happens on
- * the background thread. Snapshot reads never touch the client, so a
- * main-thread render pass just sees the store's initial state.
+ * ReactLynx executes component render code on the main (Lepus) thread for first paint, where the
+ * engine doesn't exist (`'background only'`). Snapshot reads never touch it, so a main-thread
+ * render pass just sees the store's initial state.
  *
- * Stores are module-global: every component in a bundle shares one
- * subscription and one snapshot (e.g. a saved-list store can power a
- * list page and every save button at once). Separate page bundles each
- * hold their own store; the server keeps them consistent via ops.
+ * A store hydrates its read's rows into the page's records, one object per record (rows.ts), and
+ * lays the page's waiting changes over them (writes.ts). Every store in a bundle that names the
+ * same read shares it, and so does every page: the engine counts them.
  *
- * This file is framework-agnostic (no Lynx / React imports) so the
- * reconciliation core can be unit-tested in node. The ReactLynx hook
- * lives in `use-live-query.ts`.
+ * This file is framework-agnostic (no Lynx / React imports) so the reconciliation core can be
+ * unit-tested in node. The ReactLynx hook lives in `use-live-query.ts`.
  */
 
-import { Model, patched, SYM_SERVER_MERGE, SYM_SERVER_PATCH, type PatchOp } from "@parcae/model";
+import { Model, SYM_SERVER_MERGE, serializeLazyQueryArgs, type QueryChain } from "@parcae/model";
 
-import { requireClient } from "./client-registry";
+import { page } from "./page";
+import { layOver, waitingRemoves, waitingCreates } from "./writes";
+import type { Read, ReadView, ReadRequest } from "./reads";
+import { hold, fieldsOf, mergeRow, recordFor, forgetRecords, type Holder, type ServerRow } from "./rows";
 
 export type LiveStatus = "loading" | "ready" | "error";
 
+/**
+ * `status` turns `ready` only on a server answer; rows drawn from storage come with `loading`.
+ * `total` is the last answer's count, stored or the server's. Draw what a snapshot holds, and open
+ * a page from a drawn row; act or count only on `ready`.
+ */
 export interface LiveSnapshot<T> {
   items: T[];
   status: LiveStatus;
   error: Error | null;
-  /** Rows the server matched at the last fetch, before any limit or offset. */
   total: number;
-}
-
-export interface QueryChain<T> {
-  find(): Promise<T[]>;
-  /** A sibling chain whose `find()` leaves no server subscription behind. */
-  withSubscribe?(subscribe: boolean): QueryChain<T>;
-  // ModelConstructor's static side is type-erased at the chain
-  // boundary; hydrate is cast back on at the single call site.
-  __modelClass?: unknown;
-  __adapter?: unknown;
-  __steps?: Array<{ method: string; args: unknown[] }>;
-}
-
-export interface LiveQueryOptions<T = LiveRow> {
-  /** Hydrated rows to draw while the first subscribed fetch is in flight. */
-  initial?: T[];
-  /**
-   * `false` reads the query without a server subscription, so no ops
-   * follow it: the SDK's `useQuery({ subscribe: false })`. Default `true`.
-   */
-  subscribe?: boolean;
+  /** Times the read was brought current, once more when a store retains a read the engine kept live; another read's answer redraws without one. */
+  answers: number;
+  /** `items` are an answer, the server's or a stored one, an empty answer too; until then the read holds nothing yet. */
+  drawn: boolean;
 }
 
 interface HydratingClass<T> {
   hydrate(adapter: unknown, data: Record<string, unknown>): T;
 }
 
-type QueryOp =
-  | { op: "add"; id: string; data?: Record<string, unknown> }
-  | { op: "remove"; id: string }
-  | { op: "update"; id: string; patch: PatchOp[] };
-
 export interface LiveRow {
   id?: string;
   tmp?: string;
   __data?: Record<string, unknown>;
   [SYM_SERVER_MERGE]?: (data: Record<string, unknown>) => unknown;
-  [SYM_SERVER_PATCH]?: (ops: readonly PatchOp[]) => unknown;
 }
 
 export interface LiveQueryStore<T> {
   snapshot(): LiveSnapshot<T>;
-  /** Subscribe + refcount. First retainer triggers the fetch. */
+  /** Subscribe + refcount. The first retainer holds the engine's read, which draws what it has and asks for the rest. */
   retain(onChange: () => void): () => void;
   refetch(): void;
   /** Insert a locally-created row until the server echoes it back. */
@@ -83,66 +59,122 @@ export interface LiveQueryStore<T> {
   removeOptimistic(id: string): void;
 }
 
+export interface LiveQueryOptions<T = LiveRow> {
+  /** Hydrated rows to draw while the first answer is in flight. */
+  initial?: T[];
+  /** `false` reads the query without a server subscription, so no ops follow it. Default `true`. */
+  subscribe?: boolean;
+  /** The records the read is expected to hold, drawn from storage before its own list is kept. */
+  ids?: readonly string[];
+  /** Whether an answer goes to storage, read from its rows; storage keeps what it had for one that doesn't. */
+  keeps?: (rows: readonly ServerRow[]) => boolean;
+}
+
 interface StoreInternal {
-  reset(refetchActive: boolean): void;
-  refetchIfActive(): void;
+  reset(): void;
+  holder: Holder;
+  /** The store's list in storage. */
+  listKey(): string;
 }
 
+/** The page's retained stores. */
 const registry = new Set<StoreInternal>();
-let isSuspended = false;
-let identityEpoch = 0;
+const internals = new WeakMap<LiveQueryStore<any>, StoreInternal>();
+/** Bumped when the page's records go; a store released since draws nothing it held. */
+let epoch = 0;
 
-/** Drop all store state (identity changed — rows belong to another user). */
-export function resetLiveQueries(refetchActive = true): void {
-  "background only";
-  identityEpoch++;
-  isSuspended = !refetchActive;
-  for (const s of registry) s.reset(refetchActive);
+/** This card's `PageHooks.reset`: rows were read as another account, so every record goes. */
+export function resetStores(): void {
+  epoch++;
+  forgetRecords();
+  for (const store of registry) store.reset();
 }
 
-/** Re-run every active store's query (reconnect re-established the session). */
-export function refetchLiveQueries(): void {
-  "background only";
-  if (isSuspended) return;
-  for (const s of registry) s.refetchIfActive();
+/** The store's list in storage; a kept create names it to show in the store from every page. */
+export function listKeyOf(store: LiveQueryStore<any>): string | null {
+  return internals.get(store)?.listKey() ?? null;
+}
+
+/** The holders of every retained store, redrawn when the page's waiting changes do. */
+export function retainedHolders(): Holder[] {
+  return [...registry].map((store) => store.holder);
+}
+
+/** The read a chain names: its steps as the wire sends them, every `select` naming `updatedAt`. */
+function requestOf(
+  chain: QueryChain<unknown>,
+  { ids = [], subscribe: wanted }: Pick<LiveQueryOptions, "ids" | "subscribe">,
+): ReadRequest {
+  const type = chain.__modelType;
+  const steps = chain.__steps.map((step) => ({ method: step.method, args: serializeLazyQueryArgs(step.args) }));
+  const selects = steps.filter((step) => step.method === "select");
+  const last = selects[selects.length - 1];
+  if (last && !selects.some((step) => step.args.flat().includes("updatedAt"))) last.args = [...last.args, "updatedAt"];
+  const subscribe = wanted !== false && chain.__subscribe !== false;
+  return { key: `${type}:${JSON.stringify(steps)}${subscribe ? "" : ":nosub"}`, type, steps, subscribe, ids };
 }
 
 export function createLiveQuery<T extends LiveRow>(
   chainFactory: () => QueryChain<T>,
-  { subscribe = true, initial }: LiveQueryOptions<T> = {},
+  options: LiveQueryOptions<T> = {},
 ): LiveQueryStore<T> {
-  let items: T[] = initial ?? [];
+  let items: T[] = options.initial ?? [];
   let optimistic: T[] = [];
-  let status: LiveStatus = initial ? "ready" : "loading";
+  let status: LiveStatus = options.initial ? "ready" : "loading";
   let error: Error | null = null;
   let total = items.length;
+  let answers = 0;
+  let drawn = !!options.initial;
   let snap: LiveSnapshot<T> | null = null;
+  let storeEpoch = epoch;
+
+  let chain: QueryChain<T> | null = null;
+  let request: ReadRequest | null = null;
+  let fields: ReadonlySet<string> | null = null;
+  /** The engine's rows this store last saw, each as the page's object for it. */
+  let seen = new WeakMap<ServerRow, T>();
+  let seenAnswers = 0;
+  let live = false;
 
   let refs = 0;
-  let storeIdentityEpoch = identityEpoch;
-  let generation = 0;
-  let fetching = false;
-  let fetchQueued = false;
-  let started = false;
-  let disposeOps: (() => void) | null = null;
-  let queryHash: string | null = null;
+  let release: (() => void) | null = null;
   const listeners = new Set<() => void>();
 
   const notify = () => {
     snap = null;
     for (const fn of listeners) fn();
   };
+  const unlist = (id: string) => {
+    const before = items.length + optimistic.length;
+    items = items.filter((i) => i.id !== id);
+    optimistic = optimistic.filter((o) => o.id !== id && o.tmp !== id);
+    if (items.length + optimistic.length === before) return;
+    holdItems();
+    notify();
+  };
+  const holder = { republish: notify, unlist };
 
+  /** Its rows, its optimistic rows and waiting creates, less every row a waiting delete names. */
   const merged = (): T[] => {
-    if (optimistic.length === 0) return items;
+    const removes = waitingRemoves();
+    const creates = request ? (waitingCreates(request.key, hydrate) as T[]) : [];
+    if (optimistic.length === 0 && creates.length === 0 && removes.size === 0) return items;
     const ids = new Set(items.map((i) => i.id).filter(Boolean));
     const tmps = new Set(items.map((i) => i.tmp).filter(Boolean));
+    const removed = (row: T) =>
+      [row.id, row.tmp].some((id) => id && removes.has(`${request?.type}:${id}`));
     return [
       ...items,
-      ...optimistic.filter(
+      ...[...optimistic, ...creates].filter(
         (o) => !(o.id && ids.has(o.id)) && !(o.tmp && tmps.has(o.tmp)),
       ),
-    ];
+    ].filter((row) => !removed(row));
+  };
+
+  /** `holder` lists the store's items, with the page's waiting patches laid over them. */
+  const holdItems = () => {
+    hold(holder, items, fields);
+    layOver(items);
   };
 
   /** Server rows arrived — drop optimistic entries the server now owns. */
@@ -155,263 +187,102 @@ export function createLiveQuery<T extends LiveRow>(
     );
   };
 
-  const reconcile = (next: T[]): T[] => {
-    if (items.length === 0 && optimistic.length === 0) return next;
-
-    const byId = new Map(
-      items.filter((item) => item.id).map((item) => [item.id, item]),
-    );
-    const optimisticById = new Map(
-      optimistic.filter((item) => item.id).map((item) => [item.id, item]),
-    );
-    const optimisticByTmp = new Map(
-      optimistic.filter((item) => item.tmp).map((item) => [item.tmp, item]),
-    );
-    let membershipChanged = items.length !== next.length;
-    const result = next.map((fresh, index) => {
-      const existing =
-        (fresh.id && (byId.get(fresh.id) ?? optimisticById.get(fresh.id))) ||
-        (fresh.tmp && optimisticByTmp.get(fresh.tmp));
-      if (!existing) {
-        membershipChanged = true;
-        return fresh;
-      }
-
-      const serverData =
-        fresh instanceof Model
-          ? fresh
-          : (fresh.__data ?? Object.fromEntries(Object.entries(fresh)));
-      const mergeFn = existing[SYM_SERVER_MERGE];
-      if (typeof mergeFn === "function") {
-        mergeFn.call(existing, serverData as Record<string, unknown>);
-      } else {
-        Object.assign(existing, serverData);
-      }
-
-      if (items[index] !== existing) membershipChanged = true;
-      return existing;
-    });
-
-    return membershipChanged ? result : items;
-  };
-
-  const hydrate = (
-    chain: QueryChain<T>,
-    data: Record<string, unknown>,
-  ): T | null => {
-    const ModelClass = chain.__modelClass as HydratingClass<T> | undefined;
+  const hydrate = (data: Record<string, unknown>): T | null => {
+    const ModelClass = chain?.__modelClass as unknown as HydratingClass<T> | undefined;
     if (!ModelClass || typeof ModelClass.hydrate !== "function") return null;
-    const client = requireClient();
-    const adapter =
-      client.adapter ??
-      chain.__adapter ??
-      (Model.hasAdapter() ? Model.getAdapter() : null);
-    const BoundModel =
-      client.adapter && typeof client.bind === "function"
-        ? client.bind(ModelClass as unknown as typeof Model)
-        : ModelClass;
-    return (BoundModel as unknown as HydratingClass<T>).hydrate(adapter, data);
+    const { client } = page();
+    const BoundModel = client.bind(ModelClass as unknown as typeof Model) as unknown as HydratingClass<T>;
+    return BoundModel.hydrate(client.adapter, data);
   };
 
-  const releaseSubscription = () => {
-    disposeOps?.();
-    disposeOps = null;
-    queryHash = null;
+  /**
+   * The page's object for each row: a row seen before is the object it became; a new row merges
+   * into the page's record for it over the fields this read asks for, or becomes one.
+   */
+  const reconcile = (rows: readonly ServerRow[]): T[] => {
+    const byId = new Map(items.filter((item) => item.id).map((item) => [item.id, item]));
+    const next = rows.flatMap((row) => {
+      const known = seen.get(row);
+      if (known) return [known];
+      const fresh = hydrate(row);
+      if (!fresh) return [];
+      const existing =
+        (fresh.id && (recordFor(fresh, fields) ?? byId.get(fresh.id) ?? optimistic.find((o) => o.id === fresh.id))) ||
+        (fresh.tmp && optimistic.find((o) => o.tmp === fresh.tmp));
+      if (existing) mergeRow(existing, fresh, row, fields, holder);
+      seen.set(row, existing || fresh);
+      return [existing || fresh];
+    });
+    return next.length === items.length && next.every((item, index) => item === items[index]) ? items : next;
   };
 
-  const bindChain = (chain: QueryChain<T>): QueryChain<T> => {
-    const client = requireClient();
-    const ModelClass = chain.__modelClass as typeof Model | undefined;
-    if (!client.adapter || !ModelClass || typeof client.bind !== "function") {
-      return chain;
-    }
-    const BoundModel = client.bind(ModelClass);
-    if (chain.__adapter === client.adapter && ModelClass === BoundModel)
-      return chain;
-    let rebound = client.adapter.query(BoundModel) as unknown as QueryChain<T>;
-    for (const step of chain.__steps ?? []) {
-      const method = (rebound as any)[step.method];
-      if (typeof method === "function") {
-        rebound = method(...step.args) as QueryChain<T>;
-      }
-    }
-    return rebound;
-  };
-
-  const applyOps = (chain: QueryChain<T>, ops: QueryOp[], order?: string[]) => {
-    "background only";
-    let changed = false;
-
-    for (const op of ops) {
-      if (op.op === "remove") {
-        const before = items.length + optimistic.length;
-        items = items.filter((i) => i.id !== op.id);
-        optimistic = optimistic.filter(
-          (o) => o.id !== op.id && o.tmp !== op.id,
-        );
-        if (items.length + optimistic.length !== before) changed = true;
-      } else if (op.op === "add" && op.data) {
-        if (items.some((i) => i.id === op.id)) continue;
-        // A row we created optimistically echoes back — merge into the
-        // existing instance so references stay stable. Models
-        // self-assign ids at construction and `save()` adopts the
-        // server-minted id, so the id match is the primary path (tmp
-        // is belt-and-braces).
-        const tmp = op.data.tmp as string | undefined;
-        const local = optimistic.find(
-          (o) => o.id === op.id || (tmp && o.tmp === tmp),
-        );
-        const mergeFn = local?.[SYM_SERVER_MERGE];
-        if (local && typeof mergeFn === "function") {
-          items = [...items, mergeFn.call(local, op.data) as T];
-        } else {
-          const row = hydrate(chain, op.data);
-          if (row) items = [...items, row];
-        }
-        changed = true;
-      } else if (op.op === "update") {
-        items = items.map((row) => {
-          if (row.id !== op.id) return row;
-          changed = true;
-          const apply = row[SYM_SERVER_PATCH];
-          if (!apply) return patched(row, op.patch);
-          apply.call(row, op.patch);
-          return row;
-        });
-      }
-    }
-
-    if (order && items.length > 1) {
-      const byId = new Map(items.map((i) => [i.id, i]));
-      const next: T[] = [];
-      for (const id of order) {
-        const row = byId.get(id);
-        if (row) {
-          next.push(row);
-          byId.delete(id);
-        }
-      }
-      for (const rest of byId.values()) next.push(rest);
-      items = next;
-      changed = true;
-    }
-
-    if (changed) {
+  const view: ReadView = {
+    changed(read: Read) {
+      invalidate();
+      // The caller's rows stand until the read holds an answer of its own.
+      if (items === options.initial && !read.drawn && !read.error) return;
+      const before = { items, answers, status, error, total, drawn };
+      if (read.answers !== seenAnswers) answers++;
+      seenAnswers = read.answers;
+      ({ status, error, total, drawn, live } = read);
+      items = reconcile(read.rows);
       drainOptimistic();
-      notify();
-    }
+      holdItems();
+      // Retaining a read that hasn't moved since this store last drew it redraws nothing.
+      const after = { items, answers, status, error, total, drawn };
+      if ((Object.keys(after) as (keyof typeof after)[]).some((key) => after[key] !== before[key])) notify();
+    },
+    keeps: options.keeps,
   };
 
-  const doFetch = () => {
-    "background only";
-    if (refs === 0 || isSuspended) return;
-    if (fetching) {
-      fetchQueued = true;
-      return;
-    }
-    fetching = true;
-    const fetchGeneration = generation;
-    const bound = bindChain(chainFactory());
-    const chain = subscribe ? bound : (bound.withSubscribe?.(false) ?? bound);
-    const client = requireClient();
-    client
-      .withQuerySubscriptions(async () => {
-        const result = await chain.find();
-        if (fetchGeneration !== generation) return;
-        items = reconcile(result);
-        status = "ready";
-        error = null;
-        total =
-          (result as { __totalCount?: number }).__totalCount ?? result.length;
-        drainOptimistic();
-
-        const hash = (result as { __queryHash?: string }).__queryHash;
-        if (hash && hash !== queryHash) {
-          releaseSubscription();
-          queryHash = hash;
-          disposeOps = client.subscribe(`query:${hash}`, (
-            payload: unknown,
-          ) => {
-            if (fetchGeneration !== generation) return;
-            const p = payload as
-              | { ops?: QueryOp[]; order?: string[] }
-              | QueryOp[];
-            const ops = Array.isArray(p) ? p : (p?.ops ?? []);
-            const order = Array.isArray(p) ? undefined : p?.order;
-            if (ops.length || order) applyOps(chain, ops, order);
-          });
-        } else if (!hash && queryHash) {
-          releaseSubscription();
-        }
-        notify();
-      })
-      .catch((err: Error) => {
-        if (fetchGeneration !== generation) return;
-        error = err;
-        status = items.length ? "ready" : "error";
-        notify();
-      })
-      .finally(() => {
-        if (fetchGeneration !== generation) return;
-        fetching = false;
-        if (fetchQueued) {
-          fetchQueued = false;
-          doFetch();
-        }
-      });
-  };
-
-  const stop = () => {
-    generation++;
-    fetching = false;
-    fetchQueued = false;
-    started = false;
-    releaseSubscription();
-  };
-
-  const invalidateIdentity = () => {
-    if (storeIdentityEpoch === identityEpoch) return;
-    stop();
-    storeIdentityEpoch = identityEpoch;
+  /** The page's records went since this store last drew: it holds nothing of them. */
+  const invalidate = () => {
+    if (storeEpoch === epoch) return;
+    storeEpoch = epoch;
+    seen = new WeakMap();
     items = [];
     optimistic = [];
     status = "loading";
     error = null;
     total = 0;
-    notify();
+    drawn = false;
+    snap = null;
   };
 
   const internal: StoreInternal = {
-    reset(refetchActive) {
-      invalidateIdentity();
-      if (refs > 0 && refetchActive) {
-        started = true;
-        doFetch();
-      }
+    // A retained store keeps what it drew: the engine's next word on its read says what stays.
+    reset: () => {
+      storeEpoch = epoch;
     },
-    refetchIfActive() {
-      if (refs > 0 && !isSuspended) {
-        started = true;
-        doFetch();
-      }
-    },
+    holder,
+    // A store this page never retained still names its list, for a create saved into it.
+    listKey: () => (request ?? requestOf(chainFactory(), options)).key,
   };
 
-  return {
+  const store: LiveQueryStore<T> = {
     snapshot() {
-      invalidateIdentity();
-      if (!snap) snap = { items: merged(), status, error, total };
+      invalidate();
+      if (!snap) snap = { items: merged(), status, error, total, answers, drawn };
       return snap;
     },
     retain(onChange: () => void) {
       "background only";
-      invalidateIdentity();
+      invalidate();
       listeners.add(onChange);
       refs++;
-      registry.add(internal);
-      if (!started && !isSuspended) {
-        started = true;
-        doFetch();
+      if (refs === 1) {
+        chain = chainFactory();
+        request = requestOf(chain, options);
+        fields = fieldsOf(request.steps as never);
+        registry.add(internal);
+        live = false;
+        const before = answers;
+        release = page().retain(request, view);
+        // A read the engine kept live is current: retaining it counts as an answer.
+        if (live && answers === before) {
+          answers++;
+          notify();
+        }
       }
       let released = false;
       return () => {
@@ -419,25 +290,22 @@ export function createLiveQuery<T extends LiveRow>(
         released = true;
         listeners.delete(onChange);
         refs--;
-        if (refs === 0) {
-          stop();
-          registry.delete(internal);
-        }
+        if (refs > 0) return;
+        registry.delete(internal);
+        release?.();
+        release = null;
       };
     },
     refetch() {
       "background only";
-      if (refs > 0 && !isSuspended) doFetch();
+      if (refs > 0 && request) page().refetch(request.key);
     },
     addOptimistic(item: T) {
       optimistic = [...optimistic, item];
       notify();
     },
-    removeOptimistic(id: string) {
-      const before = items.length + optimistic.length;
-      items = items.filter((i) => i.id !== id);
-      optimistic = optimistic.filter((o) => o.id !== id && o.tmp !== id);
-      if (items.length + optimistic.length !== before) notify();
-    },
+    removeOptimistic: unlist,
   };
+  internals.set(store, internal);
+  return store;
 }
