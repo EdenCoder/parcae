@@ -21,7 +21,7 @@ it("reports error when the first answer fails, and stays ready with its rows whe
   phone.resync.mockRejectedValueOnce(new Error("Disconnected"));
   const home = await page(phone);
   const store = home.shows();
-  retain(store);
+  const { release } = retain(store);
   await vi.advanceTimersByTimeAsync(1);
   expect(store.snapshot()).toMatchObject({ status: "error", items: [] });
 
@@ -32,6 +32,15 @@ it("reports error when the first answer fails, and stays ready with its rows whe
   store.refetch();
   await vi.advanceTimersByTimeAsync(1);
   expect(store.snapshot().status).toBe("ready");
+  expect(store.snapshot().items).toHaveLength(1);
+
+  // Retained again after the read's grace, the store asks afresh.
+  release();
+  await vi.advanceTimersByTimeAsync(60_000);
+  phone.resync.mockRejectedValueOnce(new Error("Disconnected"));
+  retain(store);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(store.snapshot()).toMatchObject({ status: "ready", error: { message: "Disconnected" } });
   expect(store.snapshot().items).toHaveLength(1);
 });
 
@@ -73,15 +82,22 @@ it("drops an answer to the identity the session left", async () => {
   expect(store.snapshot()).toMatchObject({ status: "ready", answers: 1 });
 });
 
-it("draws the caller's rows as ready until the first answer, which lands on the same objects", async () => {
+it("draws the caller's rows as ready through a failed ask until the first answer lands on them", async () => {
   const phone = client(server({ show: [{ id: "s1", title: "Server" }] }));
   const home = await page(phone);
   const mine = phone.bind(home.Show).hydrate(phone.adapter, { id: "s1", title: "Mine" });
   const store = home.shows([], { initial: [mine] });
   expect(store.snapshot()).toMatchObject({ status: "ready", total: 1, drawn: true, items: [mine] });
 
+  phone.resync.mockRejectedValueOnce(new Error("Disconnected"));
   retain(store);
   await vi.advanceTimersByTimeAsync(1);
+  expect(store.snapshot()).toMatchObject({ status: "ready", error: { message: "Disconnected" } });
+  expect(store.snapshot().items[0]).toBe(mine);
+
+  store.refetch();
+  await vi.advanceTimersByTimeAsync(1);
+  expect(store.snapshot().error).toBeNull();
   expect(store.snapshot().items[0]).toBe(mine);
   expect(mine.title).toBe("Server");
 });

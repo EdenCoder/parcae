@@ -219,8 +219,13 @@ export function createLiveQuery<T extends LiveRow>(
   const view: ReadView = {
     changed(read: Read) {
       invalidate();
-      // The caller's rows stand until the read holds an answer of its own.
-      if (items === options.initial && !read.drawn && !read.error) return;
+      // Until the read holds an answer of its own, an error only reports itself over the drawn
+      // rows; with no error, as after a reset, only the caller's rows stand.
+      if (!read.drawn && (read.error ? drawn : items === options.initial)) {
+        if (error === read.error) return;
+        error = read.error;
+        return notify();
+      }
       const before = { items, answers, status, error, total, drawn };
       if (read.answers !== seenAnswers) answers++;
       seenAnswers = read.answers;
