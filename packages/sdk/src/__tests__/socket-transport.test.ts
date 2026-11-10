@@ -104,8 +104,11 @@ function ackHello(userId: string | null): void {
   cb({ userId });
 }
 
-function respondToLatestCall(response: Record<string, unknown>): void {
-  const call = [...currentSocket.emits].reverse().find((e) => e.event === "call");
+/** Answer the latest call, or the latest to `path`, with a fake server response. */
+function respondToLatestCall(response: Record<string, unknown>, path?: string): void {
+  const call = [...currentSocket.emits]
+    .reverse()
+    .find((e) => e.event === "call" && (!path || e.args[2] === path));
   if (!call) throw new Error("no call emit found");
   const requestId = call.args[0] as string;
   currentSocket._fire(
@@ -704,30 +707,45 @@ describe("SocketTransport — hello/resync protocol", () => {
     await resyncRejection;
   });
 
-  it("sends a dropped GET again after the next hello, and a dropped write never", async () => {
+  it("waits out failed dials, and resends only a dropped GET or keyed write", async () => {
     const transport = makeTransport(async () => "token");
     currentSocket.connect();
     await tick();
     ackHello("user");
 
     const read = transport.get("/quote", { actions: ["shoot"] });
+    const kept = transport.post("/posts", {}, { idempotencyKey: "k1" });
     const write = transport.post("/action", { hash: "h" });
     const writeRejection = expect(write).rejects.toThrow("Disconnected");
     await tick();
     currentSocket.disconnect();
     await writeRejection;
 
+    const offline = transport.post("/later", {});
+    await tick();
+    currentSocket._fire("connect_error", new Error("offline"));
+    await tick();
     currentSocket.connect();
     await tick();
     ackHello("user");
     await tick();
-    respondToLatestCall({ success: true, result: { credits: 3 } });
+    respondToLatestCall({ success: true, result: { credits: 3 } }, "/v1/quote");
+    respondToLatestCall({ success: true, result: { id: "p1" } }, "/v1/posts");
+    respondToLatestCall({ success: true, result: { done: true } }, "/v1/later");
 
     await expect(read).resolves.toEqual({ credits: 3 });
-    const paths = currentSocket.emits
-      .filter((entry) => entry.event === "call")
-      .map((entry) => entry.args[2]);
-    expect(paths).toEqual(["/v1/quote", "/v1/action", "/v1/quote"]);
+    await expect(kept).resolves.toEqual({ id: "p1" });
+    await expect(offline).resolves.toEqual({ done: true });
+    const calls = currentSocket.emits.filter((entry) => entry.event === "call");
+    expect(calls.map((entry) => entry.args[2])).toEqual([
+      "/v1/quote",
+      "/v1/posts",
+      "/v1/action",
+      "/v1/quote",
+      "/v1/posts",
+      "/v1/later",
+    ]);
+    expect(calls[4]!.args[4]).toBe("k1");
   });
 
   it("rejects a dropped GET when the next hello confirms someone else", async () => {

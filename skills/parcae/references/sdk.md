@@ -116,8 +116,11 @@ Source: `packages/sdk/src/transports/socket.ts` (exported as `SocketTransport`)
   `parsed.message || parsed.error`.
 - **GET deduplication**: in-flight GETs are coalesced by `${path}:${JSON.stringify(data)}`
   via an `inflight` Map.
-- **Timeout**: `DEFAULT_TIMEOUT` is **120_000 ms** (120 s) for RPC calls and resync,
-  overridable per call via `options.timeout`.
+- **Timeout**: `REQUEST_TIMEOUT_MS` is **120_000 ms** (120 s) for RPC calls and resync,
+  overridable per call via `options.timeout`. A call's budget starts when it goes out.
+- **Line loss**: a call waits for the line, through failed dials, until it goes out. Once out,
+  a GET or a write with `options.idempotencyKey` whose answer the wire drops goes again after
+  the next hello under the same session; any other write goes out once, and a drop rejects it.
 - **Disconnect does NOT touch session state.** Only `connection` transitions on socket
   lifecycle events.
 - `reconnect()` is a no-op if already connected; otherwise sets `connection.connecting()`

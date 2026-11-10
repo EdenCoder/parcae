@@ -17,8 +17,9 @@
  *   - disconnect does NOT touch session state
  *   - reconnect emits a single `resync` event after `hello` resolves
  *   - session changes propagate through SessionMachine.resolve only
- *   - a GET the wire drops goes again after the next `hello`; any
- *     other call goes out once, carrying the idempotency key it was given
+ *   - a call waits for the line until it goes out; once out, a dropped
+ *     GET or keyed write goes again after the next `hello`, and any other
+ *     call goes out once
  */
 
 import SocketIO from "socket.io-client";
@@ -816,10 +817,12 @@ export class SocketTransport extends EventEmitter implements Transport {
   // ── Request/Response ─────────────────────────────────────────────
 
   /**
-   * A call waits for a connected socket and its hello. A GET whose answer
-   * the wire drops goes again under the same session, with what is left
-   * of its budget. Any other method goes out once: the server may have
-   * done the work, so a drop rejects it.
+   * A call waits for a connected socket and its hello however long the
+   * line is down: nothing has run until it goes out, and its budget starts
+   * then. A GET, or a write with an idempotency key, whose answer the wire
+   * drops goes again under the same session with what is left of its
+   * budget. Any other write goes out once: the server may have done the
+   * work, so a drop rejects it.
    */
   private async fetch(
     method: string,
@@ -828,7 +831,8 @@ export class SocketTransport extends EventEmitter implements Transport {
     options?: RequestOptions,
   ): Promise<any> {
     const read = method.toUpperCase() === "GET";
-    const deadline = Date.now() + (options?.timeout ?? REQUEST_TIMEOUT_MS);
+    const repeatable = read || !!options?.idempotencyKey;
+    let deadline: number | undefined;
     let session: number | undefined;
     let attempt = options;
     for (;;) {
@@ -841,6 +845,7 @@ export class SocketTransport extends EventEmitter implements Transport {
         if (this.session.state.version !== session) {
           throw new Error(SESSION_BOUNDARY_ERRORS.changed);
         }
+        deadline ??= Date.now() + (options?.timeout ?? REQUEST_TIMEOUT_MS);
         if (!read) return await this._call(method, path, data, attempt);
         const key = `${this.sessionGeneration}:${path}:${JSON.stringify(data)}`;
         let request = this.inflight.get(key);
@@ -852,8 +857,9 @@ export class SocketTransport extends EventEmitter implements Transport {
         }
         return await request;
       } catch (error) {
-        if (!read || !wireLoss.has(error as Error)) throw error;
-        if (Date.now() >= deadline) throw error;
+        if (!wireLoss.has(error as Error)) throw error;
+        if (deadline === undefined) continue;
+        if (!repeatable || Date.now() >= deadline) throw error;
         // A declared budget keeps the stall clock off the call: the drop
         // already cost one rebuild, and a slow answer must not cost another.
         attempt = { ...options, timeout: deadline - Date.now() };
