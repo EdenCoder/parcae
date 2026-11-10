@@ -1,7 +1,8 @@
 /**
- * The account's waiting changes and their one sender: stored under storage's account, sent oldest
- * first with their key, settled only by an answer with a status, reported at each step. Its state
- * is live only in the host's copy; page files reach it through `page()`, never by import.
+ * The account's waiting changes and their one sender: kept under the account, in storage when the
+ * app gives one and in memory when not, sent oldest first with their key, settled only by an answer
+ * with a status, reported at each step. Its state is live only in the host's copy; page files reach
+ * it through `page()`, never by import.
  *
  * The engine is the only writer of the waiting list, so after it reads storage's list at start and
  * when the session settles, its own list is the truth.
@@ -13,6 +14,7 @@ import {
   isNotFoundError,
   pointerSegments,
   IDEMPOTENCY_TTL_MS,
+  SESSION_BOUNDARY_ERRORS,
   type PatchOp,
   type TransportError,
 } from "@parcae/model";
@@ -55,9 +57,11 @@ let storage : RowStorage | null = null;
 let tell    : (outcome: WriteOutcome | null) => void;
 
 let waiting: StoredWrite[] = [];
-/** The account storage keeps the list for. */
+/** The account the waiting list belongs to. */
 let account: string | null = null;
 const storing = new Set<string>();
+/** With no storage, each waiting change's caller, until the server's word on it. */
+const callers = new Map<string, { resolve: () => void; reject: (refusal: Error) => void }>();
 
 let epoch   = 0;
 let backoff = 0;
@@ -83,7 +87,11 @@ export function waitingWrites(): readonly StoredWrite[] {
 export async function keepWrite(write: StoredWrite): Promise<void> {
   waiting = [...waiting, write];
   tell(null);
-  if (!storage) return settleNow(write);
+  if (!storage) {
+    const answered = new Promise<void>((resolve, reject) => callers.set(write.key, { resolve, reject }));
+    sendAsAccount();
+    return answered;
+  }
   storing.add(write.key);
   try {
     // Storage knows the signed-in account offline; the session learns it only from the server.
@@ -100,16 +108,6 @@ export async function keepWrite(write: StoredWrite): Promise<void> {
   sendWrites();
 }
 
-/** With no storage, a change is sent once and answers its caller; a lost line refuses it. */
-async function settleNow(write: StoredWrite): Promise<void> {
-  try {
-    settle(write, (await send(write)) as ServerRow | null);
-  } catch (cause) {
-    refuse(write, cause as TransportError);
-    throw cause;
-  }
-}
-
 /**
  * The session settled or changed: the send in flight is dropped and storage's list is read again.
  * Storage answers only for the account the phone is signed in as, so the same account keeps its
@@ -121,7 +119,7 @@ export function readWaiting(): void {
   backoff = 0;
   if (timer) clearTimeout(timer);
   timer = null;
-  if (!storage) return;
+  if (!storage) return sendAsAccount();
   const at = epoch;
   void storage.waiting({ format: STORAGE_FORMAT }).then(({ user, writes }) => {
     if (at !== epoch) return;
@@ -133,26 +131,39 @@ export function readWaiting(): void {
   });
 }
 
+/**
+ * With no storage, the waiting changes are the account's they were kept as: once the session
+ * settles as anyone else, or as no one, they are refused.
+ */
+function sendAsAccount(): void {
+  const { status, userId } = client.session.state;
+  if (status === "pending") return;
+  if (status !== "authenticated" || (account ?? userId) !== userId)
+    for (const write of waiting) refuse(write, { message: SESSION_BOUNDARY_ERRORS.changed });
+  account = userId;
+  sendWrites();
+}
+
 // =============================================================================
 // Send
 // =============================================================================
 
 /** Sends the oldest waiting change while the session is signed in and the line up. */
 export function sendWrites(): void {
-  if (!storage || sending) return;
+  if (sending) return;
   if (client.session.state.status !== "authenticated" || !client.isConnected) return;
   if (timer) clearTimeout(timer);
   timer = null;
   sending = true;
   const at = epoch;
-  drain(storage, at)
+  drain(at)
     .catch(() => retryLater())
     .finally(() => {
       if (at === epoch) sending = false;
     });
 }
 
-async function drain(storage: RowStorage, at: number): Promise<void> {
+async function drain(at: number): Promise<void> {
   for (;;) {
     const write = waiting[0];
     const user = account;
@@ -165,7 +176,7 @@ async function drain(storage: RowStorage, at: number): Promise<void> {
     } else {
       if (write.sent === null) {
         write.sent = Date.now();
-        await storage.write({ format: STORAGE_FORMAT, user, rows: [], lists: [], writes: [write] });
+        await storage?.write({ format: STORAGE_FORMAT, user, rows: [], lists: [], writes: [write] });
       }
       let answer: unknown;
       try {
@@ -182,7 +193,7 @@ async function drain(storage: RowStorage, at: number): Promise<void> {
       }
     }
     backoff = 0;
-    await storage.write({ format: STORAGE_FORMAT, user, lists: [], ...landed, settled: [write.key] });
+    await storage?.write({ format: STORAGE_FORMAT, user, lists: [], ...landed, settled: [write.key] });
   }
 }
 
@@ -228,17 +239,20 @@ function settle(write: StoredWrite, answer: ServerRow | null): void {
   report("sent", write);
   if (answer) listCreated(write.lists, answer);
   tell({ write, answer });
+  callers.get(write.key)?.resolve();
+  callers.delete(write.key);
 }
 
 function refuse(write: StoredWrite, { status, code, message }: Partial<TransportError> & { message: string }): void {
   waiting = waiting.filter((each) => each !== write);
   report("refused", write, { status, code });
   tell({ write, refusal: { method: write.method, status, code, message } });
+  callers.get(write.key)?.reject(Object.assign(new Error(message), { status, code }));
+  callers.delete(write.key);
 }
 
 /** The server's status and code go with a refusal; JSON leaves out the ones it didn't give. */
 function report(moment: WriteMoment["moment"], write: StoredWrite, answer: Pick<WriteMoment, "status" | "code"> = {}): void {
-  if (!storage) return;
   const payload: WriteMoment = { moment, type: write.type, method: write.method, ms: Date.now() - write.kept, ...answer };
   client._emitDiagnostic?.("write", { ...payload });
 }

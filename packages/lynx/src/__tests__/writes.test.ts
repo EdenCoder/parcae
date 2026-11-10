@@ -1,6 +1,7 @@
 /**
- * A kept change: shown at once, stored, sent with its key until an answer with a status settles it,
- * put back on a refusal, and landed or dropped on every other page as the engine says.
+ * A kept change: shown at once, stored or held in memory, sent with its key until an answer with a
+ * status settles it, put back on a refusal, and landed or dropped on every other page as the engine
+ * says.
  */
 
 import type { PatchOp } from "@parcae/model";
@@ -98,6 +99,41 @@ it("keeps a change made offline before the server knows the account, and sends i
   expect(remove).toHaveBeenCalledTimes(1);
   expect(remove).toHaveBeenLastCalledWith("/shows/s1", {}, { idempotencyKey: expect.any(String) });
   expect(kept).toHaveLength(0);
+});
+
+it("with no storage, holds changes for the line, sends them one at a time, and refuses them when another account signs in", async () => {
+  let answer!: (row: unknown) => void;
+  patch
+    .mockImplementationOnce(() => new Promise((done) => (answer = done)))
+    .mockResolvedValueOnce({ id: "s1", title: "Final" });
+  const phone = line();
+  const home = await page(phone);
+  const store = home.shows();
+  retain(store);
+  await vi.advanceTimersByTimeAsync(1);
+  const show = store.snapshot().items[0]!;
+
+  phone.isConnected = false;
+  const first = home.lynx.keep(show).patch(rename("Renamed"));
+  const second = home.lynx.keep(show).patch(rename("Final"));
+  await vi.advanceTimersByTimeAsync(1);
+  expect(patch).not.toHaveBeenCalled();
+
+  phone.isConnected = true;
+  phone.emit("resync-required");
+  await vi.advanceTimersByTimeAsync(1);
+  expect(patch).toHaveBeenCalledTimes(1);
+  answer({ id: "s1", title: "Renamed" });
+  await first;
+  await second;
+  expect(patch).toHaveBeenLastCalledWith("/shows/s1", { ops: rename("Final") }, { idempotencyKey: expect.any(String) });
+  expect(show.title).toBe("Final");
+
+  phone.isConnected = false;
+  const theirs = home.lynx.keep(show).patch(rename("Theirs"));
+  phone.settle("authenticated", "u2");
+  await expect(theirs).rejects.toThrow("Session changed");
+  expect(patch).toHaveBeenCalledTimes(2);
 });
 
 it("shows another page's patch while it waits, lands it there on its answer, and takes back a refusal", async () => {
