@@ -22,7 +22,11 @@
 import { betterAuth as createBetterAuth } from "better-auth";
 import type { BetterAuthOptions } from "better-auth";
 import { log } from "@parcae/backend";
+import { createAuthMiddleware, getOAuthState } from "better-auth/api";
+import { parseState } from "better-auth/oauth2";
 import { bearer } from "better-auth/plugins/bearer";
+import { genericOAuth } from "better-auth/plugins/generic-oauth";
+import type { GenericOAuthConfig } from "better-auth/plugins/generic-oauth";
 import pg from "pg";
 import type { Pool } from "pg";
 import pluralize from "pluralize";
@@ -79,6 +83,13 @@ export interface BetterAuthConfig {
   /** Passthrough to Better Auth's `databaseHooks`, run around its own user, session and account writes. */
   databaseHooks?: BetterAuthOptions["databaseHooks"];
   /**
+   * OAuth providers beyond the built-in ones, through Better Auth's generic
+   * OAuth plugin. A signed-in user links an account of one at `/oauth2/link`;
+   * its tokens live on the `accounts` row like any other provider's. A consent
+   * the provider refuses returns to the page that began it.
+   */
+  oauth?: GenericOAuthConfig[];
+  /**
    * Explicit allowlists for custom User fields. Inferred fields are private
    * to Better Auth by default: they cannot be written through auth endpoints
    * or returned in auth profiles unless listed here. Custom Model
@@ -94,6 +105,15 @@ export interface BetterAuthConfig {
    */
   database?: Pool;
 }
+
+export type { GenericOAuthConfig };
+
+/**
+ * The state of the OAuth consent a request is finishing, for a provider's own
+ * `getUserInfo`: its `link` names the user an account joins. Null outside a
+ * consent.
+ */
+export { getOAuthState };
 
 export interface BetterAuthAdapter extends AuthAdapter {
   /** Close the adapter-owned database pool. App-owned pools are untouched. */
@@ -180,6 +200,19 @@ export function inferAdditionalFields(
 
   return fields;
 }
+
+/**
+ * Sends a consent the provider refused back to the page that began it. Better
+ * Auth's generic callback answers one on its own error page before it reads the
+ * state, and the state holds that page.
+ */
+const returnRefusedConsent = createAuthMiddleware(async (ctx) => {
+  const refused = ctx.query?.error;
+  if (ctx.path !== "/oauth2/callback/:providerId" || !refused) return;
+  const { errorURL = "" } = await parseState(ctx);
+  const query = new URLSearchParams({ error: refused });
+  throw ctx.redirect(`${errorURL}${errorURL.includes("?") ? "&" : "?"}${query}`);
+});
 
 // ─── betterAuth() — factory function ─────────────────────────────────────────
 
@@ -313,8 +346,11 @@ export function betterAuth(config: BetterAuthConfig = {}): BetterAuthAdapter {
           updateAge: config.session?.updateAge ?? 60 * 60 * 24, // refresh daily
         },
 
+        // OAuth tokens act for the user's outside account, so they rest
+        // encrypted under the secret; a row that holds a plain one still reads.
         account: {
           modelName: "accounts",
+          encryptOAuthTokens: true,
           accountLinking: { enabled: true },
         },
 
@@ -330,7 +366,11 @@ export function betterAuth(config: BetterAuthConfig = {}): BetterAuthAdapter {
 
         trustedOrigins,
         databaseHooks: config.databaseHooks,
-        plugins: [bearer()],
+        hooks: { before: returnRefusedConsent },
+        plugins: [
+          bearer(),
+          ...(config.oauth?.length ? [genericOAuth({ config: config.oauth })] : []),
+        ],
 
         // Use Parcae's ID generator for consistency
         advanced: {

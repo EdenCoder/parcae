@@ -14,7 +14,10 @@ export default defineConfig({
     "@parcae/model",
     "@parcae/sdk",
     "better-auth",
+    "better-auth/api",
+    "better-auth/oauth2",
     "better-auth/plugins/bearer",
+    "better-auth/plugins/generic-oauth",
     "pg",
   ],
 });
