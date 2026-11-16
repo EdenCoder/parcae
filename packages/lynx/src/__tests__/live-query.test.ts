@@ -44,6 +44,25 @@ it("reports error when the first answer fails, and stays ready with its rows whe
   expect(store.snapshot().items).toHaveLength(1);
 });
 
+it("lands a slow answer that a refetch asked for again while it was on its way", async () => {
+  const phone = client(server({ show: [{ id: "s1", title: "A" }] }));
+  const asked = phone.resync.getMockImplementation()!;
+  const home = await page(phone);
+  const store = home.shows();
+  phone.resync.mockRejectedValueOnce(new Error("Disconnected"));
+  retain(store);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(store.snapshot().status).toBe("error");
+
+  phone.resync.mockImplementationOnce((entries) => new Promise((done) => setTimeout(() => done(asked(entries)), 5_000)));
+  store.refetch();
+  await vi.advanceTimersByTimeAsync(3_000);
+  store.refetch();
+  await vi.advanceTimersByTimeAsync(2_000);
+  expect(phone.resync).toHaveBeenCalledTimes(2);
+  expect(store.snapshot()).toMatchObject({ status: "ready", items: [{ id: "s1", title: "A" }] });
+});
+
 it("shows an optimistic row until the server holds it, then keeps the same object", async () => {
   const serve = server({ show: [{ id: "s1", title: "A" }] });
   const phone = client(serve);

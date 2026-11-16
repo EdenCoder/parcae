@@ -118,10 +118,10 @@ export function retainRead(request: ReadRequest, view: ReadView): () => void {
   };
 }
 
-/** Asks the server again; only rows that moved come back. */
+/** Asks the server again; only rows that moved come back. An ask already on its way is the one answer awaited. */
 export function refetchRead(key: string): void {
   const entry = reads.get(key);
-  if (entry?.views.size) ask(entry);
+  if (entry?.views.size && !entry.inflight) ask(entry);
 }
 
 /** A create the server took joins the reads it was listed in that don't hold it yet; the server's own `add` is the read's shape. */
