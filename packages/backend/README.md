@@ -165,6 +165,10 @@ createApp({
 });
 ```
 
+A module outside the `createApp` call adds the same kind of middleware with
+`route.use(...)`, before `app.start()` or from a discovered file. It runs after
+the `middleware` list, in registration order.
+
 Methods: `route.get`, `route.post`, `route.put`, `route.patch`, `route.delete`, `route.options`, `route.head`, `route.all`
 
 ### Route Options

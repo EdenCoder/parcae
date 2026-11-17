@@ -1,7 +1,7 @@
 import { createServer as createNetServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, expect, it } from 'vitest';
-import { createApp } from '@parcae/backend';
+import { createApp, ok, route } from '@parcae/backend';
 import type {
   AuthAdapter,
   AuthSession,
@@ -135,6 +135,12 @@ describePostgres('createApp HTTP and SocketTransport integration', () => {
 
     const port = await reservePort();
     baseUrl = `http://127.0.0.1:${port}`;
+    route.use((req, _res, next) => {
+      req.stamp = 'app-wide';
+      next();
+    });
+    route.get('/v1/stamp', (req: { stamp: string }, res: unknown) =>
+      ok(res, { stamp: req.stamp }));
     app = createApp({
       models: [Document],
       modelsPath: 'models',
@@ -305,6 +311,14 @@ describePostgres('createApp HTTP and SocketTransport integration', () => {
     expect(http.body.result).toEqual(socket);
     expect(socket.documents).toHaveLength(1);
     expect(socket.documents[0]).not.toHaveProperty('secret');
+  });
+
+  it('runs route.use middleware before a route over HTTP and socket RPC', async () => {
+    const http = await request<{ stamp: string }>('GET', '/v1/stamp', TOKEN_A);
+    const socket = await clientA.get('/stamp');
+
+    expect(http.body.result).toEqual({ stamp: 'app-wide' });
+    expect(socket).toEqual({ stamp: 'app-wide' });
   });
 
   it('shuts down sockets, HTTP, and persistence cleanly', async () => {

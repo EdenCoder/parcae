@@ -131,6 +131,24 @@ export function clearRoutes(): void {
   registeredRoutes.length = 0;
 }
 
+// ─── Global Middleware Registry ──────────────────────────────────────────────
+
+const registeredMiddleware: Middleware[] = [];
+
+/**
+ * Get all app-wide middleware registered via `route.use()`, in registration order.
+ */
+export function getMiddleware(): Middleware[] {
+  return [...registeredMiddleware];
+}
+
+/**
+ * Clear all app-wide middleware (for testing).
+ */
+export function clearMiddleware(): void {
+  registeredMiddleware.length = 0;
+}
+
 // ─── Global Socket Handler Registry ─────────────────────────────────────────
 
 const registeredSocketHandlers: SocketEntry[] = [];
@@ -260,6 +278,9 @@ function registerRoute(method: string, path: string, ...args: any[]): void {
  * route.post("/upload", auditLogMiddleware, (req, res) => { ... });
  * route.post("/upload", auditLogMiddleware, (req, res) => { ... }, { priority: 50 });
  *
+ * // App-wide middleware, before every route:
+ * route.use(requestIdMiddleware);
+ *
  * // Socket.IO event handlers (registered once per connection):
  * route.on("chat:message", requireSocketAuth, async (ctx) => {
  *   ctx.emit("chat:chunk", { text: "..." });
@@ -290,6 +311,16 @@ export const route = {
   },
   all(path: string, ...args: any[]) {
     registerRoute("ALL", path, ...args);
+  },
+
+  /**
+   * Register app-wide middleware, like a `createApp({ middleware })` entry.
+   * `createApp` mounts it after its own `middleware`, in registration order,
+   * for every HTTP request and socket RPC call. Like a route, it counts when
+   * registered before `app.start()` or from a discovered file.
+   */
+  use(...middlewares: Middleware[]) {
+    registeredMiddleware.push(...middlewares);
   },
 
   /**

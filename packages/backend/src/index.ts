@@ -88,6 +88,8 @@ export {
   Controller,
   getRoutes,
   clearRoutes,
+  getMiddleware,
+  clearMiddleware,
   getSocketHandlers,
   clearSocketHandlers,
   runSocketChain,
