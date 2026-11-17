@@ -31,6 +31,7 @@ import { startDuration } from "./durations";
 import { createServer_, listenServer } from "./server";
 import type { ServerContext } from "./server";
 import {
+  getMiddleware,
   getRoutes,
   getSocketHandlers,
   runSocketChain,
@@ -107,7 +108,7 @@ export interface AppConfig {
    * App-wide HTTP middleware. Mounted after auth/session resolution and the
    * per-request Parcae context, before health, auto-CRUD, and custom routes.
    * Socket RPC calls pass through the same middleware chain via the fake
-   * request path.
+   * request path. Middleware registered with `route.use()` follows these.
    */
   middleware?: Middleware[];
   /** API version prefix. Default: "v1" */
@@ -997,45 +998,6 @@ export function createApp(config: AppConfig): ParcaeApp {
         });
       });
 
-      if (config.middleware?.length) {
-        for (const middleware of config.middleware) {
-          server.polka.use(wrapHttpHandler(middleware));
-        }
-      }
-
-      // Middleware: optional post-auth hook. Fires for every request
-      // that has reached this point with a resolved session — covers
-      // both HTTP (after the auth-resolve middleware above) and
-      // socket-RPC (`req._socketRpc` skipped resolve but had session
-      // pre-injected). Errors are swallowed so a faulty hook can never
-      // break the request path.
-      if (config.onAuthenticatedRequest) {
-        const hook = config.onAuthenticatedRequest;
-        server.polka.use((req: any, res: any, next: any) => {
-          if (req.session?.user) {
-            try {
-              const result = hook(req, req.session ?? null, res);
-              if (result instanceof Promise) {
-                result.catch((err: unknown) => {
-                  log.warn(`[onAuthenticatedRequest] async error: ${err}`);
-                });
-              }
-            } catch (err) {
-              log.warn(`[onAuthenticatedRequest] error: ${err}`);
-            }
-            // If the hook wrote a response synchronously (e.g. a step-up
-            // gate calling `error(res, 403, ...)`), short-circuit. Async
-            // writes can't reach this branch — telemetry stays
-            // fire-and-forget.
-            if (res.writableEnded) return;
-          }
-          next();
-        });
-      }
-
-      // After the app's middleware, so only the write itself is remembered under its key.
-      server.polka.use(wrapHttpHandler(createIdempotencyMiddleware(pubsub)));
-
       // ── Step 11: Default routes ────────────────────────────────────
       server.polka.get(`/${version}/health`, (_req: any, res: any) => {
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -1108,6 +1070,47 @@ export function createApp(config: AppConfig): ParcaeApp {
           `${jobsAfter - jobsBefore} job(s), ` +
           `${cronsAfter - cronsBefore} cron(s)`,
       );
+
+      // ── Step 13.5: Mount app middleware ─────────────────────────────
+      // After discovery, so a discovered file's `route.use()` counts too.
+      // Polka runs every `use()` before any route, whenever it was mounted.
+      const appMiddleware = [...(config.middleware ?? []), ...getMiddleware()];
+      for (const middleware of appMiddleware) {
+        server.polka.use(wrapHttpHandler(middleware));
+      }
+
+      // Middleware: optional post-auth hook. Fires for every request
+      // that has reached this point with a resolved session — covers
+      // both HTTP (after the auth-resolve middleware above) and
+      // socket-RPC (`req._socketRpc` skipped resolve but had session
+      // pre-injected). Errors are swallowed so a faulty hook can never
+      // break the request path.
+      if (config.onAuthenticatedRequest) {
+        const hook = config.onAuthenticatedRequest;
+        server.polka.use((req: any, res: any, next: any) => {
+          if (req.session?.user) {
+            try {
+              const result = hook(req, req.session ?? null, res);
+              if (result instanceof Promise) {
+                result.catch((err: unknown) => {
+                  log.warn(`[onAuthenticatedRequest] async error: ${err}`);
+                });
+              }
+            } catch (err) {
+              log.warn(`[onAuthenticatedRequest] error: ${err}`);
+            }
+            // If the hook wrote a response synchronously (e.g. a step-up
+            // gate calling `error(res, 403, ...)`), short-circuit. Async
+            // writes can't reach this branch — telemetry stays
+            // fire-and-forget.
+            if (res.writableEnded) return;
+          }
+          next();
+        });
+      }
+
+      // After the app's middleware, so only the write itself is remembered under its key.
+      server.polka.use(wrapHttpHandler(createIdempotencyMiddleware(pubsub)));
 
       // ── Step 14: Apply discovered routes to Polka ──────────────────
       // Custom routes registered via `route.get/post/...` only attach when
